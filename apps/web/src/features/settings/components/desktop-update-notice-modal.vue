@@ -117,7 +117,7 @@ onBeforeUnmount(() => {
       <div class="update-notice__actions">
         <a-button :disabled="restarting" @click="close('later')">稍后提醒</a-button>
         <a-button v-if="notice?.shellOnly" type="primary" @click="openCheck">查看更新方式</a-button>
-        <a-button v-else type="primary" :loading="restarting" @click="updateNow">立即更新</a-button>
+        <a-button v-else type="primary" :loading="restarting" @click="updateNow">{{ restarting ? '正在应用更新…' : '立即更新' }}</a-button>
       </div>
     </div>
   </a-modal>

@@ -284,7 +284,7 @@ onUnmounted(() => { disposed = true; activation++; });
       </div>
       <a-space wrap>
         <a-button :disabled="restarting" @click="deferUpdate">稍后</a-button>
-        <a-button type="primary" :loading="restarting" :disabled="restartDisabled" @click="restart">重启更新</a-button>
+        <a-button type="primary" :loading="restarting" :disabled="restartDisabled" @click="restart">{{ restarting ? '正在应用更新…' : '重启更新' }}</a-button>
       </a-space>
     </div>
 

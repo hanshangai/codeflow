@@ -329,7 +329,7 @@ onBeforeUnmount(() => {
         </a-button>
         <div class="update-check__action-buttons">
           <a-button :disabled="restarting" @click="close">{{ prepared ? '稍后' : '关闭' }}</a-button>
-          <a-button v-if="prepared" type="primary" :loading="restarting" :disabled="restartDisabled" @click="restart">重启更新</a-button>
+          <a-button v-if="prepared" type="primary" :loading="restarting" :disabled="restartDisabled" @click="restart">{{ restarting ? '正在应用更新…' : '重启更新' }}</a-button>
           <a-button v-else type="primary" :loading="checking" :disabled="!capabilities.check || restarting" @click="startCheck">重新检查</a-button>
         </div>
       </div>

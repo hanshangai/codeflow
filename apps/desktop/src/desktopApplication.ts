@@ -7,6 +7,7 @@ import { toUpdateDiagnosticCause, toShellUpdateDiagnosticCause } from "@codeflow
 
 import { loadOrCreateDeviceIdentity, type DeviceIdentity } from "./deviceIdentity.js";
 import type { LegacyClientMigration } from "./legacyClientMigration.js";
+import type { StartupStatus } from "./webLoader.js";
 import { createClientRuntime, type ClientCliRuntime, type ClientRuntime, type ClientRuntimeExpectation, type ClientRuntimeSnapshot } from "./clientRuntime.js";
 import { createDesktopBridge } from "./preload.js";
 import type { DesktopBridgeApi } from "./contracts.js";
@@ -45,6 +46,8 @@ export type DesktopHost = {
   loadStartup?(window: DesktopWindow): Promise<void>;
   /** 页面先导航展示，本地启动任务收口后再开始页面就绪预算。 */
   loadWeb(window: DesktopWindow, releaseDir: string, options?: { beforeReady?: () => Promise<void> }): Promise<void>;
+  /** 启动页阶段进度；提示失败只记录，不改变启动或更新结果。 */
+  updateStartupStatus?(window: DesktopWindow, status: StartupStatus): Promise<void> | void;
   createTray(open: () => void, exit: () => Promise<void>, checkForUpdates?: () => void): { destroy(): void };
   registerBridge(bridge: DesktopBridgeApi, window: DesktopWindow): () => void;
   /** 仅在存在运行中会话时确认是否中断并更新。 */
@@ -58,6 +61,8 @@ export type DesktopHost = {
   onUpdateNotice?(notice: DesktopUpdateNotice): void;
   /** 应用资源下载进度；宿主推送到渲染进程，null 表示离开下载阶段。 */
   onUpdateProgress?(progress: DesktopUpdateProgress): void;
+  /** 本次启动已应用待更新资源；仅用于完成提示，不改变启动结果。 */
+  onUpdateApplied?(facts: { version: string }): void;
   quit(): void;
   /** 正常退出完成清理后登记下一次启动；不立即强制退出。 */
   relaunch?(): void;
@@ -1222,10 +1227,16 @@ export function createDesktopApplication(input: {
       if (operation !== "idle" || window) throw new Error("DESKTOP_ALREADY_STARTED");
       operation = "starting";
       try {
+        /** 启动页进度只做展示；held 续接尚无窗口时跳过。 */
+        const reportStartup = async (label: string, percent: number): Promise<void> => {
+          if (!window) return;
+          await input.host.updateStartupStatus?.(window, { label, percent });
+        };
         if (!continuation && input.host.loadStartup) {
           await input.host.loadStartup(ensureWindow());
           assertStartupRunning();
           window!.show();
+          await reportStartup("正在检查更新…", 10);
         }
         identity = await loadOrCreateDeviceIdentity(input.dataDir);
         assertStartupRunning();
@@ -1270,6 +1281,8 @@ export function createDesktopApplication(input: {
           }
         }
         assertStartupRunning();
+        const applyingUpdate = Boolean(pending || startupShellPending);
+        await reportStartup(applyingUpdate ? "正在应用更新…" : "正在启动…", 25);
         const startupArtifacts = continuation ? JSON.stringify([baselineRelease, activeRelease]) : undefined;
         const releaseDir = activeRelease?.releaseDir ?? baselineRelease?.releaseDir ?? input.initialReleaseDir;
         if (activeRelease || baselineRelease || pending) runtime = createRuntime(clientEntry(releaseDir), activeRelease?.manifest ?? baselineRelease?.manifest, initialStartup);
@@ -1300,8 +1313,10 @@ export function createDesktopApplication(input: {
             releaseId: "installation", clientVersion: health.clientVersion, protocolVersion: health.protocolVersion, dbSchemaVersion: health.dbSchemaVersion,
           };
         };
+        await reportStartup(applyingUpdate ? "正在应用更新…" : "正在启动本地服务…", 45);
         if (!migration) await startRuntime();
         window = ensureWindow();
+        await reportStartup(applyingUpdate ? "正在应用更新…" : "正在加载工作台…", 70);
         const bridge = createDesktopBridge({
           /** Client健康与业务放行分开；页面仅在原启动围栏解除后执行首次业务初始化。 */
           getState: () => {
@@ -1387,9 +1402,15 @@ export function createDesktopApplication(input: {
             if (failures.length > 1) throw new AggregateError(failures, "DESKTOP_MIGRATION_STARTUP_FAILED");
             throw error;
           }
-        } else await reloadWeb(releaseDir);
+        } else {
+          await reportStartup(applyingUpdate ? "正在应用更新…" : "正在加载工作台…", 85);
+          await reloadWeb(releaseDir);
+        }
         assertStartupRunning();
-        if (pending) await activatePendingAtStartup(pending, activeRelease);
+        if (pending) {
+          await activatePendingAtStartup(pending, activeRelease);
+          if (bundleDetails.result === "healthy") input.host.onUpdateApplied?.({ version: currentVersion });
+        }
         if (startupUpdateError) {
           updateCheckFailure = startupUpdateError;
           bundleDetails = { requestId: startupUpdateError.requestId, target: null, phase: "prepare", result: "failure", failure: null };

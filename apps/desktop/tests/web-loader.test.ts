@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { loadWeb, loadStartupWeb } from "../src/webLoader.js";
+import { loadWeb, loadStartupWeb, updateStartupWeb } from "../src/webLoader.js";
 
 test("启动页仅加载壳内静态内容，不探测或提前报告业务就绪", async () => {
   let entry = "";
@@ -14,6 +14,18 @@ test("启动页仅加载壳内静态内容，不探测或提前报告业务就�
   assert.doesNotMatch(html, /<script|https?:|codeflowReady/iu);
   const failure = new Error("STARTUP_NAVIGATION_FAILED");
   await assert.rejects(loadStartupWeb({ loadURL: async () => { throw failure; } }), error => error === failure);
+});
+
+test("启动页进度只更新固定状态与进度条，并把百分比收敛到 0-100", async () => {
+  const scripts: string[] = [];
+  const window = { loadURL: async () => {}, webContents: { executeJavaScript: async (source: string) => { scripts.push(source); } } };
+  await updateStartupWeb(window, { label: "正在应用更新…", percent: 45 });
+  await updateStartupWeb(window, { label: "正在应用更新…", percent: 150 });
+  assert.equal(scripts.length, 2);
+  assert.match(scripts[0]!, /正在应用更新…/u);
+  assert.match(scripts[0]!, /45%/u);
+  assert.match(scripts[0]!, /aria-valuenow/u);
+  assert.match(scripts[1]!, /100%/u);
 });
 
 test("propagates a Web load failure", async () => {

@@ -5,7 +5,7 @@ import { describeUserFacingError } from "@codeflowai/shared";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Tray, protocol, shell, session } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, Tray, protocol, shell, session } from "electron";
 import type { DesktopApiRequest, DesktopUpdateClientErrorReport } from "@codeflowai/shared";
 import { assertTrustedReleaseKeys, type TrustedReleaseKeys } from "@codeflowai/shared/desktop-release-signing";
 
@@ -14,7 +14,7 @@ import { resolveClientCliRuntime } from "./clientRuntime.js";
 import { createLegacyClientMigration, resolveLegacyClientMigrationWorker, cancelLegacyMigrationAccountForUninstall } from "./legacyClientMigration.js";
 import { createDesktopCrashCapture } from "./crashReportCapture.js";
 import type { DesktopBridgeApi } from "./contracts.js";
-import { loadWeb, loadStartupWeb } from "./webLoader.js";
+import { loadWeb, loadStartupWeb, updateStartupWeb } from "./webLoader.js";
 import { readInstalledUpdateOrigin } from './updateConfiguration.js';
 import { bindMainFrameEvents } from "./mainFrameEvents.js";
 import { resolveVersionedShellStartup } from "./shellLaunchState.js";
@@ -465,6 +465,18 @@ if (process.versions.electron) {
         : describeUserFacingError(error, "退出失败，请稍后重试。");
     dialog.showErrorBox("退出 CodeFlow 失败", `${message}\n错误码：${code}\n日志：${path.join(dataDir, "logs", "desktop-errors.jsonl")}`);
   }
+  /** 系统通知失败只记录，不改变启动或更新结果；平台不支持通知时跳过。 */
+  function notifyDesktopUpdate(title: string, body: string, dataDir: string): void {
+    try {
+      if (!Notification.isSupported()) return;
+      new Notification({ title, body }).show();
+    } catch (error) {
+      try {
+        recordDesktopError(dataDir, error, { errorCode: readDesktopErrorCode(error, "DESKTOP_UPDATE_NOTIFICATION_FAILED"),
+          requestId: `update-notification:${Date.now()}` });
+      } catch (logError) { console.error("[DESKTOP_UPDATE_NOTIFICATION_LOG_FAILED]", logError); }
+    }
+  }
   let lifecycleRequest: ReturnType<typeof readDesktopLifecycleRequest> = null, maintenanceRequestError: unknown;
   try { lifecycleRequest = readDesktopLifecycleRequest(process.argv, app.isPackaged, process.platform); }
   catch (cause) { maintenanceRequestError = cause; }
@@ -492,6 +504,8 @@ if (process.versions.electron) {
         || argument.startsWith('--codeflow-check-installation') || argument.startsWith("--codeflow-register-installation") || argument === "--delete-app-data")) return;
       if (application) application.openWindow(); else pendingOpen = true;
     });
+    // Windows 通知按 AUMID 关联开始菜单快捷方式；必须在 ready 前固定。
+    if (process.platform === "win32") app.setAppUserModelId("ai.codeflow.codeflowai");
     void app.whenReady().then(async () => {
       // 无边框窗口不需要原生菜单栏；macOS 保留最小系统菜单以维持 Cmd+Q/复制粘贴。
       if (process.platform === "darwin") {
@@ -752,6 +766,10 @@ if (process.versions.electron) {
           createWindow: () => { normalWindow = createDefaultWindow(webEntry, showError); return normalWindow; },
           /** 内置启动页与已验证的 Web 复用同一沙箱窗口。 */
           loadStartup: window => loadStartupWeb(window as BrowserWindow),
+          /** 启动页进度失败只记录，不阻断启动或更新。 */
+          updateStartupStatus: (window, status) => updateStartupWeb(window as BrowserWindow, status).catch(error => {
+            logError(error, { errorCode: readDesktopErrorCode(error, "DESKTOP_STARTUP_STATUS_FAILED"), requestId: "startup-status" });
+          }),
           onMigrationError: error => showDesktopError(dataDir, "CodeFlow 退出失败", error,
             { errorCode: readDesktopErrorCode(error, "DESKTOP_EXIT_FAILED"), requestId: startupRequestId }),
           /** 先导航展示页面，已有本地启动任务与页面资源使用各自的等待预算。 */
@@ -821,11 +839,21 @@ if (process.versions.electron) {
               return;
             }
             showDesktopError(dataDir, "CodeFlow 更新失败", error, details);
+            // 窗口隐藏或已关闭时补系统通知，避免用户错过失败。
+            if (!normalWindow || normalWindow.isDestroyed() || !normalWindow.isVisible()) {
+              notifyDesktopUpdate("CodeFlow 更新失败", "更新未完成，请打开应用查看诊断。", dataDir);
+            }
           },
           onUpdateRetry: (context) => recordDesktopError(dataDir, context.error,
             { ...context, errorCode: "DESKTOP_UPDATE_RETRY_SCHEDULED" }),
           /** 下载完成提醒：先唤起窗口再推送；页面晚挂载时由 getUpdateNotice 补查。 */
           onUpdateNotice: notice => {
+            // 窗口可见时由页面内提醒承接，避免系统通知与弹窗重复。
+            if (!normalWindow || normalWindow.isDestroyed() || !normalWindow.isVisible()) {
+              notifyDesktopUpdate("发现新版本", notice.shellOnly
+                ? `版本 ${notice.version} 已下载，请手动安装。`
+                : `版本 ${notice.version} 已下载完成，重启应用后生效。`, dataDir);
+            }
             try { application?.openWindow(); }
             catch (error) { logError(error, { errorCode: readDesktopErrorCode(error, "DESKTOP_UPDATE_NOTICE_OPEN_FAILED"), requestId: "update-notice:open" }); }
             const window = normalWindow;
@@ -837,6 +865,7 @@ if (process.versions.electron) {
             if (window.webContents.isLoading()) window.webContents.once("did-finish-load", send);
             else send();
           },
+          onUpdateApplied: ({ version }) => notifyDesktopUpdate("CodeFlow 已更新", `已更新到 ${version}，当前版本已就绪。`, dataDir),
           /** 下载进度：与提醒同一可信窗口边界；高频进度按 100ms 节流后推送。 */
           onUpdateProgress: progress => {
             const window = normalWindow;
