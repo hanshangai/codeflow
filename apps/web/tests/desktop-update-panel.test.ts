@@ -37,7 +37,8 @@ function fixture(t: test.TestContext, active = false) {
     return new Promise((resolve, reject) => items.push({ resolve, reject }));
   };
   const bridge = { getState: async () => ({}), request: async () => { throw new Error("unexpected request"); },
-    getUpdateState: pending(states), checkForUpdates: pending(checks), restartForUpdate: pending(restarts), getUpdateDiagnostics: pending(diagnostics) };
+    getUpdateState: pending(states), checkForUpdates: pending(checks), restartForUpdate: pending(restarts), getUpdateDiagnostics: pending(diagnostics),
+    reportUpdateError: async () => {} };
   Object.defineProperty(globalThis, "window", { configurable: true, value: { codeflowDesktop: bridge } });
   t.mock.method(console, "error", (...args: unknown[]) => { logs.push(args); });
   t.mock.method(globalThis, "fetch", async () => { throw new Error("unexpected fetch"); });

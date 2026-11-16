@@ -3,7 +3,7 @@ import { computed, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { ExportOutlined } from "@ant-design/icons-vue";
 import { describeUserFacingError, formatDesktopVersion, type DesktopUpdateDetails, type DesktopUpdateDiagnostics, type DesktopUpdateState } from "@codeflowai/shared";
-import { checkDesktopForUpdates, restartDesktopForUpdate, DesktopUpdateServiceError, getDesktopUpdateCapabilities, getDesktopUpdateDetails, getDesktopUpdateDiagnostics, getDesktopUpdateState } from "../../../services/desktop";
+import { checkDesktopForUpdates, reportDesktopUpdateError, restartDesktopForUpdate, DesktopUpdateServiceError, getDesktopUpdateCapabilities, getDesktopUpdateDetails, getDesktopUpdateDiagnostics, getDesktopUpdateState } from "../../../services/desktop";
 import { desktopBundlePhaseLabels, desktopShellPhaseLabels, desktopUpdateOperationLabels, desktopUpdateResultLabels, formatDesktopCurrentVersion } from "../desktopUpdateLabels";
 import { openUpgradeNotes } from "../../../utils/upgradeNotes";
 
@@ -110,6 +110,17 @@ function isCurrent(owner: number): boolean { return !disposed && props.active &&
 
 /** 宿主原拒绝已在 IPC 记录；Web 校验失败仅记固定安全原因并返回显式失败文案。 */
 function failureMessage(error: unknown, action: "state" | "details" | "check" | "restart" | "diagnostics"): string {
+  // 只读快照失败已有界面提示，不伪造更新失败；检查失败由宿主按真实阶段记录，页面不重复。
+  if (action === "restart") {
+    const message = (error instanceof Error ? error.message : String(error)).slice(0, 1000);
+    const shellTarget = details.value?.shell.result === "prepared" ? details.value.shell.target : null;
+    const bundleTarget = details.value?.bundle.result === "prepared" ? details.value.bundle.target : null;
+    void reportDesktopUpdateError(shellTarget && !bundleTarget
+      ? { phase: details.value?.shell.phase ?? "handoff", target: "shell", shellId: shellTarget.shellId,
+          code: "DESKTOP_UPDATE_RESTART_FAILED", requestId: details.value?.shell.requestId ?? null, message }
+      : { phase: "restart-client", target: "bundle", code: "DESKTOP_UPDATE_RESTART_FAILED",
+          requestId: details.value?.bundle.requestId ?? null, releaseId: bundleTarget?.releaseId ?? null, message });
+  }
   if (error instanceof DesktopUpdateServiceError) {
     console.error("desktop_update_panel_failed", { errorCode: error.code, requestId: null, deviceId: state.value?.deviceId ?? null,
       action, rootCause: error.code });

@@ -2,7 +2,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { readPendingRelease, savePendingRelease, clearPendingRelease, type PendingRelease } from "./pendingRelease.js";
 import { createReleaseDatabaseBackup } from "./releaseDatabaseBackup.js";
-import { assertReleaseBundleManifest, compareNumericVersion, snapshotDesktopStartupMode, snapshotDesktopStartupReady, type DesktopApiRequest, type DesktopStartupMode, type DesktopEvent, type DesktopUpdateDiagnostics, type DesktopUpdateState, type DesktopUpdateDetails, type DesktopBundleVersion, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress } from "@codeflowai/shared";
+import { assertReleaseBundleManifest, compareNumericVersion, snapshotDesktopStartupMode, snapshotDesktopStartupReady, type DesktopApiRequest, type DesktopStartupMode, type DesktopEvent, type DesktopUpdateDiagnostics, type DesktopUpdateState, type DesktopUpdateDetails, type DesktopBundleVersion, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress, type DesktopUpdateClientErrorReport } from "@codeflowai/shared";
 import { toUpdateDiagnosticCause, toShellUpdateDiagnosticCause } from "@codeflowai/shared/desktop-update-failure";
 
 import { loadOrCreateDeviceIdentity, type DeviceIdentity } from "./deviceIdentity.js";
@@ -1165,6 +1165,16 @@ export function createDesktopApplication(input: {
       try { await application.exit(); }
       finally { restartRequested = false; }
     },
+    /** 页面侧更新操作失败写入同一失败日志；原因码走宿主既有白名单，正文只保留为因果链。 */
+    reportUpdateError(input: DesktopUpdateClientErrorReport): void {
+      if (!failureJournal || !identity) throw new Error("DESKTOP_UPDATE_UNAVAILABLE");
+      const error = new Error(input.code);
+      if (input.message) error.cause = new Error(input.message.slice(0, 1000));
+      const base = { ...getFailureContext(), requestId: input.requestId ?? crypto.randomUUID(), recovery: "not_needed" as const, error };
+      if (input.target === "shell") failureJournal.recordShell({ ...base, shellId: input.shellId ?? null,
+        phase: input.phase as Parameters<typeof failureJournal.recordShell>[0]["phase"] });
+      else failureJournal.record({ ...base, releaseId: input.releaseId ?? "unknown", phase: input.phase });
+    },
     /** 仅在身份和回执边界就绪后接受真实阶段事实。 */
     reportReceipt,
     /** 显式补报既有待报证据；未配置 origin 时明确拒绝。 */
@@ -1317,6 +1327,7 @@ export function createDesktopApplication(input: {
           getUpdateNotice: application.getUpdateNotice,
           dismissUpdateNotice: application.dismissUpdateNotice,
           restartForUpdate: application.restartForUpdate,
+          reportUpdateError: async input => { application.reportUpdateError(input); },
           /** 页面只等待原检查，关联本次原失败，保根因与本机上下文，不返回ActiveRelease。 */
           checkForUpdates: async () => {
             try { await application.checkForUpdates(); }

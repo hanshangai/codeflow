@@ -8,6 +8,7 @@ import {
   dismissDesktopUpdateNotice,
   getDesktopUpdateCapabilities,
   getDesktopUpdateNotice,
+  reportDesktopUpdateError,
   restartDesktopForUpdate,
   subscribeDesktopUpdateNotice,
 } from "../../../services/desktop";
@@ -26,11 +27,14 @@ let disposed = false;
 const open = computed(() => notice.value !== null);
 
 /** 提醒相关失败保留固定代码、版本与真实原因，便于客户端日志检索。 */
-function report(action: string, error: unknown, releaseId: string | null): void {
-  console.error(`[desktop_update_notice_${action}]`, {
-    code: error instanceof DesktopUpdateServiceError ? error.code : "DESKTOP_UPDATE_NOTICE_FAILED",
-    releaseId,
-    message: error instanceof Error ? error.message : String(error),
+function report(action: string, error: unknown, releaseId: string | null, shellOnly = false): void {
+  const code = error instanceof DesktopUpdateServiceError ? error.code : "DESKTOP_UPDATE_NOTICE_FAILED";
+  const message = (error instanceof Error ? error.message : String(error)).slice(0, 1000);
+  console.error(`[desktop_update_notice_${action}]`, { code, releaseId, message });
+  const shellRestart = action === "restart_failed" && shellOnly;
+  void reportDesktopUpdateError({
+    phase: shellRestart ? "handoff" : action === "restart_failed" ? "restart-client" : "discovery",
+    code, message, ...(shellRestart ? { target: "shell" as const } : { releaseId }),
   });
 }
 
@@ -63,7 +67,7 @@ async function updateNow(): Promise<void> {
   restarting.value = true;
   try { await restartDesktopForUpdate(); }
   catch (error) {
-    report("restart_failed", error, notice.value?.releaseId ?? null);
+    report("restart_failed", error, notice.value?.releaseId ?? null, notice.value?.shellOnly === true);
     message.error("重启更新失败，请稍后重试。");
   } finally { restarting.value = false; }
 }

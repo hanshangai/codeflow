@@ -1,4 +1,4 @@
-import type { DesktopApiRequest, DesktopApiResponse, DesktopEvent, DesktopWindowControls, DesktopUpdateDiagnostics, DesktopUpdateState, DesktopUpdateDetails, DesktopUpdateNotice, DesktopUpdateNoticeDismissAction, DesktopUpdateProgress, DesktopMigrationState, DesktopMigrationAccount } from "@codeflowai/shared";
+import type { DesktopApiRequest, DesktopApiResponse, DesktopEvent, DesktopWindowControls, DesktopUpdateDiagnostics, DesktopUpdateState, DesktopUpdateDetails, DesktopUpdateNotice, DesktopUpdateNoticeDismissAction, DesktopUpdateProgress, DesktopUpdateClientErrorReport, DesktopMigrationState, DesktopMigrationAccount } from "@codeflowai/shared";
 import type { DesktopBridgeApi, DesktopRuntimeState } from "./contracts.js";
 
 export type DesktopBridgeDeps = {
@@ -23,6 +23,8 @@ export type DesktopBridgeDeps = {
   onUpdateNotice?: (listener: (notice: DesktopUpdateNotice) => void) => () => void;
   /** 下载进度推送；独立于更新详情契约，旧页面不订阅时零影响。 */
   onUpdateProgress?: (listener: (progress: DesktopUpdateProgress) => void) => () => void;
+  /** 页面侧更新错误上报；只接受固定阶段与去敏错误码。 */
+  reportUpdateError?: (input: DesktopUpdateClientErrorReport) => Promise<void>;
   /** 退出确认请求与结果回传；页面未订阅时主进程回退系统框。 */
   onQuitConfirmRequested?: (listener: () => void) => () => void;
   respondQuitConfirm?: (confirmed: boolean) => Promise<void>;
@@ -96,6 +98,10 @@ export function createDesktopBridge(deps: DesktopBridgeDeps): DesktopBridgeApi {
     ...(deps.onUpdateProgress ? {
       /** 只透传下载进度，不暴露 Electron 频道或参数。 */
       onUpdateProgress: (listener: (progress: DesktopUpdateProgress) => void): (() => void) => deps.onUpdateProgress!(listener),
+    } : {}),
+    ...(deps.reportUpdateError ? {
+      /** 页面错误在宿主再次校验，并写入原更新失败日志。 */
+      reportUpdateError: async (input: DesktopUpdateClientErrorReport): Promise<void> => { await deps.reportUpdateError!(input); },
     } : {}),
     ...(deps.onQuitConfirmRequested ? {
       /** 固定无参事件只表示宿主请求确认，不暴露 Electron 频道或参数。 */

@@ -51,6 +51,18 @@ export type DesktopUpdateDetails = {
 /** 应用资源下载进度；null 表示当前不在下载阶段。 */
 export type DesktopUpdateProgress = { received: number; total: number } | null;
 
+/** 页面侧更新操作失败上报；只携带固定阶段与去敏错误码，不传路径或凭据。 */
+export type DesktopUpdateClientErrorReport = {
+  phase: "discovery" | "download" | "prepare" | "read-active" | "verify" | "compatibility" | "prepare-directory"
+    | "drain" | "restart-client" | "reload-web" | "health" | "activate" | "install" | "handoff" | "admission-intent" | "recovery";
+  code: string;
+  target?: "bundle" | "shell";
+  shellId?: string | null;
+  requestId?: string | null;
+  releaseId?: string | null;
+  message?: string;
+};
+
 /** 下载完成后的更新提醒；只暴露展示所需字段，不携带路径或签名。 */
 export type DesktopUpdateNotice = {
   releaseId: string;
@@ -505,6 +517,8 @@ export type DesktopBridgeApi = {
   onUpdateNotice?: (listener: (notice: DesktopUpdateNotice) => void) => () => void;
   /** 应用资源下载进度推送；旧壳缺能力时不订阅。 */
   onUpdateProgress?: (listener: (progress: DesktopUpdateProgress) => void) => () => void;
+  /** 页面侧更新操作失败上报；旧壳缺能力时页面只保留控制台记录。 */
+  reportUpdateError?: (input: DesktopUpdateClientErrorReport) => Promise<void>;
   /** 有运行中会话时的退出确认请求；固定无参，旧壳省略时主进程回退系统确认框。 */
   onQuitConfirmRequested?: (listener: () => void) => () => void;
   /** 回传退出确认结果；只接受布尔值。 */

@@ -1,4 +1,4 @@
-import { isSharedWorkspaceSelectionId, type ApiResult, type DesktopApiRequest, type DesktopBridgeApi, type DesktopEvent, type DesktopUpdateDetails, type DesktopUpdateDiagnostics, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress, type DesktopUpdateState } from "@codeflowai/shared";
+import { isSharedWorkspaceSelectionId, type ApiResult, type DesktopApiRequest, type DesktopBridgeApi, type DesktopEvent, type DesktopUpdateClientErrorReport, type DesktopUpdateDetails, type DesktopUpdateDiagnostics, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress, type DesktopUpdateState } from "@codeflowai/shared";
 import { createApiResultError } from "../api/request";
 
 declare global {
@@ -173,10 +173,37 @@ export function subscribeDesktopUpdateProgress(listener: (progress: DesktopUpdat
         requestId: null,
         rootCause: "invalid progress payload",
       });
+      void reportDesktopUpdateError({ phase: "download", code: "DESKTOP_UPDATE_PROGRESS_INVALID", message: "invalid progress payload" });
       return;
     }
     listener(progress);
   });
+}
+
+/** 高频进度/快照错误按固定窗口去重，避免轮询或坏载荷刷写耐久日志。 */
+const reportedUpdateErrors = new Map<string, number>();
+const UPDATE_ERROR_REPORT_INTERVAL_MS = 60_000;
+
+/** 更新操作失败上报宿主失败日志；旧壳缺能力时保留控制台记录，不静默丢弃。 */
+export async function reportDesktopUpdateError(input: DesktopUpdateClientErrorReport): Promise<void> {
+  if (input.code === "DESKTOP_UPDATE_PROGRESS_INVALID" || input.code === "DESKTOP_UPDATE_CHECK_SNAPSHOT_FAILED") {
+    const key = `${input.target ?? "bundle"}|${input.phase}|${input.code}`;
+    const now = Date.now();
+    if (now - (reportedUpdateErrors.get(key) ?? 0) < UPDATE_ERROR_REPORT_INTERVAL_MS) return;
+    reportedUpdateErrors.set(key, now);
+  }
+  const bridge = getDesktopBridge();
+  if (typeof bridge?.reportUpdateError !== "function") {
+    console.error("[desktop_update_error_report_unavailable]", { code: input.code, phase: input.phase });
+    return;
+  }
+  try { await bridge.reportUpdateError(input); }
+  catch (cause) {
+    console.error("[desktop_update_error_report_failed]", {
+      code: input.code, phase: input.phase,
+      rootCause: cause instanceof Error ? cause.message : String(cause),
+    });
+  }
 }
 
 /** 等待原检查入口；void 只代表该调用结算，不代表发现或安装更新。 */

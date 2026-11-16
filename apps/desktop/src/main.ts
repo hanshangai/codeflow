@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Tray, protocol, shell, session } from "electron";
-import type { DesktopApiRequest } from "@codeflowai/shared";
+import type { DesktopApiRequest, DesktopUpdateClientErrorReport } from "@codeflowai/shared";
 import { assertTrustedReleaseKeys, type TrustedReleaseKeys } from "@codeflowai/shared/desktop-release-signing";
 
 import { createDesktopApplication, DesktopStartupCleanupError } from "./desktopApplication.js";
@@ -184,6 +184,29 @@ function registerIpcHandlers(bridge: DesktopBridgeApi, window: BrowserWindow, we
     } } : {}),
     ...(bridge.checkForUpdates ? { "desktop:checkForUpdates": async () => { await bridge.checkForUpdates!(); } } : {}),
     ...(bridge.restartForUpdate ? { "desktop:restartForUpdate": async () => { await bridge.restartForUpdate!(); } } : {}),
+    ...(bridge.reportUpdateError ? { "desktop:reportUpdateError": async (payload: unknown) => {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw Object.assign(new Error("DESKTOP_UPDATE_ERROR_INVALID"), { code: "DESKTOP_UPDATE_ERROR_INVALID" });
+      const input = payload as Record<string, unknown>;
+      const requestId = input.requestId, releaseId = input.releaseId, shellId = input.shellId, message = input.message, target = input.target;
+      if (!["discovery", "download", "prepare", "read-active", "verify", "compatibility", "prepare-directory", "drain",
+        "restart-client", "reload-web", "health", "activate", "install", "handoff", "admission-intent", "recovery"].includes(String(input.phase))
+        || typeof input.code !== "string" || !/^[A-Z][A-Z0-9_]{1,99}$/u.test(input.code)
+        || (target != null && target !== "bundle" && target !== "shell")
+        || (requestId != null && (typeof requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$/u.test(requestId)))
+        || (releaseId != null && (typeof releaseId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(releaseId)))
+        || (shellId != null && (typeof shellId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:+-]{0,255}$/u.test(shellId)))
+        || (message != null && (typeof message !== "string" || message.length > 1000))) {
+        throw Object.assign(new Error("DESKTOP_UPDATE_ERROR_INVALID"), { code: "DESKTOP_UPDATE_ERROR_INVALID" });
+      }
+      await bridge.reportUpdateError!({
+        phase: input.phase as DesktopUpdateClientErrorReport["phase"], code: input.code,
+        ...(target == null ? {} : { target: target as "bundle" | "shell" }),
+        ...(shellId == null ? {} : { shellId: shellId as string }),
+        ...(requestId == null ? {} : { requestId: requestId as string }),
+        ...(releaseId == null ? {} : { releaseId: releaseId as string }),
+        ...(message == null ? {} : { message: message as string }),
+      });
+    } } : {}),
     "desktop:request": (request: unknown) => bridge.request(request as DesktopApiRequest),
     /** 本机目录选择绑定当前窗口，页面只能提供初始目录，不能改变选择类型。 */
     "desktop:selectDirectory": async (initialPath: unknown) => {

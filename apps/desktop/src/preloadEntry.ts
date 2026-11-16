@@ -29,6 +29,7 @@ exposeDesktopBridge(contextBridge, {
   dismissUpdateNotice: (action) => ipcRenderer.invoke("desktop:dismissUpdateNotice", action),
   onUpdateNotice: (listener) => subscribeFixedChannel(ipcRenderer, "desktop:update-notice", listener),
   onUpdateProgress: (listener) => subscribeFixedChannel(ipcRenderer, "desktop:update-progress", listener),
+  reportUpdateError: (input) => ipcRenderer.invoke("desktop:reportUpdateError", input),
   /** 订阅即声明页面具备应用内确认能力；主进程据此决定是否回退系统框。 */
   onQuitConfirmRequested: (listener) => {
     reportQuitConfirmReady(true);

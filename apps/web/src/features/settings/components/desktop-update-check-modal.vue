@@ -6,7 +6,7 @@ import { describeUserFacingError, formatDesktopVersion, type DesktopUpdateDetail
 
 import {
   checkDesktopForUpdates, DesktopUpdateServiceError, getDesktopUpdateCapabilities, getDesktopUpdateDetails,
-  getDesktopUpdateState, restartDesktopForUpdate, subscribeDesktopUpdateCheckRequested, subscribeDesktopUpdateProgress,
+  getDesktopUpdateState, reportDesktopUpdateError, restartDesktopForUpdate, subscribeDesktopUpdateCheckRequested, subscribeDesktopUpdateProgress,
   takeDesktopUpdateCheckRequest,
 } from "../../../services/desktop";
 import { desktopBundlePhaseLabels, desktopShellPhaseLabels, desktopUpdateResultLabels, formatDesktopCurrentVersion } from "../desktopUpdateLabels";
@@ -40,6 +40,17 @@ let disposed = false;
 const currentRows = computed(() => [
   { label: "当前版本", value: formatDesktopCurrentVersion(details.value?.current ?? null) },
 ]);
+/** 已取得可信目标后展示待更新版本；下载阶段即可见，不依赖准备完成。 */
+const targetRows = computed(() => {
+  const bundle = details.value?.bundle, shell = details.value?.shell;
+  // same/failure/restored 时宿主仍保留目标快照，不能当成待安装的新版本展示。
+  const active = (result: string | null | undefined) => result === "prepared" || result === "unknown";
+  return [
+    ...(bundle?.target && active(bundle.result) ? [{ label: "新版本（应用资源）", value: bundle.target.version }] : []),
+    ...(shell?.target && active(shell.result) ? [{ label: "新版本（桌面壳）", value: shell.target.version }] : []),
+  ];
+});
+const versionRows = computed(() => [...currentRows.value, ...targetRows.value]);
 const prepared = computed(() => details.value?.bundle.result === "prepared" && !!details.value.bundle.target
   || details.value?.shell.result === "prepared" && !!details.value.shell.target);
 const restartDisabled = computed(() => !prepared.value || !capabilities.restart || checking.value || restarting.value || !!snapshotError.value
@@ -159,6 +170,8 @@ async function refreshSnapshots(owner: number): Promise<boolean> {
       requestId: (cause as { requestId?: unknown } | null)?.requestId ?? null,
       rootCause: cause instanceof Error ? cause.message : String(cause),
     });
+    void reportDesktopUpdateError({ phase: "discovery", code: "DESKTOP_UPDATE_CHECK_SNAPSHOT_FAILED",
+      message: (cause instanceof Error ? cause.message : String(cause)).slice(0, 1000) });
     return false;
   }
 }
@@ -189,6 +202,7 @@ async function startCheck(): Promise<void> {
         requestId: (cause as { requestId?: unknown } | null)?.requestId ?? null,
         rootCause: cause instanceof Error ? cause.message : String(cause),
       });
+      // 宿主已用真实 requestId 与阶段记录本次检查失败，页面不重复上报。
     }
   } finally {
     if (!disposed && owner === run) {
@@ -212,6 +226,14 @@ async function restart(): Promise<void> {
       console.error("[desktop_update_restart_failed]", { code: cause instanceof DesktopUpdateServiceError ? cause.code : "DESKTOP_UPDATE_RESTART_FAILED",
         requestId: details.value?.bundle.result === "prepared" ? details.value.bundle.requestId : details.value?.shell.requestId ?? null, deviceId: state.value?.deviceId ?? null,
         rootCause: cause instanceof DesktopUpdateServiceError ? cause.code : "DESKTOP_HOST_RESTART_FAILED" });
+      const message = (cause instanceof Error ? cause.message : String(cause)).slice(0, 1000);
+      const shellTarget = details.value?.shell.result === "prepared" ? details.value.shell.target : null;
+      const bundleTarget = details.value?.bundle.result === "prepared" ? details.value.bundle.target : null;
+      void reportDesktopUpdateError(shellTarget && !bundleTarget
+        ? { phase: details.value?.shell.phase ?? "handoff", target: "shell", shellId: shellTarget.shellId,
+            code: "DESKTOP_UPDATE_RESTART_FAILED", requestId: details.value?.shell.requestId ?? null, message }
+        : { phase: "restart-client", target: "bundle", code: "DESKTOP_UPDATE_RESTART_FAILED",
+            requestId: details.value?.bundle.requestId ?? null, releaseId: bundleTarget?.releaseId ?? null, message });
     }
   } finally { restarting.value = false; }
 }
@@ -235,6 +257,8 @@ async function consumeCheckRequest(fromEvent = false): Promise<void> {
     error.value = failureText(cause);
     console.error("[desktop_update_check_take_failed]", { code: "DESKTOP_UPDATE_CHECK_TAKE_FAILED", requestId: null,
       rootCause: "DESKTOP_HOST_CHECK_TAKE_FAILED" });
+    void reportDesktopUpdateError({ phase: "discovery", code: "DESKTOP_UPDATE_CHECK_TAKE_FAILED",
+      message: (cause instanceof Error ? cause.message : String(cause)).slice(0, 1000) });
   }
 }
 
@@ -281,8 +305,8 @@ onBeforeUnmount(() => {
 <template>
   <a-modal :open="open" title="检查更新" :footer="null" :width="600" centered @cancel="close">
     <div class="update-check">
-      <section class="update-check__versions" aria-label="当前版本">
-        <div v-for="row in currentRows" :key="row.label" class="update-check__version">
+      <section class="update-check__versions" aria-label="版本">
+        <div v-for="row in versionRows" :key="row.label" class="update-check__version">
           <span>{{ row.label }}</span>
           <strong :title="row.value">{{ row.value }}</strong>
         </div>
