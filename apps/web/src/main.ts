@@ -34,7 +34,7 @@ function installModalKeyboardShortcuts(): void {
     if (target.closest("textarea, [contenteditable='true'], .ant-select, .ant-picker, .ant-cascader, .ant-mentions, .ant-dropdown, .ant-popover")) return;
     // 焦点在按钮或链接上时保留原生回车行为（例如聚焦“取消”时回车应取消）。
     if (target.closest("button, a")) return;
-    if (document.querySelector(".ant-select-dropdown:not(.ant-select-dropdown-hidden), .ant-picker-dropdown:not(.ant-picker-dropdown-hidden)")) return;
+    if (hasVisiblePopup()) return;
     const modal = topVisibleModal();
     // 只响应弹框内的键盘焦点，避免后台页面误触确认。
     if (!modal || !modal.contains(target)) return;
@@ -42,6 +42,14 @@ function installModalKeyboardShortcuts(): void {
     if (!primary) return;
     event.preventDefault();
     primary.click();
+  });
+}
+
+/** 判断下拉/选择浮层是否真正展开；关闭后的浮层仍留在 DOM 中且无隐藏类，不能按类名判断。 */
+function hasVisiblePopup(): boolean {
+  return Array.from(document.querySelectorAll(".ant-select-dropdown, .ant-picker-dropdown")).some((el) => {
+    const style = getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden";
   });
 }
 
