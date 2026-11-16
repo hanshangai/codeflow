@@ -10,6 +10,15 @@ import { createBuilderProject, removeBuilderProject, resolveElectronVersion, toB
 
 const requestId = crypto.randomUUID();
 
+/** 固定 electron-builder/Electron 用户缓存，避免调用环境差异导致重复下载。 */
+function pinElectronCaches() {
+  const base = process.env.LOCALAPPDATA;
+  if (!base) return;
+  process.env.ELECTRON_BUILDER_CACHE ||= path.join(base, "electron-builder", "Cache");
+  process.env.ELECTRON_CACHE ||= path.join(base, "electron", "Cache");
+}
+pinElectronCaches();
+
 /** 解析新输出的最近既有祖先，保留尚不存在的尾段并识别父目录链接。 */
 async function resolveOutputPath(directory) {
   const missing = [];

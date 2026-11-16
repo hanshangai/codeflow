@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { runTar } from "../../apps/desktop/scripts/tar.mjs";
 import pnpmCommand from "./pnpm-command.cjs";
 
@@ -41,6 +41,16 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`DESKTOP_BUILD_COMMAND_FAILED: ${command} ${args.join(" ")} exit=${result.status}`);
 }
 
+/** 异步执行构建命令，用于互不依赖的 Client/Web 并行构建。 */
+function runAsync(command, args, options = {}) {
+  const resolved = command === "pnpm" ? pnpmCommand.resolvePnpmCommand() : { command: executableName(command), prefixArgs: [] };
+  return new Promise((resolve, reject) => {
+    const child = spawn(resolved.command, [...resolved.prefixArgs, ...args], { stdio: "inherit", ...options });
+    child.once("error", reject);
+    child.once("close", code => code === 0 ? resolve() : reject(new Error(`DESKTOP_BUILD_COMMAND_FAILED: ${command} ${args.join(" ")} exit=${code}`)));
+  });
+}
+
 /** 用 pnpm deploy 生成带 node_modules 的 Client 归档，根目录固定为 package/。 */
 async function createClientArchive(root, work) {
   const packRoot = path.join(work, "client-pack");
@@ -70,12 +80,15 @@ export async function buildDesktopResources({ root, plan, outputDir, privateKeyF
   await fs.access(trustedReleaseKeysFile);
   if (build) {
     run("pnpm", ["-C", "packages/shared", "build"], { cwd: root });
-    run("pnpm", ["-C", "apps/desktop/client", "build"], { cwd: root, env: { ...process.env,
-      CODEFLOWAI_CLIENT_BUILD_VERSION: plan.clientVersion,
-      CODEFLOWAI_CLIENT_BUILD_TARGET: plan.environment === "test" ? "test" : "prod",
-    } });
+    // Client 与 Web 互不依赖，并行构建；桌面壳依赖 Client 产物，随后执行。
+    await Promise.all([
+      runAsync("pnpm", ["-C", "apps/desktop/client", "build"], { cwd: root, env: { ...process.env,
+        CODEFLOWAI_CLIENT_BUILD_VERSION: plan.clientVersion,
+        CODEFLOWAI_CLIENT_BUILD_TARGET: plan.environment === "test" ? "test" : "prod",
+      } }),
+      runAsync("pnpm", ["-C", "apps/web", "build"], { cwd: root, env: resolveDesktopWebBuildEnv(plan) }),
+    ]);
     run("pnpm", ["-C", "apps/desktop", "build"], { cwd: root });
-    run("pnpm", ["-C", "apps/web", "build"], { cwd: root, env: resolveDesktopWebBuildEnv(plan) });
   }
   /** shared 构建完成后再加载资源准备模块，避免干净检出时提前解析 dist。 */
   const { prepareDesktopResources } = await import("../../apps/desktop/scripts/prepare-resources.mjs");
