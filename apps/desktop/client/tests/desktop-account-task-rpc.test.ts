@@ -121,14 +121,32 @@ test("desktop 账号任务RPC允许 Client 历史清理并透传截止时间", a
   assert.notEqual((status.body as { code?: string }).code, "FORBIDDEN");
 });
 
-for (const method of ["scheduledTasks.local.create", "scheduledTasks.local.runNow", "workspaces.delete", "engineKeys.list", "client.exit"]) {
-  test(`desktop 账号任务RPC拒绝通用本机方法：${method}`, async t => {
-    const f = fixture(t), result = await f.call(method, { taskId: "account-task" });
-    assert.equal(result.status, 403); assert.equal((result.body as any).ok, false);
-    assert.deepEqual(f.sent, []); assert.deepEqual(f.calls, []); assert.equal(f.db.scheduledTaskConfigs.list({ clientId: "desktop", deviceId: "installation" }).length, 0);
-    assert.equal(f.logs.length, 1);
-  });
-}
+test("desktop 账号任务RPC将Key和模型列表交给统一桌面API处理器", async t => {
+  const f = fixture(t);
+  f.db.engineKeys.insert({ label: "personal", engine: "codex", providerId: "openai", apiKey: "account-owned-secret" });
+  const keys = await f.call("engineKeys.list", { workspaceId: f.workspaceId });
+  assert.equal(keys.status, 200, JSON.stringify(keys.body));
+  assert.equal((keys.body as any).keys[0].apiKey, "account-owned-secret");
+  const models = await f.call("engineCustomModels.list", { workspaceId: f.workspaceId });
+  assert.equal(models.status, 200, JSON.stringify(models.body));
+  assert.deepEqual(f.sent, []);
+});
+
+test("desktop 账号任务RPC将参数错误交给统一桌面API校验", async t => {
+  const f = fixture(t);
+  const result = await f.call("workspaces.delete", {});
+  assert.equal(result.status, 400, JSON.stringify(result.body));
+  assert.notEqual((result.body as any).code, "FORBIDDEN");
+  assert.deepEqual(f.sent, []); assert.deepEqual(f.calls, []);
+  assert.equal(f.db.scheduledTaskConfigs.list({ clientId: "desktop", deviceId: "installation" }).length, 0);
+});
+
+test("desktop 账号任务RPC的未知方法由统一桌面API返回Not Found", async t => {
+  const f = fixture(t), result = await f.call("client.exit");
+  assert.equal(result.status, 404, JSON.stringify(result.body));
+  assert.notEqual((result.body as any).code, "FORBIDDEN");
+  assert.deepEqual(f.sent, []); assert.deepEqual(f.calls, []);
+});
 
 for (const body of [{ taskId: "account-task", ownerUserId: "B" }, { taskId: 1 }, {}, { taskId: " account-task" }, []]) {
   test(`desktop 账号任务RPC坏参数不派发：${JSON.stringify(body)}`, async t => {
@@ -155,10 +173,10 @@ test("desktop 账号任务RPC在await后重核原owner，旧响应不得落到�
   await assert.rejects(f.call("workspaces.list"), /OWNER_REVOKED/u);
 });
 
-test("desktop 账号任务RPC输入诊断失败保原错误且零派发", async t => {
+test("desktop 账号任务RPC身份校验诊断失败保原错误且零派发", async t => {
   const f = fixture(t), cause = new Error("CONTROLLED_RPC_LOG_FAILURE");
   t.mock.method(logger, "warn", () => { throw cause; });
-  await assert.rejects(f.call("workspaces.delete", { workspaceId: f.workspaceId }), error => error === cause);
+  await assert.rejects(f.call("threads.list", { workspaceId: f.workspaceId, actorUserId: "other-user" }), error => error === cause);
   assert.deepEqual(f.sent, []); assert.deepEqual(f.calls, []);
 });
 
@@ -189,7 +207,7 @@ function cloudCallbacks(ctx: ApiHandlerContext) {
   return { onMessage: read("onMessage"), executeHostTask: read("executeHostTask") };
 }
 
-for (const transport of ["ws", "http"] as const) test(`index 桌面${transport}复用任务受限RPC，其他本机方法仍拒绝`, async t => {
+for (const transport of ["ws", "http"] as const) test(`index 桌面${transport}复用统一桌面API响应`, async t => {
   const f = fixture(t), replies: any[] = [];
   f.ctx.desktopCloudAccount!.send = ((message: unknown) => { replies.push(message); return { accepted: true }; }) as any;
   const handlers = cloudCallbacks(f.ctx);
@@ -199,7 +217,8 @@ for (const transport of ["ws", "http"] as const) test(`index 桌面${transport}�
   assert.equal(replies.length, 1); assert.equal(replies[0].status, 200); assert.equal(replies[0].id, "wire");
   assert.deepEqual(replies[0].body.workspaces.map((row: any) => row.id), [f.workspaceId]);
   replies.length = 0; request.method = "engineKeys.list";
+  request.body = { workspaceId: f.workspaceId };
   if (transport === "ws") await handlers.onMessage(request, f.owner);
   else replies.push(...await handlers.executeHostTask({ operationId: "host-task", message: request }, f.owner));
-  assert.equal(replies.length, 1); assert.equal(replies[0].status, 403);
+  assert.equal(replies.length, 1); assert.equal(replies[0].status, 200);
 });

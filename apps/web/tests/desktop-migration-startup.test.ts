@@ -20,7 +20,7 @@ function accountUser(userId: string): AccountLoginResponseBody["userSummary"] {
 }
 
 /** 执行真实组件脚本，只替换宿主传输和store边界以控制迟到会话。 */
-function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnType<typeof useConfigStore>, migration?: ReturnType<typeof createLegacyClientMigration>) {
+function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnType<typeof useConfigStore>, migration?: ReturnType<typeof createLegacyClientMigration>, startupLabel = "") {
   const source = fs.readFileSync(new URL("../src/features/desktop/components/desktop-migration-startup.vue", import.meta.url), "utf8");
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/u)?.[1];
   assert.ok(script);
@@ -43,13 +43,14 @@ function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnT
     takeMigrationAccount: () => { takes++; taking(); return migration ? migration.takeAccount() : take; },
     async acknowledgeMigrationAccount() { await migration?.acknowledgeAccount(); acknowledgements++; } };
   const code = ts.transpileModule(script, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
-  const exposed = {} as { error: () => string | null; showNotice: () => boolean; openLogin: () => void; dismiss: () => void };
+  const exposed = {} as { error: () => string | null; showNotice: () => boolean; openLogin: () => void; dismiss: () => void; label: () => string };
   const errors: unknown[] = [];
-  vm.runInNewContext(code + '\nexports.error = () => actionError.value; exports.showNotice = () => showAccountNotice.value; exports.openLogin = openAccountLogin; exports.dismiss = dismissAccountNotice;', { exports: exposed, URL,
+  vm.runInNewContext(code + '\nexports.error = () => actionError.value; exports.showNotice = () => showAccountNotice.value; exports.openLogin = openAccountLogin; exports.dismiss = dismissAccountNotice; exports.label = () => stageLabel.value;', { exports: exposed, URL,
     console: { error: (...args: unknown[]) => { errors.push(args); } },
     defineEmits: () => (event: string) => { if (event === "ready") ready++; },
+    defineProps: () => ({ startupLabel }),
     require: (id: string) => {
-      if (id === "vue") return { computed, ref, watch, inject: () => ref(true), onMounted(fn: typeof mounted) { mounted = fn; }, onBeforeUnmount() {} };
+      if (id === "vue") return { computed, ref, watch, inject: () => ref(true), onMounted(fn: typeof mounted) { mounted = fn; }, onBeforeUnmount() {}, onScopeDispose() {} };
       if (id.endsWith("services/desktop")) return { getDesktopBridge: () => bridge };
       if (id.endsWith("store/config")) return { useConfigStore: () => config };
       if (id.endsWith("desktopAuthPromptState")) return { desktopAuthModalOpen };
@@ -57,8 +58,14 @@ function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnT
       throw new Error(`unexpected component dependency: ${id}`);
     } });
   return { config, state, takeStarted, run: () => mounted(), send: (value: DesktopMigrationState) => listener(value), resolveTake,
-    error: exposed.error, showNotice: exposed.showNotice, openLogin: exposed.openLogin, dismiss: exposed.dismiss, errors, counts: () => ({ acknowledgements, ready, takes }) };
+    error: exposed.error, showNotice: exposed.showNotice, openLogin: exposed.openLogin, dismiss: exposed.dismiss, label: exposed.label, errors, counts: () => ({ acknowledgements, ready, takes }) };
 }
+
+test("可见启动层显示工作台的真实升级阶段，不被迁移完成态隐藏", async () => {
+  const f = setup("cancelled", undefined, undefined, "正在切换新版本");
+  await f.run();
+  assert.equal(f.label(), "正在切换新版本");
+});
 
 /** 安装真实 Pinia 持久化插件，存储故障只施加于既有 config key。 */
 async function persistedConfig(t: test.TestContext) {

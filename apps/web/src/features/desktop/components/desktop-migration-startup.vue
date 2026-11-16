@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, onMounted, ref, watch, type Ref } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, onScopeDispose, ref, watch, type Ref } from "vue";
 import { Alert, Button, ConfigProvider, Progress, Space } from "ant-design-vue";
 import type { DesktopMigrationState } from "@codeflowai/shared";
 import { getDesktopBridge } from "../../../services/desktop";
@@ -7,11 +7,15 @@ import { useConfigStore } from "../../../store/config";
 import { desktopAuthModalOpen } from "../../account/desktopAuthPromptState";
 
 const emit = defineEmits<{ ready: []; interactive: [value: boolean] }>();
+const props = defineProps<{ startupLabel?: string }>();
 const WORKBENCH_READY_KEY = "codeflow:desktop-workbench-ready";
 const workbenchReady = inject<Ref<boolean>>(WORKBENCH_READY_KEY, ref(true));
 const bridge = getDesktopBridge();
 const config = useConfigStore();
 const state = ref<DesktopMigrationState | null>(null);
+const startedAt = Date.now();
+const elapsedSeconds = ref(0);
+let elapsedTimer: ReturnType<typeof setInterval> | undefined;
 const actionError = ref<string | null>(null);
 const busy = ref(false);
 const localReady = ref(false);
@@ -33,8 +37,8 @@ const percent = computed(() => state.value?.total ? Math.min(99, Math.floor(stat
 // 启动与迁移共用入口，尚未拿到状态时不提前显示迁移文案。
 const stageLabel = computed(() => ({ discover: "正在检查本地数据", quiesce: "正在停止旧 Client", snapshot: "正在备份旧数据",
   convert: "正在迁移工作区与会话", verify: "正在校验数据", publish: "正在保存迁移结果",
-  runtime_starting: "", completed: "" }[state.value?.stage ?? ""]
-  ?? (state.value?.status === "running" ? "正在迁移本地数据" : "正在连接本地工作台")));
+  runtime_starting: props.startupLabel || "正在启动本地服务", completed: props.startupLabel || "正在加载工作台" }[state.value?.stage ?? ""]
+  ?? (state.value?.status === "running" ? "正在迁移本地数据" : props.startupLabel || "正在连接本地工作台")));
 // 只有已确认的迁移选择/失败处理页可独立就绪，自动启动仍等待实际工作台挂载。
 watch(() => !localReady.value && (state.value?.status === "available" || state.value?.status === "failed"),
   value => emit("interactive", value), { flush: "sync" });
@@ -107,6 +111,9 @@ async function perform(action: "start" | "defer"): Promise<void> {
 }
 
 onMounted(async () => {
+  if (!workbenchReady.value) {
+    elapsedTimer = setInterval(() => { elapsedSeconds.value = Math.floor((Date.now() - startedAt) / 1000); }, 1000);
+  }
   if (!bridge?.getMigrationState) { localReady.value = true; emit("ready"); return; }
   unsubscribe = bridge.onMigrationState?.(value => { stateRevision++; void accept(value); });
   const revision = stateRevision;
@@ -116,6 +123,8 @@ onMounted(async () => {
   }
   catch { actionError.value = "无法读取迁移状态，请关闭应用后重试。"; }
 });
+watch(workbenchReady, ready => { if (ready && elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = undefined; } });
+onScopeDispose(() => { if (elapsedTimer) clearInterval(elapsedTimer); });
 onBeforeUnmount(() => { unsubscribe?.(); });
 </script>
 
@@ -167,6 +176,7 @@ onBeforeUnmount(() => { unsubscribe?.(); });
             <div class="desktop-migration__status" role="status">
               <span v-if="stageLabel">{{ stageLabel }}</span>
               <span v-if="state?.total !== null && state?.total !== undefined" class="desktop-migration__count">{{ state.completed }} / {{ state.total }}</span>
+              <span class="desktop-migration__count">已用时 {{ elapsedSeconds }} 秒</span>
             </div>
           </div>
         </template>

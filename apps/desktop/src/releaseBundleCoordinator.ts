@@ -9,7 +9,7 @@ import { createUpdateFailureJournal, type UpdateFailureContext, type UpdateFailu
 import { extractReleaseBundle } from "./releaseBundleExtract.js";
 import { createDesktopUpdateReceipt, type DesktopUpdateReceipt } from "@codeflowai/shared/desktop-update-receipt";
 import type { DesktopBundleUpdatePhase, DesktopUpdateResult, DesktopBundleVersion } from "@codeflowai/shared";
-import { writeDurableJson } from "./durableFile.js";
+import { writeDurableJson, flushDirectory } from "./durableFile.js";
 
 export { computeReleasePackageSha256 } from "@codeflowai/shared/desktop-release-signing";
 
@@ -256,6 +256,14 @@ function createReceipt(context: UpdateFailureContext, requestId: string, manifes
 /** 读取活动整组版本指针；损坏文件显式失败。 */
 export async function readActivePointer(rootDir: string): Promise<string | null> {
   return readPointer(path.resolve(rootDir), ACTIVE_POINTER);
+}
+
+/** 修复基线健康后才移除原不兼容指针；拒绝清除期间出现的其他活动版本。 */
+export async function clearIncompatibleActiveRelease(rootDir: string, expectedReleaseId: string | null): Promise<void> {
+  const root = path.resolve(rootDir);
+  if (await readActivePointer(root) !== expectedReleaseId) throw new Error("DESKTOP_STARTUP_ARTIFACT_CHANGED");
+  await fs.rm(path.join(root, ACTIVE_POINTER), { force: true });
+  await flushDirectory(root);
 }
 
 /** 活动版本默认全量核验；普通启动可显式选择核心核验。 */

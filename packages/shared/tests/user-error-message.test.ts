@@ -3,6 +3,19 @@ import test from "node:test";
 import { describeUserFacingError } from "../src/utils/userErrorMessage.ts";
 import { toUpdateDiagnosticCause, toShellUpdateDiagnosticCause } from "../src/desktopUpdateFailure.ts";
 
+test("数据库升级失败解释保留数据与修复路径，并在诊断中保留固定错误码", () => {
+  const code = "DESKTOP_DB_SCHEMA_FORWARD_ONLY";
+  const error = Object.assign(new Error(code), { code, requestId: "repair-attempt" });
+  const expected = "本地数据库可能已升级，已停止旧版本启动。请保留原数据，使用支持当前数据库版本的完整安装包修复安装。";
+  assert.equal(describeUserFacingError(error, "启动失败"), expected);
+  for (const serialize of [toUpdateDiagnosticCause, toShellUpdateDiagnosticCause]) {
+    const diagnostic = serialize(error);
+    assert.equal(diagnostic.code, code);
+    assert.equal(describeUserFacingError(diagnostic, "启动失败"), expected);
+  }
+  assert.equal(error.requestId, "repair-attempt");
+});
+
 test("证书、网络、磁盘及运行时错误以描述展示，保留原异常", () => {
   for (const [code, expected] of [["UNABLE_TO_VERIFY_LEAF_SIGNATURE", /证书/], ["ENOTFOUND", /域名/],
     ["ENOSPC", /磁盘空间/], ["CLIENT_READY_TIMEOUT", /本机运行环境/], ["DESKTOP_UPDATE_TRANSPORT_FAILED", /更新服务器/]] as const) {

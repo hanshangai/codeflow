@@ -45,6 +45,7 @@ const messages: Record<string, string> = {
   DESKTOP_UNINSTALL_WORKER_TIMEOUT: "卸载维护程序执行超时，已停止后续删除。请稍后重试。",
   DESKTOP_UNINSTALL_REQUEST_INVALID: "卸载请求无效，请重新从系统卸载入口启动。",
   DESKTOP_STARTUP_CLEANUP_FAILED: "应用启动失败，停止运行环境时也发生错误。请退出应用后重试。",
+  DESKTOP_DB_SCHEMA_FORWARD_ONLY: "本地数据库可能已升级，已停止旧版本启动。请保留原数据，使用支持当前数据库版本的完整安装包修复安装。",
   DESKTOP_REINSTALL_WORKER_TIMEOUT: "修复安装程序执行超时，请稍后重试。",
   DESKTOP_MAINTENANCE_REINSTALL_FAILED: "修复安装未完成，请保留原数据并重新运行完整安装包。",
   DESKTOP_API_TIMEOUT: "本机处理请求超时，请稍后重试。",

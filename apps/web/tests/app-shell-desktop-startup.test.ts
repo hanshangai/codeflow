@@ -11,13 +11,16 @@ import { isDesktopWorkspace } from "../src/services/desktop.ts";
 import { createCancelledRequestError, isCancelledRequestError } from "../src/api/request.ts";
 
 /** 执行实际 Shell mounted 生命周期，保留真实 config 状态读取及业务围栏。 */
-function fixture(t: test.TestContext, options: { workspaces?: number; failure?: Error; cloudFailure?: Error; directory?: Promise<void>; realDirectory?: boolean } = {}) {
+function fixture(t: test.TestContext, options: { workspaces?: number; failure?: Error; cloudFailure?: Error; directory?: Promise<void>; realDirectory?: boolean; account?: Promise<void> } = {}) {
   const source = readFileSync(new URL("../src/composables/useAppShell.ts", import.meta.url), "utf8");
   const ast = ts.createSourceFile("shell.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const shell = ast.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === "useAppShell") as ts.FunctionDeclaration;
   const mounted = shell.body!.statements.find(statement => ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)
     && statement.expression.expression.getText(ast) === "onMounted" && statement.getText(ast).includes("refreshDesktopRuntime"));
   assert.ok(mounted);
+  const unmounted = shell.body!.statements.find(statement => ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)
+    && statement.expression.expression.getText(ast) === "onUnmounted" && statement.getText(ast).includes("desktopStatusTimer"));
+  assert.ok(unmounted);
   const original = Object.getOwnPropertyDescriptor(globalThis, "window"), events: string[] = [], logs: unknown[][] = [];
   let held = true, refreshes = 0, fail = options.failure;
   const bridge: DesktopBridgeApi = { getState: async (): Promise<DesktopRuntimeState> => ({ status: held ? "starting" : "ready",
@@ -57,19 +60,22 @@ function fixture(t: test.TestContext, options: { workspaces?: number; failure?: 
     ts.transpile(`${refreshAfterConnect.getText(ast)}\nreturn refreshWorkspaceListAfterConnect;`, { target: ts.ScriptTarget.ES2022 }))(
     config, workspaces, { value: {} }, () => {}, async () => {}, isCancelledRequestError, diagnostics, feedback, startupComplete);
   let poll!: () => void;
-  const code = ts.transpile(mounted.getText(ast), { target: ts.ScriptTarget.ES2022 });
+  let dispose!: () => void;
+  const intervals: number[] = [];
+  const code = ts.transpile(`${mounted.getText(ast)}\n${unmounted.getText(ast)}`, { target: ts.ScriptTarget.ES2022 });
   new Function("config", "onMounted", "subscribeDesktopEvents", "ws", "syncDesktopAccount", "workspaces", "ctx", "openSettingsOrWizard",
-    "message", "setInterval", "window", "document", "handleThreadUrlChanged", "THREAD_URL_CHANGED_EVENT", "handleWorkspaceUrlSync", "WORKSPACE_URL_SYNC_EVENT",
-    "refreshEngineStatusAfterVisible", "console", "desktopStartupComplete", "isCancelledRequestError", "refreshWorkspaceListAfterConnect", `let stopDesktopEvents = null, desktopStatusTimer = null;\n${code}`)(
-    config, (fn: () => void) => fn(), () => () => {}, { receiveDesktopEvent() {} }, async () => { if (config.localRuntimeReady) events.push("sync-account"); },
+    "message", "setInterval", "clearInterval", "window", "document", "handleThreadUrlChanged", "THREAD_URL_CHANGED_EVENT", "handleWorkspaceUrlSync", "WORKSPACE_URL_SYNC_EVENT",
+    "refreshEngineStatusAfterVisible", "console", "desktopStartupComplete", "isCancelledRequestError", "refreshWorkspaceListAfterConnect", "onUnmounted", "stopEngineStatusAutoRefresh",
+    `let stopDesktopEvents = null, desktopStatusTimer = null, desktopStatusDisposed = false, terminalListTimeout = null;\n${code}`)(
+    config, (fn: () => void) => fn(), () => () => {}, { receiveDesktopEvent() {}, replaceLocalWorkspaceSubscription() {} }, async () => { if (config.localRuntimeReady) events.push("sync-account"); await options.account; },
     workspaces,
-    { value: {} }, () => events.push("settings"), { error: () => events.push("error") }, (fn: () => void) => { poll = fn; return 1; },
-    { addEventListener() {} }, { addEventListener() {} }, () => {}, "thread", () => {}, "workspace", () => {},
-    diagnostics, startupComplete, isCancelledRequestError, refreshWorkspaceList,
+    { value: {} }, () => events.push("settings"), { error: () => events.push("error") }, (fn: () => void, ms: number) => { intervals.push(ms); poll = fn; return 1; }, () => {},
+    { addEventListener() {}, removeEventListener() {} }, { addEventListener() {}, removeEventListener() {} }, () => {}, "thread", () => {}, "workspace", () => {},
+    diagnostics, startupComplete, isCancelledRequestError, refreshWorkspaceList, (fn: () => void) => { dispose = fn; }, () => {},
   );
   /** 排空真实状态查询、目录读取和轮询续体。 */
   const settle = async () => { for (let index = 0; index < 4; index++) await new Promise<void>(resolve => setImmediate(resolve)); };
-  return { config, events, logs, settle, workspaceReady, refreshWorkspaceList, startupComplete, refreshes: () => refreshes, release: () => { held = false; }, clearFailure: () => { fail = undefined; },
+  return { config, events, logs, settle, intervals, dispose: () => dispose(), workspaceReady, refreshWorkspaceList, startupComplete, refreshes: () => refreshes, release: () => { held = false; }, clearFailure: () => { fail = undefined; },
     poll: async () => { poll(); await settle(); } };
 }
 
@@ -83,7 +89,8 @@ test("held放行前不请求业务、不弹设置，放行后的轮询仍执行�
   assert.equal(f.config.localRuntimeReady, true);
   assert.equal(f.startupComplete.value, true);
   assert.equal(f.refreshes(), 1);
-  assert.deepEqual(f.events, ["runtime.info", "sync-account", "workspaces"]);
+  assert.deepEqual(f.events, ["runtime.info", "workspaces", "sync-account"]);
+  assert.deepEqual(f.intervals, [250, 5000]);
   await f.poll();
   assert.equal(f.refreshes(), 1);
 });
@@ -125,7 +132,7 @@ test("延后首次加载得到空目录时才沿原入口打开设置", async t 
   const f = fixture(t, { workspaces: 0 }); await f.settle();
   assert.equal(f.events.includes("settings"), false);
   f.release(); await f.poll();
-  assert.deepEqual(f.events, ["runtime.info", "sync-account", "workspaces", "settings"]);
+  assert.deepEqual(f.events, ["runtime.info", "workspaces", "settings", "sync-account"]);
 });
 
 test("首次目录失败保持显式失败，后续恢复仍补做首次加载", async t => {
@@ -135,11 +142,35 @@ test("首次目录失败保持显式失败，后续恢复仍补做首次加载",
   assert.equal(f.config.desktopError, "WORKSPACE_READ_FAILED");
   assert.equal(f.startupComplete.value, false);
   assert.equal(f.events.includes("settings"), false, "失败留在启动页，不打开设置遮挡失败原因");
+  assert.deepEqual(f.intervals, [250, 5000], "启动失败后恢复常规间隔，避免快速重复请求");
   assert.ok(f.logs.some(log => JSON.stringify(log).includes("WORKSPACE_READ_FAILED")));
   f.clearFailure(); await f.poll();
   assert.equal(f.refreshes(), 2);
   assert.equal(f.config.localRuntimeReady, true);
-  assert.equal(f.events.at(-1), "workspaces");
+  assert.equal(f.events.includes("workspaces"), true);
+});
+
+test("云账号同步仍在等待时，本地目录已经完成启动并允许使用工作台", async t => {
+  let finish!: () => void;
+  const account = new Promise<void>(resolve => { finish = resolve; });
+  t.after(() => finish());
+  const f = fixture(t, { account });
+  await f.settle(); f.release(); await f.poll();
+  assert.equal(f.startupComplete.value, true);
+  assert.equal(f.config.localRuntimeReady, true);
+  assert.deepEqual(f.events, ["runtime.info", "workspaces", "sync-account"]);
+});
+
+test("启动目录等待中卸载后不重建常规轮询、不完成旧页面启动或同步账号", async t => {
+  let finish!: () => void;
+  const directory = new Promise<void>(resolve => { finish = resolve; });
+  t.after(() => finish());
+  const f = fixture(t, { directory });
+  await f.settle(); f.release(); await f.poll();
+  f.dispose(); finish(); await f.settle();
+  assert.equal(f.startupComplete.value, false);
+  assert.deepEqual(f.intervals, [250]);
+  assert.equal(f.events.includes("sync-account"), false);
 });
 
 test("账号作用域取消目录读取不伪造Client失败，下轮仍补齐首次加载", async t => {

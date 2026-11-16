@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 
 import { loadWeb, loadStartupWeb, updateStartupWeb } from "../src/webLoader.js";
 
@@ -11,9 +12,29 @@ test("启动页仅加载壳内静态内容，不探测或提前报告业务就�
   const html = decodeURIComponent(entry.slice(entry.indexOf(",") + 1));
   assert.ok(html.includes("正在启动"));
   assert.ok(html.includes("default-src 'none'"));
-  assert.doesNotMatch(html, /<script|https?:|codeflowReady/iu);
+  assert.doesNotMatch(html, /https?:|codeflowReady/iu);
   const failure = new Error("STARTUP_NAVIGATION_FAILED");
   await assert.rejects(loadStartupWeb({ loadURL: async () => { throw failure; } }), error => error === failure);
+});
+
+test("未计量启动阶段显示活动指示和真实已用时间，不伪造百分比", async () => {
+  let entry = "";
+  await loadStartupWeb({ loadURL: async url => { entry = url; } });
+  const html = decodeURIComponent(entry.slice(entry.indexOf(",") + 1));
+  assert.doesNotMatch(html, /aria-valuenow=/u);
+  const script = html.match(/<script nonce="([^"]+)">([\s\S]*?)<\/script>/u);
+  assert.ok(script);
+  assert.ok(html.includes(`script-src 'nonce-${script[1]}'`));
+  let elapsed = 0, tick!: () => void;
+  const label = { textContent: "" };
+  vm.runInNewContext(script[2]!, { Date: { now: () => elapsed },
+    document: { querySelector: () => label }, setInterval: (callback: () => void) => { tick = callback; } });
+  elapsed = 8700; tick();
+  assert.equal(label.textContent, "已用时 8 秒");
+  let update = "";
+  await updateStartupWeb({ loadURL: async () => {}, webContents: { executeJavaScript: async source => { update = source; } } },
+    { label: "正在校验当前版本…" });
+  assert.match(update, /removeAttribute\('aria-valuenow'\)/u);
 });
 
 test("启动页进度只更新固定状态与进度条，并把百分比收敛到 0-100", async () => {

@@ -27,6 +27,7 @@ const hasMigrationStartup = Boolean(getDesktopBridge()?.getMigrationState);
 const desktopStartupReady = ref(!hasMigrationStartup);
 const layoutReady = ref(false);
 const hostSplashDone = ref(!hasMigrationStartup);
+const desktopStartupLabel = ref("正在加载工作台");
 const WORKBENCH_READY_KEY = "codeflow:desktop-workbench-ready";
 provide(WORKBENCH_READY_KEY, hostSplashDone);
 const hostStartupHold = computed(() => hasMigrationStartup && !hostSplashDone.value);
@@ -99,9 +100,10 @@ defineOptions({ name: "App" });
       <StandardApp v-if="desktopStartupReady" :host-startup-active="hostStartupHold"
         @workbench-ready="layoutReady = $event"
         @desktop-business-ready="hostSplashDone = true"
+        @desktop-startup-status="desktopStartupLabel = $event"
         @vue:mounted="markShellMounted('standard')" @vue:unmounted="markShellUnmounted('standard')" />
       <div v-if="hasMigrationStartup" class="app-startup-hold" :class="{ 'app-startup-hold--active': hostStartupHold }">
-        <DesktopMigrationStartup @ready="desktopStartupReady = true"
+        <DesktopMigrationStartup :startup-label="desktopStartupLabel" @ready="desktopStartupReady = true"
           @interactive="migrationInteractive = $event"
           @vue:mounted="markShellMounted('migration')" @vue:unmounted="markShellUnmounted('migration')" />
       </div>

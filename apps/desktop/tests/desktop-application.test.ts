@@ -202,6 +202,53 @@ test("普通启动使用核心核验，held 启动仍拒绝库存变化", async 
   await assert.rejects(held.start(), /Client payload SHA-256/u);
 });
 
+test("壳交接启动同样先检查数据库迁移围栏，不启动不兼容旧Client", async t => {
+  const f = await heldApplicationFixture(t);
+  const staging = path.join(f.dataDir, ".staging", "next");
+  await fs.mkdir(staging, { recursive: true });
+  await fs.writeFile(path.join(f.dataDir, "pending-release.json"), JSON.stringify({ schemaVersion: 1,
+    requestId: "a795cc4e-2c1f-4a3f-8611-31c54f0943d3", releaseId: "next", stagingName: "next", databaseSchemaVersion: 89 }));
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime,
+    startupContinuation: { continuationId: "candidate-1", async authorizeReady() { assert.fail("incompatible database"); } } });
+  await assert.rejects(app.start(), /DESKTOP_DB_SCHEMA_FORWARD_ONLY/u);
+  assert.equal(f.actions.includes("start"), false);
+});
+
+for (const mode of ["continuation", "preparing"] as const) test(`数据库修复与壳更新${mode}同时存在时拒绝启动Client并保留恢复记录`, async t => {
+  const f = await heldApplicationFixture(t, { dbSchemaVersion: 89 });
+  await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1", dbSchemaVersion: 88 });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }));
+  await fs.mkdir(path.join(f.dataDir, ".staging", "next"), { recursive: true });
+  const pending = { schemaVersion: 1, requestId: "a795cc4e-2c1f-4a3f-8611-31c54f0943d3",
+    releaseId: "next", stagingName: "next", databaseSchemaVersion: 89 };
+  await fs.writeFile(path.join(f.dataDir, "pending-release.json"), JSON.stringify(pending));
+  const options: Parameters<typeof createDesktopApplication>[0] = { dataDir: f.dataDir, initialReleaseDir: f.baseline,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime };
+  let attempt: ShellUpdateAttemptV2 | undefined;
+  if (mode === "continuation") {
+    options.startupContinuation = { continuationId: "candidate-1", async authorizeReady() { assert.fail("repair must precede shell handoff"); } };
+  } else {
+    const originalState = { activeShellId: "old", previousShellId: null, baselineShellId: "baseline" };
+    attempt = { schemaVersion: 2, requestId: crypto.randomUUID(), revision: 0, installationDir: f.baseline,
+      dataDir: f.dataDir, userDataDir: f.dataDir, sessionDataDir: f.dataDir, originalState,
+      candidateState: { ...originalState, activeShellId: "new", previousShellId: "old" }, phase: "preparing",
+      target: { shellId: "new", manifestSha256: "a".repeat(64), installerSha256: "b".repeat(64), installerSize: 1 },
+      binding: { kind: "active", releaseId: "active-1", packageSha256: "c".repeat(64), health: f.runtime.snapshot().health! },
+      retriesUsed: 0, network: null };
+    await createShellUpdateAttemptStore(f.dataDir).replace(null, attempt);
+    options.shellUpdate = { facts: { installationDir: f.baseline, userDataDir: f.dataDir, sessionDataDir: f.dataDir,
+      main: { pid: 101, parentPid: 90, created: 1101, executable: path.join(f.baseline, "CodeFlowAI.exe"), commandLine: "main" } } };
+  }
+  const app = createDesktopApplication(options);
+  await assert.rejects(app.start(), /DESKTOP_DB_SCHEMA_FORWARD_ONLY/u);
+  assert.equal(f.actions.includes("start"), false);
+  assert.equal(f.actions.includes("continue"), false);
+  assert.equal(await readActivePointer(f.dataDir), "active-1");
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.dataDir, "pending-release.json"), "utf8")), pending);
+  if (attempt) assert.deepEqual(await createShellUpdateAttemptStore(f.dataDir).read(), attempt);
+});
+
 test("关闭壳启动页后迟到加载不再启动Client或重开窗口", { timeout: 3000 }, async t => {
   const f = await fixture(t);
   let release!: () => void, entered!: () => void, quit!: () => void;

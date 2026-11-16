@@ -4,7 +4,7 @@ import { assertReleaseId } from "./contracts.js";
 import { assertDesktopStoragePath, readDesktopJsonFile } from "./desktopStorageLocation.js";
 import { writeDurableJson } from "./durableFile.js";
 
-export type PendingRelease = { requestId: string; releaseId: string; stagingDir: string };
+export type PendingRelease = { requestId: string; releaseId: string; stagingDir: string; databaseSchemaVersion?: number };
 const fileName = "pending-release.json";
 
 /** 只保存协调器直属暂存目录；持久记录不接受页面或任意绝对路径。 */
@@ -22,7 +22,10 @@ export async function readPendingRelease(root: string): Promise<PendingRelease |
   const rootDir = path.resolve(root), value = await readDesktopJsonFile(path.join(rootDir, fileName));
   if (value === null) return null;
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== 4 || record.schemaVersion !== 1 || typeof record.requestId !== "string"
+  const hasMigration = Object.hasOwn(record, "databaseSchemaVersion");
+  if (Object.keys(record).length !== (hasMigration ? 5 : 4)
+    || hasMigration && (!Number.isSafeInteger(record.databaseSchemaVersion) || (record.databaseSchemaVersion as number) <= 0)
+    || record.schemaVersion !== 1 || typeof record.requestId !== "string"
     || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(record.requestId)
     || typeof record.stagingName !== "string" || path.basename(record.stagingName) !== record.stagingName
     || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(record.stagingName)) throw new Error("DESKTOP_PENDING_RELEASE_INVALID");
@@ -34,7 +37,18 @@ export async function readPendingRelease(root: string): Promise<PendingRelease |
     stagingDir = path.join(rootDir, "releases", releaseId);
   }
   await assertDesktopStoragePath(stagingDir);
-  return { requestId: record.requestId, releaseId, stagingDir };
+  return { requestId: record.requestId, releaseId, stagingDir,
+    ...(hasMigration ? { databaseSchemaVersion: record.databaseSchemaVersion as number } : {}) };
+}
+
+/** 候选可能迁移原库前持久化最低可读版本；重启不能绕过同一待更新围栏。 */
+export async function markPendingDatabaseMigration(root: string, pending: PendingRelease, databaseSchemaVersion: number): Promise<void> {
+  const current = await readPendingRelease(root);
+  if (!Number.isSafeInteger(databaseSchemaVersion) || databaseSchemaVersion <= 0 || !current
+    || current.requestId !== pending.requestId || current.releaseId !== pending.releaseId) throw new Error("DESKTOP_PENDING_RELEASE_INVALID");
+  await writeDurableJson(path.join(path.resolve(root), fileName), { schemaVersion: 1, requestId: current.requestId,
+    releaseId: current.releaseId, stagingName: path.basename(current.stagingDir),
+    databaseSchemaVersion: Math.max(databaseSchemaVersion, current.databaseSchemaVersion ?? 0) });
 }
 
 /** 只在已激活或明确放弃旧尝试时清除记录，不删除用户数据。 */

@@ -14,7 +14,7 @@ import { isCancelledRequestError } from "./api/request";
 import { DesktopUpdateServiceError, getDesktopUpdateCapabilities, getDesktopUpdateDetails } from "./services/desktop";
 
 const props = withDefaults(defineProps<{ hostStartupActive?: boolean }>(), { hostStartupActive: false });
-const emit = defineEmits<{ workbenchReady: [ready: boolean]; desktopBusinessReady: [] }>();
+const emit = defineEmits<{ workbenchReady: [ready: boolean]; desktopBusinessReady: []; desktopStartupStatus: [label: string] }>();
 // 围栏内与实际渲染共用布局加载入口，确认资源时不提前挂载业务组件。
 const layoutLoaders = {
   mobile: () => import("./layouts/mobile/mobile-layout.vue"),
@@ -85,6 +85,10 @@ const STARTUP_UPGRADE_PHASES: Partial<Record<DesktopBundleUpdatePhase, { label: 
   rollback: { label: "正在恢复原版本", progress: 60 },
 };
 const startupUpgrade = ref<{ label: string; progress: number } | null>(null);
+/** 将已有启动阶段传给可见的外层启动页，避免更新提示被遮罩隐藏。 */
+const startupLabel = computed(() => shell.config.desktopError ? "启动暂未完成" : startupUpgrade.value?.label
+  ?? (shell.config.localRuntimeReady ? "正在加载本地工作区与会话" : "正在启动本地运行环境"));
+watch(startupLabel, label => emit("desktopStartupStatus", label), { immediate: true });
 let startupUpgradeTimer: ReturnType<typeof setTimeout> | null = null;
 let startupUpgradePolling = false;
 

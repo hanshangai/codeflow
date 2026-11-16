@@ -34,22 +34,22 @@ export function verifyReleaseBundleSignature(input: unknown, trustedKeys: Truste
   return manifest;
 }
 
-/** 默认核完整库存；已安装普通启动可仅核核心文件，held 与新包始终全量。 */
+/** 默认及新包核完整库存；已安装资源可显式复核核心，held 仍校验入口绑定能力。 */
 export async function verifyReleaseBundlePayload(input: {
   directory: string; manifest: unknown; trustedKeys: TrustedReleaseKeys; platform?: string; arch?: string;
   now?: () => number; requireFresh?: boolean; requireHeldStartup?: boolean;
   verification?: "full" | "startup";
 }): Promise<ReleaseBundleManifest> {
   const manifest = verifyReleaseBundleSignature(input.manifest, input.trustedKeys, input);
-  if (input.verification === "startup" && !input.requireFresh && !input.requireHeldStartup) {
-    await verifyStartupFiles(input.directory, manifest);
-    return manifest;
-  }
   let startupEntry: string | undefined;
   if (input.requireHeldStartup) {
     const marker = manifest.files.find(file => file.path === DESKTOP_STARTUP_CAPABILITY_PATH);
     startupEntry = manifest.files.find(file => file.path === "client/dist/index.cjs")?.sha256;
     if (!marker || marker.size > 1024 || !startupEntry) throw new Error("DESKTOP_STARTUP_CAPABILITY_REQUIRED");
+  }
+  if (input.verification === "startup" && !input.requireFresh) {
+    await verifyStartupFiles(input.directory, manifest, startupEntry);
+    return manifest;
   }
   const files = await readReleaseBundleFiles(input.directory, startupEntry);
   const webSha256 = computeReleaseDirectorySha256(files, "web"), clientSha256 = computeReleaseDirectorySha256(files, "client");
@@ -60,8 +60,8 @@ export async function verifyReleaseBundlePayload(input: {
   return manifest;
 }
 
-/** 普通启动核对入口、worker 和配置；依赖完整性由安装及更新时的全量核验负责。 */
-async function verifyStartupFiles(directory: string, manifest: ReleaseBundleManifest): Promise<void> {
+/** 核对入口、worker、配置及可选 held 能力；完整依赖由安装和切换前全量核验负责。 */
+async function verifyStartupFiles(directory: string, manifest: ReleaseBundleManifest, heldStartupEntrySha256?: string): Promise<void> {
   const checkedDirectories = new Set<string>();
   const core = manifest.files.filter(file => file.path.startsWith("client/dist/")
     || file.path.startsWith("client/") && file.path.split("/").length === 2 || file.path === "web/index.html");
@@ -96,7 +96,8 @@ async function verifyStartupFiles(directory: string, manifest: ReleaseBundleMani
     }
     const target = path.join(directory, file.path), stat = await fs.lstat(target);
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`DESKTOP_RELEASE_FILE_TYPE_INVALID: ${file.path}`);
-    const content = await fs.readFile(target);
+    const content = heldStartupEntrySha256 !== undefined && file.path === DESKTOP_STARTUP_CAPABILITY_PATH
+      ? await readStartupCapability(target, stat, heldStartupEntrySha256) : await fs.readFile(target);
     if (content.byteLength !== file.size || crypto.createHash("sha256").update(content).digest("hex") !== file.sha256) {
       throw new Error(`DESKTOP_RELEASE_STARTUP_FILE_MISMATCH: ${file.path}`);
     }

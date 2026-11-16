@@ -142,6 +142,7 @@ export function useAppShell() {
   const connectError = ref<string | null>(null);
   const desktopStartupComplete = ref(!config.isDesktop);
   let desktopStatusTimer: ReturnType<typeof setInterval> | null = null;
+  let desktopStatusDisposed = false;
   let stopDesktopEvents: (() => void) | null = null;
   const logoutInProgress = ref(false);
   const workspaceSwitching = ref(false);
@@ -1378,22 +1379,32 @@ export function useAppShell() {
   onMounted(() => {
     if (config.isDesktop) {
       let refreshing = false;
-      /** 放行后补做首次目录读取；作用域取消留待下轮，不把仍存活的 Client 标为失败。 */
+      /** 启动先读本地目录，云账号同步保留原失败反馈；就绪后恢复常规轮询。 */
       const refreshDesktop = async (): Promise<void> => {
-        if (refreshing) return;
+        if (refreshing || desktopStatusDisposed) return;
         refreshing = true;
         const initial = !desktopStartupComplete.value;
         try {
           if (!stopDesktopEvents) stopDesktopEvents = subscribeDesktopEvents(ws.receiveDesktopEvent);
           await config.refreshDesktopRuntime();
-          if (!config.localRuntimeReady) return;
-          await syncDesktopAccount();
+          if (desktopStatusDisposed) return;
+          if (!config.localRuntimeReady) {
+            if (initial && config.desktopError && desktopStatusTimer) {
+              clearInterval(desktopStatusTimer);
+              desktopStatusTimer = setInterval(() => { void refreshDesktop(); }, 5_000);
+            }
+            return;
+          }
           if (initial) {
             await workspaces.refresh(ctx.value, { localOnly: true });
+            if (desktopStatusDisposed) return;
             if (!workspaces.workspaces.length) openSettingsOrWizard();
             desktopStartupComplete.value = true;
+            if (desktopStatusTimer) clearInterval(desktopStatusTimer);
+            desktopStatusTimer = setInterval(() => { void refreshDesktop(); }, 5_000);
             if (config.connected) refreshWorkspaceListAfterConnect();
           }
+          await syncDesktopAccount();
         } catch (error) {
           if (isCancelledRequestError(error)) return;
           // 退出中的结构化拒绝是正常收尾，不刷新为错误态或提示。
@@ -1401,12 +1412,16 @@ export function useAppShell() {
           config.desktopError = error instanceof Error ? error.message : String(error);
           config.desktopRuntime = { status: "failed", requestId: config.desktopRuntime?.requestId ?? null,
             releaseId: config.desktopRuntime?.releaseId ?? null, errorCode: "DESKTOP_RUNTIME_UNAVAILABLE" };
+          if (initial && !desktopStatusDisposed && desktopStatusTimer) {
+            clearInterval(desktopStatusTimer);
+            desktopStatusTimer = setInterval(() => { void refreshDesktop(); }, 5_000);
+          }
           console.error("[DESKTOP_RUNTIME_UNAVAILABLE]", { errorCode: "DESKTOP_RUNTIME_UNAVAILABLE",
             requestId: config.desktopRuntime.requestId, workspaceId: config.workspaceId, initial, rootCause: config.desktopError });
         } finally { refreshing = false; }
       };
       void refreshDesktop();
-      desktopStatusTimer = setInterval(() => { void refreshDesktop(); }, 5_000);
+      desktopStatusTimer = setInterval(() => { void refreshDesktop(); }, 250);
     }
     if (typeof window !== "undefined") {
       window.addEventListener("popstate", handleThreadUrlChanged);
@@ -1419,6 +1434,7 @@ export function useAppShell() {
   });
 
   onUnmounted(() => {
+    desktopStatusDisposed = true;
     if (desktopStatusTimer) clearInterval(desktopStatusTimer);
     stopDesktopEvents?.();
     ws.replaceLocalWorkspaceSubscription(null);
