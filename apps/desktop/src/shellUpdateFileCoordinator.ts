@@ -533,6 +533,31 @@ function nativeCode(cause: unknown, codes: string[]): boolean {
   return cause instanceof Error && "code" in cause && typeof cause.code === "string" && codes.includes(cause.code);
 }
 
+/**
+ * 探针文件被安全软件/索引器短暂占用时重试：每轮先复核目录与实体，预算内只重试锁类错误，
+ * 其他故障立即抛出；耗尽时保留首因并追加复核失败。
+ */
+export async function retryTransientRename(operation: () => Promise<void>, beforeAttempt: () => Promise<void>,
+  options: { budgetMs?: number; pollMs?: number; isTransient?: (cause: unknown) => boolean } = {}): Promise<void> {
+  const budgetMs = options.budgetMs ?? 1000, pollMs = options.pollMs ?? 10;
+  const started = performance.now();
+  let first: unknown;
+  for (;;) {
+    try { await beforeAttempt(); }
+    catch (cause) { throw first ? new AggregateError([first, cause], "DESKTOP_SHELL_UPDATE_COORDINATOR_CAPABILITY_RENAME_RECHECK_FAILED") : cause; }
+    try { await operation(); return; }
+    catch (cause) {
+      if (!(options.isTransient?.(cause) ?? false)) {
+        throw first ? new AggregateError([first, cause], "DESKTOP_SHELL_UPDATE_COORDINATOR_CAPABILITY_RENAME_RETRY_FAILED") : cause;
+      }
+      first ??= cause;
+    }
+    const remaining = budgetMs - (performance.now() - started);
+    if (remaining <= 0) throw first;
+    await delay(Math.min(pollMs, remaining));
+  }
+}
+
 /** Reuse an immutable key only while the same ordinary root, directory and file remain bound. */
 async function authenticationKey(root: ShellUpdateFileRoot, initialize: boolean): Promise<Buffer> {
   const owner = pipeName(root), directory = path.join(root.root, AUTH_DIRECTORY), target = path.join(directory, "key");
@@ -667,8 +692,20 @@ async function capabilityPreflight(root: ShellUpdateFileRoot): Promise<void> {
     phase = "write-target";
     targetIdentity = await writeCapabilityFile(target, Buffer.from("target", "utf8"));
     phase = "replace";
-    await assertCapabilityDirectory(root, directory, directoryIdentity);
-    await renameNative(source, target);
+    /** 每轮重核目录与探针实体；仅 Windows rename 的锁类错误可重试。 */
+    await retryTransientRename(
+      () => renameNative(source, target),
+      async () => {
+        await assertCapabilityDirectory(root, directory, directoryIdentity);
+        if (!sourceIdentity || !sameProbeIdentity(sourceIdentity, await lstatNative(source, { bigint: true }))
+          || !targetIdentity || !sameProbeIdentity(targetIdentity, await lstatNative(target, { bigint: true }))) {
+          throw failure("CAPABILITY_WRITE_RENAME_UNAVAILABLE");
+        }
+      },
+      { isTransient: cause => process.platform === "win32" && nativeCode(cause, ["EPERM", "EACCES", "EBUSY"])
+        && cause instanceof Error && "syscall" in cause && cause.syscall === "rename"
+        && "path" in cause && cause.path === source && "dest" in cause && cause.dest === target },
+    );
     targetIdentity = sourceIdentity;
     sourceIdentity = undefined;
     phase = "readback";

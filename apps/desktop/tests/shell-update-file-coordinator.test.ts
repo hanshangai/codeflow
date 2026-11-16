@@ -713,3 +713,36 @@ test("authentication initialization failure rejects a local operation and closes
   await Promise.race([closed, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("AUTH_PEER_NOT_CLOSED")), 1000))]);
   assert.equal(socket.destroyed, true);
 });
+
+test("capability rename retry rechecks each attempt and only retries lock-class failures", async () => {
+  const retry = (implementation as Record<string, unknown>).retryTransientRename as
+    (operation: () => Promise<void>, beforeAttempt: () => Promise<void>,
+      options?: { budgetMs?: number; pollMs?: number; isTransient?: (cause: unknown) => boolean }) => Promise<void>;
+  assert.equal(typeof retry, "function", "capability preflight must retry transient probe locks");
+  let attempts = 0, rechecks = 0;
+  await retry(async () => {
+    attempts += 1;
+    if (attempts < 3) throw Object.assign(new Error("locked"), { code: "EPERM" });
+  }, async () => { rechecks += 1; }, { budgetMs: 200, pollMs: 1, isTransient: cause => (cause as { code?: string }).code === "EPERM" });
+  assert.equal(attempts, 3);
+  assert.equal(rechecks, 3, "each retry must revalidate the directory and probe entities");
+  let immediate = 0;
+  await assert.rejects(retry(async () => {
+    immediate += 1;
+    throw Object.assign(new Error("other failure"), { code: "ENOENT" });
+  }, async () => {}, { budgetMs: 200, pollMs: 1, isTransient: cause => (cause as { code?: string }).code === "EPERM" }), /other failure/);
+  assert.equal(immediate, 1);
+  let exhausted = 0;
+  await assert.rejects(retry(async () => {
+    exhausted += 1;
+    throw Object.assign(new Error("still locked"), { code: "EPERM" });
+  }, async () => {}, { budgetMs: 20, pollMs: 1, isTransient: cause => (cause as { code?: string }).code === "EPERM" }), /still locked/);
+  assert.ok(exhausted >= 2);
+  let recheckFailure = 0;
+  await assert.rejects(retry(async () => {
+    recheckFailure += 1;
+    throw Object.assign(new Error("locked"), { code: "EPERM" });
+  }, async () => { if (recheckFailure >= 2) throw new Error("directory replaced"); },
+  { budgetMs: 200, pollMs: 1, isTransient: cause => (cause as { code?: string }).code === "EPERM" }),
+  (cause: unknown) => cause instanceof AggregateError && cause.errors.some(item => String(item).includes("directory replaced")));
+});
