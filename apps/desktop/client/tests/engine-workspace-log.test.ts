@@ -10,6 +10,7 @@ import { ThreadSessionManager } from "../src/engines/threadSessionManager.js";
 import { CodexAppServerManager } from "../src/engines/codex-app-server/codexAppServerManager.js";
 import { CodexAppServerThreadSession } from "../src/engines/codex-app-server/codexAppServerThreadSession.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
+import { logger } from "../src/logger.js";
 
 /** 两个注册根和真实固定writer；无provider、安装或网络动作。 */
 function fixture(t: test.TestContext) {
@@ -81,7 +82,7 @@ test("Codex独占进程诊断按构造W落盘，payload不能改写日志归属"
   assert.equal(fs.existsSync(path.join(f.workspaces.get("engine:a" as WorkspaceId)!, ".codeflowai")), false);
 });
 
-test("Codex原回合已清空后的晚回调日志失败仍阻止send和idle且dispose清理后拒绝", async () => {
+test("Codex晚回调日志失败不阻止新请求、idle检查或正常dispose", async () => {
   let killed = 0, sent = 0;
   const session = new CodexAppServerThreadSession({ writeWorkspaceLog() { throw undefined; },
     manager: { getOrCreate() { sent += 1; throw new Error("must not send"); }, getExisting() { return { async kill() { killed += 1; } }; } } as any,
@@ -90,34 +91,28 @@ test("Codex原回合已清空后的晚回调日志失败仍阻止send和idle且d
   (session as any).trackStartingTurnLateSettlement({ providerOwnershipConflict: new Error("fenced"), clientTurnId: "late-turn" },
     Promise.resolve({ status: "fulfilled", value: {} }));
   await new Promise<void>(resolve => setImmediate(resolve));
-  assert.throws(() => session.canIdleDispose());
+  assert.doesNotThrow(() => session.canIdleDispose());
   await assert.rejects(session.sendMessage({ turnId: "new-turn", userItemId: "user", text: "", images: [], assistantItemId: "assistant", reasoningItemId: "reasoning" },
     { conversation() {}, raw() {} }));
-  assert.equal(sent, 0);
-  await assert.rejects(session.dispose());
-  assert.equal(killed, 1);
+  assert.equal(sent, 1);
+  await session.dispose();
+  assert.equal(killed, 0);
   assert.equal((session as any).disposed, true);
 });
 
-test("Codex活动回合诊断保留falsy业务根因和writer原值且停止后续provider副作用", async () => {
+test("Codex活动回合日志失败不拒绝活动owner或关闭超时控制", async () => {
   const writeFailure = { failure: "writer" };
   let stopped = 0, rejected: unknown;
   const session = new CodexAppServerThreadSession({ writeWorkspaceLog() { throw writeFailure; }, manager: {} as any,
     workspacePath: "D:/isolated", workspaceId: "engine:b" as WorkspaceId, threadId: "active-thread", initialSessionId: null,
     initialSessionCapabilities: null, onEngineProcessSnapshot: () => false, onSessionBinding() {}, onSessionBindingDropped() {}, onStartAttempt() {} });
   (session as any).active = { clientTurnId: "active-turn", codexTurnId: "provider-turn", timeoutController: { stop() { stopped += 1; } }, reject(cause: unknown) { rejected = cause; } };
-  assert.throws(() => (session as any).handleProviderRequestResponseFailure({ request() { assert.fail("must not interrupt"); } },
-    "tool/response", 42, "provider-turn", undefined), error => {
-      assert.ok(error instanceof AggregateError);
-      assert.equal(error.errors[0], undefined);
-      assert.equal(error.errors[1], writeFailure);
-      assert.equal(rejected, error);
-      return true;
-    });
-  assert.equal(stopped, 1);
+  assert.doesNotThrow(() => (session as any).log("warn", () => ({ message: "diagnostic", data: { code: "test" } }), { reason: undefined }));
+  assert.equal(rejected, undefined);
+  assert.equal(stopped, 0);
 });
 
-test("Codex真实ownership到期timer日志失败留在会话且其他W日志继续可用", async t => {
+test("Codex真实ownership到期timer日志失败不锁死会话且其他W日志可用", async t => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 100 });
   const failure = new Error("expiry-log-failed"), logs: string[] = [];
   const makeSession = (workspaceId: WorkspaceId) => new CodexAppServerThreadSession({
@@ -130,7 +125,7 @@ test("Codex真实ownership到期timer日志失败留在会话且其他W日志继
   (broken as any).pendingInterruptedStartingTurns.set("timer-turn", starting);
   (broken as any).armStartingTurnOwnershipExpiryTimer(starting);
   assert.doesNotThrow(() => t.mock.timers.tick(2));
-  assert.throws(() => broken.canIdleDispose());
+  assert.doesNotThrow(() => broken.canIdleDispose());
   (healthy as any).log("info", () => ({ message: "healthy", data: { code: "healthy" } }));
   assert.deepEqual(logs, ["engine:a"]);
 });
@@ -148,7 +143,7 @@ test("Codex会话日志不读取未知异常getter或toString", () => {
   assert.equal(logs.length, 1);
 });
 
-test("Codex诊断关闭后图片或退订失败仍由原manager持有并允许再次清理", async t => {
+test("Codex工作区日志和应用告警双失败后资源清理仍可重试", async t => {
   const f = fixture(t), workspaceId = "engine:b" as WorkspaceId, threadId = "dispose-retry-thread" as ThreadId;
   const manager = new ThreadSessionManager({ workspaces: f.workspaces, threads: new ThreadStore(),
     writeWorkspaceLog: f.db.writeWorkspaceLog, sessionIdleCleanup: { enabled: false } });
@@ -159,6 +154,7 @@ test("Codex诊断关闭后图片或退订失败仍由原manager持有并允许�
     workspacePath: f.workspaces.get(workspaceId)!, workspaceId, threadId, initialSessionId: null,
     initialSessionCapabilities: null, onEngineProcessSnapshot: () => false, onSessionBinding() {},
     onSessionBindingDropped() {}, onStartAttempt() {} });
+  t.mock.method(logger, "warn", () => { throw new Error("application-warning-failed"); });
   assert.throws(() => (session as any).log("error", () => ({ message: "injected" })));
   const leases = (session as any).providerInputImageLeases as Set<unknown>;
   const lease = { close() { closes++; if (closes === 1) throw undefined; leases.delete(lease); }, getError() { return null; } };
@@ -181,7 +177,7 @@ test("Codex诊断关闭后图片或退订失败仍由原manager持有并允许�
   await manager.stopAndDrain();
 });
 
-test("Codex配置退订诊断不调用异常getter且双失败保留原业务值", async () => {
+test("Codex配置退订日志失败只告警且保留原业务值，不读取异常getter", async () => {
   let reads = 0;
   const business = Object.create(null, { code: { get() { reads++; throw new Error("must not read"); } },
     toString: { get() { reads++; throw new Error("must not convert"); } } });
@@ -190,9 +186,7 @@ test("Codex配置退订诊断不调用异常getter且双失败保留原业务值
     initialSessionId: "provider-thread" as never, initialSessionCapabilities: null,
     onEngineProcessSnapshot: () => false, onSessionBinding() {}, onSessionBindingDropped() {}, onStartAttempt() {} });
   await assert.rejects((session as any).unloadThreadForConfigRefresh({ async request() { throw business; } }), error => {
-    assert.ok(error instanceof AggregateError);
-    assert.deepEqual(error.errors, [business, undefined]);
-    assert.equal(error.cause, business);
+    assert.equal(error, business);
     return true;
   });
   assert.equal(reads, 0);
@@ -209,9 +203,7 @@ test("Codex迟到退订失败在日志失败时仍保留provider原异常", asyn
   (session as any).pendingConfigRefreshUnsubscribe = { sessionId: "provider-thread",
     settlement: Promise.resolve({ status: "rejected", kind: "process_fault", reason: business }) };
   await assert.rejects((session as any).unloadThreadForConfigRefresh({}), error => {
-    assert.ok(error instanceof AggregateError);
-    assert.equal(error.errors[0].cause, business);
-    assert.equal(error.errors[1], undefined);
+    assert.equal((error as Error).cause, business);
     return true;
   });
   assert.equal(reads, 0);

@@ -20,7 +20,7 @@ await fs.mkdir(root);
 const { chromium } = createRequire(import.meta.url)(path.resolve(playwrightModule));
 const report = { requestId: crypto.randomUUID(), status: "running", executablePath, runs: [],
   timing: "controller_monotonic_clock; native_MainWindowHandle_polled_every_20ms; no_main_debugger; OS_file_cache_not_cleared",
-  scope: "isolated_profile; updates_disabled; no_server; same_profile_reused_after_first_run" };
+  scope: "isolated_profile; no_server; same_profile_reused_after_first_run" };
 let browser, child, monitor;
 const observedPids = new Set();
 
@@ -84,7 +84,6 @@ try {
     await fs.mkdir(env[key]);
   }
   env.CODEFLOWAI_DESKTOP_DATA_DIR = path.join(root, "runtime");
-  env.CODEFLOWAI_DESKTOP_DISABLE_UPDATES = "1";
   const profile = path.join(root, "profile");
   for (let attempt = 1; attempt <= 3; attempt++) {
     const run = { attempt, profile: attempt === 1 ? "fresh" : "reused", stderr: "" };

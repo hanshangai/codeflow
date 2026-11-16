@@ -700,13 +700,8 @@ if (process.versions.electron) {
         await persistDesktopStorageLocation(location);
       }
       if (quitAllowed) return;
-      // 本地验收可显式关闭桌面更新检查，避免未签名构建触发更新失败弹窗。
-      const configuredServerOrigin = process.env.CODEFLOWAI_DESKTOP_DISABLE_UPDATES === "1" ? undefined
-        : readInstalledUpdateOrigin(releaseResourcesDir, process.env.CODEFLOWAI_DESKTOP_SERVER_ORIGIN);
+      const configuredServerOrigin = readInstalledUpdateOrigin(releaseResourcesDir, process.env.CODEFLOWAI_DESKTOP_SERVER_ORIGIN);
       const unsignedLocal = readUnsignedLocalMarker();
-      // 未签名本地包不得配置更新源，否则会绕过更新基线的唯一信任入口。
-      if (unsignedLocal && configuredServerOrigin) throw Object.assign(new Error("DESKTOP_UNSIGNED_LOCAL_UPDATE_ORIGIN_CONFLICT"),
-        { code: "DESKTOP_UNSIGNED_LOCAL_UPDATE_ORIGIN_CONFLICT" });
       if (unsignedLocal) console.warn(JSON.stringify({ code: "DESKTOP_UNSIGNED_LOCAL_BASELINE_SKIPPED", requestId: startupRequestId }));
       const shellVersion = readRunningShellVersion();
       const shellFacts = await readShellUpdateHostFacts({ packaged: app.isPackaged, platform: process.platform, configuredServerOrigin,
@@ -911,8 +906,7 @@ if (process.versions.electron) {
       }
       if (await application.resumeStartupUpdate()) return;
       if (pendingOpen) { pendingOpen = false; application.openWindow(); }
-      const updatesDisabled = process.env.CODEFLOWAI_DESKTOP_DISABLE_UPDATES === "1";
-      if (!updatesDisabled && application.updateFailureFailure) {
+      if (application.updateFailureFailure) {
         const failure = application.updateFailureFailure;
         showDesktopError(dataDir, "CodeFlow 更新错误补报失败", new Error(failure.errorCode), failure);
       }
@@ -921,7 +915,7 @@ if (process.versions.electron) {
         recordDesktopError(dataDir, Object.assign(new Error(failure.errorCode), { code: failure.errorCode }),
           { errorCode: failure.errorCode, requestId: failure.requestId, deviceId: failure.deviceId });
       }
-      if (!updatesDisabled) application.startAutomaticUpdates();
+      application.startAutomaticUpdates();
     }).catch((error) => {
       const maintenance = error instanceof DesktopMaintenanceStartupError ? {
         maintenanceRequestId: error.maintenanceRequestId ?? maintenanceRequest?.requestId, clientId: error.clientId ?? maintenanceRecord?.clientId,

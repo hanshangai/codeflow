@@ -1,8 +1,3 @@
-<script lang="ts">
-// 同一页面内跨卡片挂载记忆，切回会话仍可手动打开。
-const autoOpenedRequests = new Set<string>();
-</script>
-
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onDeactivated, reactive, ref, watch, watchEffect } from "vue";
 import { message, Modal } from "ant-design-vue";
@@ -28,8 +23,6 @@ type Props = {
   item: ConversationUserInputRequest;
   workspaceId?: WorkspaceId;
   compact?: boolean;
-  /** 在归属容器内贴着输入区展开异步问题，不再居中弹窗。 */
-  inline?: boolean;
   /** 嵌入容器明确指定可见性；普通时间线沿用当前聊天选择。 */
   active?: boolean;
   resumeWithInput?: ResumeWithInputHandler;
@@ -66,17 +59,9 @@ watchEffect(() => {
 const submitting = ref(false);
 const dialogOpen = ref(false);
 const interactionActive = computed(() => props.active ?? (chat.selectedThreadId === props.item.threadId && ui.mainView === "chat"));
-/** 仅输入区上方的异步问题自动展开一次；切换页面关闭，重复事件不抢焦点。 */
-watch(() => [operationWorkspaceId.value, props.item.requestId, props.item.state, props.item.delivery, interactionActive.value, props.inline] as const, () => {
-  if (!interactionActive.value) {
-    dialogOpen.value = false;
-    return;
-  }
-  const key = JSON.stringify([operationWorkspaceId.value, props.item.threadId, props.item.requestId]);
-  if (props.inline && props.item.delivery === "async" && props.item.state === "pending" && !autoOpenedRequests.has(key)) {
-    autoOpenedRequests.add(key);
-    dialogOpen.value = true;
-  }
+/** 会话或页面不可见时关闭弹层；问题到达不自动弹出，统一由用户点击打开。 */
+watch(interactionActive, () => {
+  if (!interactionActive.value) dialogOpen.value = false;
 }, { immediate: true });
 const sharedSubmitting = computed(() => submittingRequestIds.has(requestKey.value));
 const busy = computed(() => submitting.value || sharedSubmitting.value);
@@ -342,11 +327,11 @@ const submit = async () => {
     </div>
   </div>
 
-  <teleport to="body" :disabled="inline">
+  <teleport to="body">
     <div
       v-if="dialogOpen"
       class="uir-dialog-layer"
-      :class="{ 'uir-dialog-layer--mobile': isMobileViewport, 'uir-dialog-layer--inline': inline }"
+      :class="{ 'uir-dialog-layer--mobile': isMobileViewport }"
     >
       <section
         class="uir-dialog"
@@ -459,24 +444,6 @@ const submit = async () => {
 .uir-dialog-layer--mobile {
   align-items: flex-end;
   padding: 12px;
-}
-
-/* 内联展开：作为待处理卡片的兄弟节点贴在输入区上方，高度受限并内部滚动。 */
-.uir-dialog-layer--inline {
-  position: static;
-  z-index: auto;
-  display: block;
-  padding: 0;
-  pointer-events: auto;
-}
-
-.uir-dialog-layer--inline .uir-dialog {
-  width: 100%;
-  max-height: min(48vh, 420px);
-  border: 1px solid var(--app-border, #e5e7eb);
-  border-radius: 12px;
-  background: var(--app-panel-bg, #fff);
-  box-shadow: none;
 }
 
 .uir-dialog {
@@ -679,14 +646,6 @@ const submit = async () => {
 @media (max-width: 767px) {
   .uir-dialog-layer {
     padding: 12px 12px 0;
-  }
-
-  .uir-dialog-layer--inline {
-    padding: 0;
-  }
-
-  .uir-dialog-layer--inline .uir-dialog {
-    max-height: 60vh;
   }
 
   .uir-dialog__footer > .ant-btn {

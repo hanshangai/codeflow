@@ -2908,13 +2908,13 @@ export class CodexAppServerThreadSession implements ThreadEngineSession {
     )));
   }
 
-  /** 精确停止证明可先反馈；原调用仍等待已接收事件保存，失败向调用方传播。 */
+  /** 已有保存失败不阻止精确停止；停止证明先反馈，随后仍返回原保存错误。 */
   async interrupt(turnId: TurnId, options?: ThreadInterruptOptions): Promise<boolean> {
     const emitters = this.emitters;
     const settlement = this.activeTurnSettled;
     const call = this.credentialCallPending?.turnId === turnId ? this.credentialCallPending : null;
-    if (call?.failure) throw call.failure;
-    if (call && (call.phase === "draining" || !this.active && !this.startingTurn && !this.hasPendingProviderMutationFence())) {
+    if (call?.failure && !this.active && !this.startingTurn) throw call.failure;
+    if (call && !call.failure && (call.phase === "draining" || !this.active && !this.startingTurn && !this.hasPendingProviderMutationFence())) {
       call.phase = "draining";
       options?.onStopConfirmed?.();
       if (call.preparing) await call.settled;
@@ -2928,6 +2928,7 @@ export class CodexAppServerThreadSession implements ThreadEngineSession {
     if (!interrupted) { if (call && this.credentialCallPending === call) call.phase = "running"; return false; }
     if (call && this.credentialCallPending === call) call.phase = "draining";
     options?.onStopConfirmed?.();
+    if (call?.failure) throw call.failure;
     if (settlement) await settlement;
     await emitters?.flush?.();
     return true;

@@ -111,3 +111,29 @@ for (const scope of ["thread", "workspace"] as const) test(`发送等待期间�
   assert.deepEqual(f.cleared, []);
   assert.equal(f.notices.length, 1);
 });
+
+test("输出保存失败仍可点击终止，已有保存中或断线状态保持禁用", async () => {
+  const source = readFileSync(new URL("../src/features/composer/components/chat-composer.vue", import.meta.url), "utf8");
+  const ast = ts.createSourceFile("composer.ts", source.slice(source.indexOf(">") + 1, source.indexOf("</script>")), ts.ScriptTarget.Latest, true);
+  const names = new Set(["primaryActionDisabled", "interrupt"]);
+  const selected = ast.statements.filter(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(declaration => names.has(declaration.name.getText(ast))));
+  let calls = 0;
+  const context = vm.createContext({ computed, props: { runningTurnId: "turn", workspaceId: "workspace", threadId: "thread" },
+    primaryActionIsStop: ref(true), composerConnected: ref(true), interrupting: ref(false), turnDraining: ref(false), turnSaveFailed: ref(true),
+    canSend: ref(false), ctx: ref({}), chat: { async interruptTurn() { calls++; } },
+    message: { info() {}, success() {} }, console,
+  });
+  vm.runInContext(ts.transpileModule(selected.map(node => node.getText(ast)).join("\n"), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
+  }).outputText + "\nglobalThis.disabled = () => primaryActionDisabled.value; globalThis.stop = interrupt;", context);
+  assert.equal(context.disabled(), false);
+  await context.stop();
+  assert.equal(calls, 1);
+  context.turnDraining.value = true;
+  assert.equal(context.disabled(), true);
+  await context.stop();
+  assert.equal(calls, 1);
+  context.turnDraining.value = false; context.composerConnected.value = false;
+  assert.equal(context.disabled(), true);
+});

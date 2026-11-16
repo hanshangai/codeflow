@@ -418,7 +418,7 @@ export function createDesktopApplication(input: {
   };
 
   /** 壳失败独立于hot事实；主进程边界按原请求/设备记录，调用者仍收到拒绝。 */
-  const reportShellFailure = (error: unknown, requestId: string): unknown => {
+  const reportShellFailure = (error: unknown, requestId: string, options: { logOnly?: boolean } = {}): unknown => {
     if (error instanceof Error) {
       const owner = Object.getOwnPropertyDescriptor(error, "helperOwner");
       if (owner && "value" in owner && owner.value) shellOwner = owner.value as ShellUpdateHelperOwner;
@@ -432,7 +432,8 @@ export function createDesktopApplication(input: {
       failureJournal.recordShell({ ...getFailureContext(), requestId, shellId: details.shellId?.value ?? null,
         phase: details.failurePhase.value, recovery: details.recovery.value, error });
     } catch (additional) { failure = new AggregateError([error, additional], "DESKTOP_SHELL_FAILURE_RECORD_FAILED"); }
-    try { input.host.onUpdateError?.(failure, { requestId, deviceId: identity!.deviceId }); }
+    try { input.host.onUpdateError?.(failure, { requestId, deviceId: identity!.deviceId,
+      ...(options.logOnly ? { logOnly: true } : {}) }); }
     catch (additional) { failure = new AggregateError([failure, additional], "DESKTOP_SHELL_ERROR_REPORT_FAILED"); }
     shellUpdateFailure = { requestId, error: failure }; return failure;
   };
@@ -1052,13 +1053,15 @@ export function createDesktopApplication(input: {
         throw error;
       }
       const failedRequestId = readReceiptErrorRequestId(error) ?? pendingUpdate?.requestId ?? requestId;
+      // 自动检查失败仅记录并保留在更新设置中；只有手动检查才展示失败弹框。
+      const logOnly = !(manual || updateFlightManualRequested);
       if (checkingShell) {
         if (shellDetails.result === "unknown") shellDetails.result = "failure";
-        throw reportShellFailure(error, failedRequestId);
+        throw reportShellFailure(error, failedRequestId, { logOnly });
       }
       if (bundleDetails.result === "unknown") bundleDetails.result = "failure";
       let failure = error;
-      try { input.host.onUpdateError?.(failure, { requestId: failedRequestId, deviceId }); }
+      try { input.host.onUpdateError?.(failure, { requestId: failedRequestId, deviceId, ...(logOnly ? { logOnly: true } : {}) }); }
       catch (reportError) { failure = new AggregateError([error, reportError], "DESKTOP_UPDATE_ERROR_REPORT_FAILED"); }
       updateCheckFailure = { requestId: failedRequestId, error: failure };
       throw failure;

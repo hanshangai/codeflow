@@ -6,7 +6,6 @@ import test from "node:test";
 import { openClientDb } from "../src/db/clientDb.js";
 import { logger } from "../src/logger.js";
 import { ClaudeThreadSession } from "../src/engines/claude/claudeThreadSession.js";
-import { isEngineWorkspaceLogFailure } from "../src/engines/threadSession.js";
 
 /** 会话只使用真实隔离W日志，不启动provider。 */
 function fixture(t: test.TestContext) {
@@ -34,12 +33,11 @@ test("Claude交互拒绝沿固定W记录关联，应用无副本且答案不进�
   assert.deepEqual(application, []);
 });
 
-test("Claude交互日志falsy拒绝沿原Promise失败，不发送或吞为provider错误", async t => {
+test("Claude交互日志失败只告警，仍返回原交互不存在错误", async t => {
   const f = fixture(t);
   f.db.writeWorkspaceLog = () => { throw 0; };
-  await assert.rejects(f.session.respondUserInput("missing", {}), error => {
-    assert.ok(isEngineWorkspaceLogFailure(error));
-    assert.equal((error as AggregateError).cause, 0);
-    return true;
-  });
+  const warnings: unknown[] = [];
+  t.mock.method(logger, "warn", (...args: unknown[]) => { warnings.push(args); });
+  await assert.rejects(f.session.respondUserInput("missing", {}), /request 不存在或已处理/);
+  assert.ok(warnings.length > 0);
 });

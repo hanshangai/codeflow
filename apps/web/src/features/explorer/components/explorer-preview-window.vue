@@ -5,7 +5,7 @@ import {
   EyeOutlined, CodeOutlined, ColumnWidthOutlined, ColumnHeightOutlined,
   CompressOutlined, ExpandOutlined, UpOutlined, DownOutlined,
   MinusOutlined, PlusOutlined, CopyOutlined, UnorderedListOutlined,
-  DownloadOutlined, FullscreenExitOutlined, FullscreenOutlined,
+  DownloadOutlined, FullscreenExitOutlined, FullscreenOutlined, CloseOutlined,
 } from "@ant-design/icons-vue";
 import { useUiStore, type PreviewWindow } from "../../../store/ui";
 import { useConfigStore } from "../../../store/config";
@@ -118,8 +118,8 @@ const modalWrapClassName = computed(() => [
 const modalWidth = computed(() => previewFullscreen.value ? "100vw" : "72%");
 const modalBodyStyle = computed(() => {
   if (!previewFullscreen.value) return { padding: "0", height: "70vh", overflow: "hidden" };
-  if (desktopFullscreen.value) return { padding: "0", overflow: "hidden" };
-  return { padding: "0", height: "calc(100dvh - 50px)", maxHeight: "calc(100dvh - 50px)", overflow: "hidden" };
+  // 全屏由 content 的 flex 布局撑满，避免固定高度与标题栏实际高度不一致。
+  return { padding: "0", overflow: "hidden" };
 });
 const modalBinding = computed<Record<string, unknown>>(() => {
   if (props.embedded) return { class: "preview-window--embedded" };
@@ -128,6 +128,8 @@ const modalBinding = computed<Record<string, unknown>>(() => {
     footer: null,
     mask: false,
     maskClosable: false,
+    // 关闭按钮统一放在自定义标题栏，避免与默认按钮叠在右上角。
+    closable: false,
     zIndex: modalZIndex.value,
     width: modalWidth.value,
     bodyStyle: modalBodyStyle.value,
@@ -299,6 +301,18 @@ function onWindowMousedown(e: MouseEvent) {
             @click.stop="togglePreviewFullscreen"
           >
             <component :is="previewFullscreen ? FullscreenExitOutlined : FullscreenOutlined" />
+          </a-button>
+        </a-tooltip>
+        <a-tooltip title="关闭预览">
+          <a-button
+            class="preview-window__title-action"
+            type="text"
+            size="small"
+            aria-label="关闭预览"
+            @mousedown.stop
+            @click.stop="ui.closePreviewWindow(win.id)"
+          >
+            <CloseOutlined />
           </a-button>
         </a-tooltip>
       </div>
@@ -484,7 +498,6 @@ function onWindowMousedown(e: MouseEvent) {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  padding-right: 32px;
 }
 
 .preview-window__title-text {
@@ -602,10 +615,11 @@ function onWindowMousedown(e: MouseEvent) {
   overflow: hidden !important;
 }
 
-/* 桌面全屏从 44px 应用顶栏下方开始，保留导航与窗口控制可点击。 */
+/* 桌面全屏从 44px 应用顶栏下方开始并锚定到窗口底部，避免视口单位推算产生缝隙。 */
 :global(.explorer-preview-modal--desktop-fullscreen.ant-modal-wrap) {
   top: 44px !important;
-  height: calc(100dvh - 44px) !important;
+  bottom: 0 !important;
+  height: auto !important;
 }
 
 :global(.explorer-preview-modal--fullscreen .ant-modal) {

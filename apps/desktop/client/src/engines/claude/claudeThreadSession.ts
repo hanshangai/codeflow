@@ -1027,10 +1027,10 @@ export class ClaudeThreadSession implements ThreadEngineSession {
         }
       }
     };
-    /** 许可等待也归stdout排空owner，收到的后续行保持FIFO。 */
+    /** 许可结束后继续排空或恢复读取，收到的后续行保持FIFO。 */
     const finishStdoutBatch = (): void => {
       stdoutDraining = false;
-      if (!stdoutFailure && stdoutHead < stdoutLines.length) scheduleClaudeStdoutDrain(drainStdoutBatch);
+      if (!stdoutFailure && (stdoutHead < stdoutLines.length || stdoutPaused)) scheduleClaudeStdoutDrain(drainStdoutBatch);
       settleStdoutWaiters();
     };
     /** 仅绑定变化行进入短许可；普通输出仍按两行预算同步映射。 */

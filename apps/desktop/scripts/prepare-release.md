@@ -112,7 +112,7 @@ pnpm -C apps/desktop package:local:mac -- <完整资源目录> <新独占输出�
 pnpm -C apps/desktop package:local:mac -- <完整资源目录> <新独占输出目录> --target dmg
 ```
 
-命令关闭官方 Developer ID 签名与 hardened runtime，但在 `afterPack` 阶段对 `.app` 做 ad-hoc 签名并执行 `codesign --verify`；DMG 使用拖拽到 Applications 的布局。ad-hoc 签名只能降低 Apple Silicon 直接判损坏的概率，不能替代 Developer ID 签名和公证。资源目录没有签名基线时，输出会携带 `desktop-unsigned-local.json`，应用仅跳过打包态基线要求，并在启动日志中记录 `DESKTOP_UNSIGNED_LOCAL_BASELINE_SKIPPED`；该标记不能替代签名、公证或正式发布材料，带更新源的资源会以 `DESKTOP_UNSIGNED_LOCAL_UPDATE_ORIGIN_CONFLICT` 拒绝启动。提供 `baseline-release-manifest.json` 时可用 `--require-baseline-proof` 先复验完整 held payload。
+命令关闭官方 Developer ID 签名与 hardened runtime，但在 `afterPack` 阶段对 `.app` 做 ad-hoc 签名并执行 `codesign --verify`；DMG 使用拖拽到 Applications 的布局。ad-hoc 签名只能降低 Apple Silicon 直接判损坏的概率，不能替代 Developer ID 签名和公证。资源目录没有签名基线时，输出会携带 `desktop-unsigned-local.json`，应用仅跳过打包态基线要求，并在启动日志中记录 `DESKTOP_UNSIGNED_LOCAL_BASELINE_SKIPPED`；该标记不能替代签名、公证或正式发布材料。提供 `baseline-release-manifest.json` 时可用 `--require-baseline-proof` 先复验完整 held payload。
 
 CI 或无交互构建可使用 `bash tools/ci/build-macos-dmg.sh <新独占输出目录>`；脚本会构建资源、安装固定 npm 12.2.2、生成 Client 归档并调用上述 DMG 打包入口。`.github/workflows/desktop-dmg.yml` 当前只在 `macos-15`（arm64）产出 DMG；x64 Mac 包需要 Intel Mac 或 x64 macOS CI。
 

@@ -2353,18 +2353,18 @@ const primaryActionIsStop = computed(() => Boolean(
 ));
 const primaryActionLabel = computed(() => {
   if (!primaryActionIsStop.value) return sendButtonLabel.value;
-  if (turnSaveFailed.value) return "输出保存失败，请重试";
+  if (turnSaveFailed.value) return "重试终止";
   if (turnDraining.value) return "保存中";
   return interrupting.value || turnPhase.value === "stopping" ? "终止中" : "终止";
 });
 const primaryActionTitle = computed(() => {
   if (!primaryActionIsStop.value) return sendButtonTitle.value;
-  if (turnSaveFailed.value) return "输出保存失败，请重试";
+  if (turnSaveFailed.value) return "输出保存失败，仍可停止引擎并重试收尾";
   if (turnDraining.value) return "已停止，正在保存剩余输出";
   return "终止当前会话";
 });
 const primaryActionLoading = computed(() => primaryActionIsStop.value ? interrupting.value || turnDraining.value : sending.value);
-const primaryActionDisabled = computed(() => primaryActionIsStop.value ? (!composerConnected.value || interrupting.value || turnDraining.value || turnSaveFailed.value) : !canSend.value);
+const primaryActionDisabled = computed(() => primaryActionIsStop.value ? (!composerConnected.value || interrupting.value || turnDraining.value) : !canSend.value);
 const primaryActionClass = computed(() => {
   if (primaryActionIsStop.value) return "composer__send-btn--stop";
   if (currentComposerInputSubmission.value.mode === "message"
@@ -3642,10 +3642,10 @@ function onToolbarClickCapture(event: MouseEvent): void {
   }
 }
 
-/** 中断复用原 Client turn 入口；失败不显示成功且保留可追踪上下文。 */
+/** 中断复用原 Client turn 入口；保存失败仍允许停止，失败不显示成功。 */
 const interrupt = async () => {
   const turnId = props.runningTurnId;
-  if (!turnId || interrupting.value || turnDraining.value || turnSaveFailed.value) return;
+  if (!turnId || !composerConnected.value || interrupting.value || turnDraining.value) return;
   interrupting.value = true;
   try {
     await chat.interruptTurn(ctx.value, { workspaceId: props.workspaceId, threadId: props.threadId, turnId });

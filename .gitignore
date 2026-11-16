@@ -6,6 +6,8 @@ release/
 .DS_Store
 .idea/
 .codeflow/
+.codex/
+.claude/
 .tmp/
 .superpowers/
 .playwright-mcp/

@@ -15,15 +15,15 @@ function loadModule(source: string, load: (id: string) => unknown) {
   return module.exports;
 }
 
-/** 编译并挂载真实 SFC setup；inline 表示输入区上方的待处理实例。 */
-function fixture(inline: boolean) {
+/** 编译并挂载真实 SFC setup；待处理卡片点击后使用 body 弹层。 */
+function fixture() {
   const source = fs.readFileSync(new URL("../src/features/messages/components/items/user-input-request-item.vue", import.meta.url), "utf8");
   const { descriptor } = parse(source);
   const script = compileScript(descriptor, { id: "async-input-inline" });
   const template = compileTemplate({ source: descriptor.template!.content, filename: "user-input-request-item.vue", id: "async-input-inline",
     compilerOptions: { bindingMetadata: script.bindings } });
   assert.deepEqual(template.errors, []);
-  const props = vue.reactive({ inline, compact: inline, item: { kind: "userInputRequest", id: "call", requestId: "call", threadId: "thread",
+  const props = vue.reactive({ compact: true, item: { kind: "userInputRequest", id: "call", requestId: "call", threadId: "thread",
     workspaceId: "workspace", delivery: "async", state: "pending", header: "问题", prompt: "补充输入",
     questions: [{ id: "q", question: "选择范围", header: "范围" }] } });
   const config = { connected: true, webSessionId: "web", webInstanceId: "instance" };
@@ -59,24 +59,17 @@ function createApp(f: ReturnType<typeof fixture>) {
   return app;
 }
 
-test("输入区上方的异步问题在组件内展开，不进入 body 弹层", async t => {
-  const f = fixture(true);
+test("异步问题卡片不自动展开，打开后走 body 弹层", async t => {
+  const f = fixture();
   t.after(f.stop);
-  assert.equal(f.state.dialogOpen.value, true);
-  const context: { teleports?: Record<string, string> } = {};
-  const html = await renderToString(createApp(f), context);
-  assert.ok(html.includes("uir-dialog-layer--inline"), html);
-  assert.ok(html.includes("选择范围"), "表单问题直接渲染在输入区上方");
-  assert.ok(!JSON.stringify(context.teleports ?? {}).includes("uir-dialog-layer"), "内联实例不产生 body 弹层内容");
-});
+  assert.equal(f.state.dialogOpen.value, false, "问题到达时不自动展开");
+  const cardContext: { teleports?: Record<string, string> } = {};
+  const cardHtml = await renderToString(createApp(f), cardContext);
+  assert.ok(cardHtml.includes("填写"), "待处理卡片提供『填写』入口");
+  assert.ok(!cardHtml.includes("uir-dialog-layer"), "待处理卡片不内联展开");
 
-test("消息流卡片点击后仍弹出 body 层", async t => {
-  const f = fixture(false);
-  t.after(f.stop);
-  assert.equal(f.state.dialogOpen.value, false);
   f.state.dialogOpen.value = true;
-  const context: { teleports?: Record<string, string> } = {};
-  const html = await renderToString(createApp(f), context);
-  assert.ok(!html.includes("uir-dialog-layer"), "消息流卡片不内联展开");
-  assert.ok(JSON.stringify(context.teleports ?? {}).includes("uir-dialog-layer"), "手动打开仍走 body 弹层");
+  const dialogContext: { teleports?: Record<string, string> } = {};
+  await renderToString(createApp(f), dialogContext);
+  assert.ok(JSON.stringify(dialogContext.teleports ?? {}).includes("uir-dialog-layer"), "手动打开走 body 弹层");
 });

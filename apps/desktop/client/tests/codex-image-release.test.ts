@@ -89,16 +89,14 @@ test("successful image release is idempotent and leaves local input files alone"
   assert.equal(f.errors.length, 0);
 });
 
-test("image release and logging failure preserve both original causes after all attempts", t => {
+test("image release keeps both deletion errors when diagnostic logging only warns", t => {
   const f = fixture(t), primary = new Error("unlink-failed"), logError = new Error("log-failed");
   let attempts = 0;
   t.mock.method(fs, "unlinkSync", () => { attempts += 1; throw primary; });
   t.mock.method(logger, "error", () => { throw logError; });
   assert.throws(() => f.prepared.cleanup(), error => {
     assert.ok(error instanceof AggregateError);
-    assert.ok(error.errors[0] instanceof AggregateError);
-    assert.deepEqual(error.errors[0].errors, [primary, primary]);
-    assert.equal(error.errors[1], logError);
+    assert.deepEqual(error.errors, [primary, primary]);
     return true;
   });
   assert.equal(attempts, 2);

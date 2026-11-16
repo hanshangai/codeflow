@@ -508,7 +508,7 @@ test("Codex stdout 已暂停时控制 RPC 会唤醒管道且不再次暂停", as
   await manager.killAllWorkspaces();
 });
 
-test("Codex诊断失败首次release仍拒绝，确认物理回收后新record可继续且不重发旧turn", async () => {
+test("Codex普通诊断失败不阻止release，物理回收后新record不重发旧turn", async () => {
   const failure = new Error("workspace-log-failed");
   const manager = new CodexAppServerManager({ writeWorkspaceLog() { throw failure; }, clientInfo: { name: "test", title: "test", version: "0" } });
   const threadId = "diagnostic-release" as ThreadId, handle = manager.forThread(threadId);
@@ -520,7 +520,7 @@ test("Codex诊断失败首次release仍拒绝，确认物理回收后新record�
   (first as any).failWorkspace(Object.assign(new Error("process failed"), { code: "codex_app_server_process_error" }), {
     child, processGeneration: 1, notifyThreads: false, killChild: true,
   });
-  await assert.rejects(manager.releaseThread(threadId));
+  await manager.releaseThread(threadId);
   assert.equal(handle.getExisting(WORKSPACE_ID), null);
   const replacement = handle.getOrCreate(WORKSPACE_ID, WORKSPACE_PATH);
   assert.notEqual(replacement, first);

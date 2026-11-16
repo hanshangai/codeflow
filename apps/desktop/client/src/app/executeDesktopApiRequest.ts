@@ -20,6 +20,7 @@ import {
 } from "@codeflowai/shared";
 import { handleApiRequest, scopeApiHandlerContext, isWorkspaceCoreApiRequest, isThreadHistoryReadApiRequest, isWorkspacePersistenceRecoveryApiRequest, describeWorkspaceApiFailure, WorkspaceApiRequestFailure, type ApiHandlerContext, type ApiRequestMessage } from "./handleApiRequest.js";
 import { handleTerminalRuntimeApi } from "./handlers/terminalHandlers.js";
+import { canInterruptRuntimeTurnWithoutDatabase } from "./turnInterrupt.js";
 import { logger } from "../logger.js";
 import { prepareCodexKeySwitch } from "./handlers/engineKeyHandlers.js";
 import { DesktopBuiltInRelayRequestError } from "../runtime/desktopCloudAccount.js";
@@ -295,15 +296,16 @@ function withDesktopDatabase<T>(ctx: Pick<ApiHandlerContext, "withDatabase">, re
   return ctx.withDatabase ? ctx.withDatabase(requestId, operation) : Promise.resolve(operation());
 }
 
-/** 桌面只做可信输入装配和响应关联，业务复用既有 Client 处理器与资产服务。 */
+/** 桌面复用既有业务入口；已核本机运行owner的停止不等待数据库预检，保存失败仍归原尾链。 */
 export async function executeDesktopApiRequest(ctx: ApiHandlerContext, request: DesktopApiRequest, input: {
   requestId: string;
   clientVersion: string | null;
   startedAt: number;
 }): Promise<DesktopApiResponse> {
   let body: Record<string, unknown>;
+  const runtimeInterrupt = request.method === "turns.interrupt" && canInterruptRuntimeTurnWithoutDatabase(ctx, request.body ?? {});
   try {
-    body = await withDesktopDatabase(ctx, input.requestId, () => request.method.startsWith("knowledge.assets.")
+    body = runtimeInterrupt ? prepareRequestBody(ctx, request) : await withDesktopDatabase(ctx, input.requestId, () => request.method.startsWith("knowledge.assets.")
       ? prepareKnowledgeAssetRequestBody(ctx, request, input.requestId)
       : prepareRequestBody(ctx, request));
     if (request.method === "orch.assetBundles.export") {
@@ -429,7 +431,7 @@ export async function executeDesktopApiRequest(ctx: ApiHandlerContext, request: 
   let failureLogged = false;
   let releaseEarlyResponse!: () => void;
   const earlyResponse = new Promise<void>(resolve => { releaseEarlyResponse = resolve; });
-  const scopedContext = await withDesktopDatabase(ctx, input.requestId, () => isWorkspaceCoreApiRequest(request.method) && typeof body.workspaceId === "string" && ctx.workspaces.has(body.workspaceId as WorkspaceId)
+  const scopedContext = runtimeInterrupt ? ctx : await withDesktopDatabase(ctx, input.requestId, () => isWorkspaceCoreApiRequest(request.method) && typeof body.workspaceId === "string" && ctx.workspaces.has(body.workspaceId as WorkspaceId)
     ? scopeApiHandlerContext(ctx, body.workspaceId as WorkspaceId, { readonly: isThreadHistoryReadApiRequest(request.method),
       deferPersistenceCheck: isWorkspacePersistenceRecoveryApiRequest(request.method) }) : ctx);
   const localContext: ApiHandlerContext = {
@@ -804,7 +806,7 @@ function assertAssetNotReferenced(ctx: ApiHandlerContext, workspaceId: Workspace
   if (referenced) throw new DesktopRequestError(409, "资产仍被引用，请先修改引用方");
 }
 
-/** 校验本机线程归属；历史沿只读视图校验，知识续聊保留原 actor 与协作边界。 */
+/** 校验本机线程归属；精确停止可复用已准入owner，其他线程仍核对持久归属。 */
 function prepareThreadRequestBody(ctx: ApiHandlerContext, method: DesktopApiRequest["method"], rawBody: Record<string, unknown>): Record<string, unknown> {
   const body = { ...rawBody };
   // Server 注入的 Web 会话标识不进入本机执行；知识会话 actor 由本机可信身份覆盖。
@@ -813,6 +815,9 @@ function prepareThreadRequestBody(ctx: ApiHandlerContext, method: DesktopApiRequ
   const workspaceId = requiredText(body.workspaceId, "workspaceId") as WorkspaceId;
   if (!isLocalWorkspaceId(ctx, workspaceId)) throw new DesktopRequestError(400, "仅支持本机本地工作区的精确 ID");
   requireHostedWorkspace(ctx, workspaceId);
+  if (method === "turns.interrupt" && canInterruptRuntimeTurnWithoutDatabase(ctx, body)) {
+    return { workspaceId, threadId: requiredText(body.threadId, "threadId"), turnId: requiredText(body.turnId, "turnId") };
+  }
   ctx = scopeApiHandlerContext(ctx, workspaceId, { readonly: isThreadHistoryReadApiRequest(method),
     deferPersistenceCheck: isWorkspacePersistenceRecoveryApiRequest(method) });
   return method === "threads.sendMessage"

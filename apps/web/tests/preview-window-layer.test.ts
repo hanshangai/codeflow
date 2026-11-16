@@ -16,10 +16,16 @@ const chatWorkflowSource = readFileSync(
   "utf8",
 );
 
-test("desktop fullscreen preview leaves the 44px app topbar uncovered", () => {
+test("desktop fullscreen preview leaves the 44px app topbar uncovered and reaches the bottom", () => {
   assert.match(previewWindowSource, /explorer-preview-modal--desktop-fullscreen/u);
   assert.match(previewWindowSource, /top: 44px !important/u);
-  assert.match(previewWindowSource, /calc\(100dvh - 44px\)/u);
+  assert.match(previewWindowSource, /bottom: 0 !important/u);
+  assert.doesNotMatch(previewWindowSource, /calc\(100dvh - 44px\)/u);
+});
+
+test("preview window renders title actions without the default modal close button", () => {
+  assert.match(previewWindowSource, /closable: false/u);
+  assert.match(previewWindowSource, /aria-label="关闭预览"/u);
 });
 
 test("file changes fullscreen modals also start below the desktop topbar", () => {

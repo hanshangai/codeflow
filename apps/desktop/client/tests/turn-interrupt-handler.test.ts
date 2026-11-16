@@ -140,6 +140,47 @@ test("已确认停止后的保存失败不能触发Codex恢复或写入终态", 
   } finally { harness.cleanup(); }
 });
 
+test("准确运行owner的终止先于数据库等待，保存失败仍明确返回", async () => {
+  const h = setupInterruptHarness(), scope = { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, turnId: TURN_ID };
+  const failure = new Error("PERSISTENCE_UNAVAILABLE");
+  let stopped = false, confirmed = false;
+  h.ctx.threads.create({ threadId: THREAD_ID, workspaceId: WORKSPACE_ID, engine: "codex", title: "停止测试" });
+  h.ctx.getActiveThreadTurn = () => ({ turnId: TURN_ID, startedAt: 1, source: "runtime" });
+  h.ctx.withDatabase = async () => { assert.equal(stopped, true, "数据库失败不得先于停止目标引擎"); throw failure; };
+  (h.ctx.sessions as any).interrupt = async (_thread: string, _turn: string, options: any) => {
+    stopped = true; options.onStopConfirmed(); throw failure;
+  };
+  try {
+    await assert.rejects(interruptTurnBestEffort(h.ctx, scope, { onStopConfirmed() { confirmed = true; } }), error => error === failure);
+    assert.equal(stopped, true); assert.equal(confirmed, true);
+    assert.equal(h.db.turns.get(TURN_ID)?.status, "started");
+  } finally { h.cleanup(); }
+});
+
+test("未完成的终态保存不阻止先中断引擎，失败仍保留原恢复进度", async () => {
+  const h = setupInterruptHarness(), scope = { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, turnId: TURN_ID };
+  const failure = new Error("TERMINAL_SAVE_UNAVAILABLE");
+  let calls = 0, confirmed = false;
+  h.ctx.flushLocalEvents = async () => { throw failure; };
+  try {
+    await assert.rejects(settleTurnTerminalOnce(h.ctx, { ...scope, status: "error" }, {
+      buildTerminalEvents: async () => [], notifyQueue() {},
+    }), error => error === failure);
+    (h.ctx.sessions as any).interrupt = async (_thread: string, _turn: string, options: any) => {
+      calls++; options.onStopConfirmed(); return true;
+    };
+    await assert.rejects(interruptTurnBestEffort(h.ctx, scope, { ensureTerminalEvent: true,
+      onStopConfirmed() { confirmed = true; } }), error => error === failure);
+    await assert.rejects(interruptTurnBestEffort(h.ctx, scope, { ensureTerminalEvent: true }), error => error === failure);
+    assert.equal(calls, 1); assert.equal(confirmed, true);
+    assert.equal(getPendingTurnTerminalFailure(scope)?.turnId, TURN_ID);
+  } finally {
+    h.ctx.flushLocalEvents = async () => {};
+    await retryPendingTurnTerminal(h.ctx, scope);
+    h.cleanup();
+  }
+});
+
 test("终态保存屏障失败不清active或推进队列，原进度重试不重复终态", async () => {
   const harness = setupInterruptHarness();
   let flushes = 0, cleared = 0, notified = 0;
@@ -654,16 +695,14 @@ test("未知turn中断的stale诊断失败保留409错误且不调用provider", 
     t.mock.method(harness.db, "writeWorkspaceLog", () => { throw undefined; });
     await assert.rejects(interruptTurnBestEffort(harness.ctx, { workspaceId: WORKSPACE_ID, threadId,
       turnId: "missing-turn" as never }), error => {
-      assert.ok(error instanceof AggregateError);
-      assert.equal(error.errors[0].code, "thread_runtime_stale");
-      assert.equal(error.errors[1], undefined);
+      assert.equal((error as { code?: string }).code, "thread_runtime_stale");
       return true;
     });
     assert.equal(calls, 0);
   } finally { harness.cleanup(); }
 });
 
-test("中断业务与W日志双失败保留falsy原因并停止恢复副作用", async t => {
+test("中断日志失败只告警，缺少精确身份仍保留原业务原因且不猜测停止", async t => {
   const harness = setupInterruptHarness(), writer = { diagnostic: "writer-failed" };
   let recoveryCalls = 0;
   try {
@@ -672,9 +711,8 @@ test("中断业务与W日志双失败保留falsy原因并停止恢复副作用",
     t.mock.method(harness.db, "writeWorkspaceLog", () => { throw writer; });
     await assert.rejects(interruptTurnBestEffort(harness.ctx, { workspaceId: WORKSPACE_ID,
       threadId: THREAD_ID, turnId: TURN_ID }), error => {
-      assert.ok(error instanceof AggregateError);
-      assert.deepEqual(error.errors, [undefined, writer]);
-      assert.equal(error.cause, undefined);
+      assert.equal((error as { code?: string }).code, "codex_provider_turn_identity_missing");
+      assert.equal((error as Error).cause, undefined);
       return true;
     });
     assert.equal(recoveryCalls, 0);

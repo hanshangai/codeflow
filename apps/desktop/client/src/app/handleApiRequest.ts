@@ -210,6 +210,7 @@ import type { WsSendJsonResult } from "../transport/wsTransport.js";
 import type { ScheduledTaskScheduler } from "../scheduled-tasks/scheduledTaskScheduler.js";
 import {
   interruptTurnBestEffort,
+  canInterruptRuntimeTurnWithoutDatabase,
   retryPendingTurnTerminal,
   settleManualTurnTerminalOnce,
   settleTurnTerminalOnce,
@@ -752,11 +753,11 @@ async function withApiDatabase<T>(ctx: Pick<ApiHandlerContext, "withDatabase">, 
   return ctx.withDatabase ? ctx.withDatabase(requestId, operation) : operation();
 }
 
-/** 规范化工作区后分发白名单 API；本机线程先验权威，异常沿原 finally 收口。 */
+/** 分发白名单API；可信本机精确停止先走控制入口，其他请求先验数据库归属，异常由原finally收口。 */
 export async function handleApiRequest(ctx: ApiHandlerContext, req: ApiRequestMessage): Promise<void> {
   /** 只包纯同步数据库段，provider/网络等待必须在许可外。 */
   const database = <T>(operation: () => T): Promise<T> => withApiDatabase(ctx, req.id, operation);
-  if (await database(() => rejectPausedTaskAdmission(ctx, req))) return;
+  if (req.method !== "turns.interrupt" && await database(() => rejectPausedTaskAdmission(ctx, req))) return;
   const requestedWorkspace = String((req.body as { workspaceId?: unknown } | null)?.workspaceId ?? "").trim() as WorkspaceId;
   let diagnosticWorkspace = ctx.workspaces.has(requestedWorkspace) ? requestedWorkspace : null;
   if (["fs.uploadChunk", "fs.uploadComplete", "fs.uploadCancel"].includes(req.method)) {
@@ -1044,6 +1045,12 @@ export async function handleApiRequest(ctx: ApiHandlerContext, req: ApiRequestMe
   let finishThreadOperation = (): void => {};
   let finishWorkspaceWrite = (): void => {};
   try {
+    if (req.method === "turns.interrupt" && ctx.localWorkspaceOnly === true
+      && canInterruptRuntimeTurnWithoutDatabase(ctx, (req.body ?? {}) as Record<string, unknown>)) {
+      finishThreadOperation = ctx.sessions.beginThreadOperation((req.body as { threadId: ThreadId }).threadId);
+      await dispatch();
+      return;
+    }
     if (ctx.workspaces.has(requestedWorkspace) && isWorkspaceCoreApiRequest(req.method)) {
       ctx = await database(() => scopeApiHandlerContext(ctx, requestedWorkspace, {
         deferPersistenceCheck: isWorkspacePersistenceRecoveryApiRequest(req.method),
@@ -1905,7 +1912,7 @@ async function onThreadsSendMessage(ctx: ApiHandlerContext, req: ApiRequestMessa
         ...(rollbackEventSeqBarrier != null ? { rollbackEventSeqBarrier } : {}),
       },
     });
-    trackOrdinaryTurnExecution(ctx.sessions, { workspaceId, threadId, turnId }, async execution => {
+    trackOrdinaryTurnExecution(ctx.sessions, { workspaceId, threadId, turnId, localWorkspaceOnly: ctx.localWorkspaceOnly === true }, async execution => {
       try {
         execution.markProviderDispatch();
         await createRequirementAnalysisService(ctx).sendMessage({
@@ -2482,7 +2489,7 @@ async function onThreadsSendMessage(ctx: ApiHandlerContext, req: ApiRequestMessa
   };
   const finishTurnOperation = ctx.sessions.beginThreadOperation(threadId);
   try {
-    trackOrdinaryTurnExecution(ctx.sessions, { workspaceId, threadId, turnId }, async execution => {
+    trackOrdinaryTurnExecution(ctx.sessions, { workspaceId, threadId, turnId, localWorkspaceOnly: ctx.localWorkspaceOnly === true }, async execution => {
       const state: { failure?: { error: unknown } } = {};
       try { await prepareAndExecute(execution); }
       catch (error) {
@@ -2715,7 +2722,7 @@ async function onThreadsCompact(ctx: ApiHandlerContext, req: ApiRequestMessage):
     },
   });
 
-  trackOrdinaryTurnExecution(ctx.sessions, { workspaceId, threadId, turnId }, async execution => {
+  trackOrdinaryTurnExecution(ctx.sessions, { workspaceId, threadId, turnId, localWorkspaceOnly: ctx.localWorkspaceOnly === true }, async execution => {
     await Promise.resolve().then(async () => {
       ctx.assertAssetExecution?.({ workspaceId, threadId, toolContext: readSharedWorkspaceToolExecutionContext(body) });
       const sources = ctx.assertAssetExecution

@@ -102,6 +102,7 @@ onBeforeUnmount(() => {
   <a-modal
     :open="open"
     :title="notice?.shellOnly ? '发现新版本（需手动安装）' : '发现新版本'"
+    :footer="null"
     :width="440"
     centered
     :mask-closable="false"

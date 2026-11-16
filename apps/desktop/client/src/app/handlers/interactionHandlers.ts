@@ -517,7 +517,7 @@ async function startThreadFollowUpTurn(ctx: ApiHandlerContext, input: {
       }
     }
   };
-  trackOrdinaryTurnExecution(ctx.sessions, { workspaceId: input.workspaceId, threadId: input.threadId, turnId }, async execution => {
+  trackOrdinaryTurnExecution(ctx.sessions, { workspaceId: input.workspaceId, threadId: input.threadId, turnId, localWorkspaceOnly: ctx.localWorkspaceOnly === true }, async execution => {
     let result: Awaited<ReturnType<typeof sendKnowledgeMessage>>;
     try {
       result = await sendKnowledgeMessage(execution);

@@ -82,15 +82,16 @@ test("partial second image failure removes both owned files and retains the orig
 });
 
 for (const stage of ["codex_image_input_received", "codex_image_temp_file_created", "codex_image_input_prepared", "codex_image_data_url_malformed"] as const) {
-  test(`${stage} logging failure rolls back all prepared images`, t => {
+  test(`${stage} logging failure warns without aborting image preparation`, t => {
     const f = fixture(t), primary = new Error("private-log-reason");
     const failLog = (_tag: string, _message: string, data: Record<string, unknown>) => { if (data.code === stage) throw primary; };
     t.mock.method(logger, stage === "codex_image_data_url_malformed" ? "warn" : "info", failLog);
-    const error = thrown(() => prepareCodexImagesForTurn([...IMAGES, "data:invalid"], f.context));
-    assert.deepEqual(f.entries(), []);
+    const prepared = prepareCodexImagesForTurn([...IMAGES, "data:invalid"], f.context);
+    assert.equal(prepared.images.length, 3);
+    assert.equal(f.entries().length, 2);
     assert.equal(f.opened.size, 0);
-    assert.ok(error instanceof Error);
-    assert.equal(error.cause, primary);
+    prepared.cleanup();
+    assert.deepEqual(f.entries(), []);
   });
 }
 
@@ -162,24 +163,22 @@ test("rollback refuses a replaced file and preserves its foreign bytes", t => {
   });
   const error = thrown(() => prepareCodexImagesForTurn(IMAGES, f.context));
   assert.ok(error instanceof AggregateError);
-  assert.equal(error.cause, primary);
+  assert.equal((error.cause as { code: string }).code, "codex_image_temp_identity_changed");
   const remaining = f.entries();
   assert.equal(remaining.length, 2);
   assert.equal(fs.readFileSync(path.join(f.root, remaining.find(file => file.endsWith("-0.png"))!), "utf8"), "foreign-image");
   assert.equal(fs.readFileSync(moved, "utf8"), "a");
 });
 
-test("error logging failure is aggregated only after image rollback completes", t => {
+test("error logging failure warns while image rollback preserves the write error", t => {
   const f = fixture(t), primary = new Error("write-failed"), logging = new Error("log-failed");
   failSecondWrite(t, f, primary);
   t.mock.method(logger, "error", () => { throw logging; });
   const error = thrown(() => prepareCodexImagesForTurn(IMAGES, f.context));
   assert.deepEqual(f.entries(), []);
   assert.equal(f.opened.size, 0);
-  assert.ok(error instanceof AggregateError);
-  assert.equal(error.errors[1], logging);
-  assert.ok(error.errors[0] instanceof Error);
-  assert.equal(error.errors[0].cause, primary);
+  assert.ok(error instanceof Error);
+  assert.equal(error.cause, primary);
 });
 
 test("non Error preparation failures remain failures with their original cause", t => {
@@ -349,7 +348,7 @@ test("directory wrapped creation failure records the filesystem root cause witho
   assert.equal(fs.existsSync(f.root), false);
 });
 
-test("wrapped failure and error logging failure preserve both original causes", t => {
+test("wrapped failure remains explicit when error logging only warns", t => {
   const f = fixture(t), primary = Object.assign(new Error("private-mkdir"), { code: "EIO", syscall: "mkdir" });
   const logError = new Error("private-log"), mkdir = fs.mkdirSync;
   t.mock.method(fs, "mkdirSync", (...args: Parameters<typeof fs.mkdirSync>) => {
@@ -358,11 +357,8 @@ test("wrapped failure and error logging failure preserve both original causes", 
   });
   t.mock.method(logger, "error", () => { throw logError; });
   const error = thrown(() => prepareCodexImagesForTurn([IMAGES[0]!], f.context));
-  assert.ok(error instanceof AggregateError);
-  assert.equal(error.errors[1], logError);
-  assert.ok(error.errors[0] instanceof Error && error.errors[0].cause instanceof Error);
-  assert.equal(error.errors[0].cause.cause, primary);
-  assert.equal(error.cause, error.errors[0]);
+  assert.ok(error instanceof Error && error.cause instanceof Error);
+  assert.equal(error.cause.cause, primary);
 });
 
 test("safe cause serialization bounds cycles and preserves existing aggregate children", t => {

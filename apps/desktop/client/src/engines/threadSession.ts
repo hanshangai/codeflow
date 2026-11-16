@@ -18,7 +18,7 @@ import type {
 import type { SharedWorkspaceToolExecutionContext } from "../app/sharedWorkspaceToolPolicy.js";
 import { types } from "node:util";
 import { createHash } from "node:crypto";
-import type { WorkspaceLogEntry } from "../logger.js";
+import { logger, type WorkspaceLogEntry } from "../logger.js";
 import { redactClientStartupText } from "../startup/clientStartupStatus.js";
 
 export type EngineWorkspaceLogWriter = (workspaceId: WorkspaceId, entry: WorkspaceLogEntry) => void;
@@ -62,25 +62,33 @@ export function engineDiagnosticField(reason: unknown, key: string): unknown {
   return field && "value" in field ? field.value : undefined;
 }
 
-/** 绑定调用方已核 W，描述、脱敏与固定写同处保因边界，绝不应用补同条。 */
+/** 用户确认普通诊断可降级：仅影响日志，应用告警补偿；双写失败显式抛出，不改变业务或保存结果。 */
 export function writeEngineWorkspaceLog(
   writer: EngineWorkspaceLogWriter,
   workspaceId: WorkspaceId,
   build: () => WorkspaceLogEntry,
   business?: { reason: unknown },
 ): void {
+  let data: Record<string, unknown> | null | undefined;
   try {
     const entry = build();
-    const data = sanitizeEngineLogData(entry.data) as Record<string, unknown> | null | undefined;
+    data = sanitizeEngineLogData(entry.data) as Record<string, unknown> | null | undefined;
     writer(workspaceId, { ...entry, message: redactClientStartupText(entry.message), data: {
       ...data, workspaceId, requestId: data?.requestId ?? `engine:${workspaceId}`,
     } });
   } catch (error) {
-    if (!business) throw error;
-    const failure = Object.assign(new AggregateError([business.reason, error], "引擎工作区诊断或固定日志失败",
-      { cause: business.reason }), { code: "ENGINE_WORKSPACE_LOG_FAILED" });
-    Object.defineProperty(failure, engineWorkspaceLogFailure, { value: true });
-    throw failure;
+    try {
+      logger.warn("engine-diagnostic", "workspace diagnostic log unavailable; continuing with application warning", {
+        code: "ENGINE_WORKSPACE_LOG_DEGRADED", workspaceId, requestId: data?.requestId ?? `engine:${workspaceId}`,
+        threadId: data?.threadId, turnId: data?.turnId ?? data?.clientTurnId,
+        rootCause: engineDiagnosticCause(error), ...(business ? { businessCause: engineDiagnosticCause(business.reason) } : {}),
+      });
+    } catch (fallbackError) {
+      const failure = Object.assign(new AggregateError(business ? [business.reason, error, fallbackError] : [error, fallbackError],
+        "引擎工作区诊断和应用告警均失败", { cause: business ? business.reason : error }), { code: "ENGINE_WORKSPACE_LOG_FAILED" });
+      Object.defineProperty(failure, engineWorkspaceLogFailure, { value: true });
+      throw failure;
+    }
   }
 }
 

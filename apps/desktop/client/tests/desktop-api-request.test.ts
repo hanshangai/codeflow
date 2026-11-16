@@ -11,6 +11,7 @@ import { execFileSync } from "node:child_process";
 import { createDefaultRoleExecutionConfig, makeWorkspaceIdFromPathDigest, normalizeWorkspacePathForDerivedId, type ApiErrorCode, type ClientToServerMessage, type DesktopApiRequest, type DesktopTerminalEvent, type SharedWorkspaceId, type TerminalAction, type TerminalInfo, type ThreadId, type WorkspaceId } from "@codeflowai/shared";
 import { writeTerminalActions } from "../src/terminal/terminalActionsConfig.js";
 import { executeDesktopApiRequest } from "../src/app/executeDesktopApiRequest.js";
+import { trackOrdinaryTurnExecution, waitForOrdinaryTurnExecution } from "../src/app/ordinaryTurnExecution.js";
 import { getWorkspaceApiRequestFailureDetails, isWorkspaceApiRequestFailure, type ApiHandlerContext } from "../src/app/handleApiRequest.js";
 import { openClientDb } from "../src/db/clientDb.js";
 import { CLIENT_DB_SCHEMA_VERSION } from "../src/db/migrateClientDb.js";
@@ -252,6 +253,56 @@ function fixture(t: test.TestContext) {
     },
   };
 }
+
+for (const dispatched of [true, false]) test(`可信本机${dispatched ? "运行" : "准备中"}回合的桌面终止先于数据库预检，保存错误留在原尾链`, async t => {
+  const f = fixture(t);
+  const created = await f.call({ method: "workspaces.upsert", body: { title: "停止测试", path: f.root } });
+  const workspaceId = (created.body as any).workspace.id as WorkspaceId, threadId = "stop-runtime" as ThreadId, turnId = "stop-turn";
+  f.ctx.threads.create({ workspaceId, threadId, engine: "codex", title: "停止测试" });
+  f.ctx.getActiveThreadTurn = () => ({ turnId, startedAt: 1, source: "runtime" });
+  const failure = new Error("DATABASE_UNAVAILABLE");
+  let stopped = 0, release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const tails: Promise<unknown>[] = [];
+  f.ctx.sessions = { beginThreadOperation() { return () => {}; }, async interrupt(_thread: string, _turn: string, options: any) {
+    stopped++; options.onStopConfirmed(); throw failure;
+  } } as any;
+  f.ctx.trackApiTail = tail => { tails.push(tail.then(() => assert.fail("保存失败不得假成功"), error => error)); };
+  trackOrdinaryTurnExecution(f.ctx.sessions, { workspaceId, threadId, turnId, localWorkspaceOnly: true }, async execution => {
+    if (dispatched) execution.markProviderDispatch();
+    await pending;
+  });
+  await Promise.resolve();
+  f.ctx.withDatabase = async () => { assert.equal(stopped, dispatched ? 1 : 0, "停止前不得访问数据库"); throw failure; };
+  try {
+    const response = await f.call({ method: "turns.interrupt", body: { workspaceId, threadId, turnId } });
+    assert.equal(response.status, 200);
+    assert.equal((response.body as any).phase, "draining");
+    assert.equal(stopped, dispatched ? 1 : 0);
+    assert.equal(tails.length, 1);
+    const tailFailure = await tails[0];
+    assert.ok(tailFailure instanceof AggregateError && tailFailure.errors.includes(failure));
+  } finally { release(); await waitForOrdinaryTurnExecution(f.ctx.sessions, { workspaceId, threadId, turnId }); }
+});
+
+for (const mismatch of ["unverified-owner", "successor", "workspace"] as const) test(`桌面终止${mismatch}不得绕过原数据库归属校验`, async t => {
+  const f = fixture(t), workspaceId = "local-client:ws-stop" as WorkspaceId, threadId = "thread-stop" as ThreadId, turnId = "turn-stop";
+  f.ctx.workspaces.set(workspaceId, f.root);
+  f.ctx.threads.create({ workspaceId, threadId, engine: "codex", title: "范围检查" });
+  f.ctx.getActiveThreadTurn = () => ({ turnId: mismatch === "successor" ? "new-turn" : turnId, startedAt: 1, source: "runtime" });
+  let stops = 0, release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  f.ctx.sessions = { async interrupt() { stops++; return true; } } as any;
+  trackOrdinaryTurnExecution(f.ctx.sessions, { workspaceId, threadId, turnId, localWorkspaceOnly: mismatch !== "unverified-owner" }, async () => { await pending; });
+  const failure = new Error("ORIGINAL_DATABASE_VALIDATION_REQUIRED");
+  f.ctx.withDatabase = async () => { throw failure; };
+  try {
+    await assert.rejects(f.call({ method: "turns.interrupt", body: {
+      workspaceId: mismatch === "workspace" ? "local-client:other" : workspaceId, threadId, turnId,
+    } }), error => error === failure);
+    assert.equal(stops, 0);
+  } finally { release(); await waitForOrdinaryTurnExecution(f.ctx.sessions, { workspaceId, threadId, turnId }); }
+});
 
 /** 桌面 Profile 诊断从真实物理工作区读取，不替换固定日志入口。 */
 function profileLogs(root: string): any[] {

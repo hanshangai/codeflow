@@ -6,6 +6,7 @@ import path from "node:path";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { logger } from "../../apps/desktop/client/src/logger.js";
+import { ThreadEventFlushError } from "../../apps/desktop/client/src/engines/threadSession.js";
 import { testEngineWorkspaceLog } from "../../apps/desktop/client/tests/engine-workspace-log-fixture.js";
 
 import {
@@ -282,6 +283,25 @@ function createSessionHarness(
     getRejected: () => rejected,
   };
 }
+
+test("Codex已有保存失败仍先停止活动provider，反馈证明后返回原保存错误", async () => {
+  const h = createSessionHarness({}), failure = new ThreadEventFlushError([new Error("SAVE_FAILED")]);
+  h.session.credentialCallPending = { turnId: "turn-client", phase: "failed", failure };
+  let confirmed = 0;
+  await assert.rejects(h.session.interrupt("turn-client", { onStopConfirmed() { confirmed++; } }), error => error === failure);
+  assert.equal(confirmed, 1);
+  assert.equal(h.requests.filter(request => request.method === "turn/interrupt").length, 1);
+  assert.equal(h.session.getTurnFailure("turn-client"), "TURN_EVENT_FLUSH_FAILED");
+});
+
+test("Codex保存失败且缺少活动owner时不得仅凭owner消失伪造停止证明", async () => {
+  const h = createSessionHarness({}), failure = new ThreadEventFlushError([new Error("SAVE_FAILED")]);
+  h.session.active = null;
+  h.session.credentialCallPending = { turnId: "turn-client", phase: "failed", failure };
+  let confirmed = 0;
+  await assert.rejects(h.session.interrupt("turn-client", { onStopConfirmed() { confirmed++; } }), error => error === failure);
+  assert.equal(confirmed, 0);
+});
 
 /** 提取 timeout reconcile 诊断载荷，忽略同回合其他 raw 事件。 */
 function listTimeoutReconcileData(rawEvents: any[]): any[] {

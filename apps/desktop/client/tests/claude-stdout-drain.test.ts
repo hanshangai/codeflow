@@ -152,6 +152,38 @@ test("Claude绑定变化等待短许可时保留stdout owner，delta不重复申
   assert.equal(f.raw.length, 5);
 });
 
+test("Claude异步绑定排空后继续读取后续chunk，无需等待child关闭", async t => {
+  let bindings = 0;
+  const f = await fixture(t, {
+    withLegacyDatabase: async (_requestId, operation) => operation(),
+    onSessionId() { bindings++; },
+  });
+  f.child.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "new-session", slash_commands: [], skills: [] }) + "\n");
+  for (let attempt = 0; bindings === 0 && attempt < 100; attempt++) await nextTick();
+  assert.equal(bindings, 1);
+  await nextTick();
+
+  f.child.stdout.write(output(2));
+  for (let attempt = 0; !f.events.includes("raw:result") && attempt < 100; attempt++) await nextTick();
+  assert.deepEqual(f.events, ["raw:system", "raw:0", "canonical:0", "raw:1", "canonical:1", "raw:result"]);
+  assert.equal(f.child.closed, false);
+  f.child.close();
+  assert.equal((await f.outcome).ok, true);
+});
+
+test("Claude异步绑定后恢复读取失败归stdout owner返回", async t => {
+  const failure = new Error("SESSION_STDOUT_RESUME_FAILED");
+  const f = await fixture(t, { withLegacyDatabase: async (_requestId, operation) => operation() });
+  t.mock.method(f.child.stdout, "resume", () => { throw failure; });
+  f.child.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "new-session", slash_commands: [], skills: [] }) + "\n");
+  for (let attempt = 0; !f.isSettled() && attempt < 100; attempt++) await nextTick();
+  assert.equal(f.isSettled(), true, "恢复读取失败必须结束回合");
+  const result = await f.outcome;
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.ok(hasCause(result.error, failure));
+  assert.equal(f.child.killed, true);
+});
+
 test("Claude短许可中的绑定失败归stdout owner返回且阻止后续canonical", async t => {
   const failure = new Error("SESSION_BINDING_DATABASE_FAILED");
   const f = await fixture(t, { withLegacyDatabase: async (_requestId, operation) => operation(), onSessionId() { throw failure; } });

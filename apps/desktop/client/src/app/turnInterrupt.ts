@@ -11,9 +11,9 @@ import {
 } from "../engines/threadSessionManager.js";
 import type { WorkspaceLogEntry } from "../logger.js";
 import type { WsSendJsonResult } from "../transport/wsTransport.js";
-import type { ApiHandlerContext } from "./handleApiRequest.js";
+import { scopeApiHandlerContext, type ApiHandlerContext } from "./handleApiRequest.js";
 import { resolveThreadRunningState } from "./threadRunningState.js";
-import { cancelOrdinaryTurnBeforeDispatch, listOrdinaryTurnExecutions } from "./ordinaryTurnExecution.js";
+import { cancelOrdinaryTurnBeforeDispatch, isLocalOrdinaryTurnExecution, listOrdinaryTurnExecutions } from "./ordinaryTurnExecution.js";
 import {
   findCodexClientUserMessageIdsFromHistory,
   findCodexProviderTurnIdentityFromHistory,
@@ -34,6 +34,7 @@ type ManualTurnQueueTarget =
   | { source: "none"; queueItemId: null };
 type TurnTerminalProgress = {
   status: "completed" | "error";
+  stopConfirmed: boolean;
   terminalEvents: ConversationEventInput[] | null;
   nextTerminalEventIndex: number;
   afterTerminalEventsSettled: boolean;
@@ -56,7 +57,7 @@ function accessDatabase<T>(ctx: ApiHandlerContext, operation: () => T): Promise<
   return ctx.withDatabase ? ctx.withDatabase("turn-interrupt", operation) : Promise.resolve(operation());
 }
 
-/** 中断诊断固定已核W；描述与写入同时保留业务失败，诊断失败禁止继续恢复。 */
+/** 中断诊断固定已核W；普通日志失败由共享入口告警，原业务错误仍由调用方处理。 */
 function logInterrupt(ctx: ApiHandlerContext, level: WorkspaceLogEntry["level"], message: string,
   build: () => Record<string, unknown>, business: { reason: unknown }): void {
   if (ctx.db.workspaceId === null) throw new Error("TURN_INTERRUPT_WORKSPACE_REQUIRED", { cause: business.reason });
@@ -73,6 +74,7 @@ export async function settleTurnTerminalOnce(
     threadId: ThreadId;
     turnId: TurnId;
     status: "completed" | "error";
+    stopConfirmed?: boolean;
   },
   actions: {
     buildTerminalEvents: () => Promise<ConversationEventInput[]>;
@@ -98,6 +100,7 @@ export async function settleTurnTerminalOnce(
     }
     progress = {
       status: input.status,
+      stopConfirmed: input.stopConfirmed === true,
       terminalEvents: null,
       nextTerminalEventIndex: 0,
       afterTerminalEventsSettled: false,
@@ -233,6 +236,7 @@ export async function settleManualTurnTerminalOnce(
     threadId,
     turnId,
     status: "error",
+    stopConfirmed: true,
   }, {
     buildTerminalEvents: async () => {
       if (!engine) throw new Error(`手动中断缺少 engine（threadId=${threadId}, turnId=${turnId}）`);
@@ -330,38 +334,70 @@ export async function retryPendingTurnTerminal(
   return await runTurnTerminalSettlement(ctx, pendingInput, progress, key);
 }
 
+/** 本机停止仅复用已准入owner和精确内存身份，未知或共享归属仍走原数据库校验。 */
+export function canInterruptRuntimeTurnWithoutDatabase(
+  ctx: Pick<ApiHandlerContext, "workspaces" | "threads" | "sessions" | "getActiveThreadTurn">,
+  input: { workspaceId?: unknown; threadId?: unknown; turnId?: unknown },
+): boolean {
+  if ([input.workspaceId, input.threadId, input.turnId].some(value => typeof value !== "string" || !value.trim())) return false;
+  const scope = { workspaceId: input.workspaceId as WorkspaceId, threadId: input.threadId as ThreadId, turnId: input.turnId as TurnId };
+  return ctx.workspaces.has(scope.workspaceId) && ctx.threads.get(scope.threadId)?.workspaceId === scope.workspaceId
+    && ctx.getActiveThreadTurn?.({ ...scope, includeDb: false })?.turnId === scope.turnId
+    && isLocalOrdinaryTurnExecution(ctx.sessions, scope);
+}
+
 /**
  * 中断 turn；Claude/Codex 已派发后必须确认 provider 停止，未派发只认精确 owner 的取消证明。
- * 输入必须是当前 workspace/thread/turn，输出通过 conversation.event 和本地 turn 索引落库。
+ * 已核内存owner先停止再等待数据库；停止证明先反馈，保存失败保留原终态进度并显式返回。
  */
 export async function interruptTurnBestEffort(
   ctx: ApiHandlerContext,
   input: { workspaceId: WorkspaceId; threadId: ThreadId; turnId: TurnId },
   opts: InterruptTurnOptions = {},
 ): Promise<InterruptTurnResponseBody> {
-  await accessDatabase(ctx, () => assertRequestedInterruptTurnOwnership(ctx, input));
   let stopConfirmed = false;
   /** 同一请求只反馈一次停止证明；之后的保存失败不能进入provider恢复路径。 */
   const confirmStop = (): void => {
     if (stopConfirmed) return;
     stopConfirmed = true;
+    const progress = turnTerminalProgressByKey.get(buildTurnTerminalKey(input));
+    if (progress) progress.stopConfirmed = true;
     opts.onStopConfirmed?.();
   };
+  let didInterrupt = false, liveInterruptAttempted = false;
+  let liveInterruptFailure: { reason: unknown } | null = null;
+  const runtimeThreadBeforeStop = ctx.threads.get(input.threadId);
+  const runtimeTurn = ctx.getActiveThreadTurn?.({ ...input, includeDb: false });
+  const existingProgress = turnTerminalProgressByKey.get(buildTurnTerminalKey(input));
+  const runtimeMatches = runtimeThreadBeforeStop?.workspaceId === input.workspaceId && runtimeTurn?.turnId === input.turnId;
+  let cancelledBeforeDispatch = runtimeMatches && cancelOrdinaryTurnBeforeDispatch(ctx.sessions, input);
+  if (cancelledBeforeDispatch) confirmStop();
+  if (runtimeMatches && !cancelledBeforeDispatch && !existingProgress?.stopConfirmed) {
+    liveInterruptAttempted = true;
+    try { didInterrupt = await ctx.sessions.interrupt(input.threadId, input.turnId, { onStopConfirmed: confirmStop }); }
+    catch (error) {
+      if (stopConfirmed) throw error;
+      liveInterruptFailure = { reason: error };
+    }
+  }
+  if (ctx.db.workspaceId !== input.workspaceId) ctx = await accessDatabase(ctx, () => scopeApiHandlerContext(ctx, input.workspaceId, { deferPersistenceCheck: true }));
+  await accessDatabase(ctx, () => assertRequestedInterruptTurnOwnership(ctx, input));
   // 先做 compare-and-cancel，再执行任何终态重试或 provider 中断。旧标签页针对 A 的迟到停止
   // 请求绝不能借由“当前 active 是 B”被静默改写成停止 B。
   const target = await accessDatabase(ctx, () => resolveAuthoritativeInterruptTurnId(ctx, input));
-  const cancelledBeforeDispatch = cancelOrdinaryTurnBeforeDispatch(ctx.sessions, input);
+  cancelledBeforeDispatch ||= cancelOrdinaryTurnBeforeDispatch(ctx.sessions, input);
   if (opts.onStopConfirmed && await accessDatabase(ctx, () => resolveThreadRunningState(ctx, input)?.phase === "draining")) confirmStop();
-
-  const pendingOutcome = await retryPendingTurnTerminal(ctx, input);
-  if (pendingOutcome) {
-    return buildInterruptResult(ctx, input, { alreadyTerminal: pendingOutcome === "already_terminal" });
+  if (existingProgress?.stopConfirmed) {
+    confirmStop();
+    const outcome = await retryPendingTurnTerminal(ctx, input);
+    return buildInterruptResult(ctx, input, { alreadyTerminal: outcome === "already_terminal" });
   }
 
   const targetTurnId = target.turnId;
 
   const existing = await accessDatabase(ctx, () => ctx.db.turns.get(targetTurnId));
   if (existing && existing.status !== "started" && target.source !== "active") {
+    await retryPendingTurnTerminal(ctx, input);
     await settleManualTurnTerminalOnce(ctx, {
       ...input,
       turnId: targetTurnId,
@@ -384,13 +420,12 @@ export async function interruptTurnBestEffort(
     ? (String(ctx.threads.get(input.threadId)?.sessionId ?? thread?.sessionId ?? "").trim() || null) as SessionId | null
     : null;
 
-  let didInterrupt = false;
   let liveCodexInterruptError: { reason: unknown } | null = null;
   try {
-    didInterrupt = await ctx.sessions.interrupt(input.threadId, targetTurnId, { onStopConfirmed: confirmStop });
+    if (liveInterruptFailure) throw liveInterruptFailure.reason;
+    if (!liveInterruptAttempted) didInterrupt = await ctx.sessions.interrupt(input.threadId, targetTurnId, { onStopConfirmed: confirmStop });
   } catch (error) {
     if (stopConfirmed) throw error;
-    if (isEngineWorkspaceLogFailure(error)) throw error;
     await accessDatabase(ctx, () => logInterrupt(ctx, "error", "turn interrupt failed; keeping authoritative running state", () => ({
       code: engineDiagnosticField(error, "code") ?? "turn_interrupt_failed",
       workspaceId: input.workspaceId,
@@ -401,6 +436,10 @@ export async function interruptTurnBestEffort(
     }), { reason: error }));
     if (engine !== "codex") throw error;
     liveCodexInterruptError = { reason: error };
+  }
+  if (didInterrupt) {
+    const pendingOutcome = await retryPendingTurnTerminal(ctx, input);
+    if (pendingOutcome) return buildInterruptResult(ctx, input, { alreadyTerminal: pendingOutcome === "already_terminal" });
   }
   if (!didInterrupt && engine === "claude") {
     throw Object.assign(new Error("Claude 当前回合停止尚未确认，请重试终止"), {
@@ -585,6 +624,8 @@ export async function interruptTurnBestEffort(
     );
   }
   const runtimeThread = ctx.threads.get(input.threadId) ?? null;
+  const pendingOutcome = await retryPendingTurnTerminal(ctx, input);
+  if (pendingOutcome) return buildInterruptResult(ctx, input, { alreadyTerminal: pendingOutcome === "already_terminal" });
   const session = !didInterrupt && engine === "codex"
     ? null
     : runtimeThread

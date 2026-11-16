@@ -31,7 +31,6 @@ const props = withDefaults(defineProps<{
         v-else-if="item.kind === 'userInputRequest'"
         :item="item"
         compact
-        :inline="item.delivery === 'async'"
         :workspace-id="props.workspaceId"
         :resume-with-input="props.userInputResumeWithInput"
         :active="props.active"

@@ -91,30 +91,27 @@ const notified = (id: string, extra = {}) => ({ type: "system", subtype: "task_n
 const result = (index: number, extra = {}) => ({ type: "result", subtype: "success", result: "done", result_index: index, queued_turn_count: 0, terminal_reason: "completed", ...extra });
 const notificationResult = (index: number) => result(index, { origin: { kind: "task-notification" } });
 
-test("Claude stdout日志失败由原回合拒绝并收口，不从事件回调逃向全局", async t => {
+test("Claude stdout普通日志失败只告警，回合继续完成并可正常释放", async t => {
   const h = await harness(t), original = new Error("STDOUT_LOG_FAILED"), info = logger.info;
   t.mock.method(logger, "info", (...args: Parameters<typeof logger.info>) => {
     if (String(args[1]).startsWith("control_request received")) throw original;
     return info(...args);
   });
-  h.expectFailure(error => error instanceof AggregateError
-    && error.errors.some((value: unknown) => value === original || (value as AggregateError)?.cause === original));
   assert.doesNotThrow(() => h.emit({ type: "control_request", request_id: "control", request: {
     subtype: "can_use_tool", tool_name: "Read", input: { path: "file.ts" },
   } }));
-  let observed: unknown;
-  await assert.rejects(h.done, error => {
-    observed = error;
-    return error instanceof AggregateError && error.errors.some((value: unknown) => value === original || (value as AggregateError)?.cause === original);
-  });
+  await nextTick();
+  h.emit(result(0));
+  await nextTick();
+  h.child.emit("close", 0, null);
+  await h.done;
   assert.equal(h.session.hasActiveTurn(), false);
-  assert.equal(h.session.canIdleDispose(), false);
-  await assert.rejects(h.session.dispose(), error => error === observed);
+  assert.equal(h.session.canIdleDispose(), true);
   await h.session.dispose();
-  assert.equal(h.events.some(event => event.type === "approval.request"), false);
+  assert.ok(h.logs.some(entry => (entry.data as { code?: string })?.code === "ENGINE_WORKSPACE_LOG_DEGRADED"));
 });
 
-test("Claude追加输入的写入与诊断双错保原业务对象", async t => {
+test("Claude追加输入写入失败保持原业务对象，诊断失败只告警", async t => {
   const h = await harness(t), primary = new Error("APPEND_PRIMARY"), log = logger.error;
   h.expectFailure(error => error instanceof Error && (error as Error & { code?: string }).code === "CLAUDE_STDIN_INPUT_UNSETTLED_ON_EXIT");
   t.mock.method(h.child.stdin, "write", (...args: unknown[]) => {
@@ -126,14 +123,14 @@ test("Claude追加输入的写入与诊断双错保原业务对象", async t => 
     return log(...args);
   });
   await assert.rejects(h.session.appendInput({ turnId: "test-turn", text: "followup", userItemId: "next", images: [] } as any), error => {
-    const queue: unknown[] = [error]; let business = false, diagnostic = false;
+    const queue: unknown[] = [error]; let business = false;
     while (queue.length) {
       const value = queue.shift();
-      business ||= value === primary; diagnostic ||= value === 0;
+      business ||= value === primary;
       if (value instanceof AggregateError) queue.push(...value.errors);
       if (value instanceof Error && "cause" in value) queue.push(value.cause);
     }
-    return business && diagnostic;
+    return business;
   });
 });
 
@@ -227,7 +224,7 @@ async function promptHarness(t: test.TestContext, bridge = false, executeHostToo
     emit: (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`) };
 }
 
-test("平台工具致命回调的kill与诊断双错保留在原回合，HTTP不把原业务失败改写", async t => {
+test("平台工具致命回调保留kill失败，诊断只告警且HTTP保留原业务失败", async t => {
   const h = await promptHarness(t, true, async () => ({ ok: false, code: "KNOWLEDGE_ASSET_READ_LIMIT_REACHED", message: "limit" }));
   h.confirmWrite();
   for (let index = 0; !h.child.stdout.listenerCount("data") && index < 100; index++) await nextTick();
@@ -253,7 +250,7 @@ test("平台工具致命回调的kill与诊断双错保留在原回合，HTTP不
   assert.ok(!outcome.ok && outcome.error instanceof AggregateError);
   const errors = !outcome.ok && (outcome.error as AggregateError).errors;
   assert.ok(Array.isArray(errors) && errors.includes(0));
-  assert.ok(Array.isArray(errors) && errors.some(error => error === false || error instanceof AggregateError && error.cause === false));
+  assert.ok(h.logs.some(entry => (entry.data as { code?: string })?.code === "ENGINE_WORKSPACE_LOG_DEGRADED"));
   await assert.rejects(h.session.dispose(), error => !outcome.ok && error === outcome.error);
 });
 
@@ -329,11 +326,7 @@ test("prompt close logging failure cannot prevent file or real bridge disposal",
   h.emit(result(0));
   h.child.emit("close", 0, null);
   const outcome = await h.outcome;
-  assert.equal(outcome.ok, false);
-  if (!outcome.ok) {
-    assert.equal((outcome.error as AggregateError).cause, loggingCause);
-    assert.equal((outcome.error as AggregateError).code, "ENGINE_WORKSPACE_LOG_FAILED");
-  }
+  assert.equal(outcome.ok, true);
   assert.equal(h.servers[0]!.listening, false);
   assert.deepEqual(await fsp.readdir(h.root), []);
 });
@@ -431,7 +424,7 @@ for (const stop of ["false", "throw"] as const) {
 }
 
 for (const primary of [null, undefined, false]) {
-  test(`prompt release preserves falsy child error ${String(primary)} with unlink and log causes`, async t => {
+  test(`prompt release preserves falsy child error ${String(primary)} and unlink failure while logging only warns`, async t => {
     const h = await promptHarness(t, true);
     const unlinkCause = Object.freeze(new Error("unlink-private-cause")), logCause = Object.freeze(new Error("log-private-cause"));
     const unlink = t.mock.method(fsp, "unlink", async () => { throw unlinkCause; });
@@ -443,12 +436,8 @@ for (const primary of [null, undefined, false]) {
     assert.equal(outcome.ok, false);
     if (!outcome.ok) {
       assert.ok(outcome.error instanceof AggregateError);
-      const failure = outcome.error.errors[0];
-      assert.ok(failure instanceof AggregateError);
-      assert.equal(failure.errors[0], primary);
-      assert.equal(failure.cause, primary);
-      assert.equal(failure.errors[1], unlinkCause);
-      assert.equal(outcome.error.errors[1], logCause);
+      assert.deepEqual(outcome.error.errors, [primary, unlinkCause]);
+      assert.equal(outcome.error.cause, primary);
     }
     assert.equal(h.servers[0]!.listening, false);
     assert.equal(h.session.canIdleDispose(), false);
