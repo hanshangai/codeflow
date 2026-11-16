@@ -1,0 +1,8 @@
+*.sh text eol=lf
+# 知识资产按字节做 SHA256 完整性校验，行尾必须固定为 LF，否则 Windows 检出会误报 KNOWLEDGE_ASSET_CONFLICT。
+codeflow-docs/知识库/** text eol=lf
+codeflow-docs/规格知识库/** text eol=lf
+# 桌面内置资产按字节做 SHA256 完整性校验，跨平台必须固定 LF。
+apps/desktop/client/assets/orchestration-builtin/** text eol=lf
+apps/desktop/client/assets/orchestration-builtin.manifest.json text eol=lf
+apps/server/tests/fixtures/orchestration/** text eol=lf

@@ -1,0 +1,26 @@
+export const DAEMON_CHILD_ENV = "CODEFLOWAI_DAEMON_CHILD";
+export const DAEMON_SUPERVISOR_ENV = "CODEFLOWAI_DAEMON_SUPERVISOR";
+export const DAEMON_SUPERVISOR_PID_ENV = "CODEFLOWAI_DAEMON_SUPERVISOR_PID";
+export const DAEMON_SUPERVISOR_TOKEN_ENV = "CODEFLOWAI_DAEMON_SUPERVISOR_TOKEN";
+export const DAEMON_WORKER_ENTRY_ENV = "CODEFLOWAI_DAEMON_WORKER_ENTRY";
+export const RESTART_PARENT_PID_ENV = "CODEFLOWAI_RESTART_PARENT_PID";
+
+const CLIENT_INTERNAL_PROCESS_ENV_KEYS = [
+  DAEMON_CHILD_ENV,
+  DAEMON_SUPERVISOR_ENV,
+  DAEMON_SUPERVISOR_PID_ENV,
+  DAEMON_SUPERVISOR_TOKEN_ENV,
+  DAEMON_WORKER_ENTRY_ENV,
+  RESTART_PARENT_PID_ENV,
+  "CODEFLOWAI_DESKTOP_REQUEST_ID",
+  "CODEFLOWAI_DESKTOP_DB_SCHEMA_VERSION",
+  "ELECTRON_RUN_AS_NODE",
+] as const;
+
+/** 移除父进程内部标记，仅当前可执行文件保留已启用的 Electron Node 模式。 */
+export function buildClientChildProcessEnv(baseEnv: NodeJS.ProcessEnv = process.env, command?: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  for (const key of CLIENT_INTERNAL_PROCESS_ENV_KEYS) delete env[key];
+  if (command === process.execPath && baseEnv.ELECTRON_RUN_AS_NODE === "1") env.ELECTRON_RUN_AS_NODE = "1";
+  return env;
+}

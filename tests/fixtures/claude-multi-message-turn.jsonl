@@ -1,0 +1,12 @@
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_preview","type":"message","role":"assistant","content":[]}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"明白，按上周的"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"简洁风格来写。"}}}
+{"type":"assistant","message":{"id":"msg_preview","type":"message","role":"assistant","content":[{"type":"text","text":"明白，按上周的简洁风格来写。"}]}}
+{"type":"stream_event","event":{"type":"message_stop"}}
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_final","type":"message","role":"assistant","content":[]}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"已写入 `周报.txt` 到项目根目录。整体风格与上周保持一致：\n\n"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"- **本周完成**按\"版本开发、客户支持、专项事项\"三大块归类，每条简明扼要\n"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"- **下周计划**同样三大块，列出关键事项和负责人\n"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"- 没有带入上周的内容（爱建AM3、法巴、自定义配置重构验证等已去掉）\n\n如需调整内容或人员归属，直接告诉我。"}}}
+{"type":"assistant","message":{"id":"msg_final","type":"message","role":"assistant","content":[{"type":"text","text":"已写入 `周报.txt` 到项目根目录。整体风格与上周保持一致：\n\n- **本周完成**按\"版本开发、客户支持、专项事项\"三大块归类，每条简明扼要\n- **下周计划**同样三大块，列出关键事项和负责人\n- 没有带入上周的内容（爱建AM3、法巴、自定义配置重构验证等已去掉）\n\n如需调整内容或人员归属，直接告诉我。"}]}}
+{"type":"stream_event","event":{"type":"message_stop"}}

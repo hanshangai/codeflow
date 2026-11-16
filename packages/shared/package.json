@@ -1,0 +1,80 @@
+{
+  "name": "@codeflowai/shared",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    "./desktop-release-extract": {
+      "types": "./src/desktopReleaseExtract.ts",
+      "development": "./src/desktopReleaseExtract.ts",
+      "default": "./dist/desktopReleaseExtract.js"
+    },
+    "./client-migration-auth": {
+      "types": "./src/clientMigrationAuth.ts",
+      "development": "./src/clientMigrationAuth.ts",
+      "default": "./dist/clientMigrationAuth.js"
+    },
+    "./desktop-device-auth": {
+      "types": "./src/desktopDeviceAuth.ts",
+      "development": "./src/desktopDeviceAuth.ts",
+      "default": "./dist/desktopDeviceAuth.js"
+    },
+    "./desktop-update-failure": {
+      "types": "./src/desktopUpdateFailure.ts",
+      "development": "./src/desktopUpdateFailure.ts",
+      "default": "./dist/desktopUpdateFailure.js"
+    },
+    "./desktop-crash-report": {
+      "types": "./src/desktopCrashReport.ts",
+      "development": "./src/desktopCrashReport.ts",
+      "default": "./dist/desktopCrashReport.js"
+    },
+    "./desktop-update-receipt": {
+      "types": "./src/desktopUpdateReceipt.ts",
+      "development": "./src/desktopUpdateReceipt.ts",
+      "default": "./dist/desktopUpdateReceipt.js"
+    },
+    "./desktop-release-signing": {
+      "types": "./src/desktopReleaseSigning.ts",
+      "development": "./src/desktopReleaseSigning.ts",
+      "default": "./dist/desktopReleaseSigning.js"
+    },
+    "./desktop-shell-release-signing": {
+      "types": "./src/desktopShellReleaseSigning.ts",
+      "development": "./src/desktopShellReleaseSigning.ts",
+      "default": "./dist/desktopShellReleaseSigning.js"
+    },
+    "./engine-model-catalog-seed": {
+      "types": "./src/engineModelCatalogSeed.ts",
+      "development": "./src/engineModelCatalogSeed.ts",
+      "default": "./dist/engineModelCatalogSeed.js"
+    },
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./node-logger": {
+      "types": "./src/nodeLogger.ts",
+      "development": "./src/nodeLogger.ts",
+      "default": "./dist/nodeLogger.js"
+    },
+    "./workspace-path-index-defaults": {
+      "types": "./src/workspacePathIndexDefaults.ts",
+      "development": "./src/workspacePathIndexDefaults.ts",
+      "default": "./dist/workspacePathIndexDefaults.js"
+    }
+  },
+  "files": ["dist"],
+  "dependencies": {
+    "tar": "7.5.22",
+    "pino": "^10.3.1",
+    "pino-roll": "^4.0.0"
+  },
+  "scripts": {
+    "build": "node ../../tools/release/clean-dist.cjs dist && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

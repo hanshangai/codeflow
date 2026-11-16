@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">CodeFlow 企业 AI 研发协作示意图</title>
+  <desc id="desc">暗色主题下展示需求在共享工作区中经过多 Agent 编排形成可追溯交付，并持续沉淀证据、度量和知识。</desc>
+  <defs>
+    <pattern id="grid" width="64" height="64" patternUnits="userSpaceOnUse">
+      <path d="M64 0H0V64" fill="none" stroke="#958a7b" stroke-opacity="0.09"/>
+    </pattern>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="14" stdDeviation="20" flood-color="#000000" flood-opacity="0.26"/>
+    </filter>
+    <marker id="arrow-orange" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M0 0L11 5.5L0 11Z" fill="#d97856"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M0 0L11 5.5L0 11Z" fill="#69b69c"/>
+    </marker>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#1f1e1d"/>
+  <rect width="1920" height="1080" fill="url(#grid)"/>
+  <rect x="1280" width="640" height="1080" fill="#1f1e1d" fill-opacity="0.98"/>
+
+  <g transform="translate(9 24) scale(0.9)" font-family="Microsoft YaHei, PingFang SC, sans-serif">
+    <g transform="translate(92 108)">
+      <rect width="278" height="34" rx="6" fill="#2d2a25" stroke="#4a443b"/>
+      <circle cx="19" cy="17" r="5" fill="#d97856"/>
+      <text x="34" y="23" font-size="15" font-weight="700" fill="#83c7b0">CODEFLOW · AI 研发中台</text>
+    </g>
+    <text x="92" y="198" font-size="52" font-weight="700" fill="#f4f1eb">让 AI Coding 进入全流程协作</text>
+    <text x="92" y="250" font-size="22" fill="#bbb3a7">在共享工作区中，让多 Agent 协作贯穿需求、开发与交付</text>
+
+    <g transform="translate(92 326)">
+      <rect width="1130" height="530" rx="28" fill="#252521" fill-opacity="0.9" stroke="#5d9582" stroke-width="2" stroke-dasharray="10 9"/>
+      <g transform="translate(32 28)">
+        <circle cx="19" cy="19" r="19" fill="#30473f"/>
+        <path d="M10 21h18M14 16a5 5 0 1 1 10 0M12 27c2-5 14-5 16 0" fill="none" stroke="#78c0a8" stroke-width="2.2" stroke-linecap="round"/>
+        <text x="52" y="25" font-size="20" font-weight="700" fill="#9fd3c1">共享工作区</text>
+      </g>
+
+      <path d="M256 272H414" fill="none" stroke="#d97856" stroke-width="3" marker-end="url(#arrow-orange)"/>
+      <path d="M716 272H876" fill="none" stroke="#d97856" stroke-width="3" marker-end="url(#arrow-orange)"/>
+
+      <g transform="translate(54 209)" filter="url(#shadow)">
+        <rect width="202" height="126" rx="8" fill="#2c2a27" stroke="#48433c"/>
+        <circle cx="34" cy="36" r="14" fill="#50382f"/>
+        <path d="M28 36h12M34 30v12" stroke="#e58562" stroke-width="2.2" stroke-linecap="round"/>
+        <text x="24" y="79" font-size="25" font-weight="700" fill="#f5f1ea">需求</text>
+        <text x="24" y="104" font-size="14" fill="#b4ab9f">目标 · 范围 · 验收</text>
+      </g>
+
+      <g>
+        <path d="M445 126L515 160M565 112V148M685 126L615 160" fill="none" stroke="#5d9582" stroke-width="2" stroke-dasharray="5 6"/>
+        <g transform="translate(386 82)">
+          <rect width="118" height="44" rx="22" fill="#293a34" stroke="#5d9582"/>
+          <circle cx="22" cy="22" r="6" fill="#78c0a8"/>
+          <text x="38" y="28" font-size="14" font-weight="700" fill="#acc4bb">产品 Agent</text>
+        </g>
+        <g transform="translate(506 68)">
+          <rect width="118" height="44" rx="22" fill="#50382f" stroke="#9c604b"/>
+          <circle cx="22" cy="22" r="6" fill="#f0a083"/>
+          <text x="38" y="28" font-size="14" font-weight="700" fill="#e8b9a8">开发 Agent</text>
+        </g>
+        <g transform="translate(626 82)">
+          <rect width="118" height="44" rx="22" fill="#303f46" stroke="#567b8e"/>
+          <circle cx="22" cy="22" r="6" fill="#75aac6"/>
+          <text x="38" y="28" font-size="14" font-weight="700" fill="#b5c0c6">评审 Agent</text>
+        </g>
+      </g>
+
+      <g filter="url(#shadow)">
+        <circle cx="565" cy="290" r="142" fill="#292824" stroke="#4c473f" stroke-width="2"/>
+        <circle cx="565" cy="290" r="112" fill="#342f2a" stroke="#d97856" stroke-width="3"/>
+        <circle cx="565" cy="250" r="28" fill="#d97856"/>
+        <path d="M546 253c12-15 23-21 38-21M546 264c14-16 26-21 41-21M547 243c10-11 18-15 30-15" fill="none" stroke="#fff8f2" stroke-width="3.4" stroke-linecap="round"/>
+        <text x="565" y="309" text-anchor="middle" font-size="29" font-weight="700" fill="#f4f1eb">CodeFlow 编排</text>
+        <text x="565" y="340" text-anchor="middle" font-size="16" fill="#bbb3a7">多 Agent 协作执行</text>
+      </g>
+
+      <g transform="translate(876 209)" filter="url(#shadow)">
+        <rect width="202" height="126" rx="8" fill="#2c2a27" stroke="#48433c"/>
+        <circle cx="34" cy="36" r="14" fill="#303f46"/>
+        <path d="M27 37l5 5 10-12" fill="none" stroke="#75aac6" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="24" y="79" font-size="25" font-weight="700" fill="#f5f1ea">交付</text>
+        <text x="24" y="104" font-size="14" fill="#b4ab9f">代码 · 产物 · 知识</text>
+      </g>
+
+      <path d="M977 354C977 451 780 470 566 470C350 470 155 451 155 354" fill="none" stroke="#69b69c" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+      <g transform="translate(401 452)">
+        <rect width="328" height="44" rx="22" fill="#263830" stroke="#4e7667"/>
+        <text x="164" y="29" text-anchor="middle" font-size="15" font-weight="700" fill="#9fd3c1">证据 · 度量 · 知识持续回流</text>
+      </g>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,97 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--app-bg);
+  color: var(--app-text);
+  line-height: 1.6;
+}
+
+/* 提示信息按内容收缩，禁止被父级 Grid/Flex 的交叉轴拉伸成大块。 */
+.ant-alert {
+  align-self: flex-start;
+  height: fit-content;
+}
+
+a {
+  color: var(--app-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.panel {
+  background: var(--app-panel-bg);
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius);
+  padding: 12px;
+  box-shadow: var(--app-shadow);
+}
+
+.events {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+/* ── Ant Design Segmented 主题适配 ── */
+
+.ant-segmented {
+  background: var(--app-sidebar-hover-bg);
+}
+
+.ant-segmented-item-selected {
+  background: var(--app-panel-bg) !important;
+  color: var(--app-text) !important;
+  box-shadow: var(--app-shadow-sm) !important;
+}
+
+.ant-segmented-item-label {
+  color: var(--app-muted);
+  font-size: 12px;
+}
+
+.ant-segmented-item-selected .ant-segmented-item-label {
+  color: var(--app-text);
+  font-weight: 600;
+}
+
+.ant-segmented-thumb {
+  background: var(--app-panel-bg) !important;
+  box-shadow: var(--app-shadow-sm) !important;
+}
+
+/* ── 移动端全局：防 iOS 自动缩放 ── */
+@media (max-width: 767px) {
+  html,
+  body,
+  #app {
+    touch-action: pan-x pan-y;
+  }
+
+  input, textarea, select {
+    font-size: 16px;
+  }
+}

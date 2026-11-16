@@ -1,0 +1,31 @@
+export type SessionId = string;
+export type WorkspaceId = string;
+export type ThreadId = string;
+export type TurnId = string;
+export type ItemId = string;
+
+export type KeyHash = string;
+export type WebSessionId = string;
+export type WebInstanceId = string;
+export type ClientId = string;
+export type AccountSessionToken = string;
+
+export type RoleId = string;
+export type WorkflowId = string;
+export type OrchestrationId = string;
+export type IntakeId = string;
+export type ProposalId = string;
+export type RequirementAnalysisSessionId = string;
+export type RequirementAnalysisMessageId = string;
+export type RequirementCandidateId = string;
+export type AssetGenerationJobId = string;
+export type AssetDraftId = string;
+export type AssetJobEventId = string;
+export type AssetVersionId = string;
+export type KnowledgeBundleId = string;
+export type SkillId = string;
+export type ToolsetId = string;
+export type ToolId = string;
+export type ArtifactId = string;
+export type OrchestrationEventId = string;
+export type FeedbackRecordId = string;

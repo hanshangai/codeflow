@@ -1,0 +1,646 @@
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+import * as tar from 'tar';
+import { signReleaseBundleManifest } from '@codeflowai/shared/desktop-release-signing';
+import { desktopDevicePublicKeySha256, readDesktopDeviceHeaders } from '@codeflowai/shared/desktop-device-auth';
+import { createDesktopApplication, type DesktopHost } from '../src/desktopApplication.js';
+import type { ClientRuntime, ClientRuntimeExpectation } from '../src/clientRuntime.js';
+import { DESKTOP_STARTUP_CAPABILITY_PATH, type DesktopStartupMode } from '@codeflowai/shared';
+import { loadOrCreateDeviceIdentity } from '../src/deviceIdentity.js';
+import { readActivePointer } from '../src/releaseBundleCoordinator.js';
+import { createUpdateFailureJournal } from '../src/updateFailureJournal.js';
+import { createUpdateReceiptJournal } from '../src/updateReceiptJournal.js';
+
+/** 真实 HTTP、签名归档及日志；仅原生窗口与 Client 进程使用替身。 */
+async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'different') {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cf-d12o-auto-'));
+  const identity = await loadOrCreateDeviceIdentity(dataDir);
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+  const packageDir = path.join(dataDir, 'incoming');
+  await fs.mkdir(path.join(packageDir, 'web'), { recursive: true });
+  await fs.mkdir(path.join(packageDir, 'client', 'dist'), { recursive: true });
+  await fs.writeFile(path.join(packageDir, 'web', 'index.html'), 'web');
+  await fs.writeFile(path.join(packageDir, 'client', 'dist', 'index.cjs'), 'client');
+  const capability = JSON.stringify({ schemaVersion: 1, heldStartupProtocol: 1, clientEntrySha256: crypto.createHash('sha256').update('client').digest('hex') });
+  await fs.writeFile(path.join(packageDir, DESKTOP_STARTUP_CAPABILITY_PATH), capability);
+  const archivePath = path.join(dataDir, 'bundle.tar.gz');
+  await tar.c({ cwd: packageDir, file: archivePath, gzip: true, portable: true }, ['web', 'client']);
+  const archive = await fs.readFile(archivePath);
+  const hash = (value: string | Buffer) => crypto.createHash('sha256').update(value).digest('hex');
+  const webSha256 = hash(`index.html\0${hash('web')}\n`);
+  const clientSha256 = hash(`dist/desktop-startup-capability.json\0${hash(capability)}\ndist/index.cjs\0${hash('client')}\n`);
+  const manifest = signReleaseBundleManifest({ schemaVersion: 2, releaseId: 'auto-release', version: '1.0.0',
+    webVersion: '1.0.0', clientVersion: '1.0.0', protocolVersion: 1, capabilityVersion: 1, dbSchemaVersion: 88,
+    platform: process.platform, arch: process.arch, keyId: 'auto-fixture', archiveSha256: hash(archive), archiveSize: archive.length,
+    webSha256, clientSha256, packageSha256: hash(`client\0${clientSha256}\nweb\0${webSha256}\n`),
+    files: [{ path: DESKTOP_STARTUP_CAPABILITY_PATH, size: Buffer.byteLength(capability), sha256: hash(capability) }, { path: 'client/dist/index.cjs', size: 6, sha256: hash('client') }, { path: 'web/index.html', size: 3, sha256: hash('web') }],
+    createdAt: '2026-01-01T00:00:00.000Z', expiresAt: '2099-10-24T00:00:00.000Z' }, privateKey);
+  const requests: { path: string; requestId: string }[] = [];
+  const baselineDir = path.join(dataDir, 'baseline');
+  await fs.cp(packageDir, baselineDir, { recursive: true });
+  const { signature: _signature, ...payload } = manifest;
+  const baselineManifest = signReleaseBundleManifest({ ...payload, releaseId: installed && installed !== 'different' ? manifest.releaseId : 'baseline-release',
+    ...(installed === 'conflict' ? { archiveSha256: 'b'.repeat(64) } : {}) }, privateKey);
+  await fs.writeFile(path.join(baselineDir, 'baseline-release-manifest.json'), JSON.stringify(baselineManifest));
+  const receipts: { stage: string; requestId: string; at: string }[] = [];
+  const actions: string[] = [];
+  const failures: unknown[] = [];
+  const serverErrors: unknown[] = [];
+  const control = { available: true, authorized: true, busy: false, confirm: true, badSignature: false, holdArchive: false,
+    failuresRemaining: 0, failReceipt: undefined as string | undefined, rejectLoadWeb: false, holdErrorBody: false,
+    holdDiscovery: undefined as (() => Promise<void>) | undefined,
+    onCandidateStart: undefined as (() => Promise<void>) | undefined,
+    confirmUpdate: undefined as ((signal?: AbortSignal) => Promise<boolean>) | undefined };
+  const server = http.createServer((request, response) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const meta = readDesktopDeviceHeaders(request.rawHeaders);
+      requests.push({ path: request.url!, requestId: meta.requestId });
+      response.setHeader('content-type', 'application/json');
+      if (request.url!.endsWith('/devices/register')) {
+        response.end(JSON.stringify({ ok: true, deviceId: identity.deviceId,
+          publicKeySha256: desktopDevicePublicKeySha256(identity.publicKeyBase64) }));
+      } else if (request.url!.startsWith('/api/software/desktop/release-availability')) {
+        if (control.holdErrorBody) { response.writeHead(403, { 'content-length': '128' }); response.flushHeaders(); return; }
+        if (control.failuresRemaining > 0) {
+          control.failuresRemaining--; response.writeHead(503, { 'retry-after': '0' }); response.end(JSON.stringify({ ok: false, code: 'DESKTOP_UPDATE_UNAVAILABLE' })); return;
+        }
+        await control.holdDiscovery?.();
+        const available = control.available && new URL(request.url!, 'http://localhost').searchParams.get('excludeReleaseId') !== manifest.releaseId;
+        response.end(JSON.stringify({ ok: true, available, deviceId: identity.deviceId, requestId: meta.requestId,
+          ...(available ? { manifest: control.badSignature ? { ...manifest, signature: 'A'.repeat(88) } : manifest } : {}) }));
+      } else if (request.url!.endsWith('/archive')) {
+        if (control.holdArchive) {
+          response.writeHead(200, { etag: `"${manifest.archiveSha256}"`, 'content-length': archive.length });
+          response.flushHeaders(); return;
+        }
+        response.writeHead(200, { etag: `"${manifest.archiveSha256}"`, 'content-length': archive.length }); response.end(archive);
+      } else if (request.url!.endsWith('/switch-authorization')) {
+        response.end(JSON.stringify({ ok: true, authorized: control.authorized, deviceId: identity.deviceId, requestId: meta.requestId,
+          releaseId: manifest.releaseId, ...(control.authorized ? { archiveSha256: manifest.archiveSha256 } : {}) }));
+      } else if (request.url!.endsWith('/update-failures')) {
+        const failure = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        response.end(JSON.stringify({ ok: true, deviceId: failure.deviceId, errorId: failure.errorId, payloadSha256: failure.payloadSha256 }));
+      } else {
+        assert.equal(request.url, '/api/software/desktop/update-receipts');
+        const receipt = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        receipts.push(receipt);
+        // 回执补报用例模拟业务拒绝，瞬时 503 的预算由发现与传输测试单独覆盖。
+        if (control.failReceipt === receipt.stage) { response.writeHead(409); response.end(JSON.stringify({ code: 'DESKTOP_UPDATE_UNAVAILABLE' })); return; }
+        response.end(JSON.stringify({ ok: true, deviceId: receipt.deviceId, requestId: receipt.requestId, releaseId: receipt.releaseId,
+          archiveSha256: receipt.archiveSha256, stage: receipt.stage, at: receipt.at, payloadSha256: receipt.payloadSha256 }));
+      }
+    })().catch(error => { serverErrors.push(error); response.writeHead(500); response.end('{}'); });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const window = Object.assign(new EventEmitter(), { show() {}, focus() {}, hide() {}, destroy() { actions.push('destroy'); } });
+  const retries: { requestId: string; retry: number }[] = [];
+  const host: DesktopHost = { createWindow: () => window, async loadWeb(_window, releaseDir) { if (control.rejectLoadWeb && releaseDir.endsWith(manifest.releaseId)) { control.rejectLoadWeb = false; throw new Error('WEB_LOAD_FAILED'); } },
+    createTray: () => ({ destroy() {} }), registerBridge: () => () => {}, quit() { actions.push('quit'); },
+    async confirmUpdate(_window, signal) { actions.push('confirm'); return control.confirmUpdate ? await control.confirmUpdate(signal) : control.confirm; },
+    onUpdateError(error) { failures.push(error); }, onUpdateRetry(context) { retries.push(context); } };
+  host.relaunch = () => { actions.push('relaunch'); };
+  /** 原健康与更新控制协议保留，观察停止前的真实调用顺序。 */
+  const createRuntime = (_entry: string, expected?: ClientRuntimeExpectation, startup?: DesktopStartupMode): ClientRuntime => ({
+    /** 候选迁移故障只注入临时数据库，保持原启动与健康协议。 */
+    async start() { actions.push('start'); if (expected?.releaseId === manifest.releaseId) await control.onCandidateStart?.(); },
+    async waitReady() {}, async stop() {}, async drain() { actions.push('drain'); }, onEvent() { return () => {}; },
+    async request(request) { actions.push(request.method); return { status: 200, body: request.method === 'runtime.startup.continue' ? { ok: true } : { ok: true, hasRunningSessions: control.busy } }; },
+    snapshot() { return { status: 'ready', requestId: null, releaseId: expected?.releaseId ?? null, errorCode: null, pid: 123,
+      health: { protocolVersion: 1, clientVersion: expected?.clientVersion ?? '1.0.0', dbSchemaVersion: expected?.dbSchemaVersion ?? 88, database: 'ready' },
+      ...(startup?.mode === 'held' ? { startup: { continuationId: startup.continuationId, admission: 'paused' as const } } : {}) }; } });
+  const runtimeFacts: Array<{ versions: { releaseId: string } }> = [];
+  const options = { dataDir, initialReleaseDir: baselineDir, requireBaseline: Boolean(installed),
+    onRuntimeFacts: (facts: { versions: { releaseId: string } }) => { runtimeFacts.push(facts); },
+    trustedReleaseKeys: { 'auto-fixture': publicKey }, host, createRuntime,
+    configuredServerOrigin: `http://127.0.0.1:${(server.address() as { port: number }).port}` };
+  let app = createDesktopApplication(options);
+  await app.start();
+  let exited = false;
+  t.after(async () => {
+    if (!exited) await app.exit();
+    server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await fs.rm(dataDir, { recursive: true, force: true }); assert.deepEqual(serverErrors, []);
+  });
+  return { get app() { return app; }, control, requests, receipts, actions, failures, retries, dataDir, manifest, identity, runtimeFacts,
+    journal: () => createUpdateFailureJournal(dataDir).pending(identity.deviceId),
+    /** 模拟完整安装包已经包含原先准备的目标，只改测试目录中的签名基线。 */
+    async installPreparedAsBaseline(conflicting = false) {
+      options.requireBaseline = true;
+      const installed = conflicting ? signReleaseBundleManifest({ ...payload, archiveSha256: 'b'.repeat(64) }, privateKey) : manifest;
+      await fs.writeFile(path.join(baselineDir, 'baseline-release-manifest.json'), JSON.stringify(installed));
+    },
+    /** 模拟更新版本已安装，只提升签名基线版本，目录内容保持不变。 */
+    async installBaselineVersion(version: string) {
+      options.requireBaseline = true;
+      const installed = signReleaseBundleManifest({ ...payload, releaseId: `baseline-${version}`, version,
+        webVersion: version, clientVersion: version }, privateKey);
+      await fs.writeFile(path.join(baselineDir, 'baseline-release-manifest.json'), JSON.stringify(installed));
+    },
+    async exit() { await app.exit(); exited = true; },
+    async restart() { await app.exit(); app = createDesktopApplication(options); await app.start(); } };
+}
+
+test('内置已安装发布与目标相同，不下载、不准备也不提示重启', async t => {
+  const f = await fixture(t, 'same');
+  assert.equal(f.runtimeFacts.at(-1)?.versions.releaseId, f.manifest.releaseId);
+  f.actions.length = 0;
+  await f.app.checkForUpdates();
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.current.bundle?.releaseId, f.manifest.releaseId);
+  assert.equal(details.bundle.result, 'same');
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 0);
+  assert.equal(f.receipts.length, 0);
+  assert.deepEqual(f.actions, []);
+  await assert.rejects(fs.access(path.join(f.dataDir, 'pending-release.json')), { code: 'ENOENT' });
+  await assert.rejects(f.app.restartForUpdate(), /DESKTOP_UPDATE_NOT_PREPARED/);
+  await f.app.checkForUpdates();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'same');
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 0);
+});
+
+test('内置发布同 ID 不同摘要必须显式拒绝，不能按相同版本忽略冲突', async t => {
+  const f = await fixture(t, 'conflict');
+  await assert.rejects(f.app.checkForUpdates(), /DESKTOP_RELEASE_CACHE_CONFLICT/);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 0);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'failure');
+  assert.ok(f.app.updateCheckFailure);
+});
+
+test('展示版本相同但发布身份不同，仍按真实目标准备更新', async t => {
+  const f = await fixture(t, 'different');
+  await f.app.checkForUpdates();
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.current.bundle?.version, details.bundle.target?.version);
+  assert.notEqual(details.current.bundle?.releaseId, details.bundle.target?.releaseId);
+  assert.equal(details.bundle.result, 'prepared');
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
+});
+
+for (const expired of [false, true]) test(`完整安装已包含待更新同包时清理待更新标记：已过下载有效期=${expired}`, async t => {
+  const f = await fixture(t);
+  await f.app.checkForUpdates();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  await f.installPreparedAsBaseline();
+  if (expired) t.mock.timers.enable({ apis: ['Date'], now: Date.parse(f.manifest.expiresAt) + 1 });
+  f.requests.length = 0; f.receipts.length = 0; f.actions.length = 0;
+  await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'same');
+  assert.equal(await readActivePointer(f.dataDir), null, '不能将安装基线伪装为活动更新');
+  assert.equal(f.actions.filter(action => action === 'start').length, 1);
+  assert.equal(f.actions.filter(action => action === 'drain').length, 1, '仅模拟重启的正常退出停止一次旧运行环境');
+  assert.equal(f.actions.filter(action => action === 'runtime.startup.continue').length, 1);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/switch-authorization')).length, 0);
+  assert.equal(f.receipts.some(receipt => ['switched', 'healthy'].includes(receipt.stage)), false);
+  await assert.rejects(fs.access(path.join(f.dataDir, 'pending-release.json')), { code: 'ENOENT' });
+  await assert.rejects(f.app.restartForUpdate(), /DESKTOP_UPDATE_NOT_PREPARED/);
+  assert.deepEqual(f.failures, []);
+});
+
+test('未安装的过期候选不能借用内置包身份绕过有效期', async t => {
+  const f = await fixture(t, 'different');
+  await f.app.checkForUpdates();
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(f.manifest.expiresAt) + 1 });
+  await f.restart();
+  assert.ok(f.app.updateCheckFailure);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'failure');
+  assert.equal(await readActivePointer(f.dataDir), null);
+  await fs.access(path.join(f.dataDir, 'pending-release.json'));
+});
+
+test('暂存候选低于当前安装版本时启动直接放弃，不请求切换授权', async t => {
+  const f = await fixture(t);
+  await f.app.checkForUpdates();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  await f.installBaselineVersion('1.0.1');
+  f.requests.length = 0; f.receipts.length = 0; f.actions.length = 0;
+  await f.restart();
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.bundle.result, 'same');
+  assert.equal(details.current.bundle?.version, '1.0.1');
+  assert.equal(f.requests.filter(request => request.path.endsWith('/switch-authorization')).length, 0);
+  await assert.rejects(fs.access(path.join(f.dataDir, 'pending-release.json')), { code: 'ENOENT' });
+  await assert.rejects(f.app.restartForUpdate(), /DESKTOP_UPDATE_NOT_PREPARED/);
+  assert.deepEqual(f.failures, []);
+});
+
+test('待更新候选被撤回且服务器无可用发布时，检查结果保持空而不是撤回', async t => {
+  const f = await fixture(t);
+  await f.app.checkForUpdates();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  f.control.authorized = false;
+  f.control.available = false;
+  await f.app.checkForUpdates();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'none');
+  assert.equal(f.app.updateCheckFailure, null);
+  await assert.rejects(f.app.restartForUpdate(), /DESKTOP_UPDATE_NOT_PREPARED/);
+});
+
+test('启动恢复的待更新候选未获切换资格时不保留可重启状态', async t => {
+  const f = await fixture(t);
+  await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json');
+  await fs.access(pendingFile);
+  f.control.authorized = false;
+  await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'revoked');
+  assert.equal(f.app.updateCheckFailure, null);
+  await assert.rejects(f.app.restartForUpdate(), /DESKTOP_UPDATE_NOT_PREPARED/);
+  await fs.access(pendingFile);
+});
+
+test('恢复同 ID 异摘要的过期候选时保留失败和原待更新记录', async t => {
+  const f = await fixture(t);
+  await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json'), pending = await fs.readFile(pendingFile);
+  await f.installPreparedAsBaseline(true);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(f.manifest.expiresAt) + 1 });
+  await f.restart();
+  assert.equal((f.app.updateCheckFailure?.error as { code?: string })?.code, 'DESKTOP_RELEASE_CACHE_CONFLICT');
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'failure');
+  assert.deepEqual(await fs.readFile(pendingFile), pending);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal(f.receipts.some(receipt => receipt.stage === 'switched'), false);
+});
+
+test('background and manual checks share preparation without interrupting running tasks', async t => {
+  const f = await fixture(t);
+  f.app.startAutomaticUpdates();
+  const active = await f.app.checkForUpdates();
+  assert.equal(active, null);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  assert.equal(f.actions.includes('runtime.update.prepare'), false);
+  assert.equal(f.actions.includes('drain'), false);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.deepEqual(f.receipts.map(receipt => receipt.stage), ['received', 'verified', 'prepared']);
+  assert.equal(new Set(f.receipts.map(receipt => receipt.requestId)).size, 1);
+  assert.deepEqual(f.failures, []);
+});
+
+test('periodic checks keep the active package and do not download or switch twice', async t => {
+  const f = await fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
+  f.app.startAutomaticUpdates(); await f.app.checkForUpdates();
+  t.mock.timers.tick(30 * 60 * 1000); await f.app.checkForUpdates();
+  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
+  assert.equal(f.receipts.length, 3);
+});
+
+test('prepared update waits for normal restart and resumes the original attempt', async t => {
+  const f = await fixture(t); f.control.busy = true; f.control.confirm = false;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  f.app.startAutomaticUpdates(); assert.equal(await f.app.checkForUpdates(), null);
+  const requestId = f.receipts[0]!.requestId;
+  t.mock.timers.tick(60 * 60 * 1000);
+  assert.equal(f.actions.filter(action => action === 'confirm').length, 0);
+  f.control.confirm = true;
+  assert.equal(await f.app.checkForUpdates(), null);
+  await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  assert.equal(f.actions.filter(action => action === 'runtime.startup.continue').length, 1);
+  assert.equal(f.actions.filter(action => action === 'confirm').length, 0);
+  assert.ok(f.receipts.every(receipt => receipt.requestId === requestId));
+  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.ok(f.requests.filter(request => request.path.endsWith('/switch-authorization')).every(request => request.requestId === requestId));
+  assert.deepEqual(f.journal(), []);
+});
+
+test('server pause does not suppress the next automatic cycle and retains the same attempt', async t => {
+  const f = await fixture(t); f.control.authorized = false;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  f.app.startAutomaticUpdates(); assert.equal(await f.app.checkForUpdates(), null);
+  const requestId = f.receipts[0]!.requestId;
+  f.control.authorized = true; t.mock.timers.tick(30 * 60 * 1000);
+  await f.app.checkForUpdates(); await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  assert.ok(f.receipts.every(receipt => receipt.requestId === requestId));
+  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.deepEqual(f.journal(), []);
+});
+
+test('signature failure stops the schedule, preserves diagnostics and keeps Client alive', async t => {
+  const f = await fixture(t); f.control.badSignature = true;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  f.app.startAutomaticUpdates(); await assert.rejects(() => f.app.checkForUpdates());
+  assert.equal(f.failures.length, 1); assert.equal(f.journal().length, 1);
+  const before = f.requests.length; t.mock.timers.tick(60 * 60 * 1000);
+  assert.equal(f.requests.length, before); assert.equal(f.actions.includes('quit'), false);
+});
+
+test('busy tasks are not interrupted or asked to confirm during background preparation', async t => {
+  const f = await fixture(t); f.control.busy = true;
+  f.app.startAutomaticUpdates(); await f.app.checkForUpdates(); await f.exit();
+  assert.equal(f.actions.includes('runtime.update.interrupt'), false);
+  assert.equal(f.actions.includes('confirm'), false); assert.equal(f.actions.at(-1), 'quit');
+  assert.deepEqual(f.journal(), []); assert.deepEqual(f.failures, []);
+});
+
+test('transient discovery succeeds before creating an incident and retains one attempt ID', async t => {
+  const f = await fixture(t); f.control.failuresRemaining = 2;
+  await f.app.checkForUpdates(); assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  const discovery = f.requests.filter(request => request.path.endsWith('/release-availability'));
+  assert.equal(discovery.length, 3); assert.equal(new Set(discovery.map(request => request.requestId)).size, 1);
+  assert.deepEqual(f.retries.map(retry => retry.retry), [1, 2]);
+  assert.deepEqual(f.journal(), []); assert.deepEqual(f.failures, []);
+});
+
+test('retry exhaustion creates one failure and requires manual recovery', async t => {
+  const f = await fixture(t); f.control.failuresRemaining = 4;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  f.app.startAutomaticUpdates(); await assert.rejects(() => f.app.checkForUpdates());
+  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 4);
+  assert.deepEqual(f.retries.map(retry => retry.retry), [1, 2, 3]);
+  assert.equal(f.journal().length, 1); assert.equal(f.failures.length, 1);
+  t.mock.timers.tick(30 * 60 * 1000);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 4);
+});
+
+test('healthy ACK recovery replays exact original evidence without switching the active release twice', async t => {
+  const f = await fixture(t); f.control.failReceipt = 'healthy';
+  await f.app.checkForUpdates(); await f.restart();
+  assert.ok(f.app.updateCheckFailure);
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  const healthy = f.receipts.find(receipt => receipt.stage === 'healthy'); assert.ok(healthy);
+  const interruptions = f.actions.filter(action => action === 'runtime.update.interrupt').length;
+  f.control.failReceipt = undefined;
+  assert.equal(await f.app.checkForUpdates(), null);
+  assert.equal(f.actions.filter(action => action === 'runtime.update.interrupt').length, interruptions);
+  assert.deepEqual(f.receipts.filter(receipt => receipt.stage === 'healthy'), [healthy, healthy]);
+  assert.deepEqual(await createUpdateReceiptJournal(f.dataDir).pending(f.identity.deviceId), []);
+});
+
+test('committed pending cleanup retains installed-release semantics after the download authorization expires', async t => {
+  const f = await fixture(t); await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json');
+  const pending = await fs.readFile(pendingFile);
+  await f.restart(); await fs.writeFile(pendingFile, pending);
+  const receipts = [...f.receipts];
+  const starts = f.actions.filter(action => action === 'start').length;
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse(f.manifest.expiresAt) + 1 });
+  await f.restart();
+  assert.equal(f.app.updateCheckFailure, null);
+  assert.equal(f.actions.filter(action => action === 'start').length, starts + 1);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'healthy');
+  assert.deepEqual(f.receipts, receipts);
+  await assert.rejects(() => fs.access(pendingFile), { code: 'ENOENT' });
+});
+
+test('restart finishes committed pending cleanup and replays the original receipts without switching again', async t => {
+  const f = await fixture(t); await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json');
+  const pending = await fs.readFile(pendingFile);
+  f.control.failReceipt = 'healthy'; await f.restart();
+  const original = f.receipts.find(receipt => receipt.stage === 'healthy'); assert.ok(original);
+  // 恢复提交后、清理前的磁盘状态，模拟此窗口进程中断。
+  await fs.writeFile(pendingFile, pending);
+  const starts = f.actions.filter(action => action === 'start').length;
+  const authorizations = f.requests.filter(request => request.path.endsWith('/switch-authorization')).length;
+  await f.restart(); assert.ok(f.app.updateCheckFailure);
+  assert.deepEqual(await fs.readFile(pendingFile), pending);
+  assert.equal(f.actions.filter(action => action === 'start').length, starts + 1);
+  f.control.failReceipt = undefined; await f.restart();
+  assert.equal(f.app.updateCheckFailure, null);
+  assert.equal(f.actions.filter(action => action === 'start').length, starts + 2);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/switch-authorization')).length, authorizations);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'healthy');
+  await assert.rejects(() => fs.access(pendingFile), { code: 'ENOENT' });
+  assert.equal(await f.app.checkForUpdates(), null);
+  assert.equal(await f.app.checkForUpdates(), null);
+  assert.deepEqual(f.receipts.filter(receipt => receipt.stage === 'healthy'), [original, original, original]);
+  assert.deepEqual(await createUpdateReceiptJournal(f.dataDir).pending(f.identity.deviceId), []);
+});
+
+for (const failedStage of ['switched', 'healthy']) {
+  test(`restart recovers committed pending when ${failedStage} evidence was not persisted`, async t => {
+    const f = await fixture(t); await f.app.checkForUpdates();
+    const pendingFile = path.join(f.dataDir, 'pending-release.json');
+    const pending = await fs.readFile(pendingFile);
+    const open = fs.open.bind(fs); let failed = false;
+    t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
+      const file = await open(...args);
+      if (String(args[0]).endsWith('update-receipts.jsonl')) {
+        const write = file.writeFile.bind(file);
+        t.mock.method(file, 'writeFile', async (...values: Parameters<typeof file.writeFile>) => {
+          if (!failed && String(values[0]).includes(`"stage":"${failedStage}"`)) {
+            failed = true; throw Object.assign(new Error('RECEIPT_STORE_FAILED'), { code: 'EIO' });
+          }
+          return await write(...values);
+        });
+      }
+      return file;
+    });
+    await f.restart(); assert.equal(failed, true); assert.ok(f.app.updateCheckFailure);
+    assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+    const journal = createUpdateReceiptJournal(f.dataDir);
+    const requestId = f.receipts[0]!.requestId;
+    const switched = await journal.find(f.identity.deviceId, requestId, 'switched');
+    assert.deepEqual(await fs.readFile(pendingFile), pending, '回执未落盘时必须保留真实待更新记录');
+    const starts = f.actions.filter(action => action === 'start').length;
+    await f.restart();
+    assert.equal(f.app.updateCheckFailure, null);
+    assert.equal(f.actions.filter(action => action === 'start').length, starts + 1);
+    if (switched) assert.deepEqual(await journal.find(f.identity.deviceId, requestId, 'switched'), switched);
+    assert.equal(await f.app.checkForUpdates(), null);
+    assert.equal(f.receipts.filter(receipt => receipt.stage === 'healthy').length, 1);
+    assert.deepEqual(await journal.pending(f.identity.deviceId), []);
+    await assert.rejects(() => fs.access(pendingFile), { code: 'ENOENT' });
+  });
+}
+
+test('rollback terminal attempt is never reused for a manual installation', async t => {
+  const f = await fixture(t); f.control.rejectLoadWeb = true;
+  await f.app.checkForUpdates(); await f.restart();
+  const rolledBack = f.receipts.find(receipt => receipt.stage === 'rolled_back'); assert.ok(rolledBack);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  await f.app.checkForUpdates(); await f.restart();
+  const healthy = f.receipts.find(receipt => receipt.stage === 'healthy'); assert.ok(healthy);
+  assert.notEqual(healthy.requestId, rolledBack.requestId);
+});
+
+test('exit cancels an in-flight archive and clears the timer without reporting a false incident', async t => {
+  const f = await fixture(t); f.control.holdArchive = true;
+  f.app.startAutomaticUpdates();
+  while (!f.requests.some(request => request.path.endsWith('/archive'))) await new Promise<void>(resolve => setImmediate(resolve));
+  await f.exit();
+  assert.equal(f.actions.at(-1), 'quit'); assert.deepEqual(f.journal(), []); assert.deepEqual(f.failures, []);
+  assert.equal(f.receipts.length, 0);
+});
+
+test('received ACK recovery retains the verified manifest and original attempt without rediscovery', async t => {
+  const f = await fixture(t); f.control.failReceipt = 'received';
+  await assert.rejects(() => f.app.checkForUpdates());
+  const original = f.receipts[0]!; assert.equal(original.stage, 'received');
+  f.control.failReceipt = undefined;
+  await f.app.checkForUpdates(); assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  assert.ok(f.receipts.every(receipt => receipt.requestId === original.requestId));
+  assert.deepEqual(f.receipts.filter(receipt => receipt.stage === 'received'), [original, original]);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
+});
+
+test('switched ACK recovery sends the persisted healthy fact without repeating the switch', async t => {
+  const f = await fixture(t); f.control.failReceipt = 'switched';
+  await f.app.checkForUpdates(); await f.restart();
+  assert.ok(f.app.updateCheckFailure);
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  const requestId = f.receipts[0]!.requestId;
+  assert.deepEqual((await createUpdateReceiptJournal(f.dataDir).pending(f.identity.deviceId)).map(receipt => receipt.stage), ['switched', 'healthy']);
+  f.control.failReceipt = undefined;
+  assert.equal(await f.app.checkForUpdates(), null);
+  const healthy = f.receipts.filter(receipt => receipt.stage === 'healthy');
+  assert.equal(healthy.length, 1); assert.equal(healthy[0]!.requestId, requestId);
+  assert.equal(f.actions.filter(action => action === 'runtime.update.interrupt').length, 0);
+});
+
+test('resume between permission denial and discovery retains the original same-package attempt', async t => {
+  const f = await fixture(t); f.control.authorized = false;
+  assert.equal(await f.app.checkForUpdates(), null);
+  const requestId = f.receipts[0]!.requestId;
+  f.control.holdDiscovery = async () => { f.control.authorized = true; };
+  assert.equal(await f.app.checkForUpdates(), null);
+  await f.app.checkForUpdates(); assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  assert.ok(f.receipts.every(receipt => receipt.requestId === requestId));
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
+});
+
+test('exit cancels an unfinished HTTP error body without creating an update incident', async t => {
+  const f = await fixture(t); f.control.holdErrorBody = true;
+  f.app.startAutomaticUpdates();
+  while (!f.requests.some(request => request.path.endsWith('/release-availability'))) await new Promise<void>(resolve => setImmediate(resolve));
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await f.exit();
+  assert.equal(f.actions.at(-1), 'quit'); assert.deepEqual(f.journal(), []); assert.deepEqual(f.failures, []);
+});
+
+test('healthy persistence failure stays explicit until its observed receipt is stored and sent', async t => {
+  const f = await fixture(t);
+  const open = fs.open.bind(fs); let failed = false;
+  t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args);
+    if (String(args[0]).endsWith('update-receipts.jsonl')) {
+      const write = file.writeFile.bind(file);
+      t.mock.method(file, 'writeFile', async (...values: Parameters<typeof file.writeFile>) => {
+        if (!failed && String(values[0]).includes('"stage":"healthy"')) { failed = true; throw Object.assign(new Error('HEALTHY_STORE_FAILED'), { code: 'EIO' }); }
+        return await write(...values);
+      });
+    }
+    return file;
+  });
+  await f.app.checkForUpdates(); await f.restart(); assert.equal(failed, true);
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  assert.equal(await f.app.checkForUpdates(), null);
+  assert.equal(f.receipts.filter(receipt => receipt.stage === 'healthy').length, 1);
+  assert.equal(f.actions.filter(action => action === 'runtime.update.interrupt').length, 0);
+});
+
+test('restart defers a revoked candidate, keeps current resources, then activates after permission returns', async t => {
+  const f = await fixture(t); await f.app.checkForUpdates();
+  f.control.authorized = false; await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'revoked');
+  assert.equal(f.receipts.some(receipt => receipt.stage === 'healthy'), false);
+  f.control.authorized = true; await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
+});
+
+test('user restart uses normal shutdown and relaunch without activating in the running process', async t => {
+  const f = await fixture(t); await f.app.checkForUpdates();
+  await f.app.restartForUpdate();
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.deepEqual(f.actions.slice(-3), ['destroy', 'relaunch', 'quit']);
+});
+
+test('活动指针重命名后刷盘失败保留候选数据库，完整重启核验后再完成升级', async t => {
+  const f = await fixture(t);
+  const workspace = path.join(f.dataDir, 'project');
+  await fs.mkdir(path.join(workspace, '.codeflowai'), { recursive: true });
+  const database = path.join(f.dataDir, 'codeflowai.db'), workspaceDb = path.join(workspace, '.codeflowai', 'workspace.db');
+  const root = new DatabaseSync(database);
+  try {
+    root.exec('CREATE TABLE workspaces(path TEXT); CREATE TABLE version(v INTEGER); INSERT INTO version VALUES(1)');
+    root.prepare('INSERT INTO workspaces VALUES(?)').run(workspace);
+  } finally { root.close(); }
+  const local = new DatabaseSync(workspaceDb);
+  try { local.exec('CREATE TABLE version(v INTEGER); INSERT INTO version VALUES(1)'); }
+  finally { local.close(); }
+  f.control.onCandidateStart = async () => {
+    for (const file of [database, workspaceDb]) {
+      const db = new DatabaseSync(file);
+      try { db.exec('UPDATE version SET v=2'); } finally { db.close(); }
+    }
+  };
+  await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json'), pending = await fs.readFile(pendingFile);
+  const open = fs.open.bind(fs), copyFile = fs.copyFile.bind(fs);
+  let pointerFault = false, restoreAttempts = 0;
+  t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
+    if (!pointerFault && args[0] === path.join(f.dataDir, 'active-release.json') && args[1] === 'r+') {
+      pointerFault = true; throw Object.assign(new Error('ACTIVE_POINTER_FLUSH_FAILED'), { code: 'EIO' });
+    }
+    return await open(...args);
+  });
+  t.mock.method(fs, 'copyFile', async (...args: Parameters<typeof fs.copyFile>) => {
+    if (String(args[1]).endsWith('.restore')) {
+      restoreAttempts++;
+      if (String(args[1]).startsWith(`${workspaceDb}.`)) throw Object.assign(new Error('WORKSPACE_RESTORE_FAILED'), { code: 'EIO' });
+    }
+    return await copyFile(...args);
+  });
+  await assert.rejects(f.restart());
+  assert.equal(pointerFault, true);
+  assert.equal(restoreAttempts, 0, '活动指针可能已提交时不能开始旧库回退');
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  for (const file of [database, workspaceDb]) {
+    const db = new DatabaseSync(file);
+    try { assert.equal(db.prepare('SELECT v FROM version').get()?.v, 2); } finally { db.close(); }
+  }
+  const marker = path.join(f.dataDir, 'update-database-backup.json');
+  assert.equal(JSON.parse(await fs.readFile(marker, 'utf8')).state, 'prepared');
+  assert.deepEqual(await fs.readFile(pendingFile), pending);
+  assert.equal(f.receipts.some(receipt => receipt.stage === 'healthy'), false);
+  assert.equal(f.receipts.some(receipt => ['rolled_back', 'unavailable'].includes(receipt.stage)), false, '提交未确认不能关闭原升级尝试');
+  f.control.onCandidateStart = undefined;
+  await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'healthy');
+  assert.equal(JSON.parse(await fs.readFile(marker, 'utf8')).state, 'committed');
+  for (const file of [database, workspaceDb]) {
+    const db = new DatabaseSync(file);
+    try { assert.equal(db.prepare('SELECT v FROM version').get()?.v, 2); } finally { db.close(); }
+  }
+  await assert.rejects(fs.access(pendingFile), { code: 'ENOENT' });
+  assert.equal(f.receipts.filter(receipt => receipt.stage === 'healthy').length, 1);
+});
+
+test('snapshot persistence failure restarts the old held Client and surfaces the failed update', async t => {
+  const f = await fixture(t); await f.app.checkForUpdates();
+  const write = fs.writeFile.bind(fs);
+  t.mock.method(fs, 'writeFile', async (...args: Parameters<typeof fs.writeFile>) => {
+    if (String(args[0]).includes('update-database-backup.json')) throw new Error('SNAPSHOT_DISK_FAILED');
+    return await write(...args);
+  });
+  await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.ok(f.app.updateCheckFailure);
+  assert.equal(f.actions.filter(action => action === 'start').length, 3);
+  assert.equal(f.actions.filter(action => action === 'runtime.startup.continue').length, 1);
+});
+
+test('damaged pending metadata is an explicit update failure while current resources remain usable', async t => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.dataDir, 'pending-release.json'), '{}');
+  await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.ok(f.app.updateCheckFailure);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'failure');
+  assert.equal(f.receipts.some(receipt => receipt.stage === 'healthy'), false);
+});

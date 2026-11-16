@@ -1,0 +1,38 @@
+{
+  "name": "@codeflowai/desktop",
+  "license": "Apache-2.0",
+  "version": "1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "engines": {
+    "node": ">=22.16.0 <23 || >=24 <25"
+  },
+  "scripts": {
+    "dev": "pnpm build && electron dist/main.js",
+    "prepare:resources": "node scripts/prepare-resources.mjs",
+    "build": "pnpm typecheck && tsc -p tsconfig.build.json && esbuild src/preloadEntry.ts --bundle --platform=node --format=cjs --external:electron --outfile=dist/preload.cjs && esbuild src/macosUninstallHelper.ts --bundle --platform=node --format=cjs --outfile=dist/macosUninstallHelper.cjs",
+    "test": "node --conditions=development --import tsx --test tests/**/*.test.ts \"tests/**/*.test.mjs\"",
+    "test:electron": "pnpm build && node tests/electron-runtime.smoke.mjs",
+    "test:ui": "pnpm build && node tests/electron-ui-workspace.smoke.mjs && node tests/electron-ui-threads.smoke.mjs && node tests/electron-ui-composer.smoke.mjs && node tests/electron-ui-chat-send.smoke.mjs && node tests/electron-ui-workspace-switch.smoke.mjs && node tests/electron-ui-local-workspace-journey.smoke.mjs",
+    "test:resources": "node tests/electron-packaged-resources.smoke.mjs",
+    "package:local:win": "node scripts/package-local-win.mjs",
+    "package:local:mac": "node scripts/package-local-mac.mjs",
+    "prepare:release": "node scripts/prepare-release.mjs",
+    "test:packaged": "node tests/electron-packaged-app.smoke.mjs",
+    "test:packaged:native": "node tests/electron-packaged-native.smoke.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "electron": "^45.0.0",
+    "electron-builder": "26.18.0",
+    "esbuild": "^0.27.3",
+    "npm": "12.2.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@codeflowai/shared": "workspace:*",
+    "tar": "7.5.22"
+  }
+}

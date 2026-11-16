@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "npm": { "version": "12.2.2" },
+  "engines": {
+    "claude": { "npmPackage": "@anthropic-ai/claude-code", "version": "2.1.318", "estimatedBytes": 350000000 },
+    "codex": { "npmPackage": "@openai/codex", "version": "0.166.0", "estimatedBytes": 520000000 }
+  }
+}

@@ -1,0 +1,57 @@
+appId: ai.codeflow.codeflowai
+productName: CodeFlow
+artifactName: CodeFlowAI-${version}-${os}-${arch}.${ext}
+directories:
+  output: dist-packages
+files:
+  - dist/**
+  - '!dist/resources/**'
+  - package.json
+extraResources:
+  - from: dist/resources
+    to: .
+    filter:
+      - desktop-update.json
+  - from: dist/resources/release-trust.json
+    to: release-trust.json
+  - from: dist/resources/baseline-release-manifest.json
+    to: baseline-release-manifest.json
+  - from: dist/resources/client
+    to: client
+  - from: dist/resources/web
+    to: web
+  - from: dist/macosUninstallHelper.cjs
+    to: macosUninstallHelper.cjs
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  runAfterFinish: true
+  include: build/installer.nsh
+win:
+  icon: build/icon.ico
+  executableName: CodeFlowAI
+  target:
+    - target: nsis
+      arch:
+        - x64
+mac:
+  icon: build/icon.png
+  category: public.app-category.developer-tools
+  # Electron 44+ 要求 macOS 13 Ventura；显式写入 Info.plist 的 LSMinimumSystemVersion。
+  minimumSystemVersion: "13.0"
+  # 资源树按构建机架构生成（desktop-runtime.json 与 node-pty prebuilds），只打当前架构。
+  target:
+    - dmg
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.inherit.plist
+dmg:
+  title: ${productName}
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications

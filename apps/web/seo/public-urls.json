@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "siteOrigin": "https://codeflowai.cn",
+  "pages": [
+    {
+      "path": "/",
+      "url": "https://codeflowai.cn/",
+      "title": "CodeFlow｜规格约束的软件开发工作流平台"
+    },
+    {
+      "path": "/download",
+      "url": "https://codeflowai.cn/download",
+      "title": "桌面版下载 | CodeFlow"
+    },
+    {
+      "path": "/best-practices",
+      "url": "https://codeflowai.cn/best-practices/",
+      "title": "最佳实践 | CodeFlow"
+    },
+    {
+      "path": "/contact",
+      "url": "https://codeflowai.cn/contact/",
+      "title": "联系我们 | CodeFlow"
+    },
+    {
+      "path": "/upgrade",
+      "url": "https://codeflowai.cn/upgrade/",
+      "title": "更新日志 | CodeFlow"
+    },
+    {
+      "path": "/data-security-commitment",
+      "url": "https://codeflowai.cn/data-security-commitment/",
+      "title": "数据安全承诺 | CodeFlow"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+name: Desktop tests
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "apps/desktop/**"
+      - "apps/desktop/client/**"
+      - "apps/web/**"
+      - "packages/shared/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "apps/desktop/client/**"
+      - "apps/web/**"
+      - "packages/shared/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - ".github/workflows/desktop.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.2"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.14.0"
+      - run: pnpm install --frozen-lockfile
+      - name: Install Chromium for desktop browser tests
+        run: pnpm -C apps/web exec playwright install chromium
+      - name: Typecheck desktop
+        run: pnpm -C apps/desktop typecheck
+      # 单元与夹具集成测试：更新下载/签名/回执、运行时与生命周期。
+      # 打包态 smoke 需要真实 exe 与 Windows 桌面会话，保持人工执行，不在此冒充已覆盖。
+      - name: Desktop unit and harness tests
+        run: pnpm -C apps/desktop test
+
+  test-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.2"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.14.0"
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck desktop and web
+        run: pnpm -C apps/desktop typecheck && pnpm -C apps/web typecheck
+      # Windows 专属生命周期测试不在 macOS 冒充通过；这里只跑本次新增的平台代码。
+      - name: macOS path, packaging and uninstall tests
+        working-directory: apps/desktop
+        run: >-
+          node --conditions=development --import tsx --test
+          tests/macos-path.test.ts
+          tests/macos-uninstall.test.ts
+          tests/package-local-mac.test.ts
+          client/tests/terminal-security-policy.test.ts

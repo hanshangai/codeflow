@@ -1,0 +1,5 @@
+{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_reconcile","type":"message","role":"assistant","content":[]}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"可以！我能帮你开发各类应用，包括：\n\n- **Web 应用**：前端（React/Vue/HTML）、后端（Node.js/Python/Java 等）、全栈\n\n"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你现在处于 AIDT 作流环境**，我可以通过标准化程来交付项目：\n\n```\n需求(PRD) → 技术设计() → 开发计划(PLAN发(DEV) → 验证\n```\n\n**想发什么应用？** 告诉我需，我来帮你推进。"}}}
+{"type":"assistant","message":{"id":"msg_reconcile","type":"message","role":"assistant","content":[{"type":"text","text":"可以！我能帮你开发各类应用，包括：\n\n- **Web 应用**：前端（React/Vue/HTML）、后端（Node.js/Python/Java 等）、全栈\n- **移动应用**：React Native、Flutter 等跨平台方案\n- **CLI 工具**：命令行脚本、自动化工具\n- **API 服务**：REST API、GraphQL\n- **AI 应用**：基于 Claude API / Anthropic SDK 的智能应用\n\n---\n\n你现在处于 **AIDT 工作流环境**，我可以通过标准化流程来交付项目：\n\n```\n需求(PRD) → 技术设计(DGN) → 开发计划(PLAN) → 开发(DEV) → 验证\n```\n\n**你想开发什么应用？** 告诉我需求，我来帮你推进。"}]}}
+{"type":"stream_event","event":{"type":"message_stop"}}

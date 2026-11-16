@@ -1,0 +1,29 @@
+export const DESKTOP_PLAN_PLATFORMS: readonly string[];
+export type DesktopReleasePlan = {
+  schemaVersion: 1;
+  environment: "test" | "production";
+  releaseId: string;
+  version: string;
+  webVersion: string;
+  clientVersion: string;
+  protocolVersion: 1;
+  capabilityVersion: 1;
+  dbSchemaVersion: number;
+  platformSet: string[];
+  sourceCommit: string;
+  keyId: string;
+  createdAt: string;
+  expiresAt: string;
+};
+export function readDesktopPlanFacts(root: string, options?: { allowDirty?: boolean }): Promise<{ sourceCommit: string; dbSchemaVersion: number }>;
+export function createDesktopReleasePlan(input: {
+  root: string;
+  platforms: readonly string[];
+  keyId: string;
+  expiresAt?: string;
+  environment?: "test" | "production";
+  now?: Date;
+  planDir?: string | null;
+  allowDirty?: boolean;
+}): Promise<{ file: string; plan: DesktopReleasePlan }>;
+export function readDesktopReleasePlan(input: { root: string; file: string; allowDirty?: boolean }): Promise<DesktopReleasePlan>;

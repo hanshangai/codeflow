@@ -1,0 +1,12 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /admin
+Disallow: /auth/
+Disallow: /chat
+Disallow: /office-h5/
+Disallow: /orchestration/
+Disallow: /payment/
+
+Sitemap: https://codeflowai.cn/sitemap.xml
+Sitemap: https://codeflowai.cn/best-practices-sitemap.xml

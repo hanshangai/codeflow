@@ -1,0 +1,8 @@
+/** Client WebSocket close codes shared by Server and Client runtime policy. */
+export const CLIENT_WS_CLOSE_CODE_TRY_AGAIN_LATER = 1013;
+export const CLIENT_WS_CLOSE_CODE_REPLACED = 4001;
+export const CLIENT_WS_CLOSE_CODE_PREEMPT_DECLINED = 4002;
+export const CLIENT_WS_CLOSE_CODE_PREEMPT_TIMEOUT = 4003;
+export const CLIENT_WS_CLOSE_CODE_STOP_REQUESTED = 4004;
+export const CLIENT_WS_CLOSE_CODE_ACCESS_CHANGED = 4005;
+export const CLIENT_WS_CLOSE_CODE_HEARTBEAT_TIMEOUT = 4100;

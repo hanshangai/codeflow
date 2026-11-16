@@ -1,0 +1,34 @@
+{
+  "execution": {
+    "mode": "confirm",
+    "language": "zh-CN"
+  },
+  "paths": {
+    "workflowDocsRoot": "codeflow-docs"
+  },
+  "workflow": {
+    "dirs": {
+      "prd": {
+        "dirName": "需求分析"
+      },
+      "ui": {
+        "dirName": "原型设计"
+      },
+      "arc": {
+        "dirName": "架构设计"
+      },
+      "design": {
+        "dirName": "设计卡"
+      },
+      "dev": {
+        "dirName": "任务与开发"
+      },
+      "test": {
+        "dirName": "集成测试"
+      }
+    }
+  },
+  "fileIndex": {
+    "maxEntries": null
+  }
+}

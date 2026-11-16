@@ -1,0 +1,1427 @@
+.chat-panel {
+  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow: hidden;
+}
+
+/* ---- TodoList Bar（悬浮卡片）---- */
+.todolist-bar-wrap {
+  pointer-events: auto;
+}
+
+.todolist-bar {
+  margin: 0 16px;
+  pointer-events: auto;
+  background: color-mix(in srgb, var(--app-panel-bg) 92%, var(--app-bg) 8%);
+  border: 1px solid color-mix(in srgb, var(--app-border) 78%, var(--app-accent) 22%);
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgba(20, 20, 19, 0.08), 0 2px 8px rgba(20, 20, 19, 0.05);
+  backdrop-filter: blur(12px) saturate(1.04);
+  overflow: hidden;
+}
+
+.todolist-bar__backdrop {
+  display: none;
+}
+
+.todolist-bar-wrap--toolbar {
+  position: static;
+}
+
+.todolist-bar__chip {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--app-border) 74%, var(--app-accent) 18%);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-panel-bg) 95%, transparent);
+  color: var(--app-text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+
+.todolist-bar__chip:hover {
+  background: color-mix(in srgb, var(--app-accent) 8%, var(--app-panel-bg) 92%);
+  border-color: color-mix(in srgb, var(--app-accent) 30%, var(--app-border) 70%);
+}
+
+.todolist-bar__chip-icon {
+  font-size: 12px;
+  color: var(--app-accent);
+}
+
+.todolist-bar__chip-title {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.todolist-bar__chip-progress {
+  min-height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-accent) 9%, transparent);
+  color: var(--app-accent);
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+}
+
+.todolist-bar__chip-toggle {
+  font-size: 9px;
+  color: var(--app-muted);
+}
+
+.todolist-bar-wrap--toolbar .todolist-bar {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: min(100%, 360px);
+  max-height: min(60vh, 480px);
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  z-index: 40;
+}
+
+.todolist-bar-wrap--toolbar .todolist-bar__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.todolist-bar__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid transparent;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.todolist-bar__header:hover {
+  background: color-mix(in srgb, var(--app-accent) 6%, transparent);
+}
+
+.todolist-bar__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--app-accent);
+  background: color-mix(in srgb, var(--app-accent) 12%, transparent);
+  flex: 0 0 auto;
+}
+
+.todolist-bar__title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--app-text);
+  flex: 0 0 auto;
+  letter-spacing: 0.01em;
+}
+
+.todolist-bar__current-step {
+  font-size: 11px;
+  color: var(--app-muted);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todolist-bar__current-step:empty {
+  display: none;
+}
+
+.todolist-bar__progress {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--app-accent);
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-accent) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--app-accent) 16%, transparent);
+}
+
+.todolist-bar__toggle {
+  font-size: 10px;
+  color: var(--app-muted);
+  flex: 0 0 auto;
+  line-height: 1;
+  width: 18px;
+  text-align: center;
+}
+
+.todolist-bar__body {
+  padding: 10px 12px 12px;
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--app-divider) 60%, transparent);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.todolist-bar__explanation {
+  font-size: 12px;
+  color: var(--app-muted);
+  margin-bottom: 4px;
+}
+
+.todolist-bar__rows {
+  display: grid;
+  gap: 6px;
+}
+
+.todolist-bar__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.todolist-bar__row-icon {
+  font-size: 13px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.todolist-bar__row-icon--done {
+  color: #52c41a;
+}
+
+.todolist-bar__row-icon--progress {
+  color: #1677ff;
+}
+
+.todolist-bar__row-icon--pending {
+  color: var(--app-muted);
+}
+
+.todolist-bar__step {
+  font-size: 12px;
+  color: var(--app-text);
+  line-height: 1.45;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.todolist-bar__step--done {
+  color: var(--app-muted);
+  text-decoration: line-through;
+}
+
+.chat-panel__usage {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--app-muted);
+}
+
+.chat-panel__meta {
+  margin-top: 6px;
+  display: grid;
+  gap: 4px;
+}
+
+.chat-panel__details {
+  margin-top: 8px;
+}
+
+.chat-panel__details summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--app-muted);
+  user-select: none;
+}
+
+.chat-panel__details summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-panel__composer {
+  --chat-panel-composer-inline-padding: 16px;
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0 16px 12px;
+  backdrop-filter: none;
+  position: relative;
+  z-index: 10;
+}
+
+.chat-panel__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.chat-panel__body--blocked .chat-panel__messages,
+.chat-panel__body--blocked .chat-panel__composer {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.chat-panel__floatbox {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+  pointer-events: none;
+  z-index: 20;
+}
+
+.chat-panel__jump-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 12px);
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 22;
+}
+
+.chat-panel__assistant-helper {
+  padding: 10px 0 0;
+}
+
+.chat-panel__assistant-helper-shell {
+  width: 100%;
+}
+
+.chat-panel__assistant-helper-row {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+}
+
+.chat-panel__assistant-helper-row > * {
+  width: 100%;
+  min-width: 0;
+}
+
+.chat-panel__composer-helper {
+  padding: 0 0 8px;
+}
+
+.chat-panel__composer-guard {
+  padding: 0 0 8px;
+}
+
+.chat-panel__composer-helper-shell {
+  width: 100%;
+}
+
+.chat-panel__messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 20px 16px;
+  position: relative;
+}
+
+.chat-panel__messages-inner {
+  max-width: 100%;
+  margin: 0 auto;
+}
+
+.chat-panel__messages-inner--has-floatbar {
+  padding-bottom: 0;
+}
+
+.chat-panel__more-bar {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  padding: 12px 0 8px;
+}
+
+.chat-panel__loading-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 0 8px;
+  font-size: 12px;
+  color: var(--app-muted);
+}
+
+
+.chat-panel__composer-inner {
+  max-width: 100%;
+  margin: 0 auto;
+}
+
+.chat-panel__loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: color-mix(in srgb, var(--app-bg) 84%, transparent);
+  backdrop-filter: blur(6px);
+  z-index: 30;
+}
+
+.chat-panel__loading-overlay-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-text);
+}
+
+.chat-panel__typing {
+  padding: 10px 4px 0;
+  color: var(--app-muted);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.typing__spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--app-muted) 22%, transparent);
+  border-top-color: color-mix(in srgb, var(--app-text) 70%, transparent);
+  animation: typing-spin 1s linear infinite;
+}
+
+.typing__text {
+  /* 工具名可能很长：单行省略，避免提示条换行导致内容跳动。 */
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: transparent;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--app-muted) 40%, transparent),
+    color-mix(in srgb, var(--app-text) 75%, transparent),
+    color-mix(in srgb, var(--app-muted) 40%, transparent)
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: typing-shimmer 2.2s ease-in-out infinite;
+}
+
+@keyframes typing-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes typing-shimmer {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.chat-panel__jump {
+  border: 1px solid var(--app-accent);
+  background: var(--app-panel-bg);
+  color: var(--app-accent);
+  border-radius: 999px;
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  transition: all 200ms ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  pointer-events: auto;
+  white-space: nowrap;
+}
+
+.chat-panel__jump-icon {
+  font-size: 12px;
+  line-height: 1;
+}
+
+.chat-panel__jump:hover {
+  background: var(--app-accent);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  transform: translateY(-1px);
+}
+
+.chat-panel__empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-panel__empty-setup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+}
+
+.chat-panel__empty-setup-text {
+  margin: 0;
+  max-width: 320px;
+  color: var(--app-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.chat-panel__loading-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.chat-panel__loading-placeholder-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-text);
+}
+
+/* ── floatbox 双卡片行（任务列表 + 文件变更）── */
+.floatbox__cards {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin: 0 16px;
+  pointer-events: none;
+}
+
+.floatbox__cards > * {
+  flex: 1;
+  min-width: 0;
+}
+
+.floatbox__cards .todolist-bar {
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .floatbox__cards {
+    flex-direction: column;
+  }
+}
+
+/* ── 文件变更卡片 (fc-bar)，与 todolist-bar 同风格 ── */
+.fc-bar-wrap {
+  pointer-events: auto;
+}
+
+.fc-bar {
+  pointer-events: auto;
+  background: color-mix(in srgb, var(--app-panel-bg) 92%, var(--app-bg) 8%);
+  border: 1px solid color-mix(in srgb, var(--app-border) 78%, var(--app-accent) 22%);
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgba(20, 20, 19, 0.08), 0 2px 8px rgba(20, 20, 19, 0.05);
+  backdrop-filter: blur(12px) saturate(1.04);
+  overflow: hidden;
+}
+
+.fc-bar__backdrop {
+  display: none;
+}
+
+.fc-bar-wrap--toolbar {
+  position: static;
+}
+
+.fc-bar__chip {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--app-border) 74%, var(--app-accent) 18%);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-panel-bg) 95%, transparent);
+  color: var(--app-text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+
+.fc-bar__chip:hover {
+  background: color-mix(in srgb, var(--app-accent) 8%, var(--app-panel-bg) 92%);
+  border-color: color-mix(in srgb, var(--app-accent) 30%, var(--app-border) 70%);
+}
+
+.fc-bar__chip-icon,
+.fc-bar__chip-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.fc-bar__chip-icon {
+  color: var(--app-accent);
+}
+
+.fc-bar__chip-title {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.fc-bar__chip-count {
+  min-height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-accent) 9%, transparent);
+  color: var(--app-accent);
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+}
+
+.fc-bar__chip-toggle {
+  color: var(--app-muted);
+}
+
+.fc-bar-wrap--toolbar .fc-bar {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: min(100%, 640px);
+  max-height: min(60vh, 480px);
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  z-index: 40;
+}
+
+.fc-bar-wrap--toolbar .fc-bar__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.fc-bar__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.fc-bar__header:hover {
+  background: color-mix(in srgb, var(--app-accent) 6%, transparent);
+}
+
+.fc-bar__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--app-accent);
+  background: color-mix(in srgb, var(--app-accent) 12%, transparent);
+  flex: 0 0 auto;
+}
+
+.fc-bar__title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--app-text);
+  flex: 0 0 auto;
+  letter-spacing: 0.01em;
+}
+
+.fc-bar__summary {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--app-accent);
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-accent) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--app-accent) 16%, transparent);
+}
+
+.fc-bar__count {
+  display: none;
+}
+
+.fc-bar__toggle {
+  font-size: 12px;
+  color: var(--app-muted);
+  flex: 0 0 auto;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  width: 18px;
+  justify-content: center;
+}
+
+.fc-bar__body {
+  padding: 6px 10px 0;
+  border-top: 1px solid color-mix(in srgb, var(--app-divider) 60%, transparent);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.fc-bar__explanation {
+  font-size: 12px;
+  color: var(--app-muted);
+  margin-bottom: 4px;
+}
+
+/* ant checkbox-group 不要产生额外布局 */
+.fc-check-group.ant-checkbox-group {
+  display: block;
+  width: 100%;
+}
+
+/*
+ * 单一 grid 容器：所有单元格都是直接子元素。
+ * 每 5 个子元素自动换行成一行，列宽严格固定对齐。
+ * 列：勾选(22px) | 状态(36px) | 文件名(minmax) | 路径(1fr) | 操作(72px, 右对齐)
+ */
+.fc-table {
+  display: grid;
+  grid-template-columns: 22px 36px minmax(60px, auto) 1fr 72px;
+  align-items: center;
+  column-gap: 6px;
+  row-gap: 0;
+  font-size: 12px;
+}
+
+/* 每行 5 个单元格；给每行底边线（通过行内单元格的 border-bottom） */
+.fc-table > :nth-child(5n+1),
+.fc-table > :nth-child(5n+2),
+.fc-table > :nth-child(5n+3),
+.fc-table > :nth-child(5n+4),
+.fc-table > :nth-child(5n+5) {
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+
+/* 行之间分割线：给第 5n+1 ~ 5n+5 的单元格都加 border-top（跳过第一行） */
+.fc-table > :nth-child(n+6):nth-child(5n+1),
+.fc-table > :nth-child(n+6):nth-child(5n+2),
+.fc-table > :nth-child(n+6):nth-child(5n+3),
+.fc-table > :nth-child(n+6):nth-child(5n+4),
+.fc-table > :nth-child(n+6):nth-child(5n+5) {
+  border-top: 1px solid color-mix(in srgb, var(--app-divider) 40%, transparent);
+}
+
+/* 勾选框 */
+.fc-table__check {
+  justify-self: center;
+}
+
+.fc-table__check .ant-checkbox {
+  top: 0;
+}
+
+.fc-table__check .ant-checkbox-inner {
+  width: 14px;
+  height: 14px;
+}
+
+.fc-table__check .ant-checkbox-inner::after {
+  width: 4px;
+  height: 7px;
+}
+
+/* 状态列 */
+.fc-table__status {
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  line-height: 1;
+}
+
+.fc-status--created { color: #73a839; }
+.fc-status--modified { color: #5b8ac4; }
+.fc-status--deleted { color: #ff4d4f; }
+
+/* 文件名列 */
+.fc-table__name {
+  font-size: 12px;
+  color: var(--app-text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.fc-table__name--clickable {
+  cursor: pointer;
+  transition: color 100ms ease;
+}
+
+.fc-table__name--clickable:hover {
+  color: var(--app-accent);
+}
+
+.fc-table__warn {
+  font-size: 10px;
+  color: #d46b08;
+  margin-left: 4px;
+  font-weight: 400;
+}
+
+.fc-table__spinner {
+  margin-right: 4px;
+  color: var(--app-accent);
+}
+
+/* 路径列 */
+.fc-table__dir {
+  font-size: 11px;
+  color: var(--app-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* 操作列（固定在最右） */
+.fc-table__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.fc-table__action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--app-muted);
+  cursor: pointer;
+  transition: all 100ms ease;
+}
+
+.fc-table__action:hover {
+  background: color-mix(in srgb, var(--app-accent) 10%, transparent);
+  color: var(--app-accent);
+}
+
+.fc-table__action--danger:hover {
+  background: color-mix(in srgb, #ff4d4f 10%, transparent);
+  color: #ff4d4f;
+}
+
+.fc-table__action--disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.fc-table__action--accepted {
+  color: #52c41a;
+  cursor: default;
+}
+
+.fc-table__action--accepted:hover {
+  background: transparent;
+  color: #52c41a;
+}
+
+/* 底栏：紧凑文字按钮 */
+.fc-bar__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  border-top: 1px solid var(--app-divider);
+  border-bottom: 1px solid var(--app-divider);
+}
+
+.fc-bar__tool-btn {
+  font-size: 11px;
+  color: var(--app-muted);
+  cursor: pointer;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  transition: color 100ms ease;
+}
+
+.fc-bar__tool-btn:hover {
+  color: var(--app-text);
+}
+
+.fc-bar__tool-btn--danger {
+  color: var(--app-muted);
+}
+
+.fc-bar__tool-btn--danger:hover {
+  color: #ff4d4f;
+}
+
+.fc-bar__tool-btn--disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.fc-bar__tool-btn--loading {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.fc-bar__tool-btn--accept:hover {
+  color: #52c41a;
+}
+
+/* ── 差异预览弹窗 ── */
+.diff-modal__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding-right: 40px;
+  flex-wrap: wrap;
+}
+
+.diff-modal__path {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--app-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-modal__header > *:not(.diff-modal__path) {
+  flex: 0 0 auto;
+}
+
+.diff-modal__body {
+  height: 70vh;
+}
+
+.chat-panel__floatbox--compact {
+  position: absolute;
+  left: auto;
+  right: var(--chat-panel-composer-inline-padding);
+  top: auto;
+  bottom: calc(100% + 2px);
+  width: auto;
+  gap: 8px;
+  padding-bottom: 0;
+  z-index: 24;
+  pointer-events: auto;
+  touch-action: auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.chat-panel__floatbox--compact .floatbox__cards {
+  margin: 0;
+  padding: 0;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  overflow: visible;
+}
+
+.chat-panel__floatbox--compact .floatbox__cards > * {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+.chat-panel__floatbox--compact .todolist-bar-wrap,
+.chat-panel__floatbox--compact .fc-bar-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.chat-panel__floatbox--compact .todolist-bar-wrap {
+  order: 2;
+}
+
+.chat-panel__floatbox--compact .fc-bar-wrap {
+  order: 1;
+}
+
+.chat-panel__floatbox--compact .todolist-bar,
+.chat-panel__floatbox--compact .fc-bar {
+  margin: 0;
+  width: auto;
+  max-width: calc(100vw - 20px);
+  box-shadow: 0 6px 16px rgba(20, 20, 19, 0.06), 0 1px 4px rgba(20, 20, 19, 0.04);
+  backdrop-filter: blur(10px) saturate(1.03);
+}
+
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded),
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded) {
+  width: 56px;
+  max-width: none;
+  border-radius: 999px;
+  opacity: 0.68;
+  transition: opacity 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded):hover,
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded):hover,
+.chat-panel__floatbox--compact .todolist-bar-wrap--expanded .todolist-bar,
+.chat-panel__floatbox--compact .fc-bar-wrap--expanded .fc-bar {
+  opacity: 0.98;
+}
+
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__header,
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded) .fc-bar__header {
+  width: 56px;
+  min-height: 32px;
+  padding: 0 7px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__title,
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded) .fc-bar__title,
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__toggle,
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded) .fc-bar__toggle,
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__current-step,
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded) .fc-bar__summary {
+  display: none;
+}
+
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__icon,
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded) .fc-bar__icon {
+  width: 15px;
+  height: 15px;
+  font-size: 9px;
+}
+
+.chat-panel__floatbox--compact .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__progress,
+.chat-panel__floatbox--compact .fc-bar:not(.fc-bar--expanded) .fc-bar__count {
+  display: block;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--app-accent);
+  white-space: nowrap;
+}
+
+.chat-panel__floatbox--compact .todolist-bar__backdrop,
+.chat-panel__floatbox--compact .fc-bar__backdrop {
+  position: fixed;
+  inset: 0;
+  display: block;
+  border: none;
+  background: rgba(20, 20, 19, 0.18);
+  backdrop-filter: blur(2px);
+  z-index: 59;
+  cursor: pointer;
+}
+
+.chat-panel__floatbox--compact .todolist-bar--expanded,
+.chat-panel__floatbox--compact .fc-bar--expanded {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  right: auto;
+  bottom: auto;
+  width: min(92vw, 440px);
+  max-width: min(92vw, 440px);
+  max-height: min(68vh, 520px);
+  border-radius: 20px;
+  box-shadow: 0 18px 36px rgba(20, 20, 19, 0.16), 0 4px 14px rgba(20, 20, 19, 0.08);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  transform: translate(-50%, -50%);
+}
+
+.chat-panel__floatbox--compact .todolist-bar--expanded .todolist-bar__header,
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-bar__header {
+  min-height: 48px;
+  padding: 12px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--app-divider) 65%, transparent);
+}
+
+.chat-panel__floatbox--compact .todolist-bar--expanded .todolist-bar__current-step {
+  display: block;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-bar__count {
+  display: none;
+}
+
+.chat-panel__floatbox--compact .todolist-bar--expanded .todolist-bar__body,
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-bar__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-bar__toolbar {
+  flex-wrap: nowrap;
+  gap: 6px;
+  padding: 10px 12px 12px;
+  justify-content: flex-end;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-bar__toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-bar__toolbar-spacer {
+  display: none;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-bar__tool-btn {
+  flex: 0 0 auto;
+  min-height: 30px;
+  justify-content: center;
+  padding: 0 9px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--app-border) 78%, var(--app-accent) 22%);
+  background: color-mix(in srgb, var(--app-panel-bg) 94%, transparent);
+  box-shadow: 0 1px 2px rgba(20, 20, 19, 0.04);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-table {
+  font-size: 14px;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-table__name {
+  font-size: 14px;
+}
+
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-table__dir,
+.chat-panel__floatbox--compact .fc-bar--expanded .fc-table__status {
+  font-size: 12px;
+}
+
+/* ── 移动端适配 ── */
+@media (max-width: 767px) {
+  .diff-modal__header {
+    gap: 8px;
+    padding-right: 44px;
+  }
+
+  .diff-modal__path {
+    width: 100%;
+  }
+
+  .chat-panel__floatbox {
+    position: absolute;
+    left: auto;
+    right: 10px;
+    top: auto;
+    bottom: calc(100% + 2px);
+    width: auto;
+    gap: 8px;
+    padding-bottom: 0;
+    z-index: 24;
+    pointer-events: auto;
+    touch-action: auto;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .chat-panel__jump-bar {
+    left: 50%;
+    right: auto;
+    bottom: calc(100% + 2px);
+    justify-content: center;
+    transform: translateX(-50%);
+  }
+  .chat-panel__jump {
+    min-height: 32px;
+    padding: 0 9px;
+    font-size: 10.5px;
+    gap: 3px;
+  }
+  .chat-panel__jump-icon {
+    font-size: 11px;
+  }
+  .chat-panel__details,
+  .chat-panel__meta {
+    display: none;
+  }
+  .chat-panel__messages {
+    padding: 16px 12px;
+  }
+  .chat-panel__assistant-helper {
+    padding: 8px 0 0;
+  }
+  .chat-panel__composer-helper {
+    padding: 0 0 6px;
+  }
+  .chat-panel__composer {
+    --chat-panel-composer-inline-padding: 10px;
+    padding: 0 10px 6px;
+  }
+  .floatbox__cards {
+    margin: 0;
+    padding: 0;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    overflow: visible;
+  }
+  .floatbox__cards > * {
+    flex: 0 0 auto;
+    width: auto;
+  }
+  .todolist-bar-wrap,
+  .fc-bar-wrap {
+    position: relative;
+    flex: 0 0 auto;
+  }
+  .todolist-bar-wrap {
+    order: 2;
+  }
+  .fc-bar-wrap {
+    order: 1;
+  }
+  .todolist-bar,
+  .fc-bar {
+    margin: 0;
+    width: auto;
+    max-width: calc(100vw - 20px);
+    box-shadow: 0 6px 16px rgba(20, 20, 19, 0.06), 0 1px 4px rgba(20, 20, 19, 0.04);
+    backdrop-filter: blur(10px) saturate(1.03);
+  }
+  .todolist-bar:not(.todolist-bar--expanded),
+  .fc-bar:not(.fc-bar--expanded) {
+    width: 56px;
+    max-width: none;
+    border-radius: 999px;
+    opacity: 0.68;
+    transition: opacity 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  }
+  .todolist-bar:not(.todolist-bar--expanded):hover,
+  .fc-bar:not(.fc-bar--expanded):hover,
+  .todolist-bar-wrap--expanded .todolist-bar,
+  .fc-bar-wrap--expanded .fc-bar {
+    opacity: 0.98;
+  }
+  .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__header,
+  .fc-bar:not(.fc-bar--expanded) .fc-bar__header {
+    width: 56px;
+    min-height: 32px;
+    padding: 0 7px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+  }
+  .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__title,
+  .fc-bar:not(.fc-bar--expanded) .fc-bar__title,
+  .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__toggle,
+  .fc-bar:not(.fc-bar--expanded) .fc-bar__toggle,
+  .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__current-step,
+  .fc-bar:not(.fc-bar--expanded) .fc-bar__summary {
+    display: none;
+  }
+  .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__icon,
+  .fc-bar:not(.fc-bar--expanded) .fc-bar__icon {
+    width: 15px;
+    height: 15px;
+    font-size: 9px;
+  }
+  .todolist-bar:not(.todolist-bar--expanded) .todolist-bar__progress,
+  .fc-bar:not(.fc-bar--expanded) .fc-bar__count {
+    display: block;
+    min-height: 0;
+    padding: 0;
+    border: none;
+    background: transparent;
+    border-radius: 0;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--app-accent);
+    white-space: nowrap;
+  }
+  .todolist-bar__backdrop,
+  .fc-bar__backdrop {
+    position: fixed;
+    inset: 0;
+    display: block;
+    border: none;
+    background: rgba(20, 20, 19, 0.18);
+    backdrop-filter: blur(2px);
+    z-index: 59;
+    cursor: pointer;
+  }
+  .todolist-bar--expanded,
+  .fc-bar--expanded {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    right: auto;
+    bottom: auto;
+    width: min(92vw, 440px);
+    max-width: min(92vw, 440px);
+    max-height: min(68vh, 520px);
+    border-radius: 20px;
+    box-shadow: 0 18px 36px rgba(20, 20, 19, 0.16), 0 4px 14px rgba(20, 20, 19, 0.08);
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    transform: translate(-50%, -50%);
+  }
+  .todolist-bar--expanded .todolist-bar__header,
+  .fc-bar--expanded .fc-bar__header {
+    min-height: 48px;
+    padding: 12px 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--app-divider) 65%, transparent);
+  }
+  .todolist-bar--expanded .todolist-bar__current-step {
+    display: block;
+  }
+  .fc-bar--expanded .fc-bar__count {
+    display: none;
+  }
+  .todolist-bar--expanded .todolist-bar__body,
+  .fc-bar--expanded .fc-bar__body {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+  }
+  .fc-bar--expanded .fc-bar__toolbar {
+    flex-wrap: nowrap;
+    gap: 6px;
+    padding: 10px 12px 12px;
+    justify-content: flex-end;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .fc-bar--expanded .fc-bar__toolbar::-webkit-scrollbar {
+    display: none;
+  }
+  .fc-bar--expanded .fc-bar__toolbar-spacer {
+    display: none;
+  }
+  .fc-bar--expanded .fc-bar__tool-btn {
+    flex: 0 0 auto;
+    min-height: 30px;
+    justify-content: center;
+    padding: 0 9px;
+    border-radius: 9px;
+    border: 1px solid color-mix(in srgb, var(--app-border) 78%, var(--app-accent) 22%);
+    background: color-mix(in srgb, var(--app-panel-bg) 94%, transparent);
+    box-shadow: 0 1px 2px rgba(20, 20, 19, 0.04);
+    font-size: 10.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .fc-bar--expanded .fc-table {
+    font-size: 14px;
+  }
+  .fc-bar--expanded .fc-table__name {
+    font-size: 14px;
+  }
+  .fc-bar--expanded .fc-table__dir {
+    font-size: 12px;
+  }
+  .fc-bar--expanded .fc-table__status {
+    font-size: 12px;
+  }
+  .fc-bar--expanded .fc-table__actions {
+    gap: 8px;
+  }
+  .fc-bar--expanded .fc-table__action {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+  }
+  .fc-bar--expanded .fc-table__action--commit,
+  .fc-bar--expanded .fc-table__action--danger,
+  .fc-bar--expanded .fc-table__action--accepted {
+    display: none;
+  }
+
+  /* fc-table 5列 → 隐藏 status/dir 列宽 */
+  .fc-table {
+    grid-template-columns: 22px 0px minmax(60px, 1fr) 0px 60px;
+  }
+  .fc-table__status,
+  .fc-table__dir {
+    overflow: hidden;
+    width: 0;
+    padding: 0;
+    font-size: 0;
+  }
+}

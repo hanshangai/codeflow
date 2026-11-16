@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "allowImportingTsExtensions": true,
+    "paths": { "@codeflowai/shared": ["./packages/shared/src/index.ts"], "@codeflowai/shared/*": ["./packages/shared/src/*"], "@/*": ["./apps/web/src/*"] }
+  },
+  "include": ["tests/**/*.ts", "apps/web/src/env.d.ts"]
+}

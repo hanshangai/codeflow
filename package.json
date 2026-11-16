@@ -1,0 +1,32 @@
+{
+  "name": "codeflow",
+  "version": "2026.11.13.07",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.14.0",
+  "engines": { "node": ">=22.16.0 <23 || >=24 <25" },
+  "scripts": {
+    "dev:web": "pnpm --filter @codeflowai/web dev",
+    "dev:client": "pnpm --filter @codeflowai/client dev",
+    "dev:desktop": "pnpm --filter @codeflowai/desktop dev",
+    "build": "pnpm --filter @codeflowai/shared build && pnpm --filter @codeflowai/client build && pnpm --filter @codeflowai/web build && pnpm --filter @codeflowai/desktop build",
+    "build:desktop": "pnpm --filter @codeflowai/desktop build",
+    "typecheck": "pnpm --filter @codeflowai/shared typecheck && pnpm --filter @codeflowai/client typecheck && pnpm --filter @codeflowai/web typecheck && pnpm --filter @codeflowai/desktop typecheck",
+    "typecheck:tests": "tsc -p tsconfig.json --noEmit",
+    "lint": "pnpm typecheck",
+    "test": "pnpm test:web:unit && pnpm test:client:unit && pnpm test:desktop:unit && pnpm test:shared:unit && pnpm test:root",
+    "test:desktop:unit": "pnpm --filter @codeflowai/desktop test",
+    "test:web:unit": "node --conditions=development --import tsx --test --test-concurrency=1 \"apps/web/tests/**/*.test.ts\"",
+    "test:client:unit": "node --conditions=development --import tsx --test --test-concurrency=1 \"apps/desktop/client/tests/**/*.test.ts\"",
+    "test:shared:unit": "node --conditions=development --import tsx --test --test-concurrency=1 \"tests/shared/**/*.test.ts\" \"packages/shared/tests/**/*.test.ts\"",
+    "test:root": "node --conditions=development --import tsx --test --test-concurrency=1 \"tests/client/**/*.test.ts\" \"tests/web/**/*.test.ts\" \"tests/integration/**/*.test.ts\" \"tests/contracts/**/*.test.ts\" \"tests/contracts/**/*.test.mjs\"",
+    "test:web": "pnpm --filter @codeflowai/web typecheck && pnpm --filter @codeflowai/web typecheck:tests && pnpm test:web:unit && pnpm --filter @codeflowai/web test:e2e",
+    "release:desktop": "node tools/release/desktop-release.mjs"
+  },
+  "pnpm": {
+    "overrides": { "pino>thread-stream": "4.2.0", "thread-stream@4.2.0>real-require": "1.0.0" },
+    "onlyBuiltDependencies": ["esbuild", "core-js", "node-pty", "@napi-rs/keyring"]
+  },
+  "devDependencies": { "@types/node": "25.2.2", "playwright": "^1.61.1", "tsx": "^4.19.0", "typescript": "^5.8.3" }
+}
