@@ -7,6 +7,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { readDeviceIdentity } from "./deviceIdentity.js";
+import { GENERATED_FILES } from "./desktopRemovalPaths.js";
 
 const APP_ID = "ai.codeflow.codeflowai";
 const LOCATOR = "desktop-data-location.json";
@@ -158,9 +159,11 @@ export async function resolveDesktopStorageLocation(input: { userDataDir: string
   await assertLocation(selectedLocation);
   if (record === null) {
     try {
-      const names = await fs.readdir(selectedLocation.dataDir);
-      if (names.some(name => name !== "workspace")) fail("DESKTOP_STORAGE_LOCATION_REQUIRED");
-      if (names.length) assertDesktopEmptyStorage(selectedLocation);
+      const names = await fs.readdir(selectedLocation.dataDir), defaultRuntime = isDefaultRuntimeDataDir(selectedLocation);
+      // 无定位时保留原有 LOCATION_REQUIRED 语义；默认 runtime 仅额外接受登记前自身条目。
+      if ((!defaultRuntime && names.some(name => name !== "workspace"))
+        || (defaultRuntime && names.some(name => !isUnregisteredRuntimeEntry(name)))) fail("DESKTOP_STORAGE_LOCATION_REQUIRED");
+      if (names.length) assertDesktopUnregisteredStorage(selectedLocation);
     }
     catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; }
   }
@@ -182,20 +185,62 @@ export async function rebindDesktopInstallRoot(location: DesktopStorageLocation)
   await assertExpected(location, false);
 }
 
-/** 双 null 时必须无应用数据；仅保留普通默认工作区目录，不遍历或删除项目。 */
-export function assertDesktopEmptyStorage(location: DesktopStorageLocation, allowMissing = false): void {
+type StorageEntryKind = "file" | "directory";
+/** 空存储允许项：仅默认 workspace 目录。 */
+const EMPTY_STORAGE_ENTRIES: ReadonlyMap<string, StorageEntryKind> = new Map([["workspace", "directory"]]);
+/** 身份未登记时应用自身可能创建的条目；仅默认 runtime 允许。 */
+const UNREGISTERED_RUNTIME_ENTRIES: ReadonlyMap<string, StorageEntryKind> = new Map([
+  ["workspace", "directory"], ["logs", "directory"], [".shell-update-file-auth", "directory"],
+  ["device-identity.json", "file"], ["errors.jsonl", "file"], ["update-receipts.jsonl", "file"],
+  ...GENERATED_FILES.map(name => [name, "file"] as const),
+]);
+
+/** Windows 文件名大小写不敏感；其他平台按原文匹配。 */
+function storageEntryKey(name: string): string {
+  return process.platform === "win32" ? name.toLowerCase() : name;
+}
+
+/** 目标条目类型；已知文件的原子写临时件按固定后缀识别，不接纳任意未知名称。 */
+function allowedStorageEntryKind(allowed: ReadonlyMap<string, StorageEntryKind>, name: string): StorageEntryKind | undefined {
+  const key = storageEntryKey(name), kind = allowed.get(key);
+  if (kind) return kind;
+  const temp = key.match(/^(.+)\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/u);
+  return temp && allowed.get(temp[1]!) === "file" ? "file" : undefined;
+}
+
+/** 双 null 身份时只允许 allowed 指定的应用自身条目，并逐项校验类型与非链接。 */
+export function assertDesktopEmptyStorage(location: DesktopStorageLocation, allowMissing = false,
+  allowed: ReadonlyMap<string, StorageEntryKind> = EMPTY_STORAGE_ENTRIES): void {
   if (location.clientId !== null || location.deviceId !== null) fail("DESKTOP_STORAGE_EMPTY_REQUIRED");
   let stat: BigIntStats;
   try { stat = syncFs.lstatSync(location.dataDir, { bigint: true }); }
   catch (cause) { if (allowMissing && (cause as NodeJS.ErrnoException | null)?.code === "ENOENT") return; throw cause; }
   if (!stat.isDirectory() || stat.isSymbolicLink()) fail("DESKTOP_STORAGE_EMPTY_REQUIRED");
   removalRoot(location.dataDir);
-  const names = syncFs.readdirSync(location.dataDir);
-  if (names.some(name => name !== "workspace")) fail("DESKTOP_STORAGE_EMPTY_REQUIRED");
-  if (names.length) {
-    const workspace = syncFs.lstatSync(path.join(location.dataDir, "workspace"));
-    if (!workspace.isDirectory() || workspace.isSymbolicLink()) fail("DESKTOP_STORAGE_EMPTY_REQUIRED");
+  for (const name of syncFs.readdirSync(location.dataDir)) {
+    const kind = allowedStorageEntryKind(allowed, name);
+    if (!kind) fail("DESKTOP_STORAGE_EMPTY_REQUIRED");
+    const entry = syncFs.lstatSync(path.join(location.dataDir, name));
+    if (entry.isSymbolicLink() || (kind === "directory" ? !entry.isDirectory() : !entry.isFile())) {
+      fail("DESKTOP_STORAGE_EMPTY_REQUIRED");
+    }
   }
+}
+
+/** 默认数据目录（userDataDir/runtime）；配置到其他目录时不得放宽。 */
+function isDefaultRuntimeDataDir(location: DesktopStorageLocation): boolean {
+  const runtime = path.resolve(location.userDataDir, "runtime"), selected = path.resolve(location.dataDir);
+  return process.platform === "win32" ? selected.toLowerCase() === runtime.toLowerCase() : selected === runtime;
+}
+
+/** 身份未登记时：默认 runtime 允许应用登记前创建的已知条目，其他数据目录仍要求为空。 */
+export function assertDesktopUnregisteredStorage(location: DesktopStorageLocation, allowMissing = false): void {
+  assertDesktopEmptyStorage(location, allowMissing, isDefaultRuntimeDataDir(location) ? UNREGISTERED_RUNTIME_ENTRIES : EMPTY_STORAGE_ENTRIES);
+}
+
+/** 默认 runtime 的条目是否属于已知自身文件；用于保留 LOCATION_REQUIRED 语义。 */
+function isUnregisteredRuntimeEntry(name: string): boolean {
+  return allowedStorageEntryKind(UNREGISTERED_RUNTIME_ENTRIES, name) !== undefined;
 }
 
 /** 安装仅登记同一六字段定位；门禁先于目录与文件写入，既有 custom 原样返回。 */
@@ -209,13 +254,13 @@ export async function registerDesktopInstallation(input: { userDataDir: string; 
   if (input.beforePersist) await input.beforePersist(location);
   else if (await readDesktopJsonFile(path.join(userDataDir, "desktop-uninstall-result.json")) !== null) fail("DESKTOP_STORAGE_LOCATION_REQUIRED");
   if (current !== null) { await assertExpected(location, false); return location; }
-  assertDesktopEmptyStorage(location, true);
-  await fs.mkdir(userDataDir, { recursive: true }); assertDesktopEmptyStorage(location, true);
-  await assertDesktopStoragePath(userDataDir); assertDesktopEmptyStorage(location, true);
-  await fs.mkdir(location.dataDir, { recursive: true }); assertDesktopEmptyStorage(location);
-  await assertLocation(location); assertDesktopEmptyStorage(location);
-  await writeLocator(location, location, true, () => assertDesktopEmptyStorage(location));
-  assertDesktopEmptyStorage(location); return location;
+  assertDesktopUnregisteredStorage(location, true);
+  await fs.mkdir(userDataDir, { recursive: true }); assertDesktopUnregisteredStorage(location, true);
+  await assertDesktopStoragePath(userDataDir); assertDesktopUnregisteredStorage(location, true);
+  await fs.mkdir(location.dataDir, { recursive: true }); assertDesktopUnregisteredStorage(location);
+  await assertLocation(location); assertDesktopUnregisteredStorage(location);
+  await writeLocator(location, location, true, () => assertDesktopUnregisteredStorage(location));
+  assertDesktopUnregisteredStorage(location); return location;
 }
 
 /** 根重绑只改 installRoot，Record 回调负责唯一 keep 授权和写序。 */

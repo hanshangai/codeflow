@@ -235,6 +235,7 @@ export type DesktopApiMethod =
   | "threads.messages.delete"
   | "orch.chat.get"
   | "orch.chat.settings"
+  | "orch.chat.prepare"
   | "orch.chat.action"
   | "orch.chat.natural"
   | "orch.chat.rework"

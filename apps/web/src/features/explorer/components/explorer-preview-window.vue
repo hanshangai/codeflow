@@ -639,6 +639,11 @@ function onWindowMousedown(e: MouseEvent) {
   max-height: 100% !important;
 }
 
+/* 补齐 Ant Design 焦点容器的高度，让自定义外壳的百分比高度沿全屏弹框传递。 */
+:global(.explorer-preview-modal--desktop-fullscreen .ant-modal > div:first-child) {
+  height: 100%;
+}
+
 :global(.explorer-preview-modal--fullscreen .ant-modal-content) {
   display: flex;
   flex-direction: column;

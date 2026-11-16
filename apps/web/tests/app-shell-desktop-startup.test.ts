@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
 import { createPinia, setActivePinia } from "pinia";
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import type { DesktopBridgeApi, DesktopRuntimeState } from "@codeflowai/shared";
 import { useConfigStore } from "../src/store/config.ts";
 import { useWorkspacesStore } from "../src/store/workspaces.ts";
@@ -39,8 +39,8 @@ function fixture(t: test.TestContext, options: { workspaces?: number; failure?: 
   const readinessCode = shell.body!.statements.filter(statement => ts.isVariableStatement(statement)
     && statement.declarationList.declarations.some(declaration => ["localWorkspaceReady", "currentWorkspaceReady"].includes(declaration.name.getText(ast))))
     .map(statement => statement.getText(ast)).join("\n");
-  const workspaceReady = new Function("config", "computed", "isDesktopWorkspace",
-    ts.transpile(`${readinessCode}\nreturn currentWorkspaceReady;`, { target: ts.ScriptTarget.ES2022 }))(config, computed, isDesktopWorkspace);
+  const workspaceReady = new Function("config", "computed", "isDesktopWorkspace", "desktopStartupComplete",
+    ts.transpile(`${readinessCode}\nreturn currentWorkspaceReady;`, { target: ts.ScriptTarget.ES2022 }))(config, computed, isDesktopWorkspace, startupComplete);
   const refreshAfterConnect = shell.body!.statements.find(statement => ts.isFunctionDeclaration(statement)
     && statement.name?.text === "refreshWorkspaceListAfterConnect");
   assert.ok(refreshAfterConnect);
@@ -168,6 +168,31 @@ test("首次目录仍在读取时轮询复用原在途初始化，不重复加�
   assert.equal(f.refreshes(), 1);
   assert.equal(f.startupComplete.value, true);
   assert.equal(f.events.filter(event => event === "workspaces").length, 1);
+});
+
+test("恢复上次工作区时目录完成前不激活会话，完成后断云也自动触发首次列表加载", async t => {
+  let finish!: () => void;
+  const directory = new Promise<void>(resolve => { finish = resolve; });
+  t.after(() => finish());
+  const f = fixture(t, { realDirectory: true, directory });
+  f.config.workspaceId = "local:workspace";
+  const directoryStore = useWorkspacesStore();
+  const activations: boolean[] = [];
+  const stop = watch(() => f.workspaceReady.value, ready => {
+    if (ready) activations.push(directoryStore.byId.has(f.config.workspaceId));
+  });
+  t.after(stop);
+  await f.settle(); f.release(); await f.poll();
+  assert.equal(f.config.localRuntimeReady, true);
+  assert.equal(f.startupComplete.value, false);
+  assert.equal(f.workspaceReady.value, false, "runtime.info就绪不能抢在首次目录前激活会话");
+  assert.deepEqual(activations, []);
+  finish(); await f.settle();
+  assert.equal(f.config.connected, false);
+  assert.equal(f.workspaceReady.value, true);
+  assert.deepEqual(activations, [true], "目录完成且工作区ID不变也应自动激活一次");
+  await f.poll();
+  assert.deepEqual(activations, [true], "相同运行态轮询不能重复加载列表");
 });
 
 test("真实列表在首次 IPC 读取中切换账号时，取消不得完成启动或打开设置", async t => {

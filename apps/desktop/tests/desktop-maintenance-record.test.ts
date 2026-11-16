@@ -13,7 +13,7 @@ import { assertDesktopMaintenanceStartup, DesktopMaintenanceStartupError } from 
 import { prepareDesktopReinstall, finishDesktopReinstall } from "../src/desktopMaintenanceRecord.js";
 import * as maintenance from "../src/desktopMaintenanceRecord.js";
 import { resolveDesktopStorageLocation, persistDesktopStorageLocation, completeDesktopStorageLocation,
-  completeDesktopReinstallLocation, registerDesktopInstallation } from "../src/desktopStorageLocation.js";
+  completeDesktopReinstallLocation, registerDesktopInstallation, assertDesktopUnregisteredStorage } from "../src/desktopStorageLocation.js";
 
 const OLD_DEVICE = "d50fcfbe-f82a-43b9-ab7e-656af07a9a45";
 const NEXT_DEVICE = "16e38f2a-0640-49b0-a871-a897e5fcae81";
@@ -1399,4 +1399,51 @@ test("empty completed history rejects the same request under a different mainten
   await maintenance.completeDesktopMaintenance(input, authorized);
   await assert.rejects(maintenance.beginDesktopMaintenance({ ...input, mode: "remove" }), error => error instanceof DesktopMaintenanceStartupError && error.code === "DESKTOP_MAINTENANCE_PENDING");
   const same = await maintenance.beginDesktopMaintenance(input); assert.equal(same.phase, "completed"); assert.equal(same.mode, "keep");
+});
+
+/** 首次启动未完成登记时，默认 runtime 会留下应用自身文件；卸载维护不能因此永久阻塞。 */
+for (const mode of ["keep", "remove"] as const) test(`pre-registration runtime entries allow ${mode} maintenance`, async t => {
+  const f = await fixture(t), location = await registerDesktopInstallation({ userDataDir: f.userDataDir, installRoot: f.location.installRoot });
+  for (const name of ["workspace", "logs", ".shell-update-file-auth"]) await fs.mkdir(path.join(location.dataDir, name), { recursive: true });
+  for (const name of ["device-identity.json", "crash-session.json", "crash-session.clean.json", "crash-reports.jsonl", "errors.jsonl"]) {
+    await fs.writeFile(path.join(location.dataDir, name), "{}");
+  }
+  const input = { userDataDir: f.userDataDir, location, requestId: `pre-registration:${mode}`, mode };
+  const started = await maintenance.beginDesktopMaintenance(input);
+  assert.equal(started.clientId, null); assert.equal(started.oldDeviceId, null);
+  const authorized = await maintenance.authorizeDesktopMaintenance(input, started);
+  const resumed = await maintenance.readDesktopMaintenanceStartup({ userDataDir: f.userDataDir, installRoot: f.location.installRoot,
+    requestId: input.requestId, mode, resumePending: true });
+  assert.equal(resumed?.kind, "authorized");
+  await maintenance.completeDesktopMaintenance(input, authorized);
+  const completed = JSON.parse(await fs.readFile(f.filePath, "utf8"));
+  assert.equal(completed.phase, "completed");
+  await assert.rejects(fs.lstat(path.join(f.userDataDir, "desktop-data-location.json")), { code: "ENOENT" });
+  assert.deepEqual((await fs.readdir(location.dataDir)).sort(),
+    [".shell-update-file-auth", "crash-reports.jsonl", "crash-session.clean.json", "crash-session.json", "device-identity.json", "errors.jsonl", "logs", "workspace"].sort());
+  // 卸载后重新解析与重装登记必须能复用默认 runtime，而不是再次被空存储门禁阻塞。
+  assert.equal((await resolveDesktopStorageLocation({ userDataDir: f.userDataDir, installRoot: f.location.installRoot })).dataDir, location.dataDir);
+  assert.equal((await registerDesktopInstallation({ userDataDir: f.userDataDir, installRoot: f.location.installRoot,
+    beforePersist: async () => {} })).dataDir, location.dataDir);
+});
+
+test("maintenance storage guard keeps strict empty checks for unknown entries, links and custom data dirs", async t => {
+  const f = await fixture(t), defaultRuntime = path.join(f.userDataDir, "runtime");
+  await fs.mkdir(defaultRuntime, { recursive: true });
+  await fs.writeFile(path.join(defaultRuntime, "device-identity.json"), "{}");
+  await fs.writeFile(path.join(defaultRuntime, "errors.jsonl"), "{}");
+  await fs.writeFile(path.join(defaultRuntime, `device-identity.json.${process.pid}.${NEXT_DEVICE}.tmp`), "{}");
+  assert.doesNotThrow(() => assertDesktopUnregisteredStorage({ ...f.location, dataDir: defaultRuntime }));
+  await fs.writeFile(path.join(defaultRuntime, "codeflowai.db"), "x");
+  assert.throws(() => assertDesktopUnregisteredStorage({ ...f.location, dataDir: defaultRuntime }),
+    error => (error as { code?: unknown }).code === "DESKTOP_STORAGE_EMPTY_REQUIRED");
+  await fs.unlink(path.join(defaultRuntime, "codeflowai.db"));
+  await fs.writeFile(path.join(defaultRuntime, "workspace"), "not a directory");
+  assert.throws(() => assertDesktopUnregisteredStorage({ ...f.location, dataDir: defaultRuntime }),
+    error => (error as { code?: unknown }).code === "DESKTOP_STORAGE_EMPTY_REQUIRED");
+  const custom = path.join(f.root, "custom-data");
+  await fs.mkdir(custom);
+  await fs.writeFile(path.join(custom, "device-identity.json"), "{}");
+  assert.throws(() => assertDesktopUnregisteredStorage({ ...f.location, dataDir: custom }),
+    error => (error as { code?: unknown }).code === "DESKTOP_STORAGE_EMPTY_REQUIRED");
 });

@@ -6,7 +6,7 @@ import { readDeviceIdentity, removeDesktopDeviceIdentity } from "./deviceIdentit
 import { GENERATED_FILES, REMOVE_FILES, REMOVE_DIRECTORIES } from "./desktopRemovalPaths.js";
 import { assertDesktopStoragePath, readDesktopJsonFile, verifyDesktopReinstallStorage, verifyDesktopStorageLocation,
   assertDesktopRemovalRoots, inspectDesktopRemovalRoots, verifyDesktopRemovalLocation, removeDesktopStorageLocation,
-  assertDesktopEmptyStorage, rebindDesktopStorageLocation,
+  assertDesktopUnregisteredStorage, rebindDesktopStorageLocation,
   type DesktopStorageLocation, type DesktopReinstallAuthorization, type DesktopRemovalRoots } from "./desktopStorageLocation.js";
 
 export type MaintenanceMode = "keep" | "remove";
@@ -75,10 +75,10 @@ export async function beginDesktopMaintenance(input: MaintenanceInput & { reques
         assertMaintenanceContext(input, previous);
         if (previous.phase === "completed") { await assertRecordCurrent(userDataDir, previous); return previous; }
         await verifyEmptyMaintenance(input, previous, previous.phase === "data_action_authorized");
-        await assertRecordCurrent(userDataDir, previous); assertDesktopEmptyStorage(location); return previous;
+        await assertRecordCurrent(userDataDir, previous); assertDesktopUnregisteredStorage(location); return previous;
       }
       await verifyEmptyMaintenance(input, started, false);
-      await replaceRecord(userDataDir, previous, started, undefined, () => assertDesktopEmptyStorage(location));
+      await replaceRecord(userDataDir, previous, started, undefined, () => assertDesktopUnregisteredStorage(location));
       return started;
     }
     const historical = previous?.phase === "completed" && (previous.mode === "remove" || previous.clientId === null);
@@ -117,11 +117,11 @@ export async function authorizeDesktopMaintenance(input: MaintenanceInput, value
     assertMaintenanceContext(input, record);
     if (record.phase !== "started") throw new DesktopMaintenanceStartupError("DESKTOP_MAINTENANCE_PHASE_INVALID", details);
     if (record.clientId === null) {
-      await assertRecordCurrent(input.userDataDir, record); assertDesktopEmptyStorage(input.location);
+      await assertRecordCurrent(input.userDataDir, record); assertDesktopUnregisteredStorage(input.location);
       const roots = await verifyEmptyMaintenance(input, record, false);
       const authorized: MaintenanceRecord = { ...record, phase: "data_action_authorized", authorizedPaths: ["userDataDir/desktop-data-location.json"], removalRoots: roots };
       await replaceRecord(input.userDataDir, record, authorized, undefined, () => {
-        assertDesktopRemovalRoots(input.location, roots); assertDesktopEmptyStorage(input.location);
+        assertDesktopRemovalRoots(input.location, roots); assertDesktopUnregisteredStorage(input.location);
       });
       return authorized;
     }
@@ -161,11 +161,11 @@ export async function completeDesktopMaintenance(input: MaintenanceInput, value:
     if (record.clientId === null) {
       if (record.phase === "completed") return;
       const roots = await verifyEmptyMaintenance(input, record, true);
-      await removeDesktopStorageLocation(input.location, roots, record.requestId, () => assertDesktopEmptyStorage(input.location));
-      assertDesktopRemovalRoots(input.location, roots); assertDesktopEmptyStorage(input.location);
+      await removeDesktopStorageLocation(input.location, roots, record.requestId, () => assertDesktopUnregisteredStorage(input.location));
+      assertDesktopRemovalRoots(input.location, roots); assertDesktopUnregisteredStorage(input.location);
       const completed = { ...record, phase: "completed" as const }; delete completed.authorizedPaths; delete completed.removalRoots;
       await replaceRecord(input.userDataDir, record, completed, undefined, () => {
-        assertDesktopRemovalRoots(input.location, roots); assertDesktopEmptyStorage(input.location);
+        assertDesktopRemovalRoots(input.location, roots); assertDesktopUnregisteredStorage(input.location);
         if (removalStat(path.join(input.userDataDir, "desktop-data-location.json"))
           || syncFs.readdirSync(input.userDataDir).some(name => name.toLowerCase().startsWith("desktop-data-location.json."))) {
           throw new DesktopMaintenanceStartupError("DESKTOP_MAINTENANCE_REMOVE_INCOMPLETE", details);
@@ -222,12 +222,12 @@ function assertMaintenanceContext(input: MaintenanceInput, record: MaintenanceRe
   }
 }
 
-/** 空安装不打开数据库或读取 D13；每个异步返回点必须仍为同根确空。 */
+/** 空安装不打开数据库或读取 D13；每个异步返回点必须仍为同根，且默认 runtime 仅接受已知自身条目。 */
 async function verifyEmptyMaintenance(input: MaintenanceInput, record: MaintenanceRecord, allowMissingLocator: boolean): Promise<DesktopRemovalRoots> {
-  assertMaintenanceContext(input, record); assertDesktopEmptyStorage(input.location);
+  assertMaintenanceContext(input, record); assertDesktopUnregisteredStorage(input.location);
   const roots = record.removalRoots ?? await inspectDesktopRemovalRoots(input.location);
-  const guard = () => { assertDesktopRemovalRoots(input.location, roots); assertDesktopEmptyStorage(input.location); };
-  guard(); await verifyDesktopRemovalLocation(input.location, roots, allowMissingLocator, () => assertDesktopEmptyStorage(input.location)); guard();
+  const guard = () => { assertDesktopRemovalRoots(input.location, roots); assertDesktopUnregisteredStorage(input.location); };
+  guard(); await verifyDesktopRemovalLocation(input.location, roots, allowMissingLocator, () => assertDesktopUnregisteredStorage(input.location)); guard();
   return roots;
 }
 
@@ -587,11 +587,11 @@ export async function readDesktopMaintenanceStartup(input: { userDataDir: string
     }
     const location: DesktopStorageLocation = { schemaVersion: 1, appId: "ai.codeflow.codeflowai", installRoot: record.installRoot,
       dataDir: record.dataDir, userDataDir: input.userDataDir, clientId: record.clientId, deviceId: record.oldDeviceId };
-    await verifyDesktopRemovalLocation(location, record.removalRoots!, true, record.clientId === null ? () => assertDesktopEmptyStorage(location) : undefined);
+    await verifyDesktopRemovalLocation(location, record.removalRoots!, true, record.clientId === null ? () => assertDesktopUnregisteredStorage(location) : undefined);
     assertDesktopRemovalRoots(location, record.removalRoots!);
-    if (record.clientId === null) assertDesktopEmptyStorage(location);
+    if (record.clientId === null) assertDesktopUnregisteredStorage(location);
     await assertRecordCurrent(input.userDataDir, record); assertDesktopRemovalRoots(location, record.removalRoots!);
-    if (record.clientId === null) assertDesktopEmptyStorage(location);
+    if (record.clientId === null) assertDesktopUnregisteredStorage(location);
     return { kind: "authorized", record, location };
   } catch (cause) {
     if (details) throw maintenanceFailure(cause, details, "DESKTOP_REMOVE_MAINTENANCE_FAILED");

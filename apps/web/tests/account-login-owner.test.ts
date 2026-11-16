@@ -146,14 +146,14 @@ function submitLogin(result: object | Error, takeOver = false) {
   const submitting = ref(false);
   const code = ts.transpile(source.slice(start, end), { target: ts.ScriptTarget.ES2022 });
   const submit = new Function("config", "account", "prepareLoginSubmit", "submitting", "form", "captchaEnabled", "captchaToken", "setError",
-    "openCaptchaModal", "clearError", "lockedUntil", "resetCaptchaAfterLoginFailure", "trackProductEventWithEmail", "message", "router", "route",
+    "clearError", "lockedUntil", "resetCaptchaAfterLoginFailure", "trackProductEventWithEmail", "message", "router", "route",
     "resolvePostLoginTarget", "createCancelledRequestError", "isCancelledRequestError", code + "\nreturn submit;")(
     config, { login: async () => {
       if (result instanceof Error) throw result;
       if (takeOver) queueMicrotask(() => { config.sessionToken = "session-B"; config.userSummary = { userId: "B" }; });
       return result;
     } }, () => {}, submitting, { email: "A@example.test", password: "test" }, false, ref(""),
-    () => events.push("error"), () => events.push("captcha"), () => {}, ref(0), async () => events.push("reset-captcha"),
+    () => events.push("error"), () => {}, ref(0), () => events.push("reset-captcha"),
     (name: string) => events.push(name), { success: () => events.push("success") }, { push: async () => { events.push("navigate"); } },
     { query: {} }, () => "/chat", createCancelledRequestError, isCancelledRequestError,
   ) as () => Promise<any>;

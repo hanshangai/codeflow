@@ -33,6 +33,8 @@ const REMOTE_ACCOUNT_TASK_METHODS = new Set<string>([
   "fs.tree", "fs.search", "fs.stat", "fs.readFile", "fs.spreadsheetPreview", "fs.documentPreview", "fs.downloadFile",
   "git.status", "git.diff", "git.diffFiles", "git.log", "git.show", "git.showFileDiff", "git.branch.list",
   "reminders.workspaceSummaries", "reminders.items", "reminders.markRead", "reminders.ignore",
+  "orch.chat.get", "orch.chat.settings", "orch.chat.prepare", "orch.chat.action",
+  "orch.chat.natural", "orch.chat.rework", "orch.chat.delete",
   "orch.roles.list", "orch.roles.upsert", "orch.roles.delete",
   "orch.workflows.list", "orch.workflows.upsert", "orch.workflows.delete",
   "orch.knowledgeBundles.list", "orch.knowledgeBundles.upsert", "orch.knowledgeBundles.delete",
@@ -109,6 +111,14 @@ export async function executeDesktopAccountTaskRequest(ctx: ApiHandlerContext, r
     if (req.method === "threads.list" && forwardedBody.actorUserId !== undefined) {
       if (String(forwardedBody.actorUserId ?? "").trim() !== input.owner.ownerUserId) return reject(400, "BAD_REQUEST", "任务请求参数无效");
       delete forwardedBody.actorUserId;
+    }
+    // 会话工作流的 Server 身份与执行范围由本机重新解析；身份不一致视为伪造，其余字段剔除后交给原桌面校验。
+    if (req.method.startsWith("orch.chat.")) {
+      if (forwardedBody.actorUserId !== undefined && String(forwardedBody.actorUserId ?? "").trim() !== input.owner.ownerUserId)
+        return reject(400, "BAD_REQUEST", "任务请求参数无效");
+      delete forwardedBody.actorUserId;
+      delete forwardedBody.executionProfileScope;
+      delete forwardedBody.sharedRequirementContext;
     }
     const result = await executeDesktopApiRequest(ctx, { method: req.method as DesktopApiRequest["method"], body: forwardedBody },
       { requestId: req.id, clientVersion: input.clientVersion, startedAt: input.startedAt });

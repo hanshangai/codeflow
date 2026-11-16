@@ -1787,7 +1787,7 @@ function describeWorkflowFailure(source: unknown): { code: string; requestId: st
   return { code: source.code, requestId: requestId || null };
 }
 
-/** 读取当前可连接会话的工作流偏好；只采纳最新请求，失败保持原状态并显式报错。 */
+/** 读取当前可连接会话的工作流偏好；只采纳最新请求，失败保持原状态并局部提示，不升级为应用级错误。 */
 async function refreshWorkflowPreference(): Promise<void> {
   const version = ++workflowPrefVersion;
   const workspaceId = props.workspaceId;
@@ -1804,8 +1804,7 @@ async function refreshWorkflowPreference(): Promise<void> {
   } catch (error) {
     if (version !== workflowPrefVersion || workspaceId !== props.workspaceId || threadId !== props.threadId) return;
     console.warn("[chat-recommendation.read.failed]", { ...describeWorkflowFailure(error), workspaceId, threadId, error });
-    message.error(error instanceof Error ? `工作流状态读取失败：${error.message}` : "工作流状态读取失败");
-    throw error;
+    message.warning(error instanceof Error ? `工作流状态读取失败：${error.message}` : "工作流状态读取失败");
   }
 }
 

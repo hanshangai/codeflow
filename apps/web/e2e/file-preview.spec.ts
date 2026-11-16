@@ -24,6 +24,49 @@ test.describe("资源预览", () => {
     await request.post("http://127.0.0.1:39290/api/test/reset");
   });
 
+  for (const desktop of [true, false]) {
+    test(`FP-05 ${desktop ? "桌面" : "Web"}全屏预览铺满可用高度并随视口调整`, async ({ page }) => {
+      page.on("pageerror", error => { throw error; });
+      // 挂载真实预览组件与应用样式，仅替换桌面宿主边界。
+      await page.route("**/__preview-layout", route => route.fulfill({ contentType: "text/html", body: `
+        <!doctype html><html><head><meta charset="utf-8"></head><body><div id="fixture"></div>
+        <script type="module">
+          import { createApp, h } from '/node_modules/.vite/deps/vue.js';
+          import { createPinia } from '/node_modules/.vite/deps/pinia.js';
+          import Antd from '/node_modules/.vite/deps/ant-design-vue.js';
+          import Preview from '/src/features/explorer/components/explorer-preview-window.vue';
+          import { useConfigStore } from '/src/store/config.ts';
+          import '/src/App.vue?vue&type=style&index=0&lang.css';
+          import '/src/styles.css';
+          ${desktop ? "window.codeflowDesktop = { request: async () => { throw new Error('Unexpected desktop request'); }, getState: async () => ({ status: 'ready' }) };" : ""}
+          const win = { id: 'layout', filePath: 'README.md', type: 'file', previewType: 'markdown',
+            content: '# CodeFlow', base64: null, mimeType: null, diffOriginal: null, diffModified: null,
+            diffStaged: false, diffVersionOld: null, diffVersionNew: null, cascadeIndex: 0, zIndex: 0 };
+          const pinia = createPinia();
+          const app = createApp({ render: () => h(Preview, { win }) }).use(pinia).use(Antd);
+          useConfigStore(pinia);
+          app.mount('#fixture');
+        </script></body></html>` }));
+      await page.goto("/__preview-layout");
+      const content = page.locator(".explorer-preview-modal .ant-modal-content");
+      await page.getByRole("button", { name: "全屏查看", exact: true }).click();
+      for (const height of [900, 720, 1080]) {
+        await page.setViewportSize({ width: 1440, height });
+        await expect.poll(async () => {
+          const bounds = await content.boundingBox();
+          return bounds && { top: Math.round(bounds.y), bottom: Math.round(bounds.y + bounds.height) };
+        }).toEqual({ top: desktop ? 44 : 0, bottom: height });
+        await expect.poll(async () => {
+          const bounds = await page.locator(".preview-window__content").boundingBox();
+          return bounds && Math.round(bounds.y + bounds.height);
+        }).toBe(height);
+      }
+      await page.getByRole("button", { name: "退出全屏", exact: true }).click();
+      await expect(page.locator(".explorer-preview-modal--fullscreen")).toHaveCount(0);
+      await expect.poll(async () => (await content.boundingBox())?.height).toBeLessThan(1080);
+    });
+  }
+
   test("FP-01 打开文件面板，文件树显示", async ({ page }) => {
     await installSession(page);
     await page.goto("/chat");

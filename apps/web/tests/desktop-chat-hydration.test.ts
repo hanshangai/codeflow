@@ -40,6 +40,7 @@ async function fixture(t: test.TestContext, options?: {
   workspaceId?: WorkspaceId;
   connected?: boolean;
   settleInitially?: boolean;
+  startupComplete?: boolean;
 }) {
   const original = Object.getOwnPropertyDescriptor(globalThis, "window");
   const requests: DesktopApiRequest[] = [];
@@ -110,6 +111,12 @@ async function fixture(t: test.TestContext, options?: {
   const errors: unknown[] = [];
   const route = reactive({ currentRoute: { value: { name: "chat", fullPath: "/chat", query: {} } } });
   const requestedThreadId = ref<ThreadId>(threadId);
+  const desktopStartupComplete = ref(options?.startupComplete ?? true);
+  const readinessCode = shell.body.statements.filter(statement => ts.isVariableStatement(statement)
+    && statement.declarationList.declarations.some(declaration => ["localWorkspaceReady", "currentWorkspaceReady"].includes(declaration.name.getText(ast))))
+    .map(statement => statement.getText(ast)).join("\n");
+  const currentWorkspaceReady = new Function("config", "computed", "isDesktopWorkspace", "desktopStartupComplete",
+    ts.transpile(`${readinessCode}\nreturn currentWorkspaceReady;`, { target: ts.ScriptTarget.ES2022 }))(config, computed, isDesktopWorkspace, desktopStartupComplete);
   const localWorkspaceReady = computed(() => isDesktopWorkspace(config, config.workspaceId ?? ""));
   const workspaceSwitching = ref(false);
   const sandbox: Record<string, any> = {
@@ -119,7 +126,12 @@ async function fixture(t: test.TestContext, options?: {
       return stop;
     },
     ctx: computed(() => ({ serverWsOrigin: "ws://unused", sessionToken: null, webSessionId: null, desktopClientId: "desktop" })),
-    currentWorkspaceReady: computed(() => localWorkspaceReady.value || config.connected), localWorkspaceReady, router: route, threadUrlTick: ref(0),
+    requestJson: async (_ctx: unknown, request: { path: string }) => {
+      assert.equal(request.path, "/api/status");
+      return { ok: true, clientVersion: null, latestClientVersion: null, clients: [] };
+    },
+    resolveWorkspaceClientVersion: () => null, resolveWorkspaceClientInfo: () => null,
+    currentWorkspaceReady, localWorkspaceReady, router: route, threadUrlTick: ref(0),
     isPaymentVerificationRoute: ref(false), workspaceSwitching,
     resolveRequestedThreadId: () => requestedThreadId.value, resolveRouteThreadId: () => requestedThreadId.value,
     resolveSharedThreadOnlyRelatedToMe: () => null, workspaces, isSharedWorkspaceSelectionId, resolveStickyWorkspaceSelection,
@@ -171,7 +183,7 @@ globalThis.pendingReads = () => Object.values(shellReadTasks).filter(Boolean).ma
     assert.equal(reminders.lastError, null);
   };
   if (options?.settleInitially !== false) await settle();
-  return { config, chat, composer, engine, reminders, workspaces, workspaceSwitching, requestedThreadId, settle, requests, errors,
+  return { config, chat, composer, engine, reminders, workspaces, workspaceSwitching, requestedThreadId, desktopStartupComplete, settle, requests, errors,
     pendingActivation: () => sandbox.pendingActivation() as Promise<void> | undefined,
     loads: () => requests.filter(request => request.method === "threads.load"),
     poll: async () => { await config.refreshDesktopRuntime(); await settle(); },
@@ -179,6 +191,21 @@ globalThis.pendingReads = () => Object.values(shellReadTasks).filter(Boolean).ma
     setReady: (value: boolean) => { runtimeReady = value; },
   };
 }
+
+for (const connected of [false, true]) test(`首次目录完成后自动加载恢复工作区的会话列表，云端已连接=${connected}`, async t => {
+  const h = await fixture(t, { startupComplete: false, connected, workspaces: [] });
+  assert.equal(h.config.localRuntimeReady, true);
+  assert.deepEqual(h.requests.map(request => request.method), ["runtime.info"]);
+  assert.equal(h.chat.threads.length, 0);
+  h.workspaces.workspaces = knownWorkspaces.map(workspace => ({ ...workspace }));
+  h.desktopStartupComplete.value = true;
+  await h.settle();
+  assert.equal(h.chat.threads[0]?.id, threadId);
+  assert.equal(h.requests.filter(request => request.method === "threads.list").length, 1);
+  assert.equal(h.requests.some(request => request.method === "workspaces.list"), false, "复用首次目录，不发起相互取消的第二轮目录读取");
+  await h.poll();
+  assert.equal(h.requests.filter(request => request.method === "threads.list").length, 1);
+});
 
 test("已知且本机可用的工作区不等待慢目录读取", async t => {
   const directory = deferred<void>();

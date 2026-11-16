@@ -142,6 +142,7 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
       execPath: executablePath, pid: 1, ppid: 2,
       argv: mainArgv },
     app: { isPackaged: !!options.maintenance || !!options.installation, getPath: (name: string) => name === "userData" ? f.userDataDir : path.join(f.userDataDir, name),
+      setAppUserModelId() {},
       requestSingleInstanceLock: () => options.locked !== false, on(name: string, listener: (...args: any[]) => void) { listeners.set(name, listener); },
       whenReady: () => ({ then(onReady: () => Promise<unknown>) {
         const flight = Promise.resolve().then(onReady), catchFailure = flight.catch.bind(flight);
@@ -355,17 +356,31 @@ test("real main first custom choice after empty registration survives initializa
   assert.deepEqual(await fs.readdir(location.dataDir), []);
 });
 
-for (const entry of ["unknown.txt", "shell-update-attempt.json", ".shell-update-file-auth"] as const) {
+for (const entry of ["unknown.txt", "shell-update-attempt.json"] as const) {
   test(`real main empty keep refuses ${entry} before browser or D13`, async t => {
     const { f, location } = await emptyInstallation(t), target = path.join(location.dataDir, entry);
-    if (entry === ".shell-update-file-auth") await fs.mkdir(target); else await fs.writeFile(target, "fixture-owned-content");
+    await fs.writeFile(target, "fixture-owned-content");
     let handoffReads = 0;
     const result = await runMain(f, {}, false, { maintenance: true, onHandoff: async () => { handoffReads++; } });
     assert.deepEqual(result.exits, [1]); assert.deepEqual(result.events, []); assert.equal(handoffReads, 0);
-    assert.ok((await fs.lstat(target))[entry === ".shell-update-file-auth" ? "isDirectory" : "isFile"]());
+    assert.ok((await fs.lstat(target)).isFile());
     await assert.rejects(fs.lstat(path.join(f.userDataDir, "desktop-uninstall-result.json")), { code: "ENOENT" });
   });
 }
+
+test("real main empty keep allows app-owned runtime entries before registration", async t => {
+  const { f, location } = await emptyInstallation(t);
+  await fs.mkdir(path.join(location.dataDir, "logs"));
+  await fs.mkdir(path.join(location.dataDir, ".shell-update-file-auth"));
+  for (const name of ["device-identity.json", "errors.jsonl", "crash-session.json"]) {
+    await fs.writeFile(path.join(location.dataDir, name), "{}");
+  }
+  const result = await runMain(f, {}, false, { maintenance: true });
+  assert.deepEqual(result.exits, [0]);
+  const completed = JSON.parse(await fs.readFile(path.join(f.userDataDir, "desktop-uninstall-result.json"), "utf8"));
+  assert.equal(completed.phase, "completed");
+  await assert.rejects(fs.lstat(path.join(f.userDataDir, "desktop-data-location.json")), { code: "ENOENT" });
+});
 
 /** 准备真实固定文件，让main的ready回填走产品SQLite和身份读取。 */
 async function readyData(dataDir: string) {

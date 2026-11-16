@@ -27,6 +27,7 @@ function fixture(t: test.TestContext) {
     assertOwner(captured: DesktopCloudAccountOwner) { assert.equal(identity.active, true, "OWNER_REVOKED"); assert.deepEqual(captured, owner); } } as unknown as DesktopCloudAccount;
   const ctx = { db, clientId: "desktop", deviceId: "installation", localWorkspaceOnly: true,
     desktopCloudAccount: cloud, workspaces: new Map([[workspaceId, local], [other, foreign]]),
+    sessions: { beginThreadOperation: () => () => {} } as unknown as ApiHandlerContext["sessions"],
     send(message) { sent.push(message); } } as ApiHandlerContext;
   t.mock.method(logger, "warn", (...args: unknown[]) => { logs.push(args); });
   const task: ScheduledTask = { id: "account-task", ownerUserId: "A", clientId: "desktop", deviceId: "installation", deviceKind: "desktop", configRevision: 1,
@@ -65,6 +66,25 @@ test("desktop 账号任务RPC允许同账号远程只读方法", async t => {
   const f = fixture(t);
   const read = await f.call("fs.readFile", { workspaceId: f.workspaceId, path: "missing.txt" });
   assert.notEqual(read.status, 403);
+});
+
+test("desktop 账号任务RPC允许同账号远程读写会话工作流", async t => {
+  const f = fixture(t), threadId = "thread-account-chat" as any;
+  f.db.forWorkspace(f.workspaceId).threads.create({ id: threadId, workspaceId: f.workspaceId, engine: "codex", title: "account chat" });
+  // Server 附带身份与执行范围，客户端校验身份一致后剔除，由本机重新解析。
+  const snapshot = await f.call("orch.chat.get", { workspaceId: f.workspaceId, threadId, actorUserId: f.owner.ownerUserId });
+  assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+  assert.deepEqual((snapshot.body as any).tasks, []);
+  const prepare = await f.call("orch.chat.prepare", { workspaceId: f.workspaceId, threadId, taskId: "missing", expectedVersion: 0, actorUserId: f.owner.ownerUserId });
+  assert.equal(prepare.status, 404, JSON.stringify(prepare.body));
+  assert.equal((prepare.body as any).code, "CHAT_WORKFLOW_TASK_NOT_FOUND");
+  const action = await f.call("orch.chat.action", { workspaceId: f.workspaceId, threadId, taskId: "missing", action: "start",
+    requestId: "req", expectedVersion: 0, actorUserId: f.owner.ownerUserId,
+    executionProfileScope: { scopeType: "shared_workspace", scopeId: "forged" } });
+  assert.equal(action.status, 404, JSON.stringify(action.body));
+  assert.equal((action.body as any).code, "CHAT_WORKFLOW_TASK_NOT_FOUND");
+  const forged = await f.call("orch.chat.get", { workspaceId: f.workspaceId, threadId, actorUserId: "other-user" });
+  assert.equal(forged.status, 400);
 });
 
 test("desktop 云连接允许已认证账号查询已知本机工作区引擎状态", async t => {

@@ -238,8 +238,9 @@ export function useAppShell() {
     },
   });
   const localWorkspaceReady = computed(() => isDesktopWorkspace(config, String(config.workspaceId ?? "")));
-  /** 桌面先取得本机身份再激活工作区，避免云端先连接时把本机请求误发到 Server。 */
-  const currentWorkspaceReady = computed(() => localWorkspaceReady.value || (config.connected && (!config.isDesktop || config.localRuntimeReady)));
+  /** 桌面身份和首次目录均完成后才激活会话，避免并发目录读取互相取消并遗漏列表。 */
+  const currentWorkspaceReady = computed(() => (!config.isDesktop || desktopStartupComplete.value)
+    && (localWorkspaceReady.value || (config.connected && (!config.isDesktop || config.localRuntimeReady))));
 
   /** 设置入口只接收已登记页签；桌面弹窗只保留模型配置。 */
   function normalizeSettingsTab(tab?: string): string {

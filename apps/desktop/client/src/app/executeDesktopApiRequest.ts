@@ -139,6 +139,7 @@ const ALLOWED_FIELDS = {
   "threads.messages.delete": ["workspaceId", "threadId", "itemId"],
   "orch.chat.get": ["workspaceId", "threadId"],
   "orch.chat.settings": ["workspaceId", "threadId", "enabled"],
+  "orch.chat.prepare": ["workspaceId", "threadId", "taskId", "expectedVersion"],
   "orch.chat.action": ["workspaceId", "threadId", "taskId", "requestId", "action", "expectedVersion", "resultVersion", "nodeId", "nodeVersion", "feedbackAction", "feedback", "targetNodeId"],
   "orch.chat.natural": ["workspaceId", "threadId", "text", "requestId"],
   "orch.chat.rework": ["workspaceId", "threadId", "taskId", "nodeId", "reason"],

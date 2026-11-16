@@ -12,12 +12,12 @@ import { formatTimestamp } from "../accountDisplay";
 import { isAccountCaptchaEnabled } from "../captchaControl";
 import { resolvePostLoginTarget } from "../loginRedirect";
 import AuthShell from "./auth-shell.vue";
-import CaptchaVerifyModal from "./captcha-verify-modal.vue";
+import NumericCaptchaField from "./numeric-captcha-field.vue";
 
 defineOptions({ name: "AuthLoginPage" });
 
-type CaptchaVerifyModalExpose = {
-  resetChallenge: () => Promise<void>;
+type CaptchaFieldExpose = {
+  refresh: () => void;
 };
 
 const router = useRouter();
@@ -32,8 +32,7 @@ const form = reactive({
   password: "",
 });
 
-const captchaModalRef = ref<CaptchaVerifyModalExpose | null>(null);
-const captchaOpen = ref(false);
+const captchaFieldRef = ref<CaptchaFieldExpose | null>(null);
 const captchaToken = ref("");
 const submitting = ref(false);
 const errorMessage = ref("");
@@ -77,8 +76,14 @@ function clearError() {
   errorLevel.value = "error";
 }
 
+/** 同步验证码 token；填满 4 位后直接登录，与原先弹窗内的自动提交保持一致。 */
 function handleCaptchaTokenUpdate(value: string) {
-  captchaToken.value = String(value ?? "").trim();
+  const next = String(value ?? "").trim();
+  const shouldSubmit = !captchaToken.value && Boolean(next) && !submitting.value;
+  captchaToken.value = next;
+  if (!shouldSubmit) return;
+  clearError();
+  void submit();
 }
 
 function clearCaptchaVerification() {
@@ -86,15 +91,9 @@ function clearCaptchaVerification() {
 }
 
 /** 登录失败后刷新数字验证码，下一次登录必须重新输入。 */
-async function resetCaptchaAfterLoginFailure(): Promise<void> {
+function resetCaptchaAfterLoginFailure(): void {
   clearCaptchaVerification();
-  await captchaModalRef.value?.resetChallenge();
-}
-
-/** 打开居中数字验证弹窗；登录中默认抑制，必要时可强制打开。 */
-function openCaptchaModal(opts?: { force?: boolean }) {
-  if (submitting.value && !opts?.force) return;
-  captchaOpen.value = true;
+  captchaFieldRef.value?.refresh();
 }
 
 /** Returns current native login inputs after browser autofill or manual edits. */
@@ -137,13 +136,6 @@ function handlePasswordInput(event: Event) {
   form.password = (event.target as HTMLInputElement | null)?.value ?? "";
 }
 
-function handleCaptchaConfirm(value: string) {
-  handleCaptchaTokenUpdate(value);
-  captchaOpen.value = false;
-  clearError();
-  void submit();
-}
-
 /** 校验后沿原账号入口登录，成功收尾只接受当前会话，真实失败明确显示。 */
 async function submit() {
   prepareLoginSubmit();
@@ -154,7 +146,6 @@ async function submit() {
   }
   if (captchaEnabled && !captchaToken.value) {
     setError("请输入图中 4 位数字验证码", "info");
-    openCaptchaModal();
     return;
   }
 
@@ -174,7 +165,7 @@ async function submit() {
         code: result.code,
       });
       const details = (result.details ?? {}) as Record<string, unknown>;
-      await resetCaptchaAfterLoginFailure();
+      resetCaptchaAfterLoginFailure();
       if (result.code === "ACCOUNT_LOCKED") {
         lockedUntil.value = Number(details.lockedUntil ?? 0);
       }
@@ -184,7 +175,6 @@ async function submit() {
           return result;
         }
         setError("数字验证码已失效，请重新输入", "info");
-        openCaptchaModal({ force: true });
         return result;
       }
       if (result.code === "UNAUTHORIZED" && typeof details.remainingAttempts === "number") {
@@ -258,6 +248,9 @@ async function submit() {
             @input="handlePasswordInput"
           />
         </a-form-item>
+        <a-form-item v-if="captchaEnabled" label="数字验证码" class="auth-login__captcha">
+          <NumericCaptchaField ref="captchaFieldRef" v-model="captchaToken" :disabled="submitting" />
+        </a-form-item>
       </a-form>
 
       <a-button
@@ -282,15 +275,6 @@ async function submit() {
         <a-button type="link" @click="router.push('/')">返回首页</a-button>
       </div>
     </div>
-
-    <CaptchaVerifyModal
-      v-if="captchaEnabled"
-      ref="captchaModalRef"
-      v-model:open="captchaOpen"
-      auto-submit
-      :loading="submitting"
-      @confirm="handleCaptchaConfirm"
-    />
   </AuthShell>
 </template>
 
@@ -325,6 +309,62 @@ async function submit() {
 
 .auth-login__form :deep(#login-password[type="password"]) {
   font-family: Arial, "Helvetica Neue", "Noto Sans", sans-serif;
+}
+
+/* affix 包装器内部输入框不再重复应用 min-height/padding，避免密码框比普通输入框更高。 */
+.auth-login__form :deep(.ant-input-affix-wrapper input.ant-input) {
+  min-height: 0;
+  padding: 0;
+}
+
+/* 登录表单较窄，验证码输入框与图片改为上下排列，避免横向挤压。 */
+.auth-login__captcha :deep(.numeric-captcha) {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.auth-login__captcha :deep(.numeric-captcha__visual) {
+  width: 100%;
+  height: 52px;
+}
+
+/* 验证码输入框沿用 antd 表单输入框的尺寸、圆角与主题色。 */
+.auth-login__captcha :deep(.numeric-captcha__input) {
+  height: auto;
+  padding: 4px 11px;
+  border: 1px solid #d9d9d9;
+  border-radius: 12px;
+  background: #fff;
+  color: rgba(0, 0, 0, 0.88);
+  font-size: 14px;
+  line-height: 1.5715;
+  letter-spacing: normal;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.auth-login__captcha :deep(.numeric-captcha__input::placeholder) {
+  color: rgba(0, 0, 0, 0.25);
+}
+
+.auth-login__captcha :deep(.numeric-captcha__input:focus) {
+  border-color: #c96442;
+  box-shadow: 0 0 0 2px rgba(201, 100, 66, 0.1);
+}
+
+:global(:root[data-theme="dark"]) .auth-login__captcha :deep(.numeric-captcha__input) {
+  background: #141414;
+  border-color: #424242;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+:global(:root[data-theme="dark"]) .auth-login__captcha :deep(.numeric-captcha__input::placeholder) {
+  color: rgba(255, 255, 255, 0.25);
+}
+
+:global(:root[data-theme="dark"]) .auth-login__captcha :deep(.numeric-captcha__input:focus) {
+  border-color: #d97757;
+  box-shadow: 0 0 0 2px rgba(217, 119, 87, 0.15);
 }
 
 .auth-login__office {
@@ -433,6 +473,7 @@ async function submit() {
 
   .auth-login__form :deep(.ant-input),
   .auth-login__form :deep(.ant-input-affix-wrapper),
+  .auth-login__captcha :deep(.numeric-captcha__input),
   .auth-login__submit {
     min-height: 48px;
     border-radius: 14px;
@@ -473,7 +514,8 @@ async function submit() {
   }
 
   .auth-login__form :deep(.ant-input),
-  .auth-login__form :deep(.ant-input-affix-wrapper) {
+  .auth-login__form :deep(.ant-input-affix-wrapper),
+  .auth-login__captcha :deep(.numeric-captcha__input) {
     min-height: 30px;
     font-size: 13px;
   }
@@ -521,7 +563,8 @@ async function submit() {
   }
 
   .auth-login__form :deep(.ant-input),
-  .auth-login__form :deep(.ant-input-affix-wrapper) {
+  .auth-login__form :deep(.ant-input-affix-wrapper),
+  .auth-login__captcha :deep(.numeric-captcha__input) {
     min-height: 28px;
     font-size: 12px;
   }
