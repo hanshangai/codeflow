@@ -126,7 +126,8 @@ export function buildThreadPresentation(state: ThreadConversationState, version:
 export function toConversationDisplayMessage(event: ConversationEventEnvelope): ConversationChangedMessage | { t: "conversation.event"; event: ConversationEventEnvelope } {
   const process = /^(?:item\.(?:reasoning|tool|diff|review|explore|subagent)\.)/.test(event.type);
   const toolName = "toolName" in event.payload ? String(event.payload.toolName ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
-  if (!process || toolName === "update_plan" || toolName === "todowrite" || "todolistItems" in event.payload) return { t: "conversation.event", event };
+  if (!process || toolName === "update_plan" || toolName === "todowrite"
+    || ("todolistItems" in event.payload && event.payload.todolistItems != null)) return { t: "conversation.event", event };
   const message: ConversationChangedMessage = { t: "conversation.changed", workspaceId: event.workspaceId, threadId: event.threadId, version: event.seq };
   if (event.type === "item.tool.completed") {
     const output = event.payload.output;
