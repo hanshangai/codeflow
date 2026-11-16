@@ -87,6 +87,8 @@ export class DesktopStartupCleanupError extends AggregateError {
 export function createDesktopApplication(input: {
   dataDir: string;
   initialReleaseDir: string;
+  /** 签名基线目录；dev 可指向测试发布资源，缺省与 initialReleaseDir 相同。 */
+  baselineReleaseDir?: string;
   /** 正式完整安装必须携带签名基线，开发夹具可显式保持无基线。 */
   requireBaseline?: boolean;
   /** 桌面私有 CLI 运行时绝对路径；缺失时 Client 沿用系统安装 CLI。 */
@@ -113,6 +115,7 @@ export function createDesktopApplication(input: {
   /** 固定资源选择完成后创建迁移 owner；换壳接续不改变原授权路径。 */
   createMigration?: (facts: { releaseDir: string; identity: DeviceIdentity }) => LegacyClientMigration | undefined;
 }) {
+  const baselineReleaseDir = input.baselineReleaseDir ?? input.initialReleaseDir;
   const continuationInput = input.startupContinuation;
   let continuation: typeof continuationInput;
   if (continuationInput !== undefined) {
@@ -799,7 +802,7 @@ export function createDesktopApplication(input: {
         }, restartClient, reloadWeb,
         waitHealthy: async () => runtime.snapshot().status === "ready",
         restoreInitialRelease: async () => {
-          if (input.requireBaseline) await resolveBaselineRelease(input.initialReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys });
+          if (input.requireBaseline) await resolveBaselineRelease(baselineReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys });
           await restartClient(input.initialReleaseDir, initialExpectation);
           await reloadWeb(input.initialReleaseDir);
         },
@@ -917,7 +920,7 @@ export function createDesktopApplication(input: {
         async beforeRestore() { await runtime.drain(); await databaseBackup.restore(); },
         /** 首次资源升级失败恢复安装包自身的已核验资源。 */
         async restoreInitialRelease() {
-          if (input.requireBaseline) await resolveBaselineRelease(input.initialReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys });
+          if (input.requireBaseline) await resolveBaselineRelease(baselineReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys });
           await restartClient(input.initialReleaseDir, initialExpectation); await reloadWeb(input.initialReleaseDir);
         },
       });
@@ -1264,13 +1267,13 @@ export function createDesktopApplication(input: {
         const releaseTrust = { trustedReleaseKeys: input.trustedReleaseKeys, requireHeldStartup: Boolean(continuation),
           verification: !continuation && !pending && !startupShellPending && !startupUpdateError && !recoveredDatabase ? "startup" as const : "full" as const };
         const baselineRelease = input.requireBaseline || continuation || pending || startupShellPending
-          ? await resolveBaselineRelease(input.initialReleaseDir, releaseTrust) : null;
+          ? await resolveBaselineRelease(baselineReleaseDir, releaseTrust) : null;
         assertStartupRunning();
         const activeRelease = await resolveActiveRelease(input.dataDir, releaseTrust);
         assertStartupRunning();
         if (pending || startupShellPending) {
           try {
-            await resolveBaselineRelease(input.initialReleaseDir, { ...releaseTrust, requireHeldStartup: true });
+            await resolveBaselineRelease(baselineReleaseDir, { ...releaseTrust, requireHeldStartup: true });
             if (activeRelease) await resolveActiveRelease(input.dataDir, { ...releaseTrust, requireHeldStartup: true });
             startupHeldId = crypto.randomUUID();
             initialStartup = { mode: "held", continuationId: startupHeldId };
@@ -1424,7 +1427,7 @@ export function createDesktopApplication(input: {
           startupHeldId = undefined;
         }
         if (continuation) {
-          const baselineBeforeAuthorization = await resolveBaselineRelease(input.initialReleaseDir, releaseTrust);
+          const baselineBeforeAuthorization = await resolveBaselineRelease(baselineReleaseDir, releaseTrust);
           const activeBeforeAuthorization = await resolveActiveRelease(input.dataDir, releaseTrust);
           if (JSON.stringify([baselineBeforeAuthorization, activeBeforeAuthorization]) !== startupArtifacts) throw new Error("DESKTOP_STARTUP_ARTIFACT_CHANGED");
           const client = runtime.snapshot();
@@ -1432,7 +1435,7 @@ export function createDesktopApplication(input: {
           snapshotDesktopStartupReady(client.startup, continuation.continuationId);
           await continuation.authorizeReady({ client, baseline: structuredClone(baselineBeforeAuthorization!), active: structuredClone(activeBeforeAuthorization),
             web: { loaded: true, releaseDir }, continueRequestId: crypto.randomUUID() });
-          const baselineAfterAuthorization = await resolveBaselineRelease(input.initialReleaseDir, releaseTrust);
+          const baselineAfterAuthorization = await resolveBaselineRelease(baselineReleaseDir, releaseTrust);
           const activeAfterAuthorization = await resolveActiveRelease(input.dataDir, releaseTrust);
           if (JSON.stringify([baselineAfterAuthorization, activeAfterAuthorization]) !== startupArtifacts) throw new Error("DESKTOP_STARTUP_ARTIFACT_CHANGED");
           const current = runtime.snapshot();

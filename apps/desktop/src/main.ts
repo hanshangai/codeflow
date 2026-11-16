@@ -596,6 +596,9 @@ if (process.versions.electron) {
       }
       const startup = app.isPackaged && process.platform === "win32" ? await resolveVersionedShellStartup(process.execPath) : null;
       if (quitAllowed) return;
+      // 仅未打包 dev 可指定已签名基线资源目录，供升级应用测试；打包态始终使用安装资源。
+      const devReleaseResourcesDir = !app.isPackaged ? process.env.CODEFLOWAI_DESKTOP_INITIAL_RELEASE_DIR?.trim() : undefined;
+      const releaseResourcesDir = app.isPackaged ? process.resourcesPath : devReleaseResourcesDir || path.resolve(currentDirectory, "..");
       const initialReleaseDir = startup?.initialReleaseDir ?? (app.isPackaged ? process.resourcesPath : path.resolve(currentDirectory, ".."));
       if (maintenanceRequest) {
         let record = maintenanceRecord;
@@ -663,7 +666,7 @@ if (process.versions.electron) {
       if (reinstall) {
         try {
         cancelLegacyMigrationAccountForUninstall(dataDir);
-        const trust = readInstalledReleaseTrust(app.isPackaged ? process.resourcesPath : path.resolve(currentDirectory, ".."));
+        const trust = readInstalledReleaseTrust(releaseResourcesDir);
         const active = await resolveActiveRelease(dataDir, { trustedReleaseKeys: trust });
         const release = active ?? await resolveBaselineRelease(initialReleaseDir, { trustedReleaseKeys: trust });
         if (quitAllowed) return;
@@ -699,8 +702,7 @@ if (process.versions.electron) {
       if (quitAllowed) return;
       // 本地验收可显式关闭桌面更新检查，避免未签名构建触发更新失败弹窗。
       const configuredServerOrigin = process.env.CODEFLOWAI_DESKTOP_DISABLE_UPDATES === "1" ? undefined
-        : readInstalledUpdateOrigin(app.isPackaged ? process.resourcesPath : path.resolve(currentDirectory, '..'),
-          process.env.CODEFLOWAI_DESKTOP_SERVER_ORIGIN);
+        : readInstalledUpdateOrigin(releaseResourcesDir, process.env.CODEFLOWAI_DESKTOP_SERVER_ORIGIN);
       const unsignedLocal = readUnsignedLocalMarker();
       // 未签名本地包不得配置更新源，否则会绕过更新基线的唯一信任入口。
       if (unsignedLocal && configuredServerOrigin) throw Object.assign(new Error("DESKTOP_UNSIGNED_LOCAL_UPDATE_ORIGIN_CONFLICT"),
@@ -749,6 +751,7 @@ if (process.versions.electron) {
           && normalWindow.webContents.mainFrame.url === normalWindow.webContents.getURL() && isTrustedDesktopUrl(normalWindow.webContents.mainFrame.url, webEntry) }) }) : undefined;
       application = createDesktopApplication({
         dataDir, initialReleaseDir, shellVersion, requireBaseline: app.isPackaged && !unsignedLocal,
+        ...(!app.isPackaged && devReleaseResourcesDir ? { baselineReleaseDir: devReleaseResourcesDir } : {}),
         cliRuntime: releaseDir => resolveClientCliRuntime({ releaseDir, dataDir, required: app.isPackaged }),
         startupContinuation: handoff?.continuation,
         createMigration: ({ releaseDir, identity }) => {
@@ -761,7 +764,7 @@ if (process.versions.electron) {
         onClientExit: facts => capture.reportClientExit(facts),
         onShutdown: () => capture.expectExit(),
         shellUpdate: shellFacts ? { facts: shellFacts } : undefined,
-        trustedReleaseKeys: readInstalledReleaseTrust(app.isPackaged ? process.resourcesPath : path.resolve(currentDirectory, "..")),
+        trustedReleaseKeys: readInstalledReleaseTrust(releaseResourcesDir),
         host: {
           createWindow: () => { normalWindow = createDefaultWindow(webEntry, showError); return normalWindow; },
           /** 内置启动页与已验证的 Web 复用同一沙箱窗口。 */
