@@ -8,7 +8,7 @@ const mockWsOrigin = `ws://127.0.0.1:${MOCK_PORT}`;
 export default defineConfig({
   testDir: "./e2e",
   // 首页回归与移动端共用现有本地 mock 和 Web 服务。
-  testMatch: /(?:homepage-efficiency|free-enterprise|analytics|basic|built-in-relay-auto-enable|chat-composer-actions|chat-thread-core|chat-workflow|default-thread-auto-create|enterprise-token-quota|file-preview|left-sidebar-resize|local-user-login|mcp-management|mobile-navigation|mobile-web|orchestration-workspace|project-knowledge|relay-recharge-pricing|settings-entry|shared-collaboration-lock|shared-workspace-rename|skill-marketplace|terminal-panel|workflow-builtin-first-order|workspace-directory-migration|workspace-thread-journey)\.spec\.ts/u,
+  testMatch: /(?:homepage-efficiency|free-enterprise|analytics|basic|built-in-relay-auto-enable|chat-composer-actions|chat-thread-core|chat-workflow|default-thread-auto-create|enterprise-token-quota|file-preview|left-sidebar-resize|local-user-login|mcp-management|mobile-navigation|mobile-web|orchestration-workspace|project-knowledge|relay-recharge-pricing|settings-entry|shared-workspace-rename|skill-marketplace|terminal-panel|workflow-builtin-first-order|workspace-directory-migration|workspace-thread-journey)\.spec\.ts/u,
   outputDir: "../../.tmp/playwright-output/local",
   timeout: 30_000,
   expect: { timeout: 8_000 },
