@@ -1,18 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { CheckCircleFilled, CloseCircleFilled, ExportOutlined, InfoCircleOutlined } from "@ant-design/icons-vue";
-import { describeUserFacingError, formatDesktopVersion, type DesktopUpdateDetails, type DesktopUpdateNotice, type DesktopUpdateProgress, type DesktopUpdateState } from "@codeflowai/shared";
+import { ArrowRightOutlined, CheckCircleFilled, CloseCircleFilled, DownloadOutlined, ExportOutlined, InfoCircleOutlined } from "@ant-design/icons-vue";
+import { describeUserFacingError, type DesktopUpdateDetails, type DesktopUpdateNotice, type DesktopUpdateProgress, type DesktopUpdateState } from "@codeflowai/shared";
 
 import {
   checkDesktopForUpdates, DesktopUpdateServiceError, getDesktopUpdateCapabilities, getDesktopUpdateDetails,
   getDesktopUpdateState, reportDesktopUpdateError, restartDesktopForUpdate, subscribeDesktopUpdateCheckRequested, subscribeDesktopUpdateProgress,
   takeDesktopUpdateCheckRequest,
 } from "../../../services/desktop";
-import { desktopBundlePhaseLabels, desktopShellPhaseLabels, desktopUpdateResultLabels, formatDesktopCurrentVersion } from "../desktopUpdateLabels";
+import { formatDesktopCurrentVersion } from "../desktopUpdateLabels";
 import { desktopUpdateCheckRequestTick } from "../desktopUpdateCheckRequest";
 import { activeDesktopUpdateNotice, dismissDesktopUpdateNoticeLater, hideDesktopUpdateNotice } from "../desktopUpdateNoticeState";
 import { openUpgradeNotes } from "../../../utils/upgradeNotes";
+import { formatFileSizeLabel } from "../../../utils/fileMetaPresentation";
 
 defineOptions({ name: "DesktopUpdateCheckModal" });
 const router = useRouter();
@@ -40,15 +41,18 @@ let disposed = false;
 const currentRows = computed(() => [
   { label: "当前版本", value: formatDesktopCurrentVersion(details.value?.current ?? null) },
 ]);
-/** 已取得可信目标后展示待更新版本；下载阶段即可见，不依赖准备完成。 */
+/** 下载起按待更新目标与当前未更新部分合成对外版本，历史失败目标不参与展示。 */
 const targetRows = computed(() => {
-  const bundle = details.value?.bundle, shell = details.value?.shell;
+  const value = details.value;
+  if (!value) return [];
   // same/failure/restored 时宿主仍保留目标快照，不能当成待安装的新版本展示。
   const active = (result: string | null | undefined) => result === "prepared" || result === "unknown";
-  return [
-    ...(bundle?.target && active(bundle.result) ? [{ label: "新版本（应用资源）", value: bundle.target.version }] : []),
-    ...(shell?.target && active(shell.result) ? [{ label: "新版本（桌面壳）", value: shell.target.version }] : []),
-  ];
+  const bundle = active(value.bundle.result) ? value.bundle.target : null;
+  const shell = active(value.shell.result) ? value.shell.target : null;
+  if (!bundle && !shell) return [];
+  return [{ label: "新版本", value: formatDesktopCurrentVersion({ ...value.current,
+    shellVersion: shell?.version ?? value.current.shellVersion, bundle: bundle ?? value.current.bundle,
+  }) }];
 });
 const versionRows = computed(() => [...currentRows.value, ...targetRows.value]);
 const prepared = computed(() => details.value?.bundle.result === "prepared" && !!details.value.bundle.target
@@ -56,19 +60,25 @@ const prepared = computed(() => details.value?.bundle.result === "prepared" && !
 const restartDisabled = computed(() => !prepared.value || !capabilities.restart || checking.value || restarting.value || !!snapshotError.value
   || !state.value || state.value.stoppingUpdates || state.value.shellOwned || state.value.operation === "exiting");
 
+/** 已准备的资源阶段不遮住随后进行的壳更新；只把活跃阶段翻译成用户动作。 */
 const phaseLabel = computed(() => {
-  const bundlePhase = details.value?.bundle.phase;
-  if (bundlePhase) return desktopBundlePhaseLabels[bundlePhase] ?? bundlePhase;
-  const shellPhase = details.value?.shell.phase;
-  return shellPhase ? desktopShellPhaseLabels[shellPhase] ?? shellPhase : "";
+  const value = details.value;
+  const phase = value?.bundle.result === "unknown" ? value.bundle.phase
+    : value?.shell.result === "unknown" ? value.shell.phase : null;
+  if (phase === "download") return "正在下载更新";
+  if (phase === "verify" || phase === "compatibility" || phase === "health") return "正在校验更新";
+  if (phase && phase !== "discovery" && phase !== "read-active") return "正在准备更新";
+  return "正在检查更新";
 });
 
 /** 下载阶段字节百分比；宿主未推送或已离开下载阶段时隐藏。 */
 const downloadPercent = computed<number | null>(() => {
   const progress = updateProgress.value;
-  if (!progress) return null;
+  if (!checking.value || !progress) return null;
   return Math.min(100, Math.max(0, Math.floor(progress.received * 100 / progress.total)));
 });
+const downloadSize = computed(() => downloadPercent.value !== null && updateProgress.value
+  ? `${formatFileSizeLabel(updateProgress.value.received)} / ${formatFileSizeLabel(updateProgress.value.total)}` : "");
 
 /** macOS 桌面壳不参与自动更新，manual_required 是人工安装提示，不是失败。 */
 const isMacDesktop = typeof window !== "undefined" && window.codeflowDesktop?.platform === "darwin";
@@ -93,13 +103,13 @@ const outcome = computed<Outcome | null>(() => {
   // 非 macOS 的本轮壳更新可能没有结果；应用资源最新时不把内部状态当成未完成。
   const shellNotApplicable = !isMacDesktop && value.shell.result === "unknown";
   if (isMacDesktop && bundleLatest && value.shell.result === "manual_required") {
-    return { tone: "success", title: "应用资源已是最新", detail: "macOS 桌面壳请手动下载安装。" };
+    return { tone: "info", title: "需要手动安装更新", detail: "应用内容已是最新，macOS 桌面应用请通过完整安装包更新。" };
   }
   if (bundleLatest && shellLatest && !value.shell.target) {
     return { tone: "success", title: "当前已是最新版本", detail: "无需下载或安装更新" };
   }
   if (bundleLatest && shellNotApplicable && !value.shell.target) {
-    return { tone: "success", title: "当前已是最新版本", detail: "应用资源已是最新版本" };
+    return { tone: "success", title: "当前已是最新版本", detail: "无需下载或安装更新" };
   }
   if (["failure", "manual_required", "unavailable", "revoked"].includes(value.bundle.result)
     || ["failure", "unavailable", ...(isMacDesktop ? [] : ["manual_required"])].includes(value.shell.result)) {
@@ -109,23 +119,43 @@ const outcome = computed<Outcome | null>(() => {
     return { tone: "warning", title: "更新已回退", detail: "新版本未通过健康检查，已恢复原版本。" };
   }
   if (prepared.value) {
-    const bundle = value.bundle.result === "prepared" ? value.bundle.target : null;
-    const shell = value.shell.result === "prepared" ? value.shell.target : null;
-    const version = formatDesktopVersion(shell?.version ?? value.current.shellVersion, bundle?.version ?? value.current.bundle?.version ?? null);
-    return { tone: "success", title: "新版本已准备", detail: `版本 ${version}。重启更新，或下次正常启动时更新。` };
+    return { tone: "success", title: "重启即可完成更新", detail: "更新已下载并校验完成。现在重启即可使用，也可以下次启动时更新。" };
   }
   if (value.bundle.result === "healthy" || value.shell.result === "healthy") {
-    return { tone: "success", title: "更新已生效", detail: "当前运行版本已通过健康检查。" };
+    return { tone: "success", title: "更新已生效", detail: "你正在使用更新后的版本。" };
   }
   if (value.bundle.target || value.shell.target) {
-    const target = [
-      value.bundle.target ? `版本 ${formatDesktopVersion(value.current.shellVersion, value.bundle.target.version)}` : "",
-      value.shell.target ? `桌面壳 ${value.shell.target.version}` : "",
-    ].filter(Boolean).join("；");
-    return { tone: "info", title: "更新尚未准备完成", detail: `${target}。请稍后重新检查。` };
+    return { tone: "info", title: "更新尚未准备完成", detail: "请重新检查，完成下载和校验后即可重启更新。" };
   }
-  return { tone: "info", title: "检查完成", detail: `应用资源：${desktopUpdateResultLabels[value.bundle.result] ?? value.bundle.result}；桌面壳：${desktopUpdateResultLabels[value.shell.result] ?? value.shell.result}` };
+  return { tone: "info", title: "暂未确认可用更新", detail: "尚未取得完整的更新结果，请稍后重新检查。" };
 });
+
+/** 展示直接派生自原检查、重启与错误事实，不维护另一套升级状态。 */
+const presentation = computed<Outcome>(() => {
+  if (error.value || snapshotError.value) return outcome.value!;
+  if (restarting.value) return { tone: "info", title: "正在重启更新", detail: "应用将关闭并重新启动，请稍候。" };
+  if (checking.value) return { tone: "info", title: downloadPercent.value !== null ? "正在下载更新" : phaseLabel.value,
+    detail: "你可以继续使用 CodeFlow，更新会在后台准备。" };
+  return outcome.value ?? { tone: "info", title: "正在读取更新状态", detail: "正在获取当前版本与可用更新。" };
+});
+
+/** 每种结果只突出一个下一步；准备完成前不提供重启操作。 */
+const primaryAction = computed(() => {
+  if (restarting.value) return { kind: "restart" as const, label: "正在重启…", disabled: true };
+  if (checking.value) return { kind: "close" as const, label: "后台继续", disabled: false };
+  if (presentation.value.tone === "error") return { kind: "check" as const, label: "重试", disabled: !capabilities.check };
+  if (prepared.value && capabilities.restart) return { kind: "restart" as const, label: "重启并更新", disabled: restartDisabled.value };
+  if (presentation.value.tone === "success" || prepared.value) return { kind: "close" as const, label: "完成", disabled: false };
+  return { kind: "check" as const, label: "重新检查", disabled: !capabilities.check };
+});
+
+/** 主操作复用现有检查、重启和关闭入口，禁用时不派发。 */
+async function performPrimaryAction(): Promise<void> {
+  if (primaryAction.value.disabled) return;
+  if (primaryAction.value.kind === "restart") await restart();
+  else if (primaryAction.value.kind === "check") await startCheck();
+  else close();
+}
 
 /** 将桥错误映射为可读结论；原始异常正文只进日志，不直接展示 IPC 包装文本。 */
 function failureText(cause: unknown): string {
@@ -176,23 +206,26 @@ async function refreshSnapshots(owner: number): Promise<boolean> {
   }
 }
 
-/** 查询和准备均由原宿主入口拥有；快照失败时不继续派发副作用。 */
+/** 从首次快照起防重复；快照失败不派发检查，宿主受理后再补查最终结果。 */
 async function startCheck(): Promise<void> {
   if (checking.value || restarting.value || disposed) return;
   const owner = ++run;
   open.value = true;
   error.value = "";
-  if (!await refreshSnapshots(owner)) return;
-  if (disposed || owner !== run) return;
-  if (!capabilities.check) { error.value = "当前桌面壳不支持检查并准备更新。"; return; }
-  if (state.value?.transportConfigured === false) { error.value = "更新源尚未配置，当前无法检查并准备更新。"; return; }
-  if (state.value?.stoppingUpdates || state.value?.shellOwned || state.value?.operation === "exiting") {
-    error.value = "桌面应用正在停止或交接更新，请稍后重试。";
-    return;
-  }
+  updateProgress.value = null;
   checking.value = true;
-  startPolling(owner);
+  let requested = false;
   try {
+    if (!await refreshSnapshots(owner)) return;
+    if (disposed || owner !== run) return;
+    if (!capabilities.check) { error.value = "当前桌面壳不支持检查并准备更新。"; return; }
+    if (state.value?.transportConfigured === false) { error.value = "更新源尚未配置，当前无法检查并准备更新。"; return; }
+    if (state.value?.stoppingUpdates || state.value?.shellOwned || state.value?.operation === "exiting") {
+      error.value = "桌面应用正在停止或交接更新，请稍后重试。";
+      return;
+    }
+    startPolling(owner);
+    requested = true;
     await checkDesktopForUpdates();
   } catch (cause) {
     if (!disposed && owner === run) {
@@ -208,7 +241,7 @@ async function startCheck(): Promise<void> {
     if (!disposed && owner === run) {
       checking.value = false;
       stopPolling();
-      await refreshSnapshots(owner);
+      if (requested) await refreshSnapshots(owner);
     }
   }
 }
@@ -303,59 +336,82 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <a-modal :open="open" title="检查更新" :footer="null" :width="600" centered @cancel="close">
+  <a-modal :open="open" title="软件更新" :footer="null" :width="520" centered
+    :closable="!restarting" :keyboard="!restarting" :mask-closable="false"
+    :body-style="{ maxHeight: 'calc(100dvh - 160px)', overflowY: 'auto' }" @cancel="close">
     <div class="update-check">
-      <section class="update-check__versions" aria-label="版本">
-        <div v-for="row in versionRows" :key="row.label" class="update-check__version">
-          <span>{{ row.label }}</span>
-          <strong :title="row.value">{{ row.value }}</strong>
+      <section class="update-check__summary" :class="`update-check__summary--${presentation.tone}`" role="status" aria-live="polite">
+        <div class="update-check__symbol" aria-hidden="true">
+          <a-spin v-if="checking || restarting" />
+          <CheckCircleFilled v-else-if="presentation.tone === 'success'" />
+          <CloseCircleFilled v-else-if="presentation.tone === 'error'" />
+          <InfoCircleOutlined v-else-if="presentation.tone === 'warning'" />
+          <DownloadOutlined v-else />
+        </div>
+        <div class="update-check__copy">
+          <h2>{{ presentation.title }}</h2>
+          <p>{{ presentation.detail }}</p>
         </div>
       </section>
-      <div class="update-check__status" :class="`update-check__status--${outcome?.tone ?? 'checking'}`" role="status">
-        <a-spin v-if="checking" size="small" />
-        <CheckCircleFilled v-else-if="outcome?.tone === 'success'" class="update-check__icon" />
-        <CloseCircleFilled v-else-if="outcome?.tone === 'error'" class="update-check__icon" />
-        <InfoCircleOutlined v-else class="update-check__icon" />
-        <div class="update-check__status-copy">
-          <strong>{{ checking ? '正在检查并准备更新…' : outcome?.title ?? '准备检查更新' }}</strong>
-          <span v-if="checking && phaseLabel">{{ phaseLabel }}<template v-if="downloadPercent !== null"> · {{ downloadPercent }}%</template></span>
-          <span v-else-if="outcome?.detail">{{ outcome.detail }}</span>
+      <section class="update-check__versions" aria-label="版本">
+        <template v-for="(row, index) in versionRows" :key="row.label">
+          <ArrowRightOutlined v-if="index > 0" class="update-check__version-arrow" aria-hidden="true" />
+          <div class="update-check__version" :class="{ 'update-check__version--target': index > 0 }">
+            <span>{{ row.label }}</span>
+            <strong :title="row.value">{{ row.value }}</strong>
+          </div>
+        </template>
+      </section>
+      <section v-if="downloadPercent !== null" class="update-check__download" aria-label="下载进度">
+        <div class="update-check__download-meta">
+          <span>已下载 {{ downloadSize }}</span>
+          <strong>{{ downloadPercent }}%</strong>
         </div>
-      </div>
+        <a-progress :percent="downloadPercent" :show-info="false" status="active" size="small"
+          :stroke-color="'var(--app-accent)'" :trail-color="'var(--app-border)'" />
+      </section>
+      <p v-if="prepared && !capabilities.restart" class="update-check__hint">当前版本不支持直接重启更新，请退出并重新启动应用。</p>
       <div class="update-check__actions">
-        <a-button type="link" @click="openNotes">
+        <a-button type="link" :disabled="restarting" @click="openNotes">
           <template #icon><ExportOutlined /></template>
           更新日志
         </a-button>
         <div class="update-check__action-buttons">
-          <a-button :disabled="restarting" @click="close">{{ prepared ? '稍后' : '关闭' }}</a-button>
-          <a-button v-if="prepared" type="primary" :loading="restarting" :disabled="restartDisabled" @click="restart">{{ restarting ? '正在应用更新…' : '重启更新' }}</a-button>
-          <a-button v-else type="primary" :loading="checking" :disabled="!capabilities.check || restarting" @click="startCheck">重新检查</a-button>
+          <a-button v-if="primaryAction.kind !== 'close'" :disabled="restarting" @click="close">{{ prepared ? '稍后' : '关闭' }}</a-button>
+          <a-button v-else-if="!checking && capabilities.check" type="text" @click="startCheck">重新检查</a-button>
+          <a-button :type="checking ? 'default' : 'primary'" :loading="restarting" :disabled="primaryAction.disabled" @click="performPrimaryAction">
+            {{ primaryAction.label }}
+          </a-button>
         </div>
       </div>
-      <p v-if="prepared && !capabilities.restart" class="update-check__hint">当前桌面壳不支持重启更新，请退出后重新启动应用。</p>
     </div>
   </a-modal>
 </template>
 
 <style scoped>
-.update-check { display: grid; gap: 14px; }
-.update-check__hint { margin: 0; color: var(--app-muted, #8b95a7); font-size: 12px; line-height: 1.5; }
-.update-check__versions { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px 16px; padding: 10px 12px; border: 1px solid var(--app-border, #e8e8e8); border-radius: 10px; background: color-mix(in srgb, var(--app-text, #1f2937) 3%, transparent); }
-.update-check__version { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.update-check__version span { color: var(--app-muted, #8b95a7); font-size: 11px; }
-.update-check__version strong { overflow: hidden; color: var(--app-text, #1f2937); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.update-check__status { display: flex; align-items: flex-start; gap: 10px; padding: 14px; border: 1px solid var(--app-border, #e8e8e8); border-radius: 10px; background: var(--app-panel-bg, #fff); }
-.update-check__status--success { border-color: color-mix(in srgb, #16a34a 32%, var(--app-border, #e8e8e8)); }
-.update-check__status--error { border-color: color-mix(in srgb, #dc2626 32%, var(--app-border, #e8e8e8)); }
-.update-check__status--warning { border-color: color-mix(in srgb, #d97706 32%, var(--app-border, #e8e8e8)); }
-.update-check__icon { margin-top: 1px; font-size: 18px; }
-.update-check__status--success .update-check__icon { color: #16a34a; }
-.update-check__status--error .update-check__icon { color: #dc2626; }
-.update-check__status--warning .update-check__icon { color: #d97706; }
-.update-check__status--info .update-check__icon, .update-check__status--checking .update-check__icon { color: var(--app-muted, #8b95a7); }
-.update-check__status-copy { display: grid; gap: 4px; min-width: 0; font-size: 12px; color: var(--app-muted, #8b95a7); overflow-wrap: anywhere; }
-.update-check__status-copy strong { color: var(--app-text, #1f2937); font-size: 14px; }
-.update-check__actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.update-check__action-buttons { display: flex; gap: 8px; }
+.update-check { display: grid; gap: 24px; padding-top: 12px; color: var(--app-text); }
+.update-check__summary { display: flex; align-items: flex-start; gap: 16px; }
+.update-check__symbol { display: grid; place-items: center; flex: 0 0 44px; height: 44px; border-radius: 14px; background: color-mix(in srgb, var(--app-accent) 10%, transparent); color: var(--app-accent); font-size: 23px; }
+.update-check__summary--success .update-check__symbol { color: var(--app-success); background: color-mix(in srgb, var(--app-success) 10%, transparent); }
+.update-check__summary--error .update-check__symbol { color: var(--app-danger); background: color-mix(in srgb, var(--app-danger) 10%, transparent); }
+.update-check__summary--warning .update-check__symbol { color: var(--app-warning); background: color-mix(in srgb, var(--app-warning) 10%, transparent); }
+.update-check__copy { min-width: 0; }
+.update-check__copy h2 { margin: 0 0 8px; color: var(--app-text); font-size: 20px; font-weight: 600; line-height: 1.4; }
+.update-check__copy p, .update-check__hint { margin: 0; color: var(--app-muted); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.update-check__versions { display: flex; align-items: center; gap: 20px; padding: 18px 20px; border: 1px solid var(--app-border); border-radius: 12px; background: var(--app-bg); }
+.update-check__version { display: grid; flex: 1; gap: 6px; min-width: 0; }
+.update-check__version span { color: var(--app-muted); font-size: 12px; }
+.update-check__version strong { color: var(--app-text); font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.update-check__version--target strong { color: var(--app-accent); font-weight: 600; }
+.update-check__version-arrow { flex: 0 0 auto; color: var(--app-muted); font-size: 16px; }
+.update-check__download { display: grid; gap: 4px; }
+.update-check__download-meta { display: flex; justify-content: space-between; gap: 12px; color: var(--app-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.update-check__download-meta strong { color: var(--app-accent); font-weight: 600; }
+.update-check__actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 18px; border-top: 1px solid var(--app-border); }
+.update-check__action-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+@media (max-width: 480px) {
+  .update-check__versions { gap: 12px; padding: 16px; }
+  .update-check__version strong { font-size: 16px; }
+  .update-check__actions { align-items: flex-start; gap: 8px; }
+}
 </style>
