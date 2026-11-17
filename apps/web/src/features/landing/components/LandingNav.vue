@@ -1,5 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed } from "vue";
+import { ArrowUpRight } from "lucide-vue-next";
 import { useRoute, useRouter } from "vue-router";
 import { useConfigStore } from "../../../store/config";
 import { useUiStore } from "../../../store/ui";
@@ -57,7 +58,10 @@ const navLinks = [
         <RouterLink to="/best-practices" class="landing-nav__link" :class="{ 'landing-nav__link--active': isBestPractices }">最佳实践</RouterLink>
         <RouterLink to="/upgrade" class="landing-nav__link" :class="{ 'landing-nav__link--active': isUpgrade }">更新日志</RouterLink>
         <RouterLink to="/download" class="landing-nav__link" :class="{ 'landing-nav__link--active': isDownload }">软件下载</RouterLink>
-        <a :href="SOURCE_REPOSITORY_URL" target="_blank" rel="noopener noreferrer" class="landing-nav__link">GitHub 开源</a>
+        <a :href="SOURCE_REPOSITORY_URL" target="_blank" rel="noopener noreferrer" class="landing-nav__link">
+          GitHub 开源
+          <ArrowUpRight :size="14" aria-hidden="true" />
+        </a>
       </div>
 
       <div class="landing-nav__actions">
@@ -150,6 +154,7 @@ const navLinks = [
 .landing-nav__link {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   text-decoration: none;
   min-height: 38px;
   padding: 0 14px;

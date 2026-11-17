@@ -8,7 +8,6 @@ import LandingRecords from "./LandingRecords.vue";
 import LandingFloatingQr from "./LandingFloatingQr.vue";
 import HeroSection from "./sections/HeroSection.vue";
 import CoreFeaturesSection from "./sections/CoreFeaturesSection.vue";
-import TaskDemoSection from "./sections/TaskDemoSection.vue";
 import ProductivitySection from "./sections/ProductivitySection.vue";
 import CostSection from "./sections/CostSection.vue";
 import SecuritySection from "./sections/SecuritySection.vue";
@@ -48,10 +47,6 @@ onActivated(activateLanding);
     </div>
 
     <div class="landing__section">
-      <TaskDemoSection />
-    </div>
-
-    <div class="landing__section">
       <ProductivitySection />
     </div>
 
@@ -71,7 +66,7 @@ onActivated(activateLanding);
 </template>
 
 <style scoped>
-.landing__footer { width: min(1180px, calc(100% - 48px)); margin: 70px auto 0; padding-block: 30px; border-top: 1px solid var(--landing-border); display: flex; align-items: center; justify-content: space-between; gap: 20px; font-size: 13px; }
+.landing__footer { width: min(1180px, calc(100% - 48px)); margin: 48px auto 0; padding-block: 24px; border-top: 1px solid var(--landing-border); display: flex; align-items: center; justify-content: space-between; gap: 20px; font-size: 13px; }
 .landing__footer div { display: flex; flex-wrap: wrap; gap: 18px; }
 .landing__footer a { color: var(--landing-muted); }
 :deep([id]) { scroll-margin-top: 120px; }
@@ -112,10 +107,10 @@ onActivated(activateLanding);
 .landing__section {
   width: min(1180px, calc(100% - 48px));
   margin: 0 auto;
-  padding-top: 90px;
+  padding-top: 64px;
 }
 .landing__section--hero { padding-top: 12px; }
-.landing__section--features { padding-top: 30px; }
+.landing__section--features { padding-top: 20px; }
 
 /* 子组件复用的工具类（按规范保留在父级） */
 :deep(.panel) {
@@ -124,7 +119,7 @@ onActivated(activateLanding);
   border-radius: 32px;
   background: var(--landing-panel);
   box-shadow: var(--landing-shadow-soft);
-  padding: 36px 36px;
+  padding: 28px 28px;
 }
 :deep(.btn) {
   display: inline-flex;

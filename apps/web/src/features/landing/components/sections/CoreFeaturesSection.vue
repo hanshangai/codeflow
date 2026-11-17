@@ -4,7 +4,7 @@ import { BarChart3, Blocks, Cpu, FileText, GitBranch, Workflow } from "lucide-vu
 const features = [
   { icon: FileText, title: "可视化规格管理", description: "需求、约束、验收标准与代码上下文放在同一处，持续维护可执行规格。", href: "#specs" },
   { icon: Workflow, title: "内置工作流", description: "Harness、Loop 与 TDD 开箱即用，复杂任务按节点、角色与确认点推进。", href: "#workflow" },
-  { icon: BarChart3, title: "研发度量体系", description: "从会话、任务与执行记录汇总效率、成本与交付观察。", href: "#metrics" },
+  { icon: BarChart3, title: "研发度量体系", description: "从会话、任务与执行记录汇总效率、成本与交付观察。" },
   { icon: Cpu, title: "多模型一键切换", description: "Claude Code 与 Codex 按任务切换模型，平衡能力、速度与成本。", href: "#models" },
   { icon: Blocks, title: "可视化自定义", description: "在画布中编排工作流、Agent、Skill 与 MCP，把团队方法沉淀为资产。", href: "#custom" },
   { icon: GitBranch, title: "研发操作一体", description: "会话、文件、终端与 Git 在同一工作台衔接，改动与验证可追踪。", href: "#changes" },

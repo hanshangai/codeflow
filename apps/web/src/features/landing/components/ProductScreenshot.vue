@@ -21,7 +21,7 @@ function handleError(event: Event): void {
         :width="portrait ? 390 : 1440" :height="portrait ? 844 : 900" decoding="async" @error="handleError" />
     </a>
     <div v-else class="product-shot__error" role="status">图片加载失败，请刷新页面重试。</div>
-    <figcaption>演示项目界面 · 非实时执行<span v-if="!failed"> · 点击查看原图</span></figcaption>
+    <figcaption>桌面端演示界面 · 非实时执行<span v-if="!failed"> · 点击查看原图</span></figcaption>
   </figure>
 </template>
 
