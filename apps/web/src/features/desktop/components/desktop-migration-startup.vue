@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, onMounted, onScopeDispose, ref, watch, type Ref } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch, type Ref } from "vue";
 import { Alert, Button, ConfigProvider, Progress, Space } from "ant-design-vue";
 import type { DesktopMigrationState } from "@codeflowai/shared";
 import { getDesktopBridge } from "../../../services/desktop";
@@ -13,9 +13,6 @@ const workbenchReady = inject<Ref<boolean>>(WORKBENCH_READY_KEY, ref(true));
 const bridge = getDesktopBridge();
 const config = useConfigStore();
 const state = ref<DesktopMigrationState | null>(null);
-const startedAt = Date.now();
-const elapsedSeconds = ref(0);
-let elapsedTimer: ReturnType<typeof setInterval> | undefined;
 const actionError = ref<string | null>(null);
 const busy = ref(false);
 const localReady = ref(false);
@@ -111,9 +108,6 @@ async function perform(action: "start" | "defer"): Promise<void> {
 }
 
 onMounted(async () => {
-  if (!workbenchReady.value) {
-    elapsedTimer = setInterval(() => { elapsedSeconds.value = Math.floor((Date.now() - startedAt) / 1000); }, 1000);
-  }
   if (!bridge?.getMigrationState) { localReady.value = true; emit("ready"); return; }
   unsubscribe = bridge.onMigrationState?.(value => { stateRevision++; void accept(value); });
   const revision = stateRevision;
@@ -123,8 +117,6 @@ onMounted(async () => {
   }
   catch { actionError.value = "无法读取迁移状态，请关闭应用后重试。"; }
 });
-watch(workbenchReady, ready => { if (ready && elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = undefined; } });
-onScopeDispose(() => { if (elapsedTimer) clearInterval(elapsedTimer); });
 onBeforeUnmount(() => { unsubscribe?.(); });
 </script>
 
@@ -176,7 +168,6 @@ onBeforeUnmount(() => { unsubscribe?.(); });
             <div class="desktop-migration__status" role="status">
               <span v-if="stageLabel">{{ stageLabel }}</span>
               <span v-if="state?.total !== null && state?.total !== undefined" class="desktop-migration__count">{{ state.completed }} / {{ state.total }}</span>
-              <span class="desktop-migration__count">已用时 {{ elapsedSeconds }} 秒</span>
             </div>
           </div>
         </template>

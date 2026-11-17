@@ -66,3 +66,9 @@ for (const scenario of ["allowed", "denied", "old-shell", "bound", "running", "u
     }
   });
 }
+
+test("启动页不显示已用时提示", () => {
+  const source = fs.readFileSync(new URL("../src/features/desktop/components/desktop-migration-startup.vue", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /已用时/);
+  assert.doesNotMatch(source, /elapsedSeconds/);
+});
