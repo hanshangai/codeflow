@@ -14,6 +14,7 @@ import { executeDesktopApiRequest } from "../src/app/executeDesktopApiRequest.js
 import { trackOrdinaryTurnExecution, waitForOrdinaryTurnExecution } from "../src/app/ordinaryTurnExecution.js";
 import { getWorkspaceApiRequestFailureDetails, isWorkspaceApiRequestFailure, type ApiHandlerContext } from "../src/app/handleApiRequest.js";
 import { openClientDb } from "../src/db/clientDb.js";
+import { ClientDbWriterService } from "../src/db/clientDbWriterService.js";
 import { CLIENT_DB_SCHEMA_VERSION } from "../src/db/migrateClientDb.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
 import { logger } from "../src/logger.js";
@@ -26,6 +27,7 @@ import { DesktopBuiltInRelayRequestError } from "../src/runtime/desktopCloudAcco
 import { handleGitStatus, handleGitDiff, handleGitDiffFiles } from "../src/app/handlers/gitHandlers.js";
 import * as gitService from "../src/git/gitService.js";
 import { WorkspaceOperationGate } from "../src/workspace-migration/workspaceOperationGate.js";
+import { createLocalEventPipeline } from "../src/runtime/localEventPersistence.js";
 
 for (const kind of ["getter", "proxy", "head"] as const) test(`GITW metadata ${kind} preserves original evidence without unsafe access or re-read`, async t => {
   const f = await gitLogFixture(t), native = fsPromises.stat, reflection = new Error("REFLECTION_FAILED"), logging = false;
@@ -273,6 +275,10 @@ for (const dispatched of [true, false]) test(`可信本机${dispatched ? "运行
     await pending;
   });
   await Promise.resolve();
+  const writerFailures: Error[] = [];
+  const writer = new ClientDbWriterService({ dbPath: path.join(f.directory, "client.db"), db: f.db,
+    onFatalError: error => { writerFailures.push(error); } });
+  await writer.ready();
   f.ctx.withDatabase = async () => { assert.equal(stopped, dispatched ? 1 : 0, "停止前不得访问数据库"); throw failure; };
   try {
     const response = await f.call({ method: "turns.interrupt", body: { workspaceId, threadId, turnId } });
@@ -282,7 +288,10 @@ for (const dispatched of [true, false]) test(`可信本机${dispatched ? "运行
     assert.equal(tails.length, 1);
     const tailFailure = await tails[0];
     assert.ok(tailFailure instanceof AggregateError && tailFailure.errors.includes(failure));
-  } finally { release(); await waitForOrdinaryTurnExecution(f.ctx.sessions, { workspaceId, threadId, turnId }); }
+  } finally {
+    release(); await waitForOrdinaryTurnExecution(f.ctx.sessions, { workspaceId, threadId, turnId });
+    await writer.close(); assert.deepEqual(writerFailures, []);
+  }
 });
 
 for (const mismatch of ["unverified-owner", "successor", "workspace"] as const) test(`桌面终止${mismatch}不得绕过原数据库归属校验`, async t => {
@@ -303,6 +312,68 @@ for (const mismatch of ["unverified-owner", "successor", "workspace"] as const) 
     assert.equal(stops, 0);
   } finally { release(); await waitForOrdinaryTurnExecution(f.ctx.sessions, { workspaceId, threadId, turnId }); }
 });
+
+for (const engine of ["codex", "claude"] as const) for (const dispatched of [true, false]) {
+  test(`真实Writer下${engine}${dispatched ? "运行" : "准备中"}回合经桌面入口停止并保存终态，重复点击不再中断`, async t => {
+    const f = fixture(t);
+    const created = await f.call({ method: "workspaces.upsert", body: { title: "停止测试", path: f.root } });
+    const workspaceId = (created.body as any).workspace.id as WorkspaceId;
+    const threadId = `writer-stop-${engine}-${dispatched}` as ThreadId, turnId = `turn-${threadId}`;
+    const scoped = f.db.forWorkspace(workspaceId), scope = { workspaceId, threadId, turnId };
+    scoped.threads.create({ id: threadId, workspaceId, engine, title: "停止测试" });
+    scoped.turns.insertStarted({ ...scope, engine, startedAt: 1, startEventSeq: 1 });
+    f.ctx.threads.create({ workspaceId, threadId, engine, title: "停止测试" });
+    f.ctx.orchEngine = { forWorkspace() { return this; } } as any;
+    let active = true, stops = 0, release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const failures: Error[] = [];
+    const writer = new ClientDbWriterService({ dbPath: path.join(f.directory, "client.db"), db: f.db,
+      onFatalError: error => { failures.push(error); } });
+    const pipeline = createLocalEventPipeline({ writer,
+      apply(message) {
+        if (message.t === "conversation.event" && message.event.type === "turn.error") {
+          scoped.turns.setEnded(message.event.payload.turnId!, { status: "error", endedAt: message.event.ts, endEventSeq: message.event.seq });
+        }
+      }, publish() {}, onFailure(error) { failures.push(error); },
+    });
+    let tailResult: Promise<PromiseSettledResult<void>[]> | undefined;
+    f.ctx.trackApiTail = tail => { tailResult = Promise.allSettled([tail]); };
+    f.ctx.getActiveThreadTurn = () => active ? { turnId, startedAt: 1, source: "runtime" } : null;
+    f.ctx.clearActiveThreadTurn = () => { active = false; };
+    f.ctx.withDatabase = (requestId, operation) => writer.withLegacyDatabase(requestId, operation);
+    f.ctx.flushLocalEvents = (ws, thread) => pipeline.flush(ws, thread);
+    f.ctx.onBeforeEmitConversationEvent = event => pipeline.enqueue({ t: "conversation.event", event }, turnId, 1);
+    f.ctx.sessions = { beginThreadOperation() { return () => {}; },
+      getOrCreate() { return { async prepareAssistantTerminalEvents() { return { events: [], latestAssistantText: null }; } }; },
+      async interrupt(targetThread: string, targetTurn: string, options: any) {
+        assert.equal(targetThread, threadId); assert.equal(targetTurn, turnId);
+        assert.throws(() => scoped.turns.get(turnId), /CLIENT_DB_LEGACY_ACCESS_REQUIRED/u);
+        stops++; options.onStopConfirmed(); return true;
+      },
+    } as any;
+    trackOrdinaryTurnExecution(f.ctx.sessions, { ...scope, localWorkspaceOnly: true }, async execution => {
+      if (dispatched) execution.markProviderDispatch();
+      await pending;
+    });
+    try {
+      await writer.ready();
+      const response = await f.call({ method: "turns.interrupt", body: scope });
+      assert.equal(response.status, 200); assert.equal((response.body as any).phase, "draining");
+      assert.ok(tailResult); assert.deepEqual(await tailResult, [{ status: "fulfilled", value: undefined }]);
+      assert.equal(await writer.withLegacyDatabase("verify-stop", () => scoped.turns.get(turnId)?.status), "error");
+      assert.equal(active, false); assert.equal(stops, dispatched ? 1 : 0);
+      const repeated = await f.call({ method: "turns.interrupt", body: scope });
+      assert.equal(repeated.status, 200); assert.equal((repeated.body as any).phase, "completed");
+      assert.equal((repeated.body as any).running, null); assert.equal(stops, dispatched ? 1 : 0);
+      assert.equal(await writer.withLegacyDatabase("verify-events", () => scoped.conversationEvents.listByThread(threadId)
+        .filter(event => event.type === "turn.error").length), 1);
+      assert.deepEqual(failures, []);
+    } finally {
+      release(); await waitForOrdinaryTurnExecution(f.ctx.sessions, scope);
+      try { await pipeline.close(); } finally { await writer.close(); }
+    }
+  });
+}
 
 /** 桌面 Profile 诊断从真实物理工作区读取，不替换固定日志入口。 */
 function profileLogs(root: string): any[] {

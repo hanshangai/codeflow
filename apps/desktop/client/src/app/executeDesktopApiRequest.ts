@@ -807,7 +807,7 @@ function assertAssetNotReferenced(ctx: ApiHandlerContext, workspaceId: Workspace
   if (referenced) throw new DesktopRequestError(409, "资产仍被引用，请先修改引用方");
 }
 
-/** 校验本机线程归属；精确停止可复用已准入owner，其他线程仍核对持久归属。 */
+/** 精确停止复用已准入本机 owner，不读取数据库；其余请求在许可内核对持久归属。 */
 function prepareThreadRequestBody(ctx: ApiHandlerContext, method: DesktopApiRequest["method"], rawBody: Record<string, unknown>): Record<string, unknown> {
   const body = { ...rawBody };
   // Server 注入的 Web 会话标识不进入本机执行；知识会话 actor 由本机可信身份覆盖。
@@ -815,10 +815,10 @@ function prepareThreadRequestBody(ctx: ApiHandlerContext, method: DesktopApiRequ
   delete body.originWebSessionId;
   const workspaceId = requiredText(body.workspaceId, "workspaceId") as WorkspaceId;
   if (!isLocalWorkspaceId(ctx, workspaceId)) throw new DesktopRequestError(400, "仅支持本机本地工作区的精确 ID");
-  requireHostedWorkspace(ctx, workspaceId);
   if (method === "turns.interrupt" && canInterruptRuntimeTurnWithoutDatabase(ctx, body)) {
     return { workspaceId, threadId: requiredText(body.threadId, "threadId"), turnId: requiredText(body.turnId, "turnId") };
   }
+  requireHostedWorkspace(ctx, workspaceId);
   ctx = scopeApiHandlerContext(ctx, workspaceId, { readonly: isThreadHistoryReadApiRequest(method),
     deferPersistenceCheck: isWorkspacePersistenceRecoveryApiRequest(method) });
   return method === "threads.sendMessage"

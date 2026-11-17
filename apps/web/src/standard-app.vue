@@ -200,7 +200,9 @@ const { guideOpen, dismissGuide, configureGuide, loginGuide } = useLocalModelSet
 const route = useRoute();
 const showNotificationPending = computed(() => shell.mode !== "mobile"
   && route.name === "chat" && resolveAccountH5DeepLink(route.query).tab === "pending");
-const showDesktopMigrationBanner = computed(() => !shell.config.isDesktop && shell.mode !== "mobile"
+/** 迁移提示关闭只保留在当前页面生命周期，切换视图不重置，刷新页面重新出现。 */
+const desktopMigrationBannerDismissed = ref(false);
+const showDesktopMigrationBanner = computed(() => !desktopMigrationBannerDismissed.value && !shell.config.isDesktop && shell.mode !== "mobile"
   && !/Android|iPhone|iPad|Mobile|MicroMessenger|wxwork|DingTalk/iu.test(navigator.userAgent)
   && shell.config.hasActiveSession && ["chat", "orchestration", "knowledge", "admin"].includes(shell.ui.mainView));
 
@@ -289,7 +291,7 @@ const authComponent = computed(() => {
         :shell="shell"
       />
       <DesktopWindowBar v-else />
-      <DesktopMigrationBanner v-if="showDesktopMigrationBanner" />
+      <DesktopMigrationBanner v-if="showDesktopMigrationBanner" @close="desktopMigrationBannerDismissed = true" />
 
       <div v-if="shell.workspaceSwitching" class="app-workspace-switching">
         <a-spin size="large" tip="切换工作区..." />

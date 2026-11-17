@@ -47,3 +47,27 @@
 独立审查发现并已修复桌面/API 前置数据库等待、停止证明未写回原终态进度、未派发取消证明反馈晚于数据库三项问题。本机控制资格沿原执行 owner 的已核准入事实保存，不使用 renderer 参数授予权限。
 
 Client/Web 类型检查、无产物写入的构建及 UTF-8 检查已通过。SQLite 事务、读连接清理和事件 Writer 四个完整测试文件通过。相关集成测试有 6 个基线失败，桌面 API 完整文件有 4 个基线失败，迁移文件 Worker 有 18 个基线失败；均通过内存加载 HEAD 对应源码重现相同断言，未回退或写入任何预存文件。迁移测试含旧 `.codeflow` 夹具路径，不能据此宣称迁移安全验证通过。详细测试结果以交付时最新命令为准，不宣称全量测试通过。
+
+## 2026-11-17 桌面停止入口补修
+
+现场证据：测试安装的活动包为 `desktop-2026.11.17.01`，09:01:03 的 `turns.interrupt` 返回 500，根因为 `CLIENT_DB_LEGACY_ACCESS_REQUIRED`，请求 ID 为 `bcfc5ba4-8100-4e6a-a69e-77a24df97103`。只读检查日志和活动指针，没有读取或写入运行数据库。
+
+根因：上轮为已准入本机回合增加免数据库等待的精确停止入口，但 `prepareThreadRequestBody` 在内存 owner 短路之前仍调用 `requireHostedWorkspace`。该方法通过 `WorkspaceRepo.get` 读取应用库，实际 Writer 的 guard 在引擎停止前拒绝访问。旧桌面测试只替换 `withDatabase`，没有安装真实 guard，因而没有捕获隐含的直接数据库读取。
+
+职责仍沿用：桌面 executor 投影参数并识别已核本机 owner；API handler 复验精确回合；`turnInterrupt` 停止 provider 并推进原终态进度；Writer 为同步数据库段授予短许可，事件管线持久化正文及终态。修复只将持久化工作区校验移到精确 owner 短路之后。未核 owner、共享归属、不同工作区及后继回合继续执行原数据库校验；停止证明不代表保存成功。
+
+- [x] 两个保存失败测试启用真实 Writer，先复现与现场一致的 guard 错误及完整调用栈，再验证准备中和运行中均先反馈停止、保存错误仍保留在原尾链。
+- [x] 新增 Codex/Claude × 准备中/运行中四项桌面入口集成回归；真实 Writer 和事件管线完成终态保存，重复请求不再次中断、不重复写终态。
+- [x] 复核 executor、API handler、运行态查询和停止收尾的数据库边界；独立只读评审未发现必须修复项。
+- [x] 四个相关完整测试文件共 254 项，250 项通过、4 项既有失败；Client 类型检查、完整入口无落盘 esbuild、改动文件 UTF-8 和 diff 检查通过。未运行全仓库测试，不宣称全量通过。
+
+验证命令：`node --conditions=development --import tsx --test --test-concurrency=1 apps/desktop/client/tests/desktop-api-request.test.ts apps/desktop/client/tests/turn-interrupt-handler.test.ts apps/desktop/client/tests/ordinary-turn-update-stop.test.ts apps/desktop/client/tests/local-event-writer.test.ts`。
+
+四项既有失败均通过 Node 加载钩子仅在内存替换为 HEAD 的旧 executor，复现相同断言，没有修改工作区文件：
+
+- `desktop bridge persists workspace CRUD through the existing handler and returns real local ownership`：工作区删除返回 500，预期 200。
+- `desktop bridge refuses shared, foreign and unhosted workspaces while allowing removal of a missing root`：夹具缺少流程引擎，删除根目录后的诊断也无法落盘。
+- `desktop bridge enforces one matching response and forwards non-control messages`：断言只匹配内层响应错误，实际为外层 `WORKSPACE_API_RESPONSE_FAILED`。
+- `desktop terminal list restores persisted terminals under the workspace write gate`：预期的 `restoreAll` 调用没有发生。
+
+本轮只修改已登记的 executor、桌面 API 测试和本文档；未提交、推送、发布或覆盖当前测试安装。
