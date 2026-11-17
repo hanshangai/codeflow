@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import {
-  DESKTOP_CRASH_EVENTS, DESKTOP_CRASH_PROCESS_TYPES, DESKTOP_CRASH_REASONS,
+  DESKTOP_CRASH_EVENTS, DESKTOP_CRASH_PROCESS_TYPES, DESKTOP_CRASH_REASONS, DESKTOP_CRASH_STACK_MAX_FRAMES,
+  DESKTOP_CRASH_STACK_MAX_LENGTH,
   type DesktopCrashCleanMarker, type DesktopCrashEvent, type DesktopCrashProcessType, type DesktopCrashReason,
   type DesktopCrashRecentError, type DesktopCrashReport, type DesktopCrashReportAck, type DesktopCrashSessionMarker,
   type DesktopCrashVersions,
@@ -10,6 +11,7 @@ export type {
   DesktopCrashCleanMarker, DesktopCrashEvent, DesktopCrashProcessType, DesktopCrashReason, DesktopCrashRecentError,
   DesktopCrashReport, DesktopCrashReportAck, DesktopCrashSessionMarker, DesktopCrashVersions,
 } from "./types/desktopCrashReport.js";
+export { DESKTOP_CRASH_STACK_MAX_FRAMES, DESKTOP_CRASH_STACK_MAX_LENGTH };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$/;
@@ -22,6 +24,7 @@ const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$/;
 const REPORT_KEYS = ["schemaVersion", "kind", "reportId", "deviceId", "sessionId", "sessionStartedAt", "event", "processType",
   "reason", "exitCode", "occurredAt", "detectedAt", "phase", "errorCode", "requestId", "causeCodes", "recentErrors", "versions",
   "platform", "arch", "payloadSha256"];
+const REPORT_KEYS_WITH_STACK = [...REPORT_KEYS, "stack"];
 const VERSION_KEYS = ["shellVersion", "webVersion", "clientVersion", "releaseId", "shellId"];
 const RECENT_ERROR_KEYS = ["at", "errorCode", "requestId", "channel", "method"];
 const SESSION_KEYS = ["schemaVersion", "sessionId", "startedAt", "deviceId", "versions", "platform", "arch"];
@@ -35,7 +38,7 @@ export function assertDesktopCrashReport(value: unknown): asserts value is Deskt
   assertPlainData(value);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid crash report");
   const record = value as DesktopCrashReport;
-  assertExactKeys(value, REPORT_KEYS);
+  assertExactKeys(value, Object.keys(value).includes("stack") ? REPORT_KEYS_WITH_STACK : REPORT_KEYS);
   if (record.schemaVersion !== 1 || record.kind !== "crash") throw new Error("invalid crash report shape");
   assertUuid(record.reportId, "reportId");
   assertUuid(record.sessionId, "sessionId");
@@ -56,6 +59,7 @@ export function assertDesktopCrashReport(value: unknown): asserts value is Deskt
   if (record.phase !== null && (typeof record.phase !== "string" || !PHASE.test(record.phase))) throw new Error("invalid phase");
   if (record.errorCode !== null && (typeof record.errorCode !== "string" || !ERROR_CODE.test(record.errorCode))) throw new Error("invalid error code");
   if (record.requestId !== null && (typeof record.requestId !== "string" || !REQUEST_ID.test(record.requestId))) throw new Error("invalid request id");
+  if (record.stack !== undefined) assertStack(record.stack);
   assertCodeList(record.causeCodes);
   assertRecentErrors(record.recentErrors);
   assertVersions(record.versions);
@@ -115,6 +119,18 @@ function assertEventShape(event: DesktopCrashEvent, processType: DesktopCrashPro
 function assertCodeList(value: unknown): void {
   if (!Array.isArray(value) || value.length > 16 || new Set(value).size !== value.length) throw new Error("invalid cause codes");
   for (const code of value) if (typeof code !== "string" || !ERROR_CODE.test(code)) throw new Error("invalid cause code");
+}
+
+/** 堆栈只接受脱敏调用帧；拒绝异常消息、空行、超长内容和 NUL。 */
+function assertStack(value: unknown): void {
+  if (value === null) return;
+  if (typeof value !== "string" || value.length === 0 || value.length > DESKTOP_CRASH_STACK_MAX_LENGTH || value.includes("\0")) {
+    throw new Error("invalid crash stack");
+  }
+  const lines = value.split("\n");
+  if (lines.length > DESKTOP_CRASH_STACK_MAX_FRAMES || lines.some(line => !line.startsWith("at "))) {
+    throw new Error("invalid crash stack frame");
+  }
 }
 
 function assertRecentErrors(value: unknown): void {

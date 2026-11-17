@@ -289,6 +289,24 @@ function toErrorLogValue(
   return { message: String(error) };
 }
 
+/** 保留脱敏后的有限异常链，供异步排空失败定位原始任务原因。 */
+function describeClientErrorTree(error: unknown, depth = 0, seen = new Set<object>()): Record<string, unknown> {
+  const described = describeWorkspaceApiFailure(error);
+  const result: Record<string, unknown> = { ...described.rootCause, message: described.message };
+  if (depth >= 4 || error === null || typeof error !== "object" && typeof error !== "function") return result;
+  if (seen.has(error)) return { ...result, circular: true };
+  seen.add(error);
+  const own = (key: string): unknown => {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  };
+  const cause = own("cause");
+  if (cause != null) result.cause = describeClientErrorTree(cause, depth + 1, seen);
+  const errors = own("errors");
+  if (Array.isArray(errors)) result.errors = errors.slice(0, 4).map(item => describeClientErrorTree(item, depth + 1, seen));
+  return result;
+}
+
 /** 将自动 Key 根因限制为安全元数据；未知输入和 cause 最多读取两层，不输出正文或秘密。 */
 function toBuiltInRelayFailureLogValue(error: unknown, depth = 0): Record<string, unknown> {
   if (!error || typeof error !== "object") return { name: "UnknownError" };
@@ -3143,7 +3161,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
           `shutdown ${step} ${phase}`, { target: { clientId: config.clientId }, requestId: `shutdown:${process.pid}`, reason, durationMs: Date.now() - startedAt,
             ...(phase === "fail" ? { errorCode: "CLIENT_CLEANUP_STEP_FAILED" } : {}),
             ...(phase === "fail" ? { errorMessage: describeWorkspaceApiFailure(error).message,
-              rootCause: describeWorkspaceApiFailure(error).rootCause } : {}) }));
+              rootCause: describeClientErrorTree(error) } : {}) }));
       } catch (error) {
         cleanupErrors.push({ step, error });
       }
@@ -3557,7 +3575,7 @@ function createEventIndexRuntime(): EventIndexRuntime {
             errorCode: "EVENT_INDEX_BACKGROUND_FAILED",
             task: label,
             errorMessage: described.message,
-            rootCause: described.rootCause,
+            rootCause: describeClientErrorTree(error),
           });
         } catch (diagnosticError) {
           return { status: "rejected", reason: new AggregateError([error, diagnosticError], "EVENT_INDEX_BACKGROUND_DIAGNOSTIC_FAILED", { cause: error }) };

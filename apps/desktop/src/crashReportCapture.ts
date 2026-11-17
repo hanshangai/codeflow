@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { DesktopCrashEvent, DesktopCrashProcessType, DesktopCrashReason, DesktopCrashRecentError, DesktopCrashReport,
-  DesktopCrashSessionMarker, DesktopCrashVersions } from "@codeflowai/shared/desktop-crash-report";
+import { DESKTOP_CRASH_STACK_MAX_FRAMES, DESKTOP_CRASH_STACK_MAX_LENGTH,
+  type DesktopCrashEvent, type DesktopCrashProcessType, type DesktopCrashReason, type DesktopCrashRecentError, type DesktopCrashReport,
+  type DesktopCrashSessionMarker, type DesktopCrashVersions } from "@codeflowai/shared/desktop-crash-report";
 import { createCrashReportJournal, readCrashCleanMarker, readCrashRetryMarker, readCrashSessionMarker, removeCrashCleanMarker,
   removeCrashRetryMarker, removeCrashSessionMarker, writeCrashCleanMarker, writeCrashRetryMarker, writeCrashSessionMarker,
   type CrashReportJournal } from "./crashReportJournal.js";
@@ -84,6 +85,7 @@ export function createDesktopCrashCapture(input: {
   const report = (facts: {
     event: DesktopCrashEvent; processType: DesktopCrashProcessType; reason: DesktopCrashReason; exitCode: number | null;
     errorCode: string | null; requestId: string | null; phase: string | null; causeCodes: string[]; occurredAt?: string;
+    stack?: string | null;
   }): DesktopCrashReport | null => {
     const at = now();
     const key = `${facts.processType}|${facts.errorCode ?? "none"}|${facts.exitCode ?? "none"}`;
@@ -99,6 +101,7 @@ export function createDesktopCrashCapture(input: {
         occurredAt: facts.occurredAt && facts.occurredAt <= detectedAt ? facts.occurredAt : detectedAt, detectedAt,
         phase: facts.phase, errorCode: facts.errorCode, requestId: facts.requestId, causeCodes, recentErrors: recent.errors,
         versions: { ...versions }, platform, arch,
+        ...(facts.stack ? { stack: facts.stack } : {}),
       });
     } catch (error) {
       reportInternal("DESKTOP_CRASH_REPORT_PERSIST_FAILED", Object.assign(error instanceof Error ? error : new Error("DESKTOP_CRASH_REPORT_PERSIST_FAILED"), {
@@ -259,8 +262,9 @@ function readDeviceId(dataDir: string): { deviceId: string | null; invalid: Erro
   }
 }
 
-/** 只保留公开错误码、请求 ID 和阶段；异常正文、stack 与扩展属性不进入证据。 */
-function safeErrorFacts(value: unknown): { errorCode: string | null; requestId: string | null; phase: string | null; causeCodes: string[] } {
+/** 只保留公开错误码、请求 ID、阶段和脱敏调用帧；异常消息与扩展属性不进入证据。 */
+function safeErrorFacts(value: unknown): { errorCode: string | null; requestId: string | null; phase: string | null; causeCodes: string[];
+  stack: string | null } {
   const chain = collectErrors(value);
   const codes = chain.map(errorCodeOf).filter((code): code is string => code !== null);
   const first = chain[0], requestId = first && typeof first === "object" ? (first as { requestId?: unknown }).requestId : undefined;
@@ -270,7 +274,21 @@ function safeErrorFacts(value: unknown): { errorCode: string | null; requestId: 
     requestId: typeof requestId === "string" && REQUEST_ID.test(requestId) ? requestId : null,
     phase: typeof phase === "string" && PHASE.test(phase) ? phase : null,
     causeCodes: [...new Set(codes.slice(1))].slice(0, 16),
+    stack: safeStack(first),
   };
+}
+
+/** 只保留调用帧并把用户目录替换为 ~；异常消息本身不上传。 */
+function safeStack(value: unknown): string | null {
+  if (!(value instanceof Error) || typeof value.stack !== "string") return null;
+  const home = process.env.USERPROFILE || process.env.HOME || "";
+  const frames = value.stack.split("\n")
+    .map(line => line.trimStart())
+    .filter(line => line.startsWith("at "))
+    .slice(0, DESKTOP_CRASH_STACK_MAX_FRAMES)
+    .map(line => home ? line.split(home).join("~") : line);
+  const stack = frames.join("\n").slice(0, DESKTOP_CRASH_STACK_MAX_LENGTH);
+  return stack || null;
 }
 
 function collectErrors(value: unknown, depth = 0): unknown[] {

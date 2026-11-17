@@ -200,8 +200,6 @@ async function submit(): Promise<void> {
 
         <a-alert v-if="errorText" type="error" show-icon :message="errorText" />
 
-        <p class="feedback-modal__privacy">请勿在描述中填写密码、Key 等敏感信息。提交后可在工单中查看处理状态。</p>
-
         <footer class="feedback-modal__actions">
           <a-button @click="close">取消</a-button>
           <a-button type="primary" :loading="submitting" :disabled="!canSubmit" @click="submit">提交反馈</a-button>
@@ -248,7 +246,6 @@ async function submit(): Promise<void> {
 .feedback-modal__image button { position: absolute; top: 3px; right: 3px; display: grid; place-items: center; width: 20px; height: 20px; border: 0; border-radius: 50%; background: rgba(0,0,0,.55); color: #fff; cursor: pointer; }
 .feedback-modal__upload { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; width: 84px; height: 62px; border: 1px dashed var(--app-border); border-radius: 8px; background: transparent; color: var(--app-muted); font-size: 11px; cursor: pointer; }
 .feedback-modal__file { display: none; }
-.feedback-modal__privacy { margin: 0; color: var(--app-muted); font-size: 12px; line-height: 1.6; }
 .feedback-modal__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; padding-top: 16px; border-top: 1px solid var(--app-divider); }
 .feedback-modal__success { display: grid; justify-items: center; gap: 14px; padding: 16px 0 4px; text-align: center; }
 .feedback-modal__success-icon { display: grid; place-items: center; width: 52px; height: 52px; border-radius: 50%; background: #e8f5ec; color: #2f7d4a; font-size: 26px; }

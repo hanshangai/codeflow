@@ -12,7 +12,7 @@ function fixture() {
   const source = fs.readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
   const tree = ts.createSourceFile("index.ts", source, ts.ScriptTarget.Latest, true);
   const selected: string[] = [];
-  const functions = new Set(["logClientStep", "createEventIndexRuntime"]);
+  const functions = new Set(["logClientStep", "describeClientErrorTree", "createEventIndexRuntime"]);
   const variables = new Set(["hasDesktopReminderScope", "sendToServer", "reminderDelivery", "reminderCompletionNotifier"]);
   /** 沿真实声明选取协作入口，避免复制准入条件导致测试与实现一起出错。 */
   const visit = (node: ts.Node): void => {
@@ -88,6 +88,20 @@ test("授权有效但实际发送失败仍显式阻止成功排空，不清除�
   assert.equal(f.sent.length, 1);
   assert.equal(f.failures.length, 1);
   assert.equal(f.logs.length, 1);
+});
+
+test("后台任务失败日志保留脱敏的嵌套根因", async () => {
+  const f = fixture();
+  const nested = Object.assign(new Error("database write token=private-token"), { code: "SQLITE_BUSY" });
+  const failure = new AggregateError([nested], "EVENT_INDEX_BACKGROUND_FAILED", { cause: nested });
+  f.runtime.trackWork(async () => { throw failure; }, () => {}, "diagnostic-test");
+  await assert.rejects(f.runtime.waitForIdle(), error => error === failure);
+  const details = f.logs[0]![2] as { rootCause: any };
+  assert.equal(details.rootCause.message, "EVENT_INDEX_BACKGROUND_FAILED");
+  assert.equal(details.rootCause.errors[0].code, "SQLITE_BUSY");
+  assert.equal(details.rootCause.errors[0].message, "database write token=[REDACTED]");
+  assert.equal(details.rootCause.cause.code, "SQLITE_BUSY");
+  assert.doesNotMatch(JSON.stringify(details), /private-token/u);
 });
 
 test("Host授权存在但没有提醒需求时不创建外发任务", async () => {

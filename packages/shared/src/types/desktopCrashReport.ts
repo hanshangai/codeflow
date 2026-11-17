@@ -35,6 +35,10 @@ export type DesktopCrashRecentError = {
   method: string | null;
 };
 
+/** 堆栈只保留脱敏后的调用帧，限制帧数与总长度。 */
+export const DESKTOP_CRASH_STACK_MAX_FRAMES = 40;
+export const DESKTOP_CRASH_STACK_MAX_LENGTH = 16_384;
+
 /** 单条崩溃报告；payloadSha256 覆盖除自身外的全部脱敏字段。 */
 export type DesktopCrashReport = {
   schemaVersion: 1;
@@ -57,6 +61,8 @@ export type DesktopCrashReport = {
   versions: DesktopCrashVersions;
   platform: "win32" | "darwin" | null;
   arch: "x64" | "arm64" | null;
+  /** 仅主进程未捕获异常/未处理拒绝提供脱敏调用帧；旧报告可省略。 */
+  stack?: string | null;
   payloadSha256: string;
 };
 

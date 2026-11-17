@@ -10,6 +10,8 @@ import { resolveSharedShellBuilderCache } from "./shell-build-cache.mjs";
 const source = fileURLToPath(new URL("../build/shell-installer.nsi", import.meta.url));
 const repository = fileURLToPath(new URL("../../..", import.meta.url));
 
+export { inventory as readShellCandidateInventory };
+
 /** 新路径以最近现存祖先的真实位置参与隔离检查，不创建父目录。 */
 async function resolveNew(directory) {
   const tail = [];
