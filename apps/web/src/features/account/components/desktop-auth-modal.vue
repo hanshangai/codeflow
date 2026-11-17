@@ -375,10 +375,6 @@ function sendLabel(purpose: "register" | "forgot_password"): string {
                   <a-input-password v-model:value="register.confirmPassword" size="large" placeholder="再次输入密码" />
                 </label>
               </div>
-              <label class="auth-field">
-                <span>邀请码（选填）</span>
-                <a-input v-model:value="register.inviteCode" size="large" placeholder="CF-XXXX-XXXX-XXXX" />
-              </label>
               <div class="auth-field">
                 <a-checkbox :checked="enterpriseAdminChecked" :disabled="submitting"
                   @change="handleEnterpriseAdminToggle">注册为企业管理员</a-checkbox>
@@ -636,6 +632,34 @@ function sendLabel(purpose: "register" | "forgot_password"): string {
   color: var(--auth-muted, #475569);
 }
 
+/* 数字验证码输入框对齐弹窗内其它大号输入框，修正 placeholder 字号和字距差异。 */
+.auth-field :deep(.numeric-captcha__input) {
+  height: 40px;
+  padding: 6px 11px;
+  border: 1px solid #d9d9d9;
+  border-radius: 12px;
+  background: #fff;
+  color: rgba(0, 0, 0, 0.88);
+  font-size: 16px;
+  letter-spacing: normal;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.auth-field :deep(.numeric-captcha__input::placeholder) {
+  color: rgba(0, 0, 0, 0.25);
+  font-size: 16px;
+  letter-spacing: normal;
+}
+
+.auth-field :deep(.numeric-captcha__input:focus) {
+  border-color: #c96442;
+  box-shadow: 0 0 0 2px rgba(201, 100, 66, 0.1);
+}
+
+.auth-field :deep(.numeric-captcha__visual) {
+  height: 40px;
+}
+
 .auth-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -782,6 +806,14 @@ function sendLabel(purpose: "register" | "forgot_password"): string {
 :root[data-theme="dark"] .desktop-auth-modal-host .ant-input-affix-wrapper input::placeholder {
   color: #8f7f76;
 }
+:root[data-theme="dark"] .desktop-auth-modal-host .auth-card .numeric-captcha__input {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: #f2e9e3;
+}
+:root[data-theme="dark"] .desktop-auth-modal-host .auth-card .numeric-captcha__input::placeholder {
+  color: #8f7f76;
+}
 :root[data-theme="dark"] .desktop-auth-modal-host .ant-checkbox-wrapper { color: #b8a79e; }
 
 @media (prefers-color-scheme: dark) {
@@ -798,6 +830,14 @@ function sendLabel(purpose: "register" | "forgot_password"): string {
   }
   :root:not([data-theme]) .desktop-auth-modal-host .ant-input::placeholder,
   :root:not([data-theme]) .desktop-auth-modal-host .ant-input-affix-wrapper input::placeholder {
+    color: #8f7f76;
+  }
+  :root:not([data-theme]) .desktop-auth-modal-host .auth-card .numeric-captcha__input {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: #f2e9e3;
+  }
+  :root:not([data-theme]) .desktop-auth-modal-host .auth-card .numeric-captcha__input::placeholder {
     color: #8f7f76;
   }
   :root:not([data-theme]) .desktop-auth-modal-host .ant-checkbox-wrapper { color: #b8a79e; }
