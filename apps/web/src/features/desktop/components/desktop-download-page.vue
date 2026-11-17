@@ -62,8 +62,9 @@ onBeforeUnmount(() => request?.abort());
 </script>
 
 <template>
-  <main class="desktop-download">
+  <div class="desktop-download">
     <LandingNav @open-settings="emit('open-settings')" @enter-app="emit('enter-app')" />
+    <main class="desktop-download__content">
     <section class="desktop-download__hero">
       <span class="desktop-download__eyebrow">CodeFlow Desktop</span>
       <h1>把 AI 研发工作台，装进你的电脑</h1>
@@ -86,11 +87,13 @@ onBeforeUnmount(() => request?.abort());
     <p class="desktop-download__mobile-note">手机用户请在电脑浏览器中打开此页面下载安装。Linux 暂不提供桌面安装包。</p>
     <section class="desktop-download__steps"><h2>首次使用</h2><ol><li>下载完整安装包，按安装程序提示完成安装。</li><li>打开 CodeFlow 桌面版，创建工作区开始使用。</li><li>需要企业、Token 和云端功能时，使用原账号登录或注册账号。</li></ol></section>
     <section id="migration" ref="migrationSection" class="desktop-download__steps"><h2>从旧 Client 迁移</h2><ol><li>请在旧 Client 所在电脑、同一系统用户下安装桌面版。</li><li>首次启动后，桌面版会检测可迁移的旧工作区；确认“开始迁移”后执行。</li><li>迁移完成后核对工作区、会话和配置，再使用桌面版继续工作。</li></ol><a-alert type="info" show-icon message="迁移前请保留旧数据。自动检测不覆盖任意历史目录、其他账号数据或浏览器设置；未检测到时请查看迁移说明或联系支持。" /><a-button type="link" @click="router.push('/contact')">获取迁移帮助</a-button></section>
-  </main>
+    </main>
+  </div>
 </template>
 
 <style scoped>
-.desktop-download { min-height: 100vh; overflow: auto; padding: 24px max(24px, calc((100vw - 1080px) / 2)) 64px; background: var(--app-bg); color: var(--app-text); }
+.desktop-download { min-height: 100vh; overflow: auto; background: var(--app-bg); color: var(--app-text); }
+.desktop-download__content { padding: 24px max(24px, calc((100vw - 1080px) / 2)) 64px; }
 .desktop-download__hero { text-align: center; padding: 48px 0 28px; }
 .desktop-download__eyebrow { color: var(--app-accent); font-size: 16px; font-weight: 700; }
 .desktop-download h1 { font-size: clamp(28px, 4vw, 44px); line-height: 1.3; }
