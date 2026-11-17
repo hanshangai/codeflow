@@ -26,12 +26,11 @@ const isHome = computed(() => ui.mainView === "landing");
 /** 公开内容页沿既有路由高亮，文章详情也归属最佳实践入口。 */
 const isBestPractices = computed(() => route.path === "/best-practices" || route.path.startsWith("/best-practices/"));
 const isUpgrade = computed(() => route.path === "/upgrade");
+const isDownload = computed(() => route.path === "/download");
 
 /** 首页导航用真实锚点；其他公开页保留返回对应首页区块的入口。 */
 const navLinks = [
   { label: "产品能力", anchor: "features" },
-  { label: "工作流", anchor: "workflow" },
-  { label: "开源与安全", anchor: "opensource" },
 ];
 </script>
 
@@ -57,6 +56,7 @@ const navLinks = [
         </a>
         <RouterLink to="/best-practices" class="landing-nav__link" :class="{ 'landing-nav__link--active': isBestPractices }">最佳实践</RouterLink>
         <RouterLink to="/upgrade" class="landing-nav__link" :class="{ 'landing-nav__link--active': isUpgrade }">更新日志</RouterLink>
+        <RouterLink to="/download" class="landing-nav__link" :class="{ 'landing-nav__link--active': isDownload }">软件下载</RouterLink>
         <a :href="SOURCE_REPOSITORY_URL" target="_blank" rel="noopener noreferrer" class="landing-nav__link">GitHub 开源</a>
       </div>
 
