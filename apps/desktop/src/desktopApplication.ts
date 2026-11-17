@@ -905,16 +905,23 @@ export function createDesktopApplication(input: {
           databaseMigration = manifest.dbSchemaVersion > current.health.dbSchemaVersion;
           snapshotDesktopStartupReady(current.startup, startupHeldId!);
         },
-        /** 用户已确认取消备份；跨结构围栏落盘后停旧 Client，候选直接使用原库。 */
+        /** 跨结构围栏先落盘；停旧 Client 后收口壳绑定，收口失败恢复旧 Client 并保留原错。 */
         async drain() {
           if (!await authorizeReleaseSwitch(candidate!.manifest, pending.requestId, AbortSignal.timeout(30_000))) throw new DesktopUpdatePostponed();
           if (databaseMigration) await markPendingDatabaseMigration(input.dataDir, pending, candidate!.manifest.dbSchemaVersion);
           await runtime.drain();
-          if (input.shellUpdate) {
-            const facts = input.shellUpdate.facts;
-            await retireShellUpdateAttempt({ ...facts, dataDir: input.dataDir, executablePath: facts.main.executable,
-              pid: facts.main.pid, parentPid: facts.main.parentPid, argv: [], trustedKeys: input.trustedReleaseKeys,
-              snapshot: input.shellUpdate.boundary?.snapshot });
+          try {
+            if (input.shellUpdate) {
+              const facts = input.shellUpdate.facts;
+              await retireShellUpdateAttempt({ ...facts, dataDir: input.dataDir, executablePath: facts.main.executable,
+                pid: facts.main.pid, parentPid: facts.main.parentPid, argv: [], trustedKeys: input.trustedReleaseKeys,
+                snapshot: input.shellUpdate.boundary?.snapshot });
+            }
+          } catch (error) {
+            // 候选尚未启动，原库未迁移；协调器的 drain 尚未完成，恢复由此边界负责。
+            try { await restartClient(activeAtStartup?.releaseDir ?? baselineReleaseDir, activeAtStartup?.manifest ?? initialExpectation); }
+            catch (recovery) { throw new AggregateError([error, recovery], "DESKTOP_RELEASE_DRAIN_RECOVERY_FAILED"); }
+            throw error;
           }
         },
         /** 启动调用即可能迁移数据库；不能仅凭未收到 ready 推断原库未变。 */
@@ -1170,12 +1177,13 @@ export function createDesktopApplication(input: {
       startupShellPending = false;
       return false;
     },
-    /** 只有用户显式重启才退出，资源仍由下一次启动统一激活。 */
+    /** 显式重启检查中新发现资源时，仍沿同一确认和退出入口完成重启。 */
     async restartForUpdate(): Promise<void> {
       if (operation !== "idle" || !window || !input.host.relaunch) throw new Error("DESKTOP_RESTART_UNAVAILABLE");
       if (!preparedUpdate && shellDetails.result !== "prepared") throw new Error("DESKTOP_UPDATE_NOT_PREPARED");
       if (!preparedUpdate) {
         await beginUpdateCheck(true, true);
+        if (preparedUpdate && window && !shellOwner) await application.restartForUpdate();
         return;
       }
       /** 用户明确重启更新仍先确认运行中会话，不能静默终止回合。 */
@@ -1276,7 +1284,8 @@ export function createDesktopApplication(input: {
           && shellAttempt.phase === "preparing" && shellAttempt.target);
         // pending 同时持有原库的迁移围栏；所有启动入口必须读取，损坏时禁止启动旧版。
         const recordedPending = await readPendingRelease(input.dataDir);
-        let pending = !continuation && !startupShellPending ? recordedPending : null;
+        // 资源先激活；已有壳准备记录在停旧 Client 后归档，再绑定新活动资源。
+        let pending = !continuation ? recordedPending : null;
         let startupUpdateError: { requestId: string; error: unknown } | undefined;
         assertStartupRunning();
         const releaseTrust = { trustedReleaseKeys: input.trustedReleaseKeys, requireHeldStartup: Boolean(continuation),
@@ -1288,8 +1297,6 @@ export function createDesktopApplication(input: {
         await reportStartup("正在校验当前版本…");
         const activeRelease = await resolveActiveRelease(input.dataDir, releaseTrust);
         assertStartupRunning();
-        // 已激活资源的 pending 只复核健康，不改壳尝试绑定；重启仍保留资源成功事实。
-        if (!continuation && startupShellPending && recordedPending?.releaseId === activeRelease?.releaseId) pending = recordedPending;
         // 已验签修复基线可接管不兼容旧活动包；磁盘指针等真实健康后再清理。
         const repairingDatabase = Boolean(recordedPending?.databaseSchemaVersion && baselineRelease
           && baselineRelease.manifest.dbSchemaVersion >= recordedPending.databaseSchemaVersion
@@ -1450,11 +1457,13 @@ export function createDesktopApplication(input: {
         }
         assertStartupRunning();
         if (pending) {
+          const preparedShellPending = startupShellPending;
+          startupShellPending = false;
           await activatePendingAtStartup(pending, activeRelease);
           if (bundleDetails.result === "healthy" && !updateCheckFailure) {
             if (input.shellUpdate) startupShellPending = true;
             else input.host.onUpdateApplied?.({ version: currentVersion });
-          }
+          } else if (bundleDetails.result === "same") startupShellPending = preparedShellPending;
         }
         if (startupUpdateError) {
           updateCheckFailure = startupUpdateError;

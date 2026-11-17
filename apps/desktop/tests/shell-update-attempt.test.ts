@@ -175,6 +175,20 @@ test("retirement refuses a live Client and leaves the original attempt intact", 
   assert.deepEqual(await f.owner.read(), f.prepared);
 });
 
+test("a released shell network failure is archived without losing its durable failure evidence", async () => {
+  const f = await preparationFixture();
+  const sent = await f.owner.replace(f.prepared, { ...f.prepared, revision: f.prepared.revision + 1,
+    network: { actionKey: "shell-discover", requestSha256: "d".repeat(64), status: "dispatching" } });
+  const failed = await f.owner.replace(sent, { ...sent, revision: sent.revision + 1, phase: "failed",
+    network: { actionKey: "shell-discover", requestSha256: "d".repeat(64), status: "failed", errorCode: "NETWORK_REFUSED" } });
+  await assert.rejects(f.owner.retire(failed, { processes: [f.main, f.client], caller: f.main }));
+  await f.owner.retire(failed, { processes: [f.main], caller: f.main });
+  assert.equal(await f.owner.read(), null);
+  const archive = (await fs.readdir(f.directory)).find(name => name.startsWith("shell-update-retired-"));
+  assert.ok(archive);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.directory, archive), "utf8")), failed);
+});
+
 test("retirement keeps the current shell renderer alive while retiring its obsolete update binding", async () => {
   const { directory, attempt } = await fixture(), owner = store(directory), fresh = freshAttempt(attempt);
   const main = handoffProcess(fresh, 101, 1), client = handoffProcess(fresh, 201, main.pid);

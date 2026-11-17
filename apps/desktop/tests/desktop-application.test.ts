@@ -767,7 +767,7 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
       if (current.target) return { status: "target", attempt: current, manifest: shellManifest };
       const sent = await store.replace(current, { ...current, revision: current.revision + 1, network: { actionKey: "shell-discover", requestSha256: "d".repeat(64), status: "dispatching" } }) as ShellUpdateAttemptV2;
       current = await store.replace(sent, { ...sent, revision: sent.revision + 1, network: { ...sent.network!, status: "succeeded", evidence: { kind: "shell-manifest", sha256: "e".repeat(64) } } }) as ShellUpdateAttemptV2;
-      if (!control.available) return { status: "no-update", attempt: await store.replace(current, { ...current, revision: current.revision + 1, phase: "no-update" }) as ShellUpdateAttemptV2 };
+      if (!control.available) return { status: "no-update", reason: "none", attempt: await store.replace(current, { ...current, revision: current.revision + 1, phase: "no-update" }) as ShellUpdateAttemptV2 };
       return { status: "target", manifest: shellManifest, attempt: await store.replace(current, { ...current, revision: current.revision + 1,
         target: { shellId: "new", manifestSha256: "c".repeat(64), installerSha256: "b".repeat(64), installerSize: 1 }, candidateState: { activeShellId: "new", previousShellId: "old", baselineShellId: "baseline" } }) as ShellUpdateAttemptV2 }; },
     async downloadInstaller() { return { installerPath: path.join(f.dataDir, "installer.exe"), sha256: "b".repeat(64), size: 1 }; }
@@ -925,6 +925,106 @@ test("a prepared shell restart retains the resource health result from its durab
   await f.restart();
   assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
   assert.equal(await f.app.resumeStartupUpdate(), true);
+});
+
+test("resources discovered after a prepared shell activate before that shell is rebound", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
+  await f.app.checkForUpdates();
+  const previous = await f.store.read(); assert.equal(previous?.target?.shellId, "new");
+  f.control.hotAvailable = true; await f.app.checkForUpdates(); await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), "hot-release");
+  assert.equal(await f.store.read(), null, "old binding must be archived before resource activation");
+  assert.equal(f.actions.includes("runtime.startup.continue"), false);
+  assert.equal(await f.app.resumeStartupUpdate(), true);
+  const current = await f.store.read();
+  assert.notEqual(current?.requestId, previous?.requestId);
+  assert.equal(current?.binding.kind === "active" && current.binding.releaseId, "hot-release");
+});
+
+test("explicit shell restart also restarts for resources first discovered by that click", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
+  await f.app.checkForUpdates(); f.control.hotAvailable = true; f.actions.length = 0;
+  await f.app.restartForUpdate();
+  assert.equal(f.actions.filter(action => action === "quit").length, 1);
+  assert.equal(f.actions.filter(action => action === "relaunch").length, 1);
+  assert.equal(f.control.spawned, false, "new resources must be activated before shell handoff");
+  assert.ok(await readPendingRelease(f.dataDir));
+});
+
+test("newly discovered resources still honor cancellation of an explicit shell restart", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
+  await f.app.checkForUpdates(); f.control.hotAvailable = true; f.control.busy = true; f.control.confirm = false;
+  await f.app.restartForUpdate();
+  assert.equal(f.actions.filter(action => action === "confirm").length, 1);
+  assert.equal(f.actions.includes("quit"), false); assert.equal(f.control.drained, false);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "prepared");
+  await f.app.exit();
+});
+
+test("resource rollback does not continue an older prepared shell update", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
+  await f.app.checkForUpdates(); f.control.hotAvailable = true; await f.app.checkForUpdates();
+  const loadWeb = f.host.loadWeb;
+  f.host.loadWeb = async (window, releaseDir, options) => {
+    if (releaseDir.endsWith("hot-release")) throw new Error("candidate web rejected");
+    await loadWeb(window, releaseDir, options);
+  };
+  await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "restored");
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  assert.equal(f.control.spawned, false);
+  assert.equal(f.actions.filter(action => action === "runtime.startup.continue").length, 1);
+  await f.app.exit();
+});
+
+/** 真实耐久网络失败用于验证后续资源更新，不伪造恢复或交接成功。 */
+async function failShellDiscovery(f: Awaited<ReturnType<typeof shellApplicationFixture>>): Promise<void> {
+  const network = f.boundary.createNetwork!;
+  f.boundary.createNetwork = () => ({
+    async prepare() {
+      const adapter = createShellUpdateAttemptNetworkAdapter(f.store), before = await adapter.read();
+      const sent = await adapter.replace(before, { retriesUsed: 0, network: { actionKey: "shell-discover", requestSha256: "d".repeat(64), status: "dispatching" } });
+      await adapter.replace(sent, { retriesUsed: 0, network: { ...sent.network!, status: "failed", errorCode: "NETWORK_REFUSED" } });
+      throw new Error("controlled terminal network failure");
+    },
+    async downloadInstaller() { assert.fail("failed discovery cannot download"); },
+  });
+  await assert.rejects(f.app.checkForUpdates());
+  f.boundary.createNetwork = network;
+}
+
+test("a historical shell network failure cannot prevent valid resources from starting", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
+  await failShellDiscovery(f); assert.equal((await f.store.read())?.phase, "failed");
+  f.control.hotAvailable = true; f.control.available = false; await f.app.checkForUpdates();
+  const snapshot = f.runtime.snapshot;
+  f.runtime.snapshot = () => ({ ...snapshot(), ...(f.control.drained ? { status: "stopped" as const } : {}) });
+  await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), "hot-release");
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  assert.equal(f.app.getRuntimeState().status, "ready");
+  assert.equal((await f.app.getUpdateDetails()).shell.result, "none");
+  await f.app.exit();
+});
+
+test("retirement I/O failure restores the stopped original Client and retains the pending update", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false; f.control.available = false;
+  await f.app.checkForUpdates(); f.control.hotAvailable = true; await f.app.checkForUpdates();
+  const snapshot = f.runtime.snapshot;
+  f.runtime.snapshot = () => ({ ...snapshot(), ...(f.control.drained ? { status: "stopped" as const } : {}) });
+  const rename = fs.rename;
+  const failure = Object.assign(new Error("retirement archive denied"), { code: "EACCES" });
+  const mocked = t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+    if (String(args[1]).includes("shell-update-retired-")) throw failure;
+    return await rename(...args);
+  });
+  await f.restart();
+  assert.equal(f.app.getRuntimeState().status, "ready");
+  assert.ok(f.app.updateCheckFailure, "recovery must preserve the explicit resource update failure");
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.ok(await readPendingRelease(f.dataDir));
+  assert.ok(await f.store.read());
+  mocked.mock.restore(); await f.app.exit();
 });
 
 test("normal restart resumes a prepared shell before held tasks are released", async t => {

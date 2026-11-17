@@ -174,7 +174,9 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
           if (!terminal) invalid();
           assertShellUpdateInventoryReleased(expected, processes, retained);
         } else {
-          if (expected.schemaVersion !== 5 || !["preparing", "no-update"].includes(expected.phase)) invalid();
+          // 明确网络失败尚未交接；原失败事实完整归档，仍须证明 Client 和引擎已退出。
+          if (expected.schemaVersion !== 5 || !["preparing", "no-update"].includes(expected.phase)
+            && !(expected.phase === "failed" && expected.network?.status === "failed")) invalid();
           assertShellUpdateInventoryReleased(expected, processes, retained);
         }
         const { root, identity } = await resolveBoundRoot();
