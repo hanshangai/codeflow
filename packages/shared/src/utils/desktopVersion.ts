@@ -3,8 +3,8 @@ export function formatDesktopVersion(shellVersion: string | null, resourceVersio
   const shell = shellVersion?.trim() || null;
   const resource = resourceVersion?.trim() || null;
   if (!resource) return shell;
-  /** 壳版本允许两位主版本（如 1.0）或三段版本（如 1.0.0），展示号只取前两段。 */
-  const shellParts = shell?.match(/^(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?$/);
+  /** 壳版本允许两至四段（含 Windows 完整版本），展示号只取前两段。 */
+  const shellParts = shell?.match(/^(\d+)\.(\d+)(?:\.\d+){0,2}(?:[-+].*)?$/);
   const resourceParts = resource.match(/^(\d{4})\.(\d{2})\.(\d{2})\.(\d+)$/);
   if (!shellParts || !resourceParts) return resource;
   const [, year, month, day, patch] = resourceParts;

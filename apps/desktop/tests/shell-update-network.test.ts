@@ -34,14 +34,15 @@ function network(input: NetworkInput): Network {
 }
 
 /** 每例独占完整本地事实和真实签名 HTTP；所有资源在例末关闭，失败现场保留。 */
-async function fixture(t: test.TestContext, options: { sameShell?: boolean; available?: boolean; installer?: boolean; requestId?: string; lifecycle?: boolean } = {}) {
+async function fixture(t: test.TestContext, options: { sameShell?: boolean; matchingInstalled?: boolean; available?: boolean; installer?: boolean; requestId?: string; lifecycle?: boolean } = {}) {
   const dataDir = await fs.realpath(await fs.mkdtemp(path.join(evidence, "data-")));
   const identity = await loadOrCreateDeviceIdentity(dataDir), keys = crypto.generateKeyPairSync("ed25519");
   const installer = Buffer.from("synthetic shell installer, never executed\n".repeat(2048));
   const manifest = signShellReleaseManifest({ schemaVersion: 1, protocol: "codeflow-desktop-shell-v1",
     shellId: options.sameShell ? "shell-current" : "shell-next", version: "2.0.0", platform: "win32", arch: "x64",
     installerSha256: options.installer ? crypto.createHash("sha256").update(installer).digest("hex") : "a".repeat(64), installerSize: options.installer ? installer.length : 123, keyId: "test-key",
-    files: ["CodeFlowAI.exe", "resources/app.asar", "resources/release-trust.json"].map(name => ({ path: name, size: 1, sha256: "b".repeat(64) })),
+    files: ["CodeFlowAI.exe", "resources/app.asar", "resources/release-trust.json"].map(name => ({ path: name, size: 1,
+      sha256: options.matchingInstalled ? crypto.createHash("sha256").update("x").digest("hex") : "b".repeat(64) })),
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString() }, keys.privateKey);
   const initial: ShellUpdateAttemptV2 = { schemaVersion: 2, requestId: options.requestId ?? `shell:${crypto.randomUUID()}`, revision: 0,
     installationDir: path.join(dataDir, "installation"), dataDir, userDataDir: path.join(dataDir, "user"), sessionDataDir: path.join(dataDir, "session"),
@@ -51,6 +52,10 @@ async function fixture(t: test.TestContext, options: { sameShell?: boolean; avai
     phase: "preparing", target: null, candidateState: null, retriesUsed: 0, network: null };
   const main = { pid: 41, parentPid: 9, created: 1041, executable: path.join(initial.installationDir, "shells", "shell-current", "CodeFlowAI.exe"), commandLine: "preparation main" };
   const client = { ...main, pid: 42, parentPid: main.pid, created: 1042, commandLine: "preparation client" };
+  for (const entry of manifest.files) {
+    const file = path.join(initial.installationDir, "shells", initial.originalState.activeShellId, entry.path);
+    await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, "x");
+  }
   const store = createShellUpdateAttemptStore(dataDir);
   if (options.lifecycle) await store.beginPreparation(null, initial, { main, client, readyRequestId: "network-ready", processes: [main, client] });
   else await store.replace(null, initial);
@@ -84,6 +89,14 @@ async function fixture(t: test.TestContext, options: { sameShell?: boolean; avai
     respond(handler: typeof respond) { respond = handler; },
     resultDirectory: path.join(dataDir, ".staging", "shell-update", crypto.createHash("sha256").update(initial.requestId).digest("hex")) };
 }
+
+test("a full installation matching the signed shell inventory is same despite a different shell ID", async t => {
+  const f = await fixture(t, { matchingInstalled: true });
+  const result = await network(f.input).prepare();
+  assert.equal(result.status, "no-update"); assert.equal(result.reason, "same");
+  assert.equal(result.attempt.target, null); assert.equal((await f.store.read())?.phase, "no-update");
+  assert.equal(f.calls.some(call => call.path.endsWith("/installer")), false);
+});
 
 test("schema5 network preserves preparation proofs across discovery installer and a new process", async t => {
   const f = await fixture(t, { lifecycle: true, installer: true });

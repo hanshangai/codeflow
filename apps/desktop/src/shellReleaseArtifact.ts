@@ -53,6 +53,17 @@ export async function verifyShellInstallerArtifact(input: {
   return (await verifyInstaller(input)).manifest;
 }
 
+/** 仅已验签完整库存可证明现有壳相同；内容差异返回 false，物理读取异常仍失败。 */
+export async function matchesInstalledShellRelease(input: {
+  manifest: unknown; trustedKeys: TrustedReleaseKeys; candidateDirectory: string;
+}): Promise<boolean> {
+  const manifest = verifyShellReleaseSignature(input.manifest, input.trustedKeys);
+  const view: typeof fs = process.versions.electron ? createRequire(import.meta.url)("original-fs") : fs;
+  const directory = path.resolve(input.candidateDirectory), stat = await view.promises.lstat(directory, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ArtifactError("PATH_INVALID");
+  return await verifyCandidate(directory, manifest, undefined, view, true);
+}
+
 /** 完整候选与单安装器共用验签、同 fd 摘要及错误翻译边界。 */
 async function verifyInstaller(input: { manifest: unknown; trustedKeys: TrustedReleaseKeys; installerPath: string }) {
   let manifest: ShellReleaseManifest;
@@ -84,10 +95,12 @@ function sameMetadata(left: BigIntStats, right: BigIntStats): boolean {
 }
 
 /** 同一个只读句柄最多按 64 KiB 分块摘要，读取和关闭双故障均向上保留。 */
-async function verifyFile(target: string, expected: { size: number; sha256: string }, view: typeof fs): Promise<BigIntStats> {
+async function verifyFile(target: string, expected: { size: number; sha256: string }, view: typeof fs): Promise<BigIntStats>;
+async function verifyFile(target: string, expected: { size: number; sha256: string }, view: typeof fs, compare: boolean): Promise<BigIntStats | null>;
+async function verifyFile(target: string, expected: { size: number; sha256: string }, view: typeof fs, compare = false): Promise<BigIntStats | null> {
   const before = await view.promises.lstat(target, { bigint: true });
   assertRegular(before);
-  if (before.size !== BigInt(expected.size)) throw new ArtifactError("FILE_MISMATCH");
+  if (before.size !== BigInt(expected.size)) { if (compare) return null; throw new ArtifactError("FILE_MISMATCH"); }
   const file = await view.promises.open(target, view.constants.O_RDONLY | (view.constants.O_NOFOLLOW ?? 0));
   let failed = false, failure: unknown;
   try {
@@ -106,7 +119,7 @@ async function verifyFile(target: string, expected: { size: number; sha256: stri
     const after = await file.stat({ bigint: true }), pathname = await view.promises.lstat(target, { bigint: true });
     assertRegular(after); assertRegular(pathname);
     if (!sameMetadata(opened, after) || !sameMetadata(opened, pathname)) throw new ArtifactError("FILE_CHANGED");
-    if (digest.digest("hex") !== expected.sha256) throw new ArtifactError("FILE_MISMATCH");
+    if (digest.digest("hex") !== expected.sha256) { if (compare) return null; throw new ArtifactError("FILE_MISMATCH"); }
     return opened;
   } catch (error) { failed = true; failure = error; throw error; }
   finally {
@@ -116,11 +129,11 @@ async function verifyFile(target: string, expected: { size: number; sha256: stri
 }
 
 /** 清单精确覆盖全部物理文件；根别名已解析，内部目录及文件一律不跟随链接。 */
-async function verifyCandidate(root: string, manifest: ShellReleaseManifest, installer: BigIntStats, view: typeof fs): Promise<void> {
+async function verifyCandidate(root: string, manifest: ShellReleaseManifest, installer: BigIntStats | undefined, view: typeof fs, compare = false): Promise<boolean> {
   const expected = new Map(manifest.files.map(file => [file.path, file])), verified = new Map<string, BigIntStats>();
   const directories: DirectorySnapshot[] = [];
   /** 目录记录身份和条目快照，文件在本次遍历中逐个绑定已签名摘要。 */
-  const visit = async (directory: string, relative: string): Promise<void> => {
+  const visit = async (directory: string, relative: string): Promise<boolean> => {
     const stat = await view.promises.lstat(directory, { bigint: true });
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ArtifactError("PATH_INVALID");
     const names = (await view.promises.readdir(directory)).sort();
@@ -129,18 +142,21 @@ async function verifyCandidate(root: string, manifest: ShellReleaseManifest, ins
       const target = path.join(directory, name), filePath = relative ? `${relative}/${name}` : name;
       const entry = await view.promises.lstat(target, { bigint: true });
       if (entry.isSymbolicLink()) throw new ArtifactError("PATH_INVALID");
-      if (entry.isDirectory()) await visit(target, filePath);
+      if (entry.isDirectory()) { if (!await visit(target, filePath)) return false; }
       else {
         assertRegular(entry);
-        if (entry.dev === installer.dev && entry.ino === installer.ino) throw new ArtifactError("PATH_OVERLAP");
+        if (installer && entry.dev === installer.dev && entry.ino === installer.ino) throw new ArtifactError("PATH_OVERLAP");
         const signed = expected.get(filePath);
-        if (!signed) throw new ArtifactError("INVENTORY_MISMATCH");
-        verified.set(target, await verifyFile(target, signed, view));
+        if (!signed) { if (compare) return false; throw new ArtifactError("INVENTORY_MISMATCH"); }
+        const stat = await verifyFile(target, signed, view, compare);
+        if (!stat) return false;
+        verified.set(target, stat);
       }
     }
+    return true;
   };
-  await visit(root, "");
-  if (verified.size !== expected.size) throw new ArtifactError("INVENTORY_MISMATCH");
+  if (!await visit(root, "")) return false;
+  if (verified.size !== expected.size) { if (compare) return false; throw new ArtifactError("INVENTORY_MISMATCH"); }
   for (const [target, original] of verified) {
     const current = await view.promises.lstat(target, { bigint: true });
     assertRegular(current);
@@ -153,4 +169,5 @@ async function verifyCandidate(root: string, manifest: ShellReleaseManifest, ins
     if (names.length !== snapshot.names.length || names.some((name, index) => name !== snapshot.names[index])) throw new ArtifactError("DIRECTORY_CHANGED");
     if (!sameMetadata(stat, await view.promises.lstat(snapshot.directory, { bigint: true }))) throw new ArtifactError("DIRECTORY_CHANGED");
   }
+  return true;
 }

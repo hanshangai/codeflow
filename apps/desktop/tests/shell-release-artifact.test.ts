@@ -66,6 +66,25 @@ test("a valid signed installer and complete physical candidate return an indepen
   for (const [relative, bytes] of Object.entries(f.contents)) assert.deepEqual(await fs.readFile(path.join(f.input.candidateDirectory, relative)), bytes);
 });
 
+test("an installed complete shell matching the signed inventory needs no installer download", async () => {
+  const f = await fixture(), api = await import("../src/shellReleaseArtifact.js");
+  const matches = (api as any).matchesInstalledShellRelease;
+  assert.equal(typeof matches, "function");
+  await fs.unlink(f.input.installerPath);
+  assert.equal(await matches(f.input), true);
+  await fs.writeFile(path.join(f.input.candidateDirectory, "resources/app.asar"), "new content");
+  assert.equal(await matches(f.input), false);
+});
+
+test("installed-shell comparison rejects invalid signatures and propagates I/O failures", async t => {
+  const f = await fixture(), api = await import("../src/shellReleaseArtifact.js"), matches = (api as any).matchesInstalledShellRelease;
+  assert.equal(typeof matches, "function");
+  await assert.rejects(matches({ ...f.input, manifest: { ...f.manifest, signature: "A".repeat(88) } }));
+  const read = t.mock.method(fs, "open", async () => { throw Object.assign(new Error("read denied"), { code: "EACCES" }); });
+  await assert.rejects(matches(f.input), error => (error as NodeJS.ErrnoException).code === "EACCES");
+  read.mock.restore();
+});
+
 test("the installer-only verifier shares physical validation without reading candidate inventory", async () => {
   const f = await fixture();
   await fs.rename(f.input.candidateDirectory, path.join(f.root, "unused-candidate"));

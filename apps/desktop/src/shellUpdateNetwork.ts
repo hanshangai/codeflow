@@ -11,6 +11,7 @@ import { createDesktopUpdateTransport } from "./updateTransport.js";
 import { createShellUpdateAttemptNetworkAdapter, isShellUpdateHandoffAttempt, type ShellUpdateAttemptStore, type ShellUpdatePreparationAttempt, type ShellUpdateHandoffAttempt, type ShellUpdateTarget } from "./shellUpdateAttempt.js";
 import { createUpdateNetworkRetry, preserveUpdateNetworkCancellation, type UpdateNetworkAction, type UpdateNetworkEvidence } from "./updateNetworkRetry.js";
 import { downloadShellInstaller, recoverShellInstaller, type DownloadedShellInstaller } from "./shellInstallerDownload.js";
+import { matchesInstalledShellRelease } from "./shellReleaseArtifact.js";
 
 type Registration = { ok: true; deviceId: string; publicKeySha256: string };
 type Discovery = { ok: true; available: false; deviceId: string; requestId: string }
@@ -96,7 +97,11 @@ export function createShellUpdateNetwork(input: NetworkInput) {
         if (attempt.requestId !== requestId || ["schemaVersion", "installationDir", "dataDir", "userDataDir", "sessionDataDir", "originalState", "binding",
           ...(initial.schemaVersion === 5 ? ["preparationMains", "owned", "ownedLifecycle"] : [])]
           .some(key => JSON.stringify((attempt as unknown as Record<string, unknown>)[key]) !== JSON.stringify((initial as unknown as Record<string, unknown>)[key]))) throw failure("DESKTOP_SHELL_NETWORK_STATE_CONFLICT");
-        if (!found.available || found.manifest.shellId === attempt.originalState.activeShellId) {
+        // 完整安装初始标识可不同；同一签名库存不重复下载或改写启动选择。
+        const sameInstalled = found.available && attempt.target === null && found.manifest.shellId !== attempt.originalState.activeShellId
+          && await matchesInstalledShellRelease({ manifest: found.manifest, trustedKeys: input.trustedKeys,
+            candidateDirectory: path.join(attempt.installationDir, "shells", attempt.originalState.activeShellId) });
+        if (!found.available || found.manifest.shellId === attempt.originalState.activeShellId || sameInstalled) {
           if (attempt.target !== null) throw failure("DESKTOP_SHELL_NETWORK_STATE_CONFLICT");
           const terminal = attempt.phase === "no-update" ? attempt : await input.store.replace(attempt, { ...attempt, revision: attempt.revision + 1, phase: "no-update" }) as ShellUpdatePreparationAttempt;
           input.signal.throwIfAborted(); return { status: "no-update", attempt: terminal, reason: found.available ? "same" : "none" };
