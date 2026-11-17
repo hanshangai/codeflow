@@ -7,8 +7,13 @@ import { getDesktopDownload, type DesktopDownloadInfo } from "../../../api/deskt
 import { wsOriginToHttpOrigin } from "../../../api/request";
 import { trackProductEvent } from "../../../analytics/analytics";
 import { useConfigStore } from "../../../store/config";
+import LandingNav from "../../landing/components/LandingNav.vue";
 
 defineOptions({ name: "DesktopDownloadPage" });
+const emit = defineEmits<{
+  (e: "open-settings"): void;
+  (e: "enter-app"): void;
+}>();
 const config = useConfigStore();
 const router = useRouter();
 const route = useRoute();
@@ -58,7 +63,7 @@ onBeforeUnmount(() => request?.abort());
 
 <template>
   <main class="desktop-download">
-    <nav class="desktop-download__nav"><a-button type="text" @click="router.push('/')">CodeFlow · 返回首页</a-button></nav>
+    <LandingNav @open-settings="emit('open-settings')" @enter-app="emit('enter-app')" />
     <section class="desktop-download__hero">
       <span class="desktop-download__eyebrow">CodeFlow Desktop</span>
       <h1>把 AI 研发工作台，装进你的电脑</h1>
@@ -86,7 +91,6 @@ onBeforeUnmount(() => request?.abort());
 
 <style scoped>
 .desktop-download { min-height: 100vh; overflow: auto; padding: 24px max(24px, calc((100vw - 1080px) / 2)) 64px; background: var(--app-bg); color: var(--app-text); }
-.desktop-download__nav { display: flex; justify-content: space-between; gap: 12px; }
 .desktop-download__hero { text-align: center; padding: 48px 0 28px; }
 .desktop-download__eyebrow { color: var(--app-accent); font-size: 16px; font-weight: 700; }
 .desktop-download h1 { font-size: clamp(28px, 4vw, 44px); line-height: 1.3; }

@@ -325,7 +325,11 @@ const authComponent = computed(() => {
         />
       </KeepAlive>
       <component v-else-if="shell.ui.mainView === 'auth'" :is="authComponent" />
-      <DesktopDownloadPage v-else-if="shell.ui.mainView === 'download'" />
+      <DesktopDownloadPage
+        v-else-if="shell.ui.mainView === 'download'"
+        @open-settings="shell.openSettingsOrWizard"
+        @enter-app="enterApplication"
+      />
       <DesktopMigrationPage v-else-if="shell.ui.mainView === 'desktop-migration'" />
       <PaymentVerificationPage v-else-if="shell.ui.mainView === 'payment-verification'" />
       <ProjectKnowledgePage v-else-if="shell.ui.mainView === 'knowledge'" />
