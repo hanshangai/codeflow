@@ -18,7 +18,7 @@ function selectStep(index: number): void {
 </script>
 
 <template>
-  <section id="demo" class="demo">
+  <section class="demo">
     <header class="section-head"><span class="eyebrow">从一个真实需求开始</span><h2>从想法到改动，放在一个工作台里</h2><p>少切换工具，把注意力留给问题本身。</p></header>
     <div class="demo__controls" role="group" aria-label="选择功能演示步骤">
       <button v-for="(step, index) in steps" :key="step.label" type="button" :aria-pressed="selected === index"

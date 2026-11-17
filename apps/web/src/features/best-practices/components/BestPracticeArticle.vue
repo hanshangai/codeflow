@@ -142,7 +142,7 @@ function headingLevelClass(level: number): string {
   gap: 72px;
   width: min(1160px, calc(100% - 48px));
   margin: 0 auto;
-  padding: 42px 0 96px;
+  padding: 16px 0 96px;
 }
 
 .best-practice-article__main {
@@ -352,7 +352,7 @@ function headingLevelClass(level: number): string {
 @media (max-width: 767px) {
   .best-practice-article__layout {
     width: min(calc(100% - 32px), 820px);
-    padding: 28px 0 64px;
+    padding: 16px 0 64px;
   }
 
   .best-practice-article__header {

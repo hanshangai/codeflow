@@ -155,10 +155,10 @@ const thread = computed(() => {
   if (!id) return null;
   return chat.threadSummaryById(id);
 });
-/** 本机已接入的聊天、需求分析和节点线程直接使用 Client。 */
+/** 本机已接入的聊天、需求分析、节点和知识线程直接使用 Client。 */
 const localChatReady = computed(() => isDesktopWorkspace(config, props.workspaceId)
-  && Boolean(thread.value && (thread.value.threadType === "chat" && (!thread.value.threadSubtype || thread.value.threadSubtype === "requirement-analysis" || thread.value.threadSubtype === "node-discussion")
-    || thread.value.threadType === "orchestration" && thread.value.threadSubtype === "node")));
+  && Boolean(thread.value && (thread.value.threadType === "chat" && (!thread.value.threadSubtype || thread.value.threadSubtype === "requirement-analysis" || thread.value.threadSubtype === "node-discussion" || thread.value.threadSubtype === "knowledge-conversation")
+    || thread.value.threadType === "orchestration" && (thread.value.threadSubtype === "node" || thread.value.threadSubtype === "knowledge-assets"))));
 const chatConnected = computed(() => config.connected || localChatReady.value);
 /** 主会话中的规格线程复用助手边界；嵌入规格库时继续由原页面管理授权。 */
 const primaryKnowledgeThread = computed(() => !props.assistantMode && (route.name === "chat" || route.name === "h5") && Boolean(thread.value && isKnowledgeThread(thread.value)));

@@ -140,6 +140,32 @@ async function dependencyFixture(t: test.TestContext, retain = false) {
     ...await writeCliRuntimeFixture(root) };
 }
 
+test("assembles a materialized Client directory without copying its stale dist or modifying input", async t => {
+  const { archive: _archive, ...f } = await dependencyFixture(t);
+  const clientPackageDir = path.join(f.root, "package"), dependencyDir = path.join(clientPackageDir, "node_modules", "runtime-dep");
+  await fs.mkdir(dependencyDir);
+  await fs.writeFile(path.join(dependencyDir, "package.json"), '{"main":"index.js"}', "utf8");
+  await fs.writeFile(path.join(dependencyDir, "index.js"), "module.exports = {};", "utf8");
+  await fs.mkdir(path.join(clientPackageDir, "dist"));
+  await fs.writeFile(path.join(clientPackageDir, "dist", "stale.cjs"), "stale", "utf8");
+  await prepareDesktopResources({ ...f, clientPackageDir });
+  assert.equal(await fs.readFile(path.join(f.outputDir, "client", "dist", "index.cjs"), "utf8"), "current runtime");
+  await assert.rejects(fs.access(path.join(f.outputDir, "client", "dist", "stale.cjs")), { code: "ENOENT" });
+  assert.equal(await fs.readFile(path.join(clientPackageDir, "dist", "stale.cjs"), "utf8"), "stale");
+  await assert.rejects(fs.access(path.join(clientPackageDir, "desktop-runtime.json")), { code: "ENOENT" });
+  assert.equal(await fs.readFile(path.join(f.outputDir, "client", "node_modules", "runtime-dep", "index.js"), "utf8"), "module.exports = {};");
+});
+
+test("Client directory input rejects links and ambiguous or missing package sources", async t => {
+  const f = await dependencyFixture(t), clientPackageDir = path.join(f.root, "package");
+  await assert.rejects(prepareDesktopResources({ ...f, clientPackageDir }), /DESKTOP_CLIENT_PACKAGE_SOURCE_INVALID/);
+  const { archive: _archive, ...directoryInput } = f;
+  await assert.rejects(prepareDesktopResources(directoryInput), /DESKTOP_CLIENT_PACKAGE_SOURCE_INVALID/);
+  await fs.symlink(f.clientDir, path.join(clientPackageDir, "linked"), process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(prepareDesktopResources({ ...directoryInput, clientPackageDir }), /DESKTOP_CLIENT_PACKAGE_DIRECTORY_INVALID/);
+  await assert.rejects(fs.access(f.outputDir), { code: "ENOENT" });
+});
+
 /** 独立夹具中的固定 npm 包与清单，避免测试依赖真实 npm 安装。 */
 async function writeCliRuntimeFixture(root: string): Promise<{ npmPackageDir: string; cliRuntimeManifestFile: string }> {
   const npmPackageDir = path.join(root, "cli-runtime-npm"), cliRuntimeManifestFile = path.join(root, "cli-runtime.json");

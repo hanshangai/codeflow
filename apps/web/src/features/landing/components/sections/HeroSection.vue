@@ -7,16 +7,20 @@ defineOptions({ name: "HeroSection" });
 const emit = defineEmits<{
   (e: "primary"): void;
 }>();
+
+/** 首页内滚动到功能演示区块，不写入 URL hash。 */
+function scrollToDemo(): void {
+  document.querySelector(".productivity")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 </script>
 
 <template>
   <section class="hero">
     <div class="hero__copy">
-      <span class="eyebrow">规格约束的软件开发工作流平台</span>
-      <h1 class="hero__title"><span>CodeFlow · </span>把研发规范变成可执行的工作流</h1>
+      <h1 class="hero__title">把研发规范变成可执行的工作流</h1>
       <p class="hero__highlight">规格先行，工作流执行。<br />内置 Harness、Loop 与 TDD。</p>
       <p class="hero__desc">从需求与规格出发，选择合适的模型和内置/自定义工作流推进开发；用度量、会话、文件、终端与 Git 记录每一次执行，结果可核对、过程可回看。</p>
-      <div class="hero__cta"><a-button type="primary" size="large" @click="emit('primary')"><ArrowDownToLine :size="18" />下载桌面版</a-button><a href="#demo">查看功能演示 <ArrowRight :size="16" /></a></div>
+      <div class="hero__cta"><a-button type="primary" size="large" @click="emit('primary')"><ArrowDownToLine :size="18" />下载桌面版</a-button><a href="#" @click.prevent="scrollToDemo">查看功能演示 <ArrowRight :size="16" /></a></div>
       <p class="hero__trust">系统开源，安全可控 · 内置模型 Token 流量享折扣</p>
     </div>
     <div class="hero__visual">
@@ -31,7 +35,7 @@ const emit = defineEmits<{
   grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
   gap: 32px;
   align-items: center;
-  padding: 48px 0 36px;
+  padding: 0 0 36px;
 }
 .hero__copy {
   display: flex;
@@ -39,7 +43,7 @@ const emit = defineEmits<{
   min-width: 0;
 }
 .hero__title {
-  margin: 12px 0 16px;
+  margin: 0 0 16px;
   font-size: clamp(34px, 3.6vw, 49px);
   line-height: 1.24;
   letter-spacing: -0.02em;
@@ -48,7 +52,6 @@ const emit = defineEmits<{
   text-wrap: balance;
   word-break: normal;
 }
-.hero__title span { display: block; font-size: 19px; margin-bottom: 14px; font-weight: 500; letter-spacing: 0; }
 .hero__trust { margin: 16px 0 0; font-size: 12px; color: var(--landing-muted); }
 .hero__cta { align-items: center; }
 .hero__cta > a { display: inline-flex; align-items: center; gap: 8px; color: var(--landing-text); font-size: 14px; }
@@ -82,9 +85,9 @@ const emit = defineEmits<{
 }
 
 @media (max-width: 1100px) {
-  .hero { gap: 28px; padding: 45px 0 30px; }
+  .hero { gap: 28px; padding: 0 0 30px; }
 }
 @media (max-width: 720px) {
-  .hero { padding: 24px 12px 12px; }
+  .hero { padding: 0 12px 12px; }
 }
 </style>

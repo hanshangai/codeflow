@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { compileFunction } from "node:vm";
 import { formatDesktopVersion } from "@codeflowai/shared";
 import { assertTrustedReleaseKeys, verifyReleaseBundlePayload, readReleaseBundleFiles, computeReleaseDirectorySha256, computeReleasePackageSha256, signReleaseBundleManifest } from "@codeflowai/shared/desktop-release-signing";
-import { createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion } from "../scripts/package-local-builder.mjs";
+import { createBuilderProject, removeBuilderProject, toBuilderVersion } from "../scripts/package-local-builder.mjs";
 
 const script = await fs.readFile(new URL("../scripts/package-local-win.mjs", import.meta.url), "utf8");
 const builderEntry = createRequire(import.meta.url).resolve("electron-builder");
@@ -47,7 +47,7 @@ async function fixture(t: TestContext) {
   return { root, resources, shell };
 }
 
-/** 执行原完整 CLI；仅控制 builder 返回工件和进程参数，所有写入留在独占夹具。 */
+/** 执行原完整 CLI；隔离本机 Electron 和 builder 边界，所有写入留在独占夹具。 */
 async function runScript(f: Fixture, output: string, input = f.resources, extra: string[] = [], argv = [input, output, ...extra],
   builderResult?: (executable: string) => Promise<string[]>) {
   const state: { argv: string[]; platform: string; env: Record<string, string>; exitCode?: number } = {
@@ -55,6 +55,11 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
   };
   const messages: Array<Record<string, unknown>> = [];
   const calls: Array<{ projectDir: string; targets: unknown; publish: string; config: string }> = [];
+  /** 目录选择和 PE 校验另有真实测试；此处只隔离构建机依赖并核对打包目标。 */
+  const resolveInstalledElectronDist = async (target: { platform: string; arch: string }) => {
+    assert.deepEqual(target, { platform: "win32", arch: "x64" });
+    return { electronDist: path.join(f.root, "electron-dist"), electronVersion: "45.0.0" };
+  };
   // 真正的 builder 会启动打包并写工件；此替身只创建可核对的占位 exe。
   const build = async (options: typeof calls[number]) => {
     calls.push(options);
@@ -71,12 +76,12 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     .replaceAll("import.meta.url", JSON.stringify(pathToFileURL(path.join(f.shell, "scripts/package-local-win.mjs")).href));
   const execute = compileFunction(`return (async () => {${source}\n})();`,
     ["fs", "path", "crypto", "createRequire", "fileURLToPath", "build", "Platform", "Arch", "process", "console", "formatDesktopVersion",
-      "createBuilderProject", "removeBuilderProject", "resolveElectronVersion", "toBuilderVersion",
+      "createBuilderProject", "removeBuilderProject", "resolveInstalledElectronDist", "toBuilderVersion",
       "assertTrustedReleaseKeys", "verifyReleaseBundlePayload"]);
   await execute(fs, { ...path, resolve: (...segments: string[]) => path.resolve(f.root, ...segments) }, crypto, createRequire, fileURLToPath, build,
     { WINDOWS: { createTarget: (target: string, arch: number) => [target, arch] } }, { x64: 1 }, state,
     { log: (line: string) => messages.push(JSON.parse(line)), error: (line: string) => messages.push(JSON.parse(line)) }, formatDesktopVersion,
-    createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion,
+    createBuilderProject, removeBuilderProject, resolveInstalledElectronDist, toBuilderVersion,
     assertTrustedReleaseKeys, verifyReleaseBundlePayload);
   return { state, messages, calls };
 }
@@ -167,6 +172,8 @@ test("allows a separate output with a shared name prefix and preserves the local
   await assert.rejects(fs.lstat(result.calls[0]!.projectDir), { code: "ENOENT" });
   const config = JSON.parse(await fs.readFile(path.join(output, "local-builder.json"), "utf8"));
   assert.equal(config.extraMetadata.version, "1.0.0", "builder metadata normalizes two-segment shell versions");
+  assert.equal(config.electronDist, path.join(f.root, "electron-dist"));
+  assert.equal(config.electronVersion, "45.0.0");
   assert.equal(config.extraResources.some((entry: { to: string }) => ["npm", "cli-runtime.json"].includes(entry.to)), false);
   assert.equal(config.npmRebuild, false);
   assert.equal(config.win.signAndEditExecutable, undefined);

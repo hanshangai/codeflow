@@ -136,9 +136,33 @@ function parseCliRuntimeManifest(bytes) {
   return manifest;
 }
 
-/** 组装完整资源与独立信任根；显式 baseline proof 经同 payload 校验后按原字节携带。 */
-export async function prepareDesktopResources({ archive, clientDir, webDir, outputDir, trustedReleaseKeysFile, baselineReleaseManifestFile,
+/** 复制自包含生产依赖目录；排除旧 dist，拒绝链接、特殊文件及输入输出重叠。 */
+async function copyClientPackageDirectory(directory, target) {
+  const sourceStat = await fs.lstat(directory);
+  if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) throw new Error("DESKTOP_CLIENT_PACKAGE_DIRECTORY_INVALID");
+  const source = await fs.realpath(directory), output = path.join(await fs.realpath(path.dirname(target)), path.basename(target));
+  for (const relative of [path.relative(source, output), path.relative(output, source)]) {
+    if (!relative || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+      throw new Error("DESKTOP_CLIENT_PACKAGE_DIRECTORY_INVALID: input and output overlap");
+    }
+  }
+  await fs.cp(source, output, { recursive: true, errorOnExist: true, force: false, filter: async entry => {
+    if (path.relative(source, entry) === "dist") return false;
+    const stat = await fs.lstat(entry);
+    if (stat.isSymbolicLink() || !stat.isDirectory() && !stat.isFile()) {
+      throw new Error(`DESKTOP_CLIENT_PACKAGE_DIRECTORY_INVALID: ${path.relative(source, entry)}`);
+    }
+    return true;
+  } });
+}
+
+/** 组装完整资源与独立信任根；包目录或归档必须二选一，当前源码 dist 始终后装。 */
+export async function prepareDesktopResources({ archive, clientPackageDir, clientDir, webDir, outputDir, trustedReleaseKeysFile, baselineReleaseManifestFile,
   updateServerOrigin, npmPackageDir, cliRuntimeManifestFile, runtimeExecutable, expectedClientVersion }) {
+  const packageSource = archive ?? clientPackageDir;
+  if ((archive === undefined) === (clientPackageDir === undefined) || typeof packageSource !== "string" || !packageSource.length) {
+    throw new Error("DESKTOP_CLIENT_PACKAGE_SOURCE_INVALID");
+  }
   if (updateServerOrigin !== undefined) {
     if (typeof updateServerOrigin !== "string" || !URL.canParse(updateServerOrigin)) throw new Error("DESKTOP_UPDATE_ORIGIN_INVALID");
     const origin = new URL(updateServerOrigin);
@@ -159,9 +183,11 @@ export async function prepareDesktopResources({ archive, clientDir, webDir, outp
   await fs.access(path.join(webDir, "index.html"));
   const { readDesktopBuiltinAssetBundles } = createRequire(import.meta.url)(path.resolve(clientDir, "dist", "orchAssetBundleValidation.cjs"));
   readDesktopBuiltinAssetBundles(path.join(clientDir, "dist", "orchestration-builtin"));
-  const entries = runTar(["-tzf", archive], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }).trim().split(/\r?\n/);
-  if (entries.some((entry) => !entry.startsWith("package/") || entry.split("/").includes("..") || entry.includes("\\"))) {
-    throw new Error("DESKTOP_CLIENT_ARCHIVE_INVALID");
+  if (archive !== undefined) {
+    const entries = runTar(["-tzf", archive], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }).trim().split(/\r?\n/);
+    if (entries.some((entry) => !entry.startsWith("package/") || entry.split("/").includes("..") || entry.includes("\\"))) {
+      throw new Error("DESKTOP_CLIENT_ARCHIVE_INVALID");
+    }
   }
   await fs.mkdir(path.dirname(outputDir), { recursive: true });
   try {
@@ -173,8 +199,11 @@ export async function prepareDesktopResources({ archive, clientDir, webDir, outp
   const stagingDir = await fs.mkdtemp(`${outputDir}.prepare-`);
   try {
     const clientOutput = path.join(stagingDir, "client");
-    await fs.mkdir(clientOutput);
-    runTar(["-xzf", archive, "-C", clientOutput, "--strip-components=1", "--exclude=package/dist"], { stdio: "inherit" });
+    if (clientPackageDir !== undefined) await copyClientPackageDirectory(clientPackageDir, clientOutput);
+    else {
+      await fs.mkdir(clientOutput);
+      runTar(["-xzf", archive, "-C", clientOutput, "--strip-components=1", "--exclude=package/dist"], { stdio: "inherit" });
+    }
     const packagedManifest = JSON.parse(await fs.readFile(path.join(clientOutput, "package.json"), "utf8"));
     assert.equal(packagedManifest.name, "@codeflowai/client", "DESKTOP_CLIENT_PACKAGE_INVALID");
     assert.deepEqual(packagedManifest.dependencies, sourceManifest.dependencies, "DESKTOP_CLIENT_DEPENDENCIES_MISMATCH");

@@ -305,7 +305,7 @@ onUnmounted(() => {
 .upgrade-page__main {
   width: min(1180px, calc(100% - 48px));
   margin: 0 auto;
-  padding: 30px 0 88px;
+  padding: 16px 0 88px;
 }
 
 .upgrade-page__layout {
@@ -567,7 +567,7 @@ onUnmounted(() => {
 
   .upgrade-page__main {
     width: min(100%, calc(100% - 32px));
-    padding: 18px 0 52px;
+    padding: 16px 0 52px;
   }
 
   .upgrade-page__card {

@@ -12,7 +12,7 @@ const features = [
 </script>
 
 <template>
-  <section id="features" class="features" aria-label="六项核心能力">
+  <section class="features" aria-label="六项核心能力">
     <component
       :is="feature.href ? 'a' : 'div'"
       v-for="feature in features"

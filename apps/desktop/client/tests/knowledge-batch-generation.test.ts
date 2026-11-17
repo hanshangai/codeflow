@@ -326,7 +326,7 @@ test("未提交文档的失败重试会丢弃旧资产执行线程", async () =>
   assert.deepEqual(executionThreads, [null, null]);
 });
 
-test("绑定范围与权限在运行和提交时复核，已完成项不因引擎后续失败被撤销", async () => {
+test("绑定范围与权限在运行和提交时复核", async () => {
   let allowed = true;
   const { store, service, begin } = fixture(async input => {
     allowed = false;
@@ -341,9 +341,253 @@ test("绑定范围与权限在运行和提交时复核，已完成项不因引�
   assert.equal((await settle(service, run.id)).items[0]?.status, "failed");
   assert.equal(store.detail("a").current, null);
   assert.throws(() => service.start(run.id, { retryFailed: true }), /已解绑/);
-  const second = fixture(async input => { await submit(input); throw new Error("提交后引擎失败"); });
-  const accepted = second.begin({ selectedNodeIds: ["a"], includeDescendants: false }); second.service.start(accepted.id);
-  assert.equal((await settle(second.service, accepted.id)).items[0]?.status, "completed");
+});
+
+/** 提交事实保留，但执行器后续失败必须终止复检；显式重试复用同一版本。 */
+for (const stage of ["execute", "flush", "dispose", "429"] as const) test(`提交后 ${stage} 失败保留版本并停止复检，显式重试不重复生成`, async () => {
+  let generationCalls = 0, reviewCalls = 0;
+  const { store, service, begin } = fixture(async input => {
+    if (input.registry.tools.some(tool => tool.toolId === "knowledge.review.submit")) {
+      reviewCalls++;
+      const read = await input.execute({ toolId: "knowledge.review.read", toolInput: { startLine: 1, count: 200 } } as any);
+      assert.equal(read.ok, true, JSON.stringify(read));
+      const evidence = await input.execute({ toolId: "knowledge.source.read", toolInput: { path: "evidence.ts", startLine: 1, count: 1 } } as any);
+      assert.equal(evidence.ok, true, JSON.stringify(evidence));
+      assert.ok(evidence.ok);
+      const report = await input.execute({ toolId: "knowledge.review.submit", toolInput: {
+        outcome: "passed", summary: "已核对实现", issues: [], sources: [{ kind: "code", path: "evidence.ts", contentHash: (evidence.output as { contentHash: string }).contentHash, startLine: 1, endLine: 1, relation: "真实实现" }],
+      } } as any);
+      assert.equal(report.ok, true, JSON.stringify(report));
+      return;
+    }
+    generationCalls++;
+    if (stage === "429" && generationCalls > 1) throw new Error("已交付资产被自动重试");
+    assert.equal((await submit(input, "# 已提交正文")).ok, true);
+    throw Object.assign(new Error(`提交后 ${stage} 失败`), stage === "429" ? { status: 429 } : {});
+  });
+  fs.writeFileSync(path.join(store.files.root, "evidence.ts"), "export const delivered = true;", "utf8");
+  const run = begin({ selectedNodeIds: ["a"], includeDescendants: false, reviewConfig: { enabled: true, model: null, effort: null } });
+  service.start(run.id);
+  const failed = await settle(service, run.id);
+  assert.equal(failed.phase, "partial");
+  assert.equal(failed.items[0]?.status, "failed");
+  assert.match(failed.items[0]?.error?.message ?? "", new RegExp(stage));
+  assert.equal(reviewCalls, 0, "执行失败后不能继续复检");
+  const revisionId = failed.items[0]!.revisionId;
+  assert.ok(revisionId);
+  assert.equal(store.readRevision("a", revisionId).content, "# 已提交正文");
+  assert.equal(store.revisions("a").length, 1);
+  service.start(run.id, { retryFailed: true, nodeIds: ["a"] });
+  const retried = await settle(service, run.id);
+  assert.equal(retried.phase, "completed", JSON.stringify(retried.items));
+  assert.equal(retried.items[0]?.revisionId, revisionId);
+  assert.equal(store.revisions("a").length, 1);
+  assert.equal(generationCalls, 1);
+  assert.equal(reviewCalls, 1);
+});
+
+/** 恢复正文不能抹掉本次显式失败重试的资格，也不能扩大到待处理或已完成项。 */
+for (const startMethod of ["start", "startAsync"] as const)
+for (const reviewEnabled of [false, true]) test(`${startMethod} 无复检的显式失败重试直接恢复正文，不重新生成（原复检=${reviewEnabled}）`, async () => {
+  let calls = 0;
+  const { store, service, begin } = fixture(async input => {
+    calls++;
+    assert.equal((await submit(input)).ok, true);
+    throw new Error("已交付后执行失败");
+  });
+  const run = begin({ selectedNodeIds: ["a", "b"], includeDescendants: false, reviewConfig: { enabled: reviewEnabled, model: null, effort: null } });
+  service.start(run.id, { nodeIds: ["a"] });
+  const failed = await settle(service, run.id);
+  assert.equal(failed.items[0]?.status, "failed");
+  const revisionId = failed.items[0]!.revisionId;
+  assert.ok(revisionId);
+  for (const change of [{ prompt: "新要求" }, { model: "新模型" }, { effort: "high" }]) {
+    assert.throws(() => service.start(run.id, { retryFailed: true, nodeIds: ["a"], ...change }), /正文已保存/);
+  }
+  service[startMethod](run.id, { retryFailed: true, nodeIds: ["a"], ...(reviewEnabled ? { reviewConfig: { enabled: false, model: null, effort: null } } : {}) });
+  const recovered = await settle(service, run.id);
+  assert.equal(recovered.phase, "partial", JSON.stringify(recovered));
+  assert.equal(recovered.error, null);
+  assert.equal(recovered.items[0]?.status, "completed");
+  assert.equal(recovered.items[0]?.revisionId, revisionId);
+  assert.equal(recovered.items[0]?.error, null);
+  assert.equal(recovered.items[1]?.status, "pending");
+  assert.equal(store.revisions("a").length, 1);
+  assert.equal(store.revisions("b").length, 0);
+  assert.equal(calls, 1);
+  assert.throws(() => service.start(run.id, { retryFailed: true, nodeIds: ["a"] }), /尚未完成/);
+  assert.throws(() => service.start(run.id, { retryFailed: true, nodeIds: ["b"] }), /失败知识/);
+  assert.throws(() => service.start(run.id, { retryFailed: true, nodeIds: ["outside"] }), /尚未完成/);
+});
+
+/** 真实恢复结束后仍须核对原预留代次，不能继承重连后的执行权限。 */
+test("异步恢复等待期间会话代次变化，旧预留不得创建执行器", async () => {
+  let activationVersion = 1, calls = 0, entered!: () => void, release!: () => void;
+  const paused = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const { store, service, begin } = fixture(async input => { calls++; await submit(input); }, () => ({ nodeId: null, activationVersion }));
+  const hooks = service as unknown as { prepareRecovery: (...args: any[]) => Promise<Set<string>> };
+  const recover = hooks.prepareRecovery.bind(service);
+  // 使用真实恢复结果，仅挂起预留进入最终启动校验前的等待。
+  hooks.prepareRecovery = async (...args: any[]) => { const result = await recover(...args); entered(); await gate; return result; };
+  const run = begin({ selectedNodeIds: ["a"], includeDescendants: false });
+  service.startAsync(run.id);
+  await paused;
+  activationVersion++;
+  release();
+  const failed = await settle(service, run.id);
+  assert.equal(failed.error?.code, "KNOWLEDGE_ASSET_INTERRUPTED");
+  assert.equal(failed.items[0]?.status, "pending");
+  assert.equal(store.revisions("a").length, 0);
+  assert.equal(calls, 0);
+});
+
+/** 非法异步变更不能持久化恢复状态，合法失败重试仍能复用同一正文。 */
+for (const [label, input, reason] of [
+  ["prompt", { nodeIds: ["a"], prompt: "新要求" }, /正文已保存/],
+  ["model", { nodeIds: ["a"], model: "新模型" }, /正文已保存/],
+  ["effort", { nodeIds: ["a"], effort: "high" }, /正文已保存/],
+  ["省略选区修改参数", { model: "新模型" }, /明确选择/],
+  ["混合越界选区", { nodeIds: ["a", "outside"] }, /尚未完成/],
+] as const) test(`startAsync 拒绝 ${label} 非法重试后仍可显式重试`, async () => {
+  let calls = 0;
+  const { store, service, begin } = fixture(async input => {
+    calls++;
+    assert.equal((await submit(input)).ok, true);
+    throw new Error("交付后执行失败");
+  });
+  const run = begin({ selectedNodeIds: ["a"], includeDescendants: false });
+  service.start(run.id);
+  const failed = await settle(service, run.id);
+  const item = failed.items[0]!;
+  assert.equal(item.status, "failed");
+  service.startAsync(run.id, { retryFailed: true, ...input, ...("nodeIds" in input ? { nodeIds: [...input.nodeIds] } : {}) });
+  const rejected = await settle(service, run.id);
+  assert.equal(rejected.phase, "failed");
+  assert.match(rejected.error?.message ?? "", reason);
+  assert.deepEqual(rejected.items[0], item, "非法参数不得持久化恢复后的完成状态");
+  service.startAsync(run.id, { retryFailed: true, nodeIds: ["a"] });
+  const completed = await settle(service, run.id);
+  assert.equal(completed.phase, "completed", JSON.stringify(completed));
+  assert.equal(completed.error, null);
+  assert.equal(completed.items[0]?.revisionId, item.revisionId);
+  assert.equal(store.revisions("a").length, 1);
+  assert.equal(calls, 1);
+});
+
+/** 历史失败任务通过已有正文恢复完成，不能继续携带失败投影。 */
+test("已落盘正文恢复后直接完成时清除旧任务错误", async () => {
+  let calls = 0;
+  const { store, service, begin } = fixture(async input => {
+    calls++;
+    await submit(input);
+    throw new Error("交付后执行失败");
+  });
+  const run = begin({ selectedNodeIds: ["a"], includeDescendants: false });
+  service.start(run.id);
+  await settle(service, run.id);
+  const failed = store.readRun(run.id);
+  failed.phase = "failed";
+  failed.error = { code: "KNOWLEDGE_ASSET_IO_FAILED", message: "历史任务写入失败" };
+  store.saveRun(failed);
+  service.start(run.id, { retryFailed: true, nodeIds: ["a"] });
+  const completed = await settle(service, run.id);
+  assert.equal(completed.phase, "completed");
+  assert.equal(completed.error, null);
+  assert.equal(completed.items[0]?.revisionId, failed.items[0]?.revisionId);
+  assert.equal(calls, 1);
+});
+
+/** 确定性挂起权限校验，执行器先收口后释放工具，不能继续读取或写入进度。 */
+for (const [boundary, toolId] of [
+  ["assertCurrentOwner", "knowledge.asset.submit"], ["assertItem", "knowledge.asset.submit"], ["assertCurrentOwner", "knowledge.node.read"],
+] as const) test(`${boundary} 等待期间执行器结束，迟到 ${toolId} 明确拒绝`, async t => {
+  let release!: () => void, entered!: () => void, block = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const paused = new Promise<void>(resolve => { entered = resolve; });
+  let late!: Promise<PromiseSettledResult<Awaited<ReturnType<typeof submit>>>[]>;
+  const { store, service, begin } = fixture(async input => {
+    block = true;
+    late = Promise.allSettled([toolId === "knowledge.asset.submit" ? submit(input) : input.execute({ toolId, toolInput: { nodeId: "a" } } as any)]);
+    await paused;
+  });
+  const hooks = service as unknown as Record<typeof boundary, (...args: any[]) => Promise<void>>;
+  const validate = hooks[boundary].bind(service);
+  // 仅挂起执行器发起的校验，启动阶段仍使用原校验。
+  hooks[boundary] = async (...args: any[]) => {
+    await validate(...args);
+    if (block) { block = false; entered(); await gate; }
+  };
+  const run = begin({ selectedNodeIds: ["a"], includeDescendants: false });
+  service.start(run.id);
+  const finished = await settle(service, run.id);
+  assert.equal(finished.items[0]?.status, "failed");
+  const persisted = store.readRun(run.id);
+  const saves = t.mock.method(store, "saveRun");
+  release();
+  const outcome = (await late)[0]!;
+  assert.equal(outcome.status, "fulfilled");
+  assert.ok(outcome.status === "fulfilled");
+  assert.equal(outcome.value.ok, false, JSON.stringify(outcome.value));
+  assert.ok(!outcome.value.ok);
+  assert.equal(outcome.value.code, "KNOWLEDGE_ASSET_INTERRUPTED");
+  assert.equal(store.revisions("a").length, 0);
+  assert.equal(saves.mock.callCount(), 0);
+  assert.deepEqual(store.readRun(run.id), persisted);
+});
+
+/** 两次工具提交跨越同一异步权限校验，也只能形成一次落盘交付。 */
+test("同一生成回合并行提交返回同一版本，不重复写正文", async () => {
+  let results: Awaited<ReturnType<typeof submit>>[] = [];
+  const { store, service, begin } = fixture(async input => { results = await Promise.all([submit(input), submit(input)]); });
+  const run = begin({ selectedNodeIds: ["a"], includeDescendants: false });
+  service.start(run.id);
+  const completed = await settle(service, run.id);
+  assert.equal(completed.phase, "completed");
+  assert.equal(results.length, 2);
+  assert.ok(results.every(result => result.ok));
+  assert.equal(store.revisions("a").length, 1);
+  assert.deepEqual(results.map(result => result.ok && (result.output as { revisionId: string }).revisionId), [completed.items[0]!.revisionId, completed.items[0]!.revisionId]);
+});
+
+/** 正文落盘后的任务保存失败沿原活动失败入口停止，保留版本供显式恢复。 */
+test("正文落盘后 saveRun 失败拒绝后续工具和下一资产，显式恢复不重复生成", async () => {
+  let calls = 0;
+  const outcomes: PromiseSettledResult<Awaited<ReturnType<typeof submit>>>[] = [];
+  const { store, service, begin } = fixture(async input => {
+    calls++;
+    outcomes.push(...await Promise.allSettled([submit(input)]));
+    outcomes.push(...await Promise.allSettled([submit(input)]));
+    outcomes.push(...await Promise.allSettled([input.execute({ toolId: "knowledge.node.read", toolInput: { nodeId: "a" } } as any)]));
+  });
+  const run = begin({ selectedNodeIds: ["a", "b"], includeDescendants: false, concurrency: 1 });
+  const saveRun = store.saveRun.bind(store);
+  let failureInjected = false;
+  store.saveRun = saved => {
+    if (!failureInjected && saved.items.some(item => item.revisionId)) {
+      failureInjected = true;
+      throw new Error("正文后任务状态落盘失败");
+    }
+    saveRun(saved);
+  };
+  service.start(run.id);
+  const failed = await settle(service, run.id);
+  assert.equal(failureInjected, true);
+  assert.equal(failed.phase, "failed");
+  assert.match(failed.error?.message ?? "", /正文后任务状态落盘失败/);
+  assert.deepEqual(outcomes.map(outcome => outcome.status), ["rejected", "rejected", "rejected"]);
+  for (const outcome of outcomes) if (outcome.status === "rejected") assert.match(String(outcome.reason), /正文后任务状态落盘失败/);
+  assert.equal(calls, 1);
+  assert.equal(store.revisions("a").length, 1);
+  assert.equal(store.revisions("b").length, 0);
+  const revisionId = store.revisions("a")[0]!.id;
+  assert.equal(store.readRevision("a", revisionId).content, "# a");
+  service.start(run.id);
+  const recovered = await settle(service, run.id);
+  assert.equal(recovered.items[0]?.revisionId, revisionId);
+  assert.equal(recovered.items[0]?.status, "completed");
+  assert.equal(calls, 2, "恢复已落盘 a 后只生成尚未执行的 b");
+  assert.equal(store.revisions("a").length, 1);
 });
 
 test("任务恢复回读已落盘版本，正文或继承要求变化不会被静默覆盖", async () => {

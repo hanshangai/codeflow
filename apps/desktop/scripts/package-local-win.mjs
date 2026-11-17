@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { build, Platform, Arch } from "electron-builder";
 import { formatDesktopVersion } from "@codeflowai/shared";
 import { assertTrustedReleaseKeys, verifyReleaseBundlePayload } from "@codeflowai/shared/desktop-release-signing";
-import { createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion } from "./package-local-builder.mjs";
+import { createBuilderProject, removeBuilderProject, resolveInstalledElectronDist, toBuilderVersion } from "./package-local-builder.mjs";
 
 const requestId = crypto.randomUUID();
 
@@ -116,6 +116,7 @@ async function packageLocalWindows() {
   }
   if (!worker.isFile() || worker.isSymbolicLink() || worker.nlink !== 1) throw new Error("DESKTOP_UNINSTALL_WORKER_INVALID");
   const baselineProof = await verifyBaselineProof(resources, required || target === "nsis");
+  const { electronDist, electronVersion } = await resolveInstalledElectronDist({ platform: "win32", arch: "x64" });
   const hasBaselineProof = baselineProof !== null;
   /** 对外文件名与界面共用同一展示版本；非日期基线退回打包用三段壳版本，避免文件名与安装后版本脱节。 */
   const composedVersion = baselineProof && formatDesktopVersion(shellVersion, baselineProof.version);
@@ -127,12 +128,11 @@ async function packageLocalWindows() {
   const requireBuilderLibrary = createRequire(requireBuilder.resolve("app-builder-lib"));
   const { load } = requireBuilderLibrary("js-yaml");
   const original = load(await fs.readFile(path.join(desktopDir, "electron-builder.yml"), "utf8"));
-  const electronVersion = await resolveElectronVersion();
   const configPath = path.join(outputDir, "local-builder.json");
   // 独立配置复用原 YAML，避免 builder 深合并数组后把旧资源再复制一次。
   await fs.writeFile(configPath, `${JSON.stringify({ ...original,
       directories: { output: outputDir }, extraMetadata: { version: toBuilderVersion(shellVersion) },
-      electronVersion,
+      electronVersion, electronDist,
       artifactName: `CodeFlowAI-${displayVersion}-win32-x64.\${ext}`,
       npmRebuild: false,
       // 本地包只跳过签名，仍写入应用图标和版本资源，避免安装后沿用 Electron 默认图标。

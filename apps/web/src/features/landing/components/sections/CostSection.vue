@@ -3,7 +3,7 @@ import { Coins, KeyRound } from "lucide-vue-next";
 </script>
 
 <template>
-  <section id="cost" class="cost panel">
+  <section class="cost panel">
     <div><span class="eyebrow">把预算花在有价值的研发上</span><h2>Token 流量折扣<br />让研发预算更从容</h2><p>内置模型 Token 流量享折扣。<br />模型选择更灵活，使用成本更清楚。</p></div>
     <div class="cost__options">
       <article><Coins :size="24" aria-hidden="true" /><h3>平台内置模型服务</h3><p>对应内置模型与渠道享优惠 Token 价格，具体价格在账号内模型价格与 Token 充值页面查看。</p><span>按实际用量计费</span></article>

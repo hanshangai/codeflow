@@ -11,6 +11,7 @@ import { setImmediate as nextTick } from "node:timers/promises";
 import type { ConversationEventInput, RawEngineEventInput } from "@codeflowai/shared";
 import { ClaudeThreadSession } from "../src/engines/claude/claudeThreadSession.js";
 import { initializeLocalEngineModelCatalog, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { createLocalEventPipeline } from "../src/runtime/localEventPersistence.js";
 
 let nextFakePid = 12345;
 
@@ -65,6 +66,7 @@ async function fixture(t: TestContext, hooks: {
   flush?: () => Promise<void>;
   withLegacyDatabase?: <T>(requestId: string, operation: () => T) => Promise<T>;
   onSessionId?: () => void;
+  threadId?: string;
 } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cf-claude-stdout-"));
   resetEngineModelCatalogRuntimeForTest();
@@ -86,7 +88,7 @@ async function fixture(t: TestContext, hooks: {
   const raw: RawEngineEventInput[] = [];
   const logs: unknown[] = [];
   const session = new ClaudeThreadSession({
-    workspacePath: root, workspaceId: "stdout-probe:workspace", threadId: "stdout-thread", initialSessionId: null,
+    workspacePath: root, workspaceId: "stdout-probe:workspace", threadId: hooks.threadId ?? "stdout-thread", initialSessionId: null,
     onEngineProcessSnapshot: () => false, onSessionId: hooks.onSessionId ?? (() => {}),
     withLegacyDatabase: hooks.withLegacyDatabase,
     writeWorkspaceLog(_workspaceId, entry) { logs.push(entry); },
@@ -150,6 +152,114 @@ test("Claude绑定变化等待短许可时保留stdout owner，delta不重复申
   assert.equal(bindings, 1);
   assert.equal(calls, preparationCalls + 1);
   assert.equal(f.raw.length, 5);
+});
+
+test("Claude持续输出在存储屏障未完成时暂停消费，完成后保留全部事件顺序", async t => {
+  let release!: () => void, flushes = 0, permitted = false;
+  const storage = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture(t, {
+    withLegacyDatabase: async (_requestId, operation) => { permitted = true; try { return operation(); } finally { permitted = false; } },
+    flush: async () => { assert.equal(permitted, false, "等待落盘不能持有数据库短许可"); flushes++; await storage; },
+  });
+  f.child.stdout.write(output(120));
+  try {
+    for (let tick = 0; flushes === 0 && f.raw.length < 121 && tick < 200; tick++) await nextTick();
+    assert.ok(flushes > 0, "provider仍运行时即应等待存储，不能只在回合结束时flush");
+    const count = f.raw.length;
+    assert.ok(count > 0 && count < 121);
+    await nextTick(); await nextTick();
+    assert.equal(f.raw.length, count, "存储积压时不得继续消费后续stdout");
+  } finally { release(); f.child.close(); }
+  assert.equal((await f.outcome).ok, true);
+  assert.equal(f.raw.length, 121);
+  assert.deepEqual(f.events.filter(event => event.startsWith("canonical:")), Array.from({ length: 120 }, (_, index) => `canonical:${index}`));
+});
+
+test("Claude输出保存屏障失败停止后续事件，保留原失败并释放调度", async t => {
+  const failure = new Error("STREAM_STORAGE_FAILED");
+  const f = await fixture(t, { flush: async () => { throw failure; } });
+  f.child.stdout.write(output(120));
+  f.child.close();
+  const outcome = await f.outcome;
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) assert.ok(hasCause(outcome.error, failure));
+  assert.ok(f.raw.length < 121, "保存失败后不能继续交付后续输出");
+});
+
+test("Claude大输出按字节预算等待存储，不必等到行数阈值", async t => {
+  let release!: () => void, entered!: () => void;
+  const storage = new Promise<void>(resolve => { release = resolve; });
+  const flushing = new Promise<void>(resolve => { entered = resolve; });
+  const f = await fixture(t, { flush: async () => { entered(); await storage; } });
+  const line = JSON.stringify({ type: "stream_event", event: { type: "content_block_delta", index: 0,
+    delta: { type: "thinking_delta", thinking: "a".repeat(80 * 1024) } } });
+  f.child.stdout.write(Array.from({ length: 8 }, () => line).join("\n") + "\n");
+  try {
+    await flushing;
+    assert.ok(f.raw.length > 0 && f.raw.length < 8);
+    await nextTick(); assert.ok(f.raw.length < 8);
+  } finally { release(); f.child.stdout.write(output(0)); f.child.close(); }
+  assert.equal((await f.outcome).ok, true);
+  assert.equal(f.raw.length, 9);
+});
+
+test("Claude流式保存等待中仍可先停止进程，再排空原事件", async t => {
+  let release!: () => void, entered!: () => void;
+  const storage = new Promise<void>(resolve => { release = resolve; });
+  const flushing = new Promise<void>(resolve => { entered = resolve; });
+  const f = await fixture(t, { flush: async () => { entered(); await storage; } });
+  f.child.stdout.write(output(80));
+  await flushing;
+  let confirmed = false, settled = false;
+  const stopping = f.session.interrupt("stdout-turn", { onStopConfirmed() { confirmed = true; } })
+    .then(value => { settled = true; return value; });
+  try {
+    for (let tick = 0; !confirmed && tick < 10; tick++) await nextTick();
+    assert.equal(confirmed, true);
+    assert.equal(settled, false, "停止证明不能代替保存完成");
+  } finally { release(); }
+  assert.equal(await stopping, true);
+  assert.equal(f.raw.length, 81);
+  assert.equal((await f.outcome).ok, false);
+});
+
+test("五路Claude持续输出超过管线容量时等待慢存储，恢复后全部保存不丢事件", { timeout: 20_000 }, async t => {
+  let release!: () => void, persisted = 0;
+  const storage = new Promise<void>(resolve => { release = resolve; });
+  const flushing = new Set<string>();
+  let allFlushing!: () => void;
+  const backpressured = new Promise<void>(resolve => { allFlushing = resolve; });
+  const failures: unknown[] = [];
+  const pipeline = createLocalEventPipeline({ writer: {
+    async submit(batch) {
+      await storage;
+      const messages = batch.events.map(message => ({ ...message, event: { ...message.event, schema: 1, seq: ++persisted } })) as any;
+      return { batchId: batch.batchId, digest: "test", messages, indexedCount: messages.length, indexedThroughSeq: persisted };
+    },
+    async completeIndexes(_workspaceId, _batchId, count) { return count; },
+    async withLegacyDatabase(_requestId, operation) { return operation(); },
+    failIndexes(_workspaceId, _batchId, error) { failures.push(error); },
+  }, apply() {}, publish() {}, onFailure(error) { failures.push(error); } });
+  const sessions = [];
+  for (let index = 0; index < 5; index++) {
+    const threadId = `stream-${index}`;
+    sessions.push(await fixture(t, { threadId,
+      raw: event => pipeline.enqueue({ t: "raw.event", event }, "stdout-turn", 1),
+      conversation: event => pipeline.enqueue({ t: "conversation.event", event }, "stdout-turn", 1),
+      flush: () => { flushing.add(threadId); if (flushing.size === 5) allFlushing(); return pipeline.flush("stdout-probe:workspace", threadId); },
+    }));
+  }
+  for (const f of sessions) { f.child.stdout.write(output(1000)); f.child.close(); }
+  await backpressured;
+  assert.equal(persisted, 0);
+  release();
+  for (const f of sessions) {
+    assert.equal((await f.outcome).ok, true);
+    assert.equal(f.raw.length, 1001);
+  }
+  await pipeline.close();
+  assert.equal(persisted, 10_015);
+  assert.deepEqual(failures, []);
 });
 
 test("Claude异步绑定排空后继续读取后续chunk，无需等待child关闭", async t => {

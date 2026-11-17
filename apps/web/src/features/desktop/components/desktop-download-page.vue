@@ -95,7 +95,7 @@ onBeforeUnmount(() => request?.abort());
     var(--app-bg);
   color: var(--app-text);
 }
-.desktop-download__content { padding: 36px max(24px, calc((100vw - 1080px) / 2)) 72px; }
+.desktop-download__content { padding: 16px max(24px, calc((100vw - 1080px) / 2)) 72px; }
 .desktop-download p, .desktop-download li { color: var(--app-muted); line-height: 1.8; }
 .desktop-download__packages { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
 .desktop-download__packages article,
@@ -113,7 +113,7 @@ onBeforeUnmount(() => request?.abort());
 .desktop-download__packages article > p:first-of-type { margin-top: 0; }
 .desktop-download__steps { margin-top: 24px; scroll-margin-top: 24px; }
 @media (max-width: 720px) {
-  .desktop-download__content { padding-top: 24px; }
+  .desktop-download__content { padding-top: 16px; }
   .desktop-download__packages { grid-template-columns: minmax(0, 1fr); gap: 16px; }
 }
 </style>

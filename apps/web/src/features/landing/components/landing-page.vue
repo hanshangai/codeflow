@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 电脑官网：研发效率展示与桌面下载；手机沿既有路由进入 H5。
-import { onActivated } from "vue";
+import { onMounted } from "vue";
 import { SOURCE_REPOSITORY_URL } from "../landingLinks";
 import { useDesktopDownloadEntry } from "../../desktop/desktopDownloadEntry";
 import LandingNav from "./LandingNav.vue";
@@ -26,12 +26,11 @@ function handlePrimary() {
   void download();
 }
 
-/** 缓存页重新激活时恢复首页锚点位置。 */
-function activateLanding(): void {
-  const hash = window.location.hash.slice(1);
-  if (hash) document.getElementById(hash)?.scrollIntoView();
-}
-onActivated(activateLanding);
+/** 首页不保留锚点：清理旧地址中的 hash，刷新后保持顶部。 */
+onMounted(() => {
+  if (window.location.hash) history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+});
+
 </script>
 
 <template>
@@ -109,7 +108,7 @@ onActivated(activateLanding);
   margin: 0 auto;
   padding-top: 64px;
 }
-.landing__section--hero { padding-top: 12px; }
+.landing__section--hero { padding-top: 16px; }
 .landing__section--features { padding-top: 20px; }
 
 /* 子组件复用的工具类（按规范保留在父级） */
@@ -180,7 +179,7 @@ onActivated(activateLanding);
 }
 @media (max-width: 720px) {
   .landing__section { width: min(100%, calc(100% - 28px)); }
-  .landing__section--hero { padding-top: 0; }
+  .landing__section--hero { padding-top: 16px; }
   :deep(.panel) { padding: 22px 18px; border-radius: 24px; }
 }
 </style>

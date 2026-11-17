@@ -595,11 +595,12 @@ export class KnowledgeGenerationService {
     return this.startSync(id, input);
   }
 
-  /** 同步和异步启动共用占用，准备失败或无执行项时立即归还。 */
-  private startSync(id: string, input: KnowledgeGenerationStartInput = {}, reservation?: StartReservation, options: { skipRecovery?: boolean; resetStaleRepairIds?: Set<string> } = {}): KnowledgeGenerationRunView {
-    const run = this.store.readRun(id);
+  /** 仅同次预留可复用内存恢复结果；当前权限与占用仍在启动边界校验。 */
+  private startSync(id: string, input: KnowledgeGenerationStartInput = {}, reservation?: StartReservation, options: { skipRecovery?: boolean; resetStaleRepairIds?: Set<string>; failedItemIds?: Set<string>; recoveredRun?: KnowledgeGenerationRun } = {}): KnowledgeGenerationRunView {
+    const run = reservation && options.recoveredRun ? options.recoveredRun : this.store.readRun(id);
     this.assertBatch(run);
     const owner = this.assertOwner(run.ownerThreadId!);
+    if (reservation && (reservation.controller.signal.aborted || owner.activationVersion !== reservation.ownerVersion)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INTERRUPTED", "所属会话已停止或重新连接，请显式继续该任务");
     this.assertScope(run, owner.nodeId);
     const key = this.key(id);
     const pendingStart = startReservations.get(key);
@@ -626,8 +627,8 @@ export class KnowledgeGenerationService {
     return !reservation && !activities.has(key) ? this.summaryView(this.store.readRun(id)) : result;
   }
 
-  /** 在已领取的执行占用内恢复任务并启动 worker，占用随 worker 最终收口释放。 */
-  private startReserved(run: KnowledgeGenerationRun, input: KnowledgeGenerationStartInput, ownerVersion: number, release: () => void, options: { skipRecovery?: boolean; resetStaleRepairIds?: Set<string> }): KnowledgeGenerationRunView {
+  /** 在占用内恢复任务；显式失败目标可确认已落盘交付，但不能借此修改正文要求。 */
+  private startReserved(run: KnowledgeGenerationRun, input: KnowledgeGenerationStartInput, ownerVersion: number, release: () => void, options: { skipRecovery?: boolean; resetStaleRepairIds?: Set<string>; failedItemIds?: Set<string> }): KnowledgeGenerationRunView {
     if (run.mode === "build" && !run.proposedTree) {
       if (input.prompt !== undefined) run.prompt = knowledgeText(input.prompt, 16000);
       if (input.model !== undefined) run.model = input.model;
@@ -639,6 +640,7 @@ export class KnowledgeGenerationService {
       return this.summaryView(run);
     }
     const explicitIds = input.nodeIds === undefined ? null : new Set(this.nodeIds(input.nodeIds));
+    const failedItemIds = options.failedItemIds ?? new Set(run.items.filter(item => !this.itemDone(run, item) && this.itemFailed(item)).map(item => item.id));
     // 重试和续跑都只恢复可能继续工作的资产。已经完成且复检结束的资产不需要重新读取报告、来源和正文。
     const recoveryItems = this.recoveryItems(run, input, explicitIds);
     // 崩溃可能发生在正文版本写入后、任务结果写入前。先恢复，不能把已交付项改成另一份要求。
@@ -672,14 +674,15 @@ export class KnowledgeGenerationService {
     }
     if (explicitIds) for (const nodeId of explicitIds) {
       const item = run.items.find(i => i.nodeId === nodeId);
-      if (!item || this.itemDone(run, item)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_SCOPE_INVALID", "只能选择本任务中尚未完成的知识");
-      if (input.retryFailed && !this.itemFailed(item) && !resetStaleRepairIds.has(item.id)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "重试失败仅接受失败知识", 400);
+      if (!item || this.itemDone(run, item) && !(input.retryFailed && failedItemIds.has(item.id))) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_SCOPE_INVALID", "只能选择本任务中尚未完成的知识");
+      if (input.retryFailed && !this.itemFailed(item) && !failedItemIds.has(item.id) && !resetStaleRepairIds.has(item.id)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "重试失败仅接受失败知识", 400);
       if (item.status === "completed" && (prompt !== undefined || model !== undefined || effort !== undefined)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "正文已保存，只能调整复检配置；修改正文请另建修订任务", 400);
     }
     // 继续未完成项包含失败项；“重试失败项”仍可只重试失败集合。
     const targets = run.items.filter(item => !this.itemDone(run, item) && (explicitIds ? explicitIds.has(item.nodeId) : input.retryFailed ? this.itemFailed(item) || resetStaleRepairIds.has(item.id) : true));
     if (!targets.length) {
       run.phase = run.items.every(item => this.itemDone(run, item)) ? "completed" : "partial";
+      run.error = null;
       this.store.saveRun(run);
       return this.summaryView(run);
     }
@@ -740,7 +743,7 @@ export class KnowledgeGenerationService {
 
   /**
    * 后台启动前的恢复扫描按资产让出事件循环。
-   * 这一步不能把整批已完成项重新读一遍，否则一个“继续”会阻塞所有普通会话 RPC。
+   * 仅恢复内存，完整启动校验通过后才沿原入口落盘，非法输入不清除原失败状态。
    */
   private async prepareRecovery(run: KnowledgeGenerationRun, input: KnowledgeGenerationStartInput, signal: AbortSignal): Promise<Set<string>> {
     const explicitIds = input.nodeIds === undefined ? null : new Set(this.nodeIds(input.nodeIds));
@@ -756,8 +759,6 @@ export class KnowledgeGenerationService {
     }
     if (signal.aborted) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INTERRUPTED", "知识任务已停止");
     const resetStaleRepairIds = this.resetStaleRepairs(run, items);
-    // 让后续 startSync 直接使用已恢复状态，避免同一任务再次执行恢复扫描。
-    this.store.saveRun(run);
     this.writeLog(run.id, "info", "knowledge run recovery scan completed", () => ({
       code: "KNOWLEDGE_RUN_RECOVERY_SCAN_COMPLETED",
       requestId: this.requestId,
@@ -769,7 +770,7 @@ export class KnowledgeGenerationService {
     return resetStaleRepairIds;
   }
 
-  /** 后台准备失败也必须写回项目任务，避免前端永远停在“正在生成”。 */
+  /** 后台准备保留恢复前失败资格，准备异常也必须显式写回任务失败。 */
   private async runStartInBackground(id: string, input: KnowledgeGenerationStartInput, reservation: StartReservation): Promise<void> {
     const startedAt = Date.now();
     const key = this.key(id);
@@ -779,10 +780,11 @@ export class KnowledgeGenerationService {
       this.assertBatch(run);
       const owner = await this.database(() => this.assertOwner(run.ownerThreadId!));
       this.assertScope(run, owner.nodeId);
+      const failedItemIds = new Set(run.items.filter(item => !this.itemDone(run, item) && this.itemFailed(item)).map(item => item.id));
       const resetStaleRepairIds = await this.prepareRecovery(run, input, reservation.controller.signal);
       if (reservation.controller.signal.aborted) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INTERRUPTED", "知识任务已停止");
-      // prepareRecovery 已把恢复后的任务状态和失效修订状态写回，启动阶段不能再次扫描整批资产。
-      await this.database(() => this.startSync(id, input, reservation, { skipRecovery: true, resetStaleRepairIds }));
+      // 同次预留传递内存恢复结果，完整校验后再由启动入口保存，避免重复扫描。
+      await this.database(() => this.startSync(id, input, reservation, { skipRecovery: true, resetStaleRepairIds, failedItemIds, recoveredRun: run }));
       this.writeLog(id, "info", "knowledge run start preparation completed", () => ({
         code: "KNOWLEDGE_RUN_START_PREPARED",
         requestId: this.requestId,
@@ -1295,7 +1297,7 @@ export class KnowledgeGenerationService {
     this.store.saveRun(run);
   }
 
-  /** 执行单项生成和复检；不同 worker 只共享批次元数据，不共享资产写入基线。 */
+  /** 执行单项生成和复检；提交后失败保留版本，并等待显式恢复后再复检。 */
   private async processItem(run: KnowledgeGenerationRun, item: KnowledgeGenerationItem, activity: Activity): Promise<void> {
     this.assertActive(activity);
     activity.activeItemIds.add(item.id);
@@ -1316,16 +1318,14 @@ export class KnowledgeGenerationService {
             await this.executeWithRateLimitRetry(run, item, activity, "generating", () => this.generateDocument(run, item, activity));
           } catch (error) {
             if (isKnowledgeGenerationLogFailure(error) || activity.stopFailure || activity.controller.signal.aborted) throw error;
-            if ((item.status as KnowledgeGenerationItem["status"]) !== "completed") {
-              item.status = "failed";
-              item.error = this.failure(error, run.id);
-              // 未提交通常表示模型在旧执行上下文中形成了“只读不能交付”的错误结论。
-              // 下次重试必须建立全新资产线程，不能把这段错误历史继续喂给模型。
-              if (item.error.code === "KNOWLEDGE_ASSET_NO_SUBMISSION") item.executionThreadId = null;
-              if (item.review?.status === "repairing") item.review = { ...item.review, status: "failed", error: item.error };
-            }
+            item.status = "failed";
+            item.error = this.failure(error, run.id);
+            // 未提交通常表示模型在旧执行上下文中形成了“只读不能交付”的错误结论。
+            // 下次重试必须建立全新资产线程，不能把这段错误历史继续喂给模型。
+            if (item.error.code === "KNOWLEDGE_ASSET_NO_SUBMISSION") item.executionThreadId = null;
+            if (item.review) item.review = { ...item.review, status: "failed", error: item.error };
             this.log(error, run.id, item.id, "generate_item");
-            if ((item.status as KnowledgeGenerationItem["status"]) !== "completed") break;
+            break;
           }
         }
         if ((item.status as KnowledgeGenerationItem["status"]) !== "completed" || !(item.reviewConfig ?? run.reviewConfig)?.enabled) break;
@@ -1419,6 +1419,7 @@ export class KnowledgeGenerationService {
    * 429 不是资产内容错误，直接把这一项标成失败会迫使用户手动重试，
    * 还会让多个并发项继续撞同一个限流窗口。每次重试都重新进入调度器，
    * 让当前 Client 的并发预算重新排队；退避等待可被停止信号立即取消。
+   * 正文已交付后的失败不自动重跑生成，保留版本等待显式恢复。
    */
   private async executeWithRateLimitRetry(run: KnowledgeGenerationRun, item: KnowledgeGenerationItem, activity: Activity, stage: "generating" | "reviewing", work: () => Promise<void>): Promise<void> {
     const maxAttempts = 3;
@@ -1427,7 +1428,7 @@ export class KnowledgeGenerationService {
         await this.executeQueued(run, item, activity, stage, work);
         return;
       } catch (error) {
-        if (isKnowledgeGenerationLogFailure(error) || activity.stopFailure || !isKnowledgeGenerationRateLimitError(error) || attempt >= maxAttempts - 1) throw error;
+        if (isKnowledgeGenerationLogFailure(error) || activity.stopFailure || stage === "generating" && item.status === "completed" || !isKnowledgeGenerationRateLimitError(error) || attempt >= maxAttempts - 1) throw error;
         const delayMs = Math.min(8_000, 1_000 * 2 ** attempt) + Math.floor(Math.random() * 250);
         this.log(error, run.id, item.id, `${stage}_rate_limit_retry_${attempt + 1}`);
         await this.waitForRetry(activity, delayMs);
@@ -1452,7 +1453,7 @@ export class KnowledgeGenerationService {
       activity.controller.signal.addEventListener("abort", abort, { once: true });
     });
   }
-  /** 只生成绑定正文；规格沿用统一策略，架构深入核对代码和文档后归纳。 */
+  /** 只生成绑定正文；提交幂等，状态保存失败沿原活动入口中止后续副作用。 */
   private async generateDocument(run: KnowledgeGenerationRun, item: KnowledgeGenerationItem, activity: Activity): Promise<void> {
     const store = this.context(run);
     const config = item.executionConfig ?? run;
@@ -1573,6 +1574,8 @@ export class KnowledgeGenerationService {
             this.assertActive(activity);
             if (!accepting) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INTERRUPTED", "该知识执行已结束，本次迟到提交未写入");
             await this.assertCurrentOwner(run, activity);
+            this.assertActive(activity);
+            if (!accepting) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INTERRUPTED", "该知识执行已结束，本次迟到提交未写入");
             if (toolId !== "knowledge.asset.submit") {
               const input = knowledgeRecord(toolInput);
               if (toolId === "knowledge.node.read") {
@@ -1618,6 +1621,10 @@ export class KnowledgeGenerationService {
             }
             if (submitted) return { ok: true, output: { accepted: true, revisionId: item.revisionId } };
             await this.assertItem(run, item, activity);
+            this.assertActive(activity);
+            if (!accepting) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INTERRUPTED", "该知识执行已结束，本次迟到提交未写入");
+            // 同一回合并发提交可能已在权限校验等待期间完成落盘。
+            if (submitted) return { ok: true, output: { accepted: true, revisionId: item.revisionId } };
             const input = knowledgeRecord(toolInput);
             if (input.nodeId !== undefined && input.nodeId !== item.nodeId) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_SCOPE_INVALID", "只能提交当前绑定知识");
             if (!Array.isArray(input.sources) || !input.sources.length) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "知识必须附直接代码、文档或用户要求来源", 400);
@@ -1631,7 +1638,9 @@ export class KnowledgeGenerationService {
             const revision = store.saveDocument({ nodeId: item.nodeId, content, sources,
               expectedHash: item.expectedHash, origin: "ai", instructions: item.instructions, userInstructions: store.generationUserInstructions(run, item.nodeId, item.instructions), summary: knowledgeText(input.summary, 4000, true), runId: run.id, adopt: false });
             item.revisionId = revision.id; item.status = "completed"; item.error = null;
-            this.store.saveRun(run); submitted = true;
+            try { this.store.saveRun(run); }
+            catch (error) { retainGenerationFailure(this.key(run.id), error); throw error; }
+            submitted = true;
             return { ok: true, output: { accepted: true, nodeId: item.nodeId, revisionId: revision.id, adopted: false, reviewPending: reviewing } };
           } catch (error) {
             if (isKnowledgeGenerationLogFailure(error) || activity.stopFailure) throw error;

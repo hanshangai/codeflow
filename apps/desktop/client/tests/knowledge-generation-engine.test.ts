@@ -14,6 +14,7 @@ import { resolveClaudePermissionLaunchMode } from "../src/engines/claude/claudeC
 import { flushClientLogger, logger } from "../src/logger.js";
 import { openClientDb } from "../src/db/clientDb.js";
 import { ClientDbWriterService } from "../src/db/clientDbWriterService.js";
+import { createLocalEventPipeline } from "../src/runtime/localEventPersistence.js";
 
 test.beforeEach(() => applyEngineModelCatalogSnapshot({
   schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1,
@@ -1303,6 +1304,56 @@ for (const outcome of ["completed", "provider-error", "invalid-report", "stopped
   assert.ok(parentEvents.some(event => event.type === "item.subagent.childEvent" && event.payload.innerEventType === "item.agentMessage.completed" && event.payload.innerPayload.text === "已核对真实来源"));
   assert.equal(parentEvents.at(-1).payload.status, outcome === "completed" ? "completed" : outcome === "stopped" ? "stopped" : "failed");
   assert.equal(f.events.filter(event => event.threadId === parentId && event.type === "turn.started").length, 1);
+});
+
+for (const failed of [false, true]) test(`复检流式屏障同时等待父投影，父保存失败=${failed}`, async () => {
+  const f = fixture();
+  let parentId = "", advanced = false, parentEntered!: () => void, release!: () => void, reject!: (error: Error) => void;
+  const entered = new Promise<void>(resolve => { parentEntered = resolve; });
+  const storage = new Promise<void>((resolve, fail) => { release = resolve; reject = fail; });
+  const cause = new Error("PARENT_TRACE_STORAGE_FAILED");
+  await f.execute(input({ onThreadCreated: id => { parentId = id; } }));
+  const pipeline = createLocalEventPipeline({ writer: {
+    async submit(batch) {
+      if (batch.events.some(message => message.t === "conversation.event" && message.event.type === "item.subagent.childEvent")) {
+        parentEntered(); await storage;
+      }
+      const messages = batch.events.map((message, index) => ({ ...message, event: { ...message.event, schema: 1, seq: index + 1 } })) as any;
+      return { batchId: batch.batchId, digest: "test", messages, indexedCount: messages.length, indexedThroughSeq: messages.length };
+    },
+    async completeIndexes(_workspaceId, _batchId, count) { return count; },
+    async withLegacyDatabase(_requestId, operation) { return operation(); }, failIndexes() {},
+  }, apply() {}, publish() {}, onFailure() {} });
+  f.deps.emitConversation = (event: ConversationEventInput) => { f.events.push(event); pipeline.enqueue({ t: "conversation.event", event }, null, 1); };
+  f.deps.flushLocalEvents = (workspaceId: string, threadId: string) => pipeline.flush(workspaceId, threadId);
+  f.deps.sessions.getOrCreate = (thread: any) => ({
+    resolvePlatformToolTransport: () => "native-dynamic", interrupt: async () => {},
+    prepareAssistantTerminalEvents: async () => ({ events: [], latestAssistantText: null }),
+    async sendMessage(message: any, sink: any) {
+      sink.conversation({ ts: 1, workspaceId: "ws", threadId: thread.threadId, engine: "codex", type: "item.reasoning.delta", payload: { itemId: "proof", delta: "证据" } });
+      await sink.flush();
+      advanced = true;
+      sink.conversation({ ts: 2, workspaceId: "ws", threadId: thread.threadId, engine: "codex", type: "turn.completed", payload: { turnId: message.turnId } });
+    },
+  });
+  const execution = f.execute(input({ purpose: "review", reviewParent: { threadId: parentId, model: "model", effort: "high", onThreadCreated() {}, completionSummary: () => "已核验" } }))
+    .then(() => ({ ok: true as const }), error => ({ ok: false as const, error }));
+  try {
+    await entered;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(advanced, false, "子线程不得越过尚未保存的父投影");
+  } finally { if (failed) reject(cause); else release(); }
+  const outcome = await execution;
+  if (failed) {
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) assert.ok(failureContains(outcome.error, cause));
+    assert.equal(advanced, false);
+    await assert.rejects(pipeline.close(), error => error === cause);
+  } else {
+    assert.equal(outcome.ok, true);
+    assert.equal(advanced, true);
+    await pipeline.close();
+  }
 });
 
 test("单独复检从确切版本复用原生成会话，不受最近任务列表上限影响", async t => {

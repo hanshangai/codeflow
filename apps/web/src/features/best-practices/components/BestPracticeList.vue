@@ -128,7 +128,7 @@ function changePage(direction: -1 | 1): void {
 .best-practice-list {
   width: min(980px, calc(100% - 48px));
   margin: 0 auto;
-  padding: 64px 0 88px;
+  padding: 16px 0 88px;
   color: var(--app-text);
 }
 
@@ -323,7 +323,7 @@ function changePage(direction: -1 | 1): void {
 @media (max-width: 767px) {
   .best-practice-list {
     width: min(calc(100% - 32px), 980px);
-    padding: 32px 0 56px;
+    padding: 16px 0 56px;
   }
 
   .best-practice-list__header {

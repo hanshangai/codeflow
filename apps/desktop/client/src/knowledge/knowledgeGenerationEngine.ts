@@ -206,6 +206,11 @@ export function createKnowledgeGenerationExecutor(deps: KnowledgeGenerationEngin
         type: "item.subagent.childEvent", payload: { itemId: parent.itemId, taskId: parent.taskId, innerEventType: event.type, innerPayload: event.payload },
       });
     };
+    /** 复检的父镜像与子trace共用保存屏障，任一失败不得进入后续provider步骤。 */
+    const flushExecutionEvents = async (): Promise<void> => {
+      await deps.flushLocalEvents?.(input.workspaceId, threadId);
+      if (parent) await deps.flushLocalEvents?.(input.workspaceId, parent.threadId);
+    };
     input.signal.addEventListener("abort", stop, { once: true });
     try {
       input.onThreadCreated(threadId);
@@ -217,7 +222,7 @@ export function createKnowledgeGenerationExecutor(deps: KnowledgeGenerationEngin
       if (toolTransport !== "native-dynamic") throw new KnowledgeAssetError("KNOWLEDGE_ASSET_ENGINE_UNSUPPORTED", "当前引擎不支持项目知识所需的真实平台工具，请切换可用引擎");
       emit({ ts: Date.now(), workspaceId: input.workspaceId, threadId, engine: input.engine, type: "turn.started", payload: { turnId } });
       emit({ ts: Date.now(), workspaceId: input.workspaceId, threadId, engine: input.engine, type: "item.userMessage.created", payload: { turnId, itemId: userItemId, text: input.prompt } });
-      await deps.flushLocalEvents?.(input.workspaceId, threadId);
+      await flushExecutionEvents();
       const sendInput = {
         turnId, userItemId, assistantItemId: `item_assistant_${crypto.randomUUID()}`, reasoningItemId: `item_reasoning_${crypto.randomUUID()}`,
         text: input.prompt, userMessage: input.prompt,
@@ -232,7 +237,7 @@ export function createKnowledgeGenerationExecutor(deps: KnowledgeGenerationEngin
         executeHostTool: input.execute, platformToolTransportRequirement: "required" as const, responseFormat: "text" as const, providerNativeToolPolicy: "allow" as const, timeoutPolicy: deps.timeoutPolicy,
       };
       const emitters = {
-        flush: () => deps.flushLocalEvents?.(input.workspaceId, threadId) ?? Promise.resolve(),
+        flush: flushExecutionEvents,
         conversation: (event: ConversationEventInput) => {
           if ((event.type === "turn.completed" || event.type === "turn.error") && event.payload.turnId === turnId) {
             if (terminal) return;
@@ -360,11 +365,11 @@ export function createKnowledgeGenerationExecutor(deps: KnowledgeGenerationEngin
       input.signal.removeEventListener("abort", stop);
       await Promise.all(interrupts);
       const cleanupFailures: unknown[] = [];
-      try { await deps.flushLocalEvents?.(input.workspaceId, threadId); }
+      try { await flushExecutionEvents(); }
       catch (error) { cleanupFailures.push(error); }
       try { await deps.sessions.disposeThread(threadId); }
       catch (error) { cleanupFailures.push(error); }
-      try { await deps.flushLocalEvents?.(input.workspaceId, threadId); }
+      try { await flushExecutionEvents(); }
       catch (error) { cleanupFailures.push(error); }
       const failures = [...executionFailures, ...(interruptError && !executionFailures.includes(interruptError) ? [interruptError] : []), ...cleanupFailures]
         .filter(error => !(interruptError && error instanceof KnowledgeAssetError && error.code === "KNOWLEDGE_ASSET_INTERRUPTED"));

@@ -12,7 +12,7 @@ const items = [
 </script>
 
 <template>
-  <section id="opensource" class="security panel">
+  <section class="security panel">
     <header class="security__head">
       <span class="eyebrow">放心开始，也能看清背后如何运行</span>
       <h2 class="security__title">系统开源，安全可控</h2>

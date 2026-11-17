@@ -169,10 +169,10 @@ const appModals = inject(APP_MODALS_KEY, null);
 const { ctx } = useApiContext();
 const router = useRouter();
 const thread = computed(() => chat.threadSummaryById(props.threadId));
-/** 本机已接入的线程独立于云端连接；精确归属由 Client 统一权威校验。 */
+/** 本机已接入的聊天、节点和知识线程独立于云端；精确归属由 Client 校验。 */
 const localChatReady = computed(() => isDesktopWorkspace(config, props.workspaceId)
-  && Boolean(thread.value && (thread.value.threadType === "chat" && (!thread.value.threadSubtype || thread.value.threadSubtype === "requirement-analysis" || thread.value.threadSubtype === "node-discussion")
-    || thread.value.threadType === "orchestration" && thread.value.threadSubtype === "node")));
+  && Boolean(thread.value && (thread.value.threadType === "chat" && (!thread.value.threadSubtype || thread.value.threadSubtype === "requirement-analysis" || thread.value.threadSubtype === "node-discussion" || thread.value.threadSubtype === "knowledge-conversation")
+    || thread.value.threadType === "orchestration" && (thread.value.threadSubtype === "node" || thread.value.threadSubtype === "knowledge-assets"))));
 const composerConnected = computed(() => config.connected || localChatReady.value);
 const modelCatalogLoaded = computed(() => {
   const state = engines.byWorkspaceId[String(props.workspaceId)];

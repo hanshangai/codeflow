@@ -225,7 +225,7 @@ watch(
   display: grid;
   width: min(1180px, calc(100% - 48px));
   margin: 0 auto;
-  padding: 24px 0 84px;
+  padding: 0 0 84px;
 }
 
 .contact-page__hero {
@@ -233,7 +233,7 @@ watch(
   grid-template-columns: minmax(0, 1.04fr) minmax(0, 0.96fr);
   gap: 64px;
   align-items: start;
-  padding: 52px 0 48px;
+  padding: 16px 0 48px;
   border-bottom: 1px solid rgba(55, 69, 63, 0.14);
 }
 

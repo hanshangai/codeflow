@@ -25,4 +25,4 @@ apps/desktop/release-trust.json
 *.pfx
 !**/tests/**
 !**/LICENSE
-codeflow-docs
+codeflow-docs/

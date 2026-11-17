@@ -29,10 +29,14 @@ const isBestPractices = computed(() => route.path === "/best-practices" || route
 const isUpgrade = computed(() => route.path === "/upgrade");
 const isDownload = computed(() => route.path === "/download");
 
-/** 首页导航用真实锚点；其他公开页保留返回对应首页区块的入口。 */
-const navLinks = [
-  { label: "产品能力", anchor: "features" },
-];
+/** 首页导航只做站内滚动，不写入 URL hash；其他公开页返回首页顶部。 */
+const navLinks = [{ label: "产品能力" }];
+/** 首页滚到产品能力区块；其他页面回到首页，不产生锚点地址。 */
+function openFeatures(event: Event): void {
+  event.preventDefault();
+  if (!isHome.value) { void router.push("/"); return; }
+  document.querySelector(".features")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 </script>
 
 <template>
@@ -51,7 +55,8 @@ const navLinks = [
           v-for="link in navLinks"
           :key="link.label"
           class="landing-nav__link"
-          :href="`${isHome ? '' : '/'}#${link.anchor}`"
+          href="/"
+          @click.prevent="openFeatures"
         >
           {{ link.label }}
         </a>

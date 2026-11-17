@@ -11,6 +11,7 @@ import { useConfigStore } from "../src/store/config.ts";
 import { useThreadQueueStore } from "../src/store/threadQueue.ts";
 import { isDesktopWorkspace } from "../src/services/desktop.ts";
 import type { ApiRequestContext } from "../src/api/request.ts";
+import { shouldAllowComposerSend } from "../src/features/composer/send-guard.ts";
 
 const workspaceId = "desktop:project" as WorkspaceId;
 const threadId = "desktop-chat" as ThreadId;
@@ -143,7 +144,7 @@ test("本机草稿和模型偏好串行保存保留 Client 身份，成功后可
   assert.equal(h.config.connected, false);
 });
 
-/** 执行源码中的单个计算值，验证真实本机范围与普通会话边界。 */
+/** 执行源码计算值，验证真实本机范围、目录状态和输入边界。 */
 function computedFromSource(path: string, names: string[], context: Record<string, unknown>): Record<string, { value: unknown }> {
   const source = readFileSync(new URL(path, import.meta.url), "utf8").replace(/^<script setup lang="ts">/u, "").split("</script>")[0]!;
   const ast = ts.createSourceFile("component.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -157,33 +158,66 @@ function computedFromSource(path: string, names: string[], context: Record<strin
   return (sandbox as typeof sandbox & { result: Record<string, { value: unknown }> }).result;
 }
 
-test("本机聊天就绪只放行已接入的普通、需求分析和节点线程", t => {
+test("面板与输入框只放行本机已接入线程，知识类型与工作区边界保持一致", t => {
   const h = fixture(t);
-  for (const [target, type, subtype, expected] of [
+  for (const [path, connected] of [
+    ["../src/features/chat/components/chat-panel.vue", "chatConnected"],
+    ["../src/features/composer/components/chat-composer.vue", "composerConnected"],
+  ] as const) for (const [target, type, subtype, expected] of [
     [workspaceId, "chat", null, true], ["other:project", "chat", null, false], ["shared:project", "chat", null, false],
     [workspaceId, "chat", "requirement-analysis", true], [workspaceId, "chat", "node-discussion", true],
     [workspaceId, "orchestration", "node", true], [workspaceId, "chat", "node", false],
+    [workspaceId, "chat", "knowledge-conversation", true], [workspaceId, "orchestration", "knowledge-assets", true],
     [workspaceId, "chat", "knowledge-assets", false], [workspaceId, "orchestration", null, false],
+    [workspaceId, "orchestration", "knowledge-conversation", false],
+    ["other:project", "chat", "knowledge-conversation", false], ["shared:project", "chat", "knowledge-conversation", false],
+    ["other:project", "orchestration", "knowledge-assets", false], ["shared:project", "orchestration", "knowledge-assets", false],
   ] as const) {
-    const values = computedFromSource("../src/features/composer/components/chat-composer.vue", ["localChatReady", "composerConnected"], {
+    const values = computedFromSource(path, ["localChatReady", connected], {
       config: h.config, props: { workspaceId: target }, thread: ref({ threadType: type, threadSubtype: subtype }),
     });
-    assert.equal(values.localChatReady!.value, expected, `${target}:${type}:${subtype}`);
-    assert.equal(values.composerConnected!.value, expected);
+    assert.equal(values.localChatReady!.value, expected, `${path}:${target}:${type}:${subtype}`);
+    assert.equal(values[connected]!.value, expected);
   }
 });
 
 test("本机目录就绪使用 Client 成功快照，失败或未读取不能借云端版本放行", t => {
   const h = fixture(t);
+  for (const [type, subtype] of [["chat", null], ["chat", "knowledge-conversation"], ["orchestration", "knowledge-assets"]] as const)
   for (const [snapshot, expected] of [
     [{ localModels: true, lastUpdatedAt: 1, lastError: null, catalogVersion: null }, true],
     [{ localModels: true, lastUpdatedAt: null, lastError: null, catalogVersion: null }, false],
     [{ localModels: true, lastUpdatedAt: 1, lastError: "本机读取失败", catalogVersion: 3 }, false],
     [{ localModels: false, lastUpdatedAt: 1, lastError: null, catalogVersion: 3 }, false],
   ] as const) {
-    const values = computedFromSource("../src/features/composer/components/chat-composer.vue", ["localChatReady", "modelCatalogLoaded"], {
-      config: h.config, props: { workspaceId }, thread: ref({ threadType: "chat", threadSubtype: null }), engines: { byWorkspaceId: { [workspaceId]: snapshot } },
+    const values = computedFromSource("../src/features/composer/components/chat-composer.vue", ["localChatReady", "composerConnected", "modelCatalogLoaded", "composerWriteBlocked"], {
+      config: h.config, props: { workspaceId, disabled: false }, thread: ref({ threadType: type, threadSubtype: subtype }), engines: { byWorkspaceId: { [workspaceId]: snapshot } },
+      workspaceSwitchFlushInProgress: ref(false), sending: ref(false),
     });
-    assert.equal(values.modelCatalogLoaded!.value, expected);
+    assert.equal(values.modelCatalogLoaded!.value, expected, `${type}:${subtype}:${JSON.stringify(snapshot)}`);
+    assert.equal(values.composerWriteBlocked!.value, !expected);
+  }
+});
+
+/** 本机知识目录就绪不能绕过父级禁用、模型凭据和活动任务限制。 */
+test("本机知识会话仍受父级禁用、模型凭据和活动任务限制", t => {
+  const h = fixture(t);
+  for (const [type, subtype] of [["chat", "knowledge-conversation"], ["orchestration", "knowledge-assets"]] as const)
+  for (const [disabled, providerIssue, selectedModel, runningTurnId, expected] of [
+    [false, null, CODEX_MODELS[0]!.id, null, true],
+    [true, null, CODEX_MODELS[0]!.id, null, false],
+    [false, "本机凭据缺失", CODEX_MODELS[0]!.id, null, false],
+    [false, null, "", null, false],
+    [false, null, CODEX_MODELS[0]!.id, "active-turn", false],
+  ] as const) {
+    const values = computedFromSource("../src/features/composer/components/chat-composer.vue", ["localChatReady", "composerConnected", "modelCatalogLoaded", "composerWriteBlocked", "canSend"], {
+      config: h.config, props: { workspaceId, disabled, runningTurnId, allowQueue: false }, thread: ref({ threadType: type, threadSubtype: subtype }),
+      engines: { byWorkspaceId: { [workspaceId]: { localModels: true, lastUpdatedAt: 1, lastError: null, catalogVersion: null } } },
+      workspaceSwitchFlushInProgress: ref(false), sending: ref(false), turnDraining: ref(false), turnSaveFailed: ref(false), pendingReads: ref(false),
+      currentComposerInputSubmission: ref({ mode: "message" }), currentModelProviderIssue: ref(providerIssue),
+      flatModelOptions: ref([{ value: CODEX_MODELS[0]!.id }]), model: ref(selectedModel), hasComposerPayload: ref(true), shouldAllowComposerSend,
+    });
+    assert.equal(values.composerWriteBlocked!.value, disabled, `${type}:${subtype}:disabled=${disabled}`);
+    assert.equal(values.canSend!.value, expected, `${type}:${subtype}:${providerIssue}:${selectedModel}:${runningTurnId}`);
   }
 });

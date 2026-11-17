@@ -1,6 +1,7 @@
-/** 组装完整资源；显式 baseline proof 仅在同 payload 验签后按原字节附入。 */
+/** 包目录与归档必须二选一；当前 dist 后装，baseline proof 经同 payload 验签后附入。 */
 export function prepareDesktopResources(input: {
-  archive: string;
+  archive?: string;
+  clientPackageDir?: string;
   clientDir: string;
   webDir: string;
   outputDir: string;

@@ -686,6 +686,7 @@ export class ClaudeThreadSession implements ThreadEngineSession {
     rl.once("close", () => { stdoutReadlineClosed = true; });
     const stdoutLines: string[] = [];
     let stdoutHead = 0, stdoutPaused = false, stdoutDraining = false;
+    let unflushedStdoutLines = 0, unflushedStdoutBytes = 0;
     let stdoutFailure: { error: unknown } | undefined;
     const stdoutWaiters = new Set<{ resolve(): void; reject(error: unknown): void }>();
     /** 仅在当前 turn 已接收行完成或失败后交还排空 owner。 */
@@ -1002,6 +1003,8 @@ export class ClaudeThreadSession implements ThreadEngineSession {
         timeoutController.onConversationEvent(e);
         emitConversation(e);
       }
+      unflushedStdoutLines++;
+      unflushedStdoutBytes += Buffer.byteLength(line, "utf8");
 
       // 后台 agent 完成后仍会触发通知轮次；中间 result 不能关闭确认通道。
       if (!requiredSkillFailure && newRootResult) {
@@ -1027,11 +1030,24 @@ export class ClaudeThreadSession implements ThreadEngineSession {
         }
       }
     };
-    /** 许可结束后继续排空或恢复读取，收到的后续行保持FIFO。 */
-    const finishStdoutBatch = (): void => {
+    /** 保存屏障结束后才恢复原FIFO，关闭同样等待正在保存的批次。 */
+    const resumeStdoutBatch = (): void => {
       stdoutDraining = false;
       if (!stdoutFailure && (stdoutHead < stdoutLines.length || stdoutPaused)) scheduleClaudeStdoutDrain(drainStdoutBatch);
       settleStdoutWaiters();
+    };
+    /** 小批次在数据库短许可外等待落盘，让并发provider随存储速度消费输出。 */
+    const finishStdoutBatch = (): void => {
+      if (!stdoutFailure && !activeTurn.failed && emitters.flush && (unflushedStdoutLines >= 32 || unflushedStdoutBytes >= 256 * 1024)) {
+        unflushedStdoutLines = 0;
+        unflushedStdoutBytes = 0;
+        void Promise.resolve().then(() => emitters.flush!()).then(resumeStdoutBatch, error => {
+          activeTurn.fail(error);
+          resumeStdoutBatch();
+        });
+        return;
+      }
+      resumeStdoutBatch();
     };
     /** 仅绑定变化行进入短许可；普通输出仍按两行预算同步映射。 */
     const drainStdoutBatch = (deadline: number): void => {

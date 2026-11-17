@@ -17,16 +17,16 @@ const extras = [
 </script>
 
 <template>
-  <section id="scenarios" class="productivity" aria-label="研发效率场景">
-    <article v-for="(scene, index) in scenes" :id="scene.id" :key="scene.id" class="scene" :class="{ 'scene--reverse': index % 2 === 1 }">
+  <section class="productivity" aria-label="研发效率场景">
+    <article v-for="(scene, index) in scenes" :key="scene.id" class="scene" :class="{ 'scene--reverse': index % 2 === 1 }">
       <div class="scene__copy"><span class="eyebrow">{{ scene.label }}</span><h2>{{ scene.title }}</h2><p>{{ scene.description }}</p><p class="scene__detail">{{ scene.detail }}</p></div>
       <ProductScreenshot :src="`/images/landing/desktop-${scene.image}.png`" :alt="scene.alt" />
     </article>
-    <article id="remote" class="scene scene--remote">
+    <article class="scene scene--remote">
       <div class="scene__devices"><ProductScreenshot src="/images/landing/desktop-workbench.png" alt="电脑上的 CodeFlow 研发工作台" /><ProductScreenshot portrait src="/images/landing/efficiency-mobile.png" alt="手机 H5 会话工作台" /></div>
       <div class="scene__copy"><span class="eyebrow">移动远程操作</span><h2>电脑负责执行，手机随时跟进</h2><p>通过手机 H5 发起任务、查看进度和结果，处理允许的确认或继续补充要求。离开电脑，也能持续推进研发。</p><p class="scene__detail">执行电脑需保持在线，完成账号关联，并拥有相应工作区权限。</p><RouterLink to="/chat">进入 H5 工作台 →</RouterLink></div>
     </article>
-    <div id="custom" class="extras"><article v-for="extra in extras" :key="extra.title"><component :is="extra.icon" :size="22" aria-hidden="true" /><h3>{{ extra.title }}</h3><p>{{ extra.description }}</p></article></div>
+    <div class="extras"><article v-for="extra in extras" :key="extra.title"><component :is="extra.icon" :size="22" aria-hidden="true" /><h3>{{ extra.title }}</h3><p>{{ extra.description }}</p></article></div>
   </section>
 </template>
 
