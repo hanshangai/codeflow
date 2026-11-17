@@ -42,13 +42,12 @@ test("protected knowledge and enterprise checkout entry pages are emitted for st
   assert.equal(publicPaths.has("/payment/enterprise"), false);
 });
 
-test("SEO public pages include fixed marketing pages only", () => {
+test("only the homepage participates in SEO, other marketing routes keep noindex entry shells", () => {
   const publicPages = collectPublicPages();
-  assert.equal(publicPages.length, 6);
-  assert.equal(new Set(publicPages.map((page) => page.path)).size, publicPages.length);
-  assert.ok(publicPages.every((page) => !page.path.startsWith("/auth") && page.path !== "/chat" && page.path !== "/docs"));
-  assert.ok(publicPages.some((page) => page.path === "/best-practices"));
-  assert.ok(publicPages.every((page) => page.path !== "/pricing"));
+  assert.deepEqual(publicPages.map(page => page.path), ["/"]);
+  for (const route of ["/download", "/best-practices", "/contact", "/upgrade", "/data-security-commitment"]) {
+    assert.ok(NOINDEX_PATHS.includes(route), route);
+  }
 });
 
 test("generated Baidu manifest and sitemap contain the same public URL set", (t) => {
@@ -56,7 +55,8 @@ test("generated Baidu manifest and sitemap contain the same public URL set", (t)
   const manifest = JSON.parse(fs.readFileSync(path.join(outputDir, "seo", "public-urls.json"), "utf-8"));
   const sitemap = fs.readFileSync(path.join(outputDir, "public", "sitemap.xml"), "utf-8");
   assert.equal(manifest.schemaVersion, 1);
-  assert.equal(manifest.pages.length, 6);
+  assert.deepEqual(manifest.pages.map(page => page.path), ["/"]);
+  assert.equal((sitemap.match(/<loc>/gu) ?? []).length, 1);
   assert.equal(manifest.siteOrigin, "https://codeflowai.cn");
   assert.ok(manifest.pages.every((page) => page.url.startsWith("https://codeflowai.cn/")));
   for (const page of manifest.pages) {
@@ -68,11 +68,12 @@ test("generated Baidu manifest and sitemap contain the same public URL set", (t)
   assert.doesNotMatch(sitemap, /\/pricing\//u);
 });
 
-test("generated robots declares both static and dynamic sitemaps", (t) => {
+test("robots allows reading noindex responses and advertises only the homepage sitemap", (t) => {
   const outputDir = generateSeoOutput(t);
   const robots = fs.readFileSync(path.join(outputDir, "public", "robots.txt"), "utf-8");
   assert.match(robots, /^Sitemap: https:\/\/codeflowai\.cn\/sitemap\.xml$/mu);
-  assert.match(robots, /^Sitemap: https:\/\/codeflowai\.cn\/best-practices-sitemap\.xml$/mu);
+  assert.doesNotMatch(robots, /best-practices-sitemap/u);
+  assert.doesNotMatch(robots, /Disallow: \/(?:auth|chat|admin)/u);
   assert.doesNotMatch(robots, /codeflow\.hanshangai\.com/u);
 });
 
@@ -109,6 +110,29 @@ test("non-indexable release SEO output blocks crawling without changing source a
     fs.rmSync(outputDir, { recursive: true, force: true });
   }
   sourceFiles.forEach((filePath, index) => assert.deepEqual(fs.readFileSync(filePath), before[index]));
+});
+
+/** 使用隔离的完整构建布局验证真实 --prerender 输出，不覆盖本机 dist。 */
+test("prerender keeps homepage SEO and emits plain noindex shells for every other entry", t => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "codeflow-home-seo-"));
+  t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+  for (const directory of ["scripts", "apps/web/src/seo", "apps/web/dist"]) fs.mkdirSync(path.join(fixture, directory), { recursive: true });
+  for (const file of ["scripts/generate-site-seo.mjs", "apps/web/src/seo/publicPages.json"]) fs.copyFileSync(path.join(ROOT, file), path.join(fixture, file));
+  const shell = fs.readFileSync(path.join(ROOT, "apps/web/index.html"), "utf8");
+  fs.writeFileSync(path.join(fixture, "apps/web/dist/index.html"), shell, "utf8");
+  for (const enabled of ["1", "0"]) {
+    execFileSync(process.execPath, ["scripts/generate-site-seo.mjs", "--prerender"], { cwd: fixture, env: { ...process.env, CODEFLOWAI_SEO_OUTPUT_DIR: fixture, VITE_CODEFLOWAI_SITE_ORIGIN: "https://example.test", VITE_CODEFLOWAI_SEO_INDEXING_ENABLED: enabled }, encoding: "utf8" });
+    const home = fs.readFileSync(path.join(fixture, "apps/web/dist/index.html"), "utf8");
+    assert.match(home, enabled === "1" ? /content="index, follow"/u : /content="noindex, nofollow"/u);
+    if (enabled === "1") assert.match(home, /rel="canonical" href="https:\/\/example\.test\/"/u);
+    else assert.doesNotMatch(home, /canonical|application\/ld\+json/u);
+    for (const route of NOINDEX_PATHS) {
+      const html = fs.readFileSync(path.join(fixture, "apps/web/dist", route, "index.html"), "utf8");
+      assert.match(html, /name="robots" content="noindex, nofollow"/u, route);
+      assert.doesNotMatch(html, /canonical|application\/ld\+json|property="og:|<main\b[^>]*data-seo-prerender/u, route);
+      assert.match(html, /<div id="app"><\/div>/u, route);
+    }
+  }
 });
 
 test("SEO private route snapshots include the H5 application entry", () => {

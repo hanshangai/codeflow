@@ -16,10 +16,6 @@ import {
 } from "@/api/request";
 import { useApiContext } from "@/composables/useApiContext";
 import LandingNav from "@/features/landing/components/LandingNav.vue";
-import {
-  applyBestPracticeArticleSeo,
-  applyBestPracticeArticleUnavailableSeo,
-} from "@/seo/pageSeo";
 import BestPracticeArticle from "./BestPracticeArticle.vue";
 import BestPracticeList from "./BestPracticeList.vue";
 
@@ -60,7 +56,7 @@ const slug = computed(() => {
 });
 const isDetail = computed(() => Boolean(slug.value));
 
-/** 根据当前路由读取列表或文章详情，并拒绝过期请求回写。 */
+/** 根据当前路由读取内容并拒绝过期回写；元信息统一由路由入口处理。 */
 async function loadCurrentView(): Promise<void> {
   activeRequest?.abort(createCancelledRequestError("scope-change"));
   const controller = new AbortController();
@@ -77,18 +73,14 @@ async function loadCurrentView(): Promise<void> {
       if (runId !== requestRunId) return;
       if (result.ok) {
         article.value = result.article;
-        applyBestPracticeArticleSeo(result.article);
       } else if (result.code === "NOT_FOUND") {
         articleNotFound.value = true;
-        applyBestPracticeArticleUnavailableSeo(route.path);
       } else {
         articleError.value = result.message || "最佳实践文章加载失败";
-        applyBestPracticeArticleUnavailableSeo(route.path);
       }
     } catch (error) {
       if (isCancelledRequestError(error)) return;
       articleError.value = error instanceof Error ? error.message : "最佳实践文章加载失败";
-      applyBestPracticeArticleUnavailableSeo(route.path);
     } finally {
       if (runId === requestRunId) articleLoading.value = false;
     }

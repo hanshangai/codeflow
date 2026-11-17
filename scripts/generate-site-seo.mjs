@@ -11,14 +11,15 @@ const SITEMAP_FILE = path.join(SEO_OUTPUT_DIR, "public", "sitemap.xml");
 const ROBOTS_FILE = path.join(SEO_OUTPUT_DIR, "public", "robots.txt");
 const DIST_DIR = path.join(WEB_DIR, "dist");
 const DEFAULT_SITE_ORIGIN = "https://codeflowai.cn";
-const CANONICAL_DIRECTORY_PATHS = new Set([
+const SHOULD_PRERENDER = process.argv.includes("--prerender");
+export const NOINDEX_PATHS = [
+  "/download",
+  "/desktop-migration",
+  "/guide",
   "/best-practices",
   "/contact",
   "/upgrade",
   "/data-security-commitment",
-]);
-const SHOULD_PRERENDER = process.argv.includes("--prerender");
-export const NOINDEX_PATHS = [
   "/auth/login",
   "/auth/register",
   "/auth/forgot",
@@ -50,37 +51,30 @@ function main() {
   }
 }
 
-/** 生成静态与动态 sitemap 共用的爬虫入口，避免部署域名写死。 */
+/** 生成仅首页 sitemap 的爬虫入口，避免部署域名写死。 */
 export function writeRobots(siteOrigin, indexingEnabled = resolveSeoIndexingEnabled()) {
   fs.mkdirSync(path.dirname(ROBOTS_FILE), { recursive: true });
   fs.writeFileSync(ROBOTS_FILE, buildRobotsContent(siteOrigin, indexingEnabled), "utf-8");
 }
 
-/** 按目标环境生成爬虫规则；非索引环境禁止全站抓取且不声明 Sitemap。 */
+/** 允许爬虫读取非首页 noindex；非生产环境禁止抓取且不声明 Sitemap。 */
 export function buildRobotsContent(siteOrigin, indexingEnabled = true) {
   if (!indexingEnabled) return ["User-agent: *", "Disallow: /", ""].join("\n");
   return [
     "User-agent: *",
     "Allow: /",
     "Disallow: /api/",
-    "Disallow: /admin",
-    "Disallow: /auth/",
-    "Disallow: /chat",
-    "Disallow: /office-h5/",
-    "Disallow: /orchestration/",
-    "Disallow: /payment/",
     "",
     `Sitemap: ${new URL("/sitemap.xml", `${siteOrigin}/`).toString()}`,
-    `Sitemap: ${new URL("/best-practices-sitemap.xml", `${siteOrigin}/`).toString()}`,
     "",
   ].join("\n");
 }
 
-/** 固定营销页构成公开可索引页面。 */
+/** 仅首页参与静态 SEO；页面访问清单独立保留。 */
 export function collectPublicPages() {
   const fixedPages = JSON.parse(fs.readFileSync(PUBLIC_PAGES_FILE, "utf-8"));
   if (!Array.isArray(fixedPages)) throw new Error("publicPages.json 必须是数组");
-  return fixedPages.map(validateFixedPage);
+  return fixedPages.map(validateFixedPage).filter(page => page.path === "/");
 }
 
 /** 写入结构化 URL 清单，推送工具不需要反向解析 XML。 */
@@ -162,7 +156,7 @@ function renderPublicPageHtml(appShell, siteOrigin, page, indexingEnabled) {
   return injectPrerenderedContent(html, renderPageContent(page));
 }
 
-/** 为私有路由生成无 canonical、无结构化数据的 noindex 页面壳。 */
+/** 非首页仅输出 noindex 应用壳，清理从首页继承的 SEO。 */
 function renderNoindexPageHtml(appShell) {
   let html = appShell;
   html = replaceTagContent(html, "title", "CodeFlow");
@@ -170,6 +164,7 @@ function renderNoindexPageHtml(appShell) {
   html = removeCanonical(html);
   html = removeMeta(html, "property", "og:url");
   html = removeStructuredData(html);
+  html = html.replace(/\s*<meta\b[^>]*(?:property=["'](?:og:|article:)[^"']*["']|name=["'](?:description|keywords|twitter:[^"']*)["'])[^>]*>/giu, "");
   // 私有入口不需要 SEO 内容，保持空挂载点以缩短 H5/登录深链的首个响应。
   return html;
 }
@@ -268,18 +263,10 @@ export function resolveSeoIndexingEnabled(rawValue = process.env.VITE_CODEFLOWAI
   return !["0", "false", "no", "off"].includes(normalized);
 }
 
-/** 判断公开路径是否为目录型路由：这类地址只有带尾斜杠才是最终 200 页面。 */
-function isCanonicalDirectoryPath(path) {
-  return CANONICAL_DIRECTORY_PATHS.has(path);
-}
-
-/** 生成与 Caddy 最终 200 地址一致的公开页面 URL。 */
+/** 唯一索引入口始终使用站点根地址。 */
 function buildCanonicalUrl(siteOrigin, pagePath) {
-  const normalizedPath = String(pagePath ?? "").trim().replace(/\/+$/u, "") || "/";
-  const canonicalPath = isCanonicalDirectoryPath(normalizedPath)
-    ? `${normalizedPath}/`
-    : normalizedPath;
-  return new URL(canonicalPath, `${siteOrigin}/`).toString();
+  if (pagePath !== "/") throw new Error("Only the homepage may have a canonical URL");
+  return new URL("/", `${siteOrigin}/`).toString();
 }
 
 function escapeHtml(value) {
