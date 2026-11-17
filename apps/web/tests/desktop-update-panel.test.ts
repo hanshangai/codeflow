@@ -172,10 +172,10 @@ test("prepared与healthy区分待重启和已生效，当前版本只取实际�
   };
   assert.match(f.panel.preparedTargetText.value, /1\.0\.1109\.2/u);
   assert.deepEqual(f.panel.currentRows.value, [{ label: "当前版本", value: "1.0.1108" }]);
-  assert.equal(f.panel.statusSummary.value, "新版本已准备，重启应用后生效。");
+  assert.match(f.panel.statusSummary.value, /重启.*检查桌面壳/u);
   f.panel.details.value = { ...base, bundle: { ...base.bundle, result: "healthy" } };
   assert.equal(f.panel.preparedTargetText.value, "");
-  assert.match(f.panel.statusSummary.value, /已生效/u);
+  assert.match(f.panel.statusSummary.value, /应用内容已更新.*桌面壳尚未检查/u);
 
   f.panel.details.value = {
     ...base,

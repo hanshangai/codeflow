@@ -21,7 +21,7 @@ import { resolveVersionedShellStartup } from "./shellLaunchState.js";
 import { readCandidateShellHealthRequest, executeCandidateShellHealth, assertCandidateShellHealthEnvironment,
   reportCandidateShellHealthFailure, type CandidateShellHealthRequest } from "./candidateShellHealth.js";
 import { DESKTOP_WEB_ENTRY, createDesktopWebHandler, isTrustedDesktopUrl, assertTrustedDesktopSender, resolveDesktopInitialEntry } from "./webProtocol.js";
-import { readShellHandoffStartup, createShellHandoffContinuation, startShellRecoveryController, readShellUpdateHostFacts,
+import { readShellHandoffStartup, createShellHandoffContinuation, startShellRecoveryController, readShellUpdateHostFacts, retireShellUpdateAttempt,
   snapshotShellHandoffErrorContext, type ShellRecoveryControllerOwner } from "./shellHandoff.js";
 import { processSnapshot, type ProcessIdentity } from "./windowsProcessIdentity.js";
 import { resolveDesktopStorageLocation, persistDesktopStorageLocation, completeDesktopStorageLocation,
@@ -521,9 +521,11 @@ if (process.versions.electron) {
           ? path.dirname(path.dirname(executableDirectory)) : executableDirectory;
       if (lifecycleRequest) lifecycleRunning = true;
       if (lifecycleRequest?.kind === 'check') {
-        // 只读同一定位与进程事实；安装器覆盖文件前核验，不登记或生成任何身份。
+        // 覆盖前核定位及进程释放，旧壳尝试先受控归档；不登记或生成身份。
         const location = await resolveDesktopStorageLocation({ userDataDir, installRoot });
         await assertNoDesktopClientProcess(location.dataDir, installRoot);
+        await retireShellUpdateAttempt({ executablePath: process.execPath, pid: process.pid, parentPid: process.ppid,
+          dataDir: location.dataDir, installationDir: installRoot, userDataDir, sessionDataDir, argv: process.argv });
         lifecycleRunning = false; quitAllowed = true; app.exit(0); return;
       }
       if (lifecycleRequest?.kind === "installation") {
@@ -531,6 +533,8 @@ if (process.versions.electron) {
         await resolveVersionedShellStartup(process.execPath);
         let registered = await registerDesktopInstallation({ userDataDir, installRoot, beforePersist: async location => {
           await assertNoDesktopClientProcess(location.dataDir, installRoot);
+          await retireShellUpdateAttempt({ executablePath: process.execPath, pid: process.pid, parentPid: process.ppid,
+            dataDir: location.dataDir, installationDir: installRoot, userDataDir, sessionDataDir, argv: process.argv });
           if (location.clientId === null) await assertDesktopMaintenanceStartup({ userDataDir, location });
           else if (path.relative(location.installRoot, installRoot) === "") await rebindDesktopKeepInstallation({ userDataDir, location, installRoot });
         } });

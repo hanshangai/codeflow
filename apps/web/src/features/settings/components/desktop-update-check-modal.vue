@@ -83,7 +83,7 @@ const downloadSize = computed(() => downloadPercent.value !== null && updateProg
 /** macOS 桌面壳不参与自动更新，manual_required 是人工安装提示，不是失败。 */
 const isMacDesktop = typeof window !== "undefined" && window.codeflowDesktop?.platform === "darwin";
 
-/** 只展示结论，详细诊断仍由设置页持有。 */
+/** 资源与壳均取得完成事实才报告整体成功，未检查不能推断为不适用。 */
 const outcome = computed<Outcome | null>(() => {
   if (error.value) return { tone: "error", title: "更新未完成", detail: error.value };
   if (snapshotError.value) return { tone: "error", title: "更新状态读取失败", detail: snapshotError.value };
@@ -96,32 +96,36 @@ const outcome = computed<Outcome | null>(() => {
   }
   if (checking.value) return null;
   const value = details.value;
+  const bundleHealthy = value.bundle.result === "healthy";
+  const shellFailure = state.value?.shellUpdateFailure ?? value.shell.failure;
   const failure = state.value?.updateCheckFailure ?? state.value?.shellUpdateFailure ?? value.bundle.failure ?? value.shell.failure;
-  if (failure) return { tone: "error", title: "更新未完成", detail: describeUserFacingError(failure.rootCause, "更新未完成，请到更新设置查看诊断。") };
+  if (failure) return { tone: "error", title: "更新未完成", detail: (bundleHealthy && shellFailure ? "应用内容已更新，桌面壳更新未完成。" : "")
+    + describeUserFacingError(failure.rootCause, "更新未完成，请到更新设置查看诊断。") };
   const bundleLatest = value.bundle.result === "none" || value.bundle.result === "same";
   const shellLatest = value.shell.result === "none" || value.shell.result === "same";
-  // 非 macOS 的本轮壳更新可能没有结果；应用资源最新时不把内部状态当成未完成。
-  const shellNotApplicable = !isMacDesktop && value.shell.result === "unknown";
-  if (isMacDesktop && bundleLatest && value.shell.result === "manual_required") {
-    return { tone: "info", title: "需要手动安装更新", detail: "应用内容已是最新，macOS 桌面应用请通过完整安装包更新。" };
+  if (isMacDesktop && (bundleLatest || bundleHealthy) && value.shell.result === "manual_required") {
+    return { tone: "info", title: "需要手动安装更新", detail: `${bundleHealthy ? "应用内容已更新" : "应用内容已是最新"}，macOS 桌面应用请通过完整安装包更新。` };
   }
   if (bundleLatest && shellLatest && !value.shell.target) {
     return { tone: "success", title: "当前已是最新版本", detail: "无需下载或安装更新" };
   }
-  if (bundleLatest && shellNotApplicable && !value.shell.target) {
-    return { tone: "success", title: "当前已是最新版本", detail: "无需下载或安装更新" };
-  }
   if (["failure", "manual_required", "unavailable", "revoked"].includes(value.bundle.result)
     || ["failure", "unavailable", ...(isMacDesktop ? [] : ["manual_required"])].includes(value.shell.result)) {
-    return { tone: "error", title: "更新未完成", detail: "请到更新设置查看诊断。" };
+    return { tone: "error", title: "更新未完成", detail: (bundleHealthy ? "应用内容已更新，桌面壳更新未完成。" : "") + "请到更新设置查看诊断。" };
   }
   if (value.bundle.result === "restored" || value.shell.result === "restored") {
     return { tone: "warning", title: "更新已回退", detail: "新版本未通过健康检查，已恢复原版本。" };
   }
   if (prepared.value) {
+    if (!isMacDesktop && value.bundle.result === "prepared") {
+      return { tone: "success", title: "重启并继续更新", detail: "应用内容已下载并校验完成。重启后将激活应用内容，并继续检查桌面壳更新。" };
+    }
     return { tone: "success", title: "重启即可完成更新", detail: "更新已下载并校验完成。现在重启即可使用，也可以下次启动时更新。" };
   }
-  if (value.bundle.result === "healthy" || value.shell.result === "healthy") {
+  if ((bundleLatest || bundleHealthy) && value.shell.result === "unknown") {
+    return { tone: "info", title: "桌面壳尚未检查", detail: `${bundleHealthy ? "应用内容已更新" : "应用内容已是最新"}，桌面壳尚未检查，请重新检查。旧版安装可能需要通过完整安装包更新桌面壳。` };
+  }
+  if (bundleHealthy && shellLatest || (bundleLatest || bundleHealthy) && value.shell.result === "healthy") {
     return { tone: "success", title: "更新已生效", detail: "你正在使用更新后的版本。" };
   }
   if (value.bundle.target || value.shell.target) {

@@ -48,7 +48,16 @@ async function run(file, args, env, capture = false) {
   });
 }
 
-/** 在新独占输出及缓存目录中构建固定启动器，不执行安装或发布。 */
+/** 可选壳版本转成 NSIS 四段版本，拒绝超界值及编译指令注入。 */
+function readWindowsVersion(version) {
+  if (typeof version !== "string" || !/^\d+(?:\.\d+){1,3}$/u.test(version)) throw new Error("DESKTOP_SHELL_LAUNCHER_VERSION_INVALID");
+  const parts = version.split(".").map(Number);
+  if (parts.some(part => !Number.isSafeInteger(part) || part > 65535)) throw new Error("DESKTOP_SHELL_LAUNCHER_VERSION_INVALID");
+  while (parts.length < 4) parts.push(0);
+  return parts.join(".");
+}
+
+/** 在新独占目录编译启动器；可选图标/版本须在编译时写入，避免破坏 NSIS CRC。 */
 export async function buildShellLauncher(input) {
   if (process.platform !== "win32") throw new Error("DESKTOP_SHELL_BUILD_WINDOWS_REQUIRED");
   const sharedCache = !input.cacheDir;
@@ -61,6 +70,21 @@ export async function buildShellLauncher(input) {
   }
   assertSeparate(outputDir, cacheDir);
   await fs.access(sourcePath);
+  const metadata = [];
+  if (input.iconPath !== undefined) {
+    const icon = await fs.realpath(input.iconPath), stat = await fs.lstat(input.iconPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || /[\r\n"]/u.test(icon)) throw new Error("DESKTOP_SHELL_LAUNCHER_ICON_INVALID");
+    metadata.push(`/XIcon "${icon}"`);
+  }
+  if (input.version !== undefined) {
+    const version = readWindowsVersion(input.version);
+    metadata.push(`/XVIProductVersion ${version}`,
+      '/XVIAddVersionKey /LANG=1033 "ProductName" "CodeFlow"',
+      '/XVIAddVersionKey /LANG=1033 "FileDescription" "CodeFlow"',
+      '/XVIAddVersionKey /LANG=1033 "LegalCopyright" "CodeFlow"',
+      `/XVIAddVersionKey /LANG=1033 "FileVersion" "${version}"`,
+      `/XVIAddVersionKey /LANG=1033 "ProductVersion" "${version}"`);
+  }
   await fs.mkdir(outputDir);
   if (sharedCache) await fs.mkdir(cacheDir, { recursive: true });
   else await fs.mkdir(cacheDir);
@@ -77,7 +101,7 @@ export async function buildShellLauncher(input) {
   if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("DESKTOP_SHELL_COMPILER_OUTSIDE_CACHE");
   assertSeparate(outputDir, path.dirname(compilerPath));
   const output = path.join(outputDir, "CodeFlowAI.exe");
-  await run(compilerPath, ["/V2", `/DOUTPUT_FILE=${output}`, "/INPUTCHARSET", "UTF8", sourcePath], { ...env, ...compiler.env });
+  await run(compilerPath, ["/V2", `/DOUTPUT_FILE=${output}`, "/INPUTCHARSET", "UTF8", ...metadata, sourcePath], { ...env, ...compiler.env });
   const executable = path.join(outputDir, "CodeFlowAI.exe");
   if (!(await fs.lstat(executable)).isFile()) throw new Error("DESKTOP_SHELL_LAUNCHER_OUTPUT_INVALID");
   return executable;

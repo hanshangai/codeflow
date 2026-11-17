@@ -13,6 +13,7 @@ import { createDesktopApplication, DesktopStartupCleanupError, type DesktopHost 
 import type { ClientRuntime } from "../src/clientRuntime.js";
 import { createClientRuntime } from "../src/clientRuntime.js";
 import { readActivePointer } from "../src/releaseBundleCoordinator.js";
+import { readPendingRelease } from "../src/pendingRelease.js";
 import { loadOrCreateDeviceIdentity } from "../src/deviceIdentity.js";
 import { createLegacyClientMigration, type LegacyClientMigration } from "../src/legacyClientMigration.js";
 import { loadWeb } from "../src/webLoader.js";
@@ -722,7 +723,7 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
   f.runtime.snapshot = () => ({ status: "ready", requestId: "client-ready-1", releaseId: runtimeReleaseId, errorCode: null, pid: client.pid, health,
     ...(heldId ? { startup: { continuationId: heldId, admission: "paused" as const } } : {}) });
   const store = createShellUpdateAttemptStore(f.dataDir), identity = await loadOrCreateDeviceIdentity(f.dataDir), errors: unknown[] = [], serverErrors: unknown[] = [];
-  const control = { available: true, busy: false, confirm: true, fail: "", spawned: false, closed: false, drained: false, failHot: false, quitFail: false,
+  const control = { available: true, hotAvailable: hotUpdate, busy: false, confirm: true, fail: "", spawned: false, closed: false, drained: false, failHot: false, quitFail: false,
     holdHealth: undefined as (() => Promise<void>) | undefined, holdDrain: undefined as (() => Promise<void>) | undefined };
   let hotManifest = manifest, archive: Buffer = Buffer.alloc(0);
   if (hotUpdate) {
@@ -740,7 +741,7 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
     if (request.url?.endsWith("/switch-authorization")) { response.end(JSON.stringify({ ok: true, authorized: true, deviceId: identity.deviceId, requestId: meta.requestId, releaseId: hotManifest.releaseId, archiveSha256: hotManifest.archiveSha256 })); return; }
     f.actions.push("hot-discover");
     if (control.failHot) { response.writeHead(403); response.end("{}"); return; }
-    response.end(JSON.stringify({ ok: true, available: hotUpdate, ...(hotUpdate ? { manifest: hotManifest } : {}), deviceId: identity.deviceId, requestId: meta.requestId }));
+    response.end(JSON.stringify({ ok: true, available: control.hotAvailable, ...(control.hotAvailable ? { manifest: hotManifest } : {}), deviceId: identity.deviceId, requestId: meta.requestId }));
   })().catch(error => { serverErrors.push(error); response.writeHead(500); response.end("{}"); }); });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   t.after(async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); assert.deepEqual(serverErrors, []); });
@@ -826,6 +827,104 @@ test("prepared resource defers shell discovery until its next activation", async
   const details = await f.app.getUpdateDetails(); assert.equal(details.bundle.result, "prepared");
   assert.equal(details.bundle.target?.releaseId, "hot-release"); assert.notEqual(details.current.bundle?.releaseId, "hot-release");
   assert.equal(f.actions.includes("drain"), false); assert.equal(f.errors.length, 0); await f.app.exit();
+});
+
+test("resource activation keeps tasks held and continues the shell in the same user update", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates();
+  await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
+  assert.equal(f.actions.includes("runtime.startup.continue"), false, "business must remain held until the shell decision");
+  assert.ok(await readPendingRelease(f.dataDir), "resource pending must survive the transfer to the shell owner");
+  assert.equal(await f.app.resumeStartupUpdate(), true);
+  const attempt = await f.store.read();
+  assert.equal(attempt?.binding.kind, "active");
+  assert.equal(attempt?.binding.kind === "active" && attempt.binding.releaseId, "hot-release");
+  assert.equal(f.actions.filter(action => action === "quit").length, 2, "one resource restart and one shell handoff");
+  assert.equal(f.actions.includes("runtime.startup.continue"), false);
+});
+
+test("resource update without a shell update releases tasks after a durable shell decision", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.available = false;
+  await f.app.checkForUpdates();
+  await f.restart();
+  assert.equal(f.actions.includes("runtime.startup.continue"), false);
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
+  assert.equal(f.actions.filter(action => action === "runtime.startup.continue").length, 1);
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.equal(f.control.spawned, false);
+  await f.app.exit();
+});
+
+test("a restart between resource activation and shell discovery resumes the same durable update", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.available = false;
+  await f.app.checkForUpdates(); await f.restart();
+  assert.ok(await readPendingRelease(f.dataDir));
+  await f.restart();
+  assert.equal(f.actions.includes("runtime.startup.continue"), false);
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  await f.app.exit();
+});
+
+test("a historical shell no-update binding is archived before activating new resources", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false; f.control.available = false;
+  await f.app.checkForUpdates();
+  assert.equal((await f.store.read())?.binding.kind, "installation");
+  f.control.hotAvailable = true;
+  await f.app.checkForUpdates(); await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
+  assert.equal(await f.store.read(), null);
+  assert.ok((await fs.readdir(f.dataDir)).some(name => name.startsWith("shell-update-retired-")));
+  await f.app.resumeStartupUpdate();
+  const attempt = await f.store.read();
+  assert.equal(attempt?.binding.kind === "active" && attempt.binding.releaseId, "hot-release");
+  await f.app.exit();
+});
+
+test("shell discovery failure after resource activation remains a partial update failure", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates(); await f.restart(); f.control.fail = "discover";
+  await f.app.resumeStartupUpdate();
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.bundle.result, "healthy");
+  assert.equal(details.shell.result, "failure");
+  assert.ok(f.app.shellUpdateFailure);
+  assert.ok(await readPendingRelease(f.dataDir));
+  assert.equal(f.control.spawned, false);
+  await f.app.exit();
+});
+
+test("resource pending cleanup must finish before a shell helper receives lifecycle ownership", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates(); await f.restart();
+  const remove = fs.rm;
+  const mocked = t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+    if (String(args[0]) === path.join(f.dataDir, "pending-release.json")) throw new Error("pending cleanup failed");
+    return await remove(...args);
+  });
+  const outcome = await Promise.allSettled([f.app.resumeStartupUpdate()]);
+  assert.equal(outcome.length, 1);
+  assert.equal(f.control.spawned, false, "fallible resource cleanup cannot strand an accepted shell helper");
+  assert.ok(f.app.shellUpdateFailure);
+  assert.ok(await readPendingRelease(f.dataDir));
+  mocked.mock.restore();
+  await f.app.exit();
+});
+
+test("a prepared shell restart retains the resource health result from its durable pending", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates(); await f.restart();
+  f.control.holdHealth = async () => { throw new Error("candidate health interrupted"); };
+  await f.app.resumeStartupUpdate();
+  assert.ok((await f.store.read())?.target);
+  assert.ok(await readPendingRelease(f.dataDir));
+  f.control.holdHealth = undefined;
+  await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
+  assert.equal(await f.app.resumeStartupUpdate(), true);
 });
 
 test("normal restart resumes a prepared shell before held tasks are released", async t => {

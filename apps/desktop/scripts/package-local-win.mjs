@@ -137,7 +137,9 @@ async function packageLocalWindows() {
       npmRebuild: false,
       // 本地包只跳过签名，仍写入应用图标和版本资源，避免安装后沿用 Electron 默认图标。
       win: { ...original.win, signExecutable: false },
-      ...(target === "nsis" ? { nsis: { ...original.nsis, runAfterFinish: true } } : {}),
+      // afterPack 后 builder 仍校验根 resources/app.asar；资源编辑后、归档前再转换布局。
+      ...(target === "nsis" ? { nsis: { ...original.nsis, runAfterFinish: true },
+        afterSign: path.join(desktopDir, "scripts/windows-install-layout.mjs") } : {}),
       extraResources: [
         { from: resources, to: ".", filter: ["desktop-update.json"] },
         { from: path.join(resources, "release-trust.json"), to: "release-trust.json" },

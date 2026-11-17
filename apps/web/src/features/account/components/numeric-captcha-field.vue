@@ -38,13 +38,20 @@ function handleInput(event: Event): void {
   digits.value = value;
 }
 
+/** 验证码图片跟随手动主题或系统暗色，由服务端生成对应对比度的图片。 */
+function resolveCaptchaTheme(): "light" | "dark" {
+  const explicit = document.documentElement.dataset.theme;
+  if (explicit === "dark" || explicit === "light") return explicit;
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
 async function loadChallenge(): Promise<void> {
   if (!enabled) return;
   loading.value = true;
   errorText.value = "";
   digits.value = "";
   try {
-    const result = await account.fetchNumericCaptchaChallenge("light");
+    const result = await account.fetchNumericCaptchaChallenge(resolveCaptchaTheme());
     if (!result.ok) {
       challenge.value = null;
       errorText.value = result.message || "验证码加载失败";
@@ -101,8 +108,8 @@ defineExpose({ refresh, reset: refresh });
   height: 52px;
   border-radius: 12px;
   overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.35);
-  background: #f8fafc;
+  border: 1px solid var(--app-border, rgba(148, 163, 184, 0.35));
+  background: var(--app-bg-secondary, #f8fafc);
   flex: 0 0 auto;
 }
 
@@ -136,12 +143,12 @@ defineExpose({ refresh, reset: refresh });
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: #334155;
-  background: rgba(255, 255, 255, 0.82);
+  color: var(--app-text, #334155);
+  background: var(--app-panel-bg, rgba(255, 255, 255, 0.82));
   cursor: pointer;
 }
 
-.numeric-captcha__refresh:hover { background: #fff; }
+.numeric-captcha__refresh:hover { background: var(--app-panel-bg, #fff); }
 .numeric-captcha__refresh:disabled { cursor: not-allowed; opacity: 0.6; }
 
 .numeric-captcha__input {
@@ -150,14 +157,16 @@ defineExpose({ refresh, reset: refresh });
   height: 44px;
   padding: 0 12px;
   border-radius: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.45);
-  background: rgba(255, 255, 255, 0.7);
-  color: #0f172a;
+  border: 1px solid var(--app-border, rgba(148, 163, 184, 0.45));
+  background: var(--app-bg-secondary, rgba(255, 255, 255, 0.7));
+  color: var(--app-text, #0f172a);
   font-size: 16px;
   letter-spacing: 6px;
   outline: none;
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
+
+.numeric-captcha__input::placeholder { color: var(--app-muted, #94a3b8); }
 
 .numeric-captcha__input:focus {
   border-color: #2563eb;
@@ -167,7 +176,7 @@ defineExpose({ refresh, reset: refresh });
 .numeric-captcha__hint {
   margin: 0;
   font-size: 12px;
-  color: #64748b;
+  color: var(--app-muted, #64748b);
 }
 
 :global(:root[data-theme="dark"]) .numeric-captcha__visual {

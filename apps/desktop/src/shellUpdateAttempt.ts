@@ -87,6 +87,8 @@ export type ShellUpdateRecoveryBindFacts = ShellUpdateRecoveryRuntimeFacts & { m
 export type ShellUpdateRecoveryClaimFacts = ShellUpdateRecoveryFacts & { helper: ProcessIdentity; processes: ProcessIdentity[];
   knownOwned: { status: "known"; identities: ProcessIdentity[] } | { status: "unknown" } };
 export type ShellUpdateAttemptStore = {
+  /** 仅已释放的准备/充分终态可归档，未完成交接不能被资源或安装覆盖绕过。 */
+  retire(expected: unknown, facts: { processes: ProcessIdentity[]; caller?: ProcessIdentity }): Promise<void>;
   read(): Promise<ShellUpdateAttempt | null>;
   replace(expected: unknown, next: unknown): Promise<ShellUpdateAttempt>;
   /** 新helper以同一真实根和严格reader保留物理owner，释放前不允许嵌套。 */
@@ -149,6 +151,42 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
       if (request.kind === "replace") next = readAttempt(request.next);
     } catch (cause) { throw operationError("REPLACE", "input", false, cause); }
     if (next) return await replaceCurrent(resolveBoundRoot, expected, next);
+    if (request.kind === "retire") {
+      let archived = false;
+      try {
+        if (!expected) invalid();
+        const facts = fields(request.facts, undefined), caller = Object.hasOwn(facts, "caller") ? readProcess(facts.caller) : undefined;
+        fields(facts, ["processes", ...(caller ? ["caller"] : [])]);
+        const processes = readProcessList(facts.processes, true);
+        if (caller && (!processes.some(item => sameIdentity(item, caller))
+          || ![expected.originalState.activeShellId, expected.candidateState?.activeShellId].some(id => id && caller.executable === shellExecutable(expected!, id)))) invalid();
+        const retained = caller ? [caller] : [];
+        // 只保留当前壳及其 Electron 辅助进程；Client/引擎仍必须真实退出。
+        for (let length = -1; length !== retained.length;) {
+          length = retained.length;
+          for (const item of processes) if (caller && item.executable === caller.executable
+            && /(?:^|\s)"?--type=(?:renderer|gpu-process|utility|zygote|crashpad-handler|broker)"?(?:\s|$)/u.test(item.commandLine)
+            && retained.some(parent => item.parentPid === parent.pid && item.created >= parent.created)
+            && !retained.some(known => sameIdentity(known, item))) retained.push(item);
+        }
+        if (isShellUpdateHandoffAttempt(expected)) {
+          const terminal = expected.recovery ? expected.recovery.terminalEvidence !== null : ["completed", "restored"].includes(expected.phase);
+          if (!terminal) invalid();
+          assertShellUpdateInventoryReleased(expected, processes, retained);
+        } else {
+          if (expected.schemaVersion !== 5 || !["preparing", "no-update"].includes(expected.phase)) invalid();
+          assertShellUpdateInventoryReleased(expected, processes, retained);
+        }
+        const { root, identity } = await resolveBoundRoot();
+        if (expected.dataDir !== root || !equal(await readCurrent(root, identity), expected)) invalid();
+        await assertRoot(root, identity);
+        await fs.rename(path.join(root, FILENAME), path.join(root, `shell-update-retired-${crypto.randomUUID()}.json`));
+        archived = true;
+        await assertRoot(root, identity);
+        if (await readCurrent(root, identity) !== null) invalid();
+        return null;
+      } catch (cause) { throw operationError("REPLACE", "retire", archived, cause, expected?.requestId); }
+    }
     try {
       const { root, identity } = await resolveBoundRoot(), current = await readCurrent(root, identity);
       if (!expected || expected.dataDir !== root || !equal(current, expected)) invalid();
@@ -177,7 +215,7 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
       }
       throw cause;
     }
-    if (result === null && request.kind === "read") return null;
+    if (result === null && (request.kind === "read" || request.kind === "retire")) return null;
     const value = readAttempt(result);
     if (value.dataDir !== bound.root || request.kind === "replace" && !equal(value, request.next)
       || request.kind === "checkExpected" && !equal(value, request.expected)) invalid();
@@ -197,6 +235,14 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
   }
 
   return {
+    /** 首次 await 前严格复制事实，归档在唯一物理队列内核 expected 后执行。 */
+    async retire(expectedInput, factsInput) {
+      const expected = readAttempt(expectedInput), facts = fields(factsInput, undefined);
+      const copied = { processes: readProcessList(facts.processes, true),
+        ...(Object.hasOwn(facts, "caller") ? { caller: readProcess(facts.caller) } : {}) };
+      fields(facts, ["processes", ...(copied.caller ? ["caller"] : [])]);
+      await physical({ kind: "retire", expected, facts: copied });
+    },
     /** 仅转接现有根与execute；作用域结束后仍由协调器核资源释放结果。 */
     async acquireOwner(timeoutMs) {
       const { root, identity } = await resolveBoundRoot();

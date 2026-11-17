@@ -61,6 +61,26 @@ export async function readShellUpdateHostFacts(input: Pick<StartupInput, "execut
   return { installationDir, userDataDir: input.userDataDir, sessionDataDir: input.sessionDataDir, main: structuredClone(main) };
 }
 
+/** 绑定变化前核原安装/资源与进程释放，证据由原物理 owner 归档；交接中不允许覆盖。 */
+export async function retireShellUpdateAttempt(input: StartupInput & { installationDir: string }): Promise<void> {
+  // 无尝试记录时不创建 owner 认证目录，安装预检仍保持只读。
+  try { await fs.lstat(path.join(input.dataDir, "shell-update-attempt.json")); }
+  catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return; throw cause; }
+  const store = createShellUpdateAttemptStore(input.dataDir), attempt = await store.read();
+  if (!attempt) return;
+  if (attempt.installationDir !== input.installationDir || attempt.schemaVersion < 3) fail("RETIRE_FACTS_INVALID");
+  await matchingProfile(input, attempt);
+  const launch = await readShellLaunchState(input.installationDir);
+  const expectedState = isShellUpdateHandoffAttempt(attempt) && attempt.admission ? attempt.candidateState : attempt.originalState;
+  if (!equal(launch.state, expectedState) || launch.executablePath !== input.executablePath) fail("RETIRE_FACTS_INVALID");
+  if (attempt.schemaVersion !== 5 && !isShellUpdateHandoffAttempt(attempt)) fail("RETIRE_FACTS_INVALID");
+  await currentBinding(input, attempt as ShellUpdateHandoffAttempt | ShellUpdatePreparationAttemptV5, true);
+  const processes = await (input.snapshot ?? processSnapshot)(shellUpdateProcessSnapshotContext(attempt));
+  const caller = processes.find(item => item.pid === input.pid);
+  if (!caller || caller.parentPid !== input.parentPid || caller.executable !== input.executablePath) fail("PROCESS_IDENTITY_INVALID");
+  await store.retire(attempt, { processes, caller });
+}
+
 /** 主进程日志只投影稳定上下文、短码和已核诊断；不执行访问器或记录进程正文。 */
 export function snapshotShellHandoffErrorContext(input: unknown): {
   requestId?: string; shellId?: string; revision?: number; phase?: string; installerRequestId?: string; causeCodes: string[]; diagnostic?: Record<string, unknown>;

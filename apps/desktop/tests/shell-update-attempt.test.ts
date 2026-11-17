@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import { createUpdateFailureJournal } from "../src/updateFailureJournal.js";
+import { retireShellUpdateAttempt } from "../src/shellHandoff.js";
 import { digestUpdateFailureRecord } from "@codeflowai/shared/desktop-update-failure";
 import type { ProcessIdentity } from "../src/windowsProcessIdentity.js";
 import { createUpdateNetworkRetry, type UpdateNetworkAction } from "../src/updateNetworkRetry.js";
@@ -155,6 +156,61 @@ async function preparationFixture() {
   const prepared = await owner.beginPreparation(null, fresh, { main, client, readyRequestId: "initial-ready", processes: [main, client, ordinary] });
   return { directory, owner, fresh, prepared, main, client, ordinary };
 }
+
+test("retiring a released preparation archives its evidence before a resource binding changes", async () => {
+  const f = await preparationFixture();
+  const retire = (f.owner as any).retire;
+  assert.equal(typeof retire, "function", "store must retire obsolete bindings through its physical owner");
+  await retire.call(f.owner, f.prepared, { processes: [f.main], caller: f.main });
+  assert.equal(await f.owner.read(), null);
+  const archives = (await fs.readdir(f.directory)).filter(name => name.startsWith("shell-update-retired-"));
+  assert.equal(archives.length, 1);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.directory, archives[0]!), "utf8")), f.prepared);
+});
+
+test("retirement refuses a live Client and leaves the original attempt intact", async () => {
+  const f = await preparationFixture();
+  assert.equal(typeof (f.owner as any).retire, "function");
+  await assert.rejects((f.owner as any).retire(f.prepared, { processes: [f.main, f.client], caller: f.main }));
+  assert.deepEqual(await f.owner.read(), f.prepared);
+});
+
+test("retirement keeps the current shell renderer alive while retiring its obsolete update binding", async () => {
+  const { directory, attempt } = await fixture(), owner = store(directory), fresh = freshAttempt(attempt);
+  const main = handoffProcess(fresh, 101, 1), client = handoffProcess(fresh, 201, main.pid);
+  const renderer = { ...handoffProcess(fresh, 301, main.pid), commandLine: '"CodeFlowAI.exe" --type=renderer' };
+  const prepared = await owner.beginPreparation(null, fresh, { main, client, readyRequestId: "ready", processes: [main, client, renderer] });
+  await owner.retire(prepared, { processes: [main, renderer], caller: main });
+  assert.equal(await owner.read(), null);
+});
+
+test("retirement refuses an unfinished handoff even after its processes disappear", async () => {
+  const f = await preparedHandoffFixture();
+  const handoff = await f.owner.beginHandoff(f.prepared, f.facts);
+  assert.equal(typeof (f.owner as any).retire, "function");
+  await assert.rejects((f.owner as any).retire(handoff, { processes: [] }));
+  assert.deepEqual(await f.owner.read(), handoff);
+});
+
+test("retirement cannot use a historical restored phase to bypass an unfinished recovery", async () => {
+  const { owner, previous, facts, methods, ready: historicalReady } = await recoveryFixture();
+  const ready: ShellUpdateReadyEvidence = { ...clone(historicalReady), role: "original", main: previous.oldMain,
+    client: handoffProcess(previous, 106, previous.oldMain.pid), launchState: previous.originalState };
+  const restored = await owner.replace(previous, { ...previous, revision: previous.revision + 1, phase: "restored",
+    terminalEvidence: { ready, startedRequestId: "historical-started", continueRequestId: "historical-continue", startup: "completed", application: "started" } }) as ShellUpdateAttemptV3;
+  const claimed = await methods.beginRecovery(restored, { ...facts,
+    knownOwned: { status: "known", identities: [...facts.knownOwned.identities, ready.client] } });
+  await assert.rejects(owner.retire(claimed, { processes: [] }));
+  assert.deepEqual(await owner.read(), claimed);
+});
+
+test("installation preflight without a shell attempt does not create update owner artifacts", async () => {
+  const directory = await fs.mkdtemp(path.join(root, "no-attempt-"));
+  await retireShellUpdateAttempt({ dataDir: directory, installationDir: path.join(directory, "install"),
+    userDataDir: directory, sessionDataDir: directory, executablePath: path.join(directory, "install", "CodeFlowAI.exe"),
+    pid: 101, parentPid: 1, argv: [] });
+  assert.deepEqual(await fs.readdir(directory), []);
+});
 
 /** 普通重启事实引用同一S0/profile，调用者身份由本次成功系统快照给出。 */
 function preparationRuntime(attempt: AnyAttempt, caller: ProcessIdentity, processes: ProcessIdentity[]) {

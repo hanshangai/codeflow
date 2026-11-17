@@ -34,7 +34,7 @@ function setupComponent(t: test.TestContext, file: string, imports: Record<strin
 }
 
 /** 完整宿主事实区分当前资源与未激活目标，检查调用不会自行变更版本。 */
-function modalFixture(t: test.TestContext, canRestart = true) {
+function modalFixture(t: test.TestContext, canRestart = true, platform: "win32" | "darwin" = "win32") {
   const state: DesktopUpdateState = { deviceId, operation: "idle", checking: false, transportConfigured: true, automaticUpdates: true,
     updatesSuppressed: false, stoppingUpdates: false, shellOwned: false, updateCheckFailure: null, shellUpdateFailure: null,
     updateReceiptFailure: null, updateFailureFailure: null };
@@ -43,7 +43,7 @@ function modalFixture(t: test.TestContext, canRestart = true) {
     bundle: { requestId: "prepare:1", target: { releaseId: "next", version: "2026.11.09.02", webVersion: "next", clientVersion: "next" }, phase: "prepare", result: "prepared", failure: null },
     shell: { requestId: null, target: null, phase: null, result: "same", failure: null } };
   let checks = 0;
-  const bridge = { getState: async () => ({}), request: async () => { throw new Error("unexpected request"); },
+  const bridge = { platform, getState: async () => ({}), request: async () => { throw new Error("unexpected request"); },
     getUpdateState: async () => structuredClone(state), getUpdateDetails: async () => structuredClone(details), checkForUpdates: async () => { checks++; },
     ...(canRestart ? { restartForUpdate: async () => {} } : {}) };
   const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -62,11 +62,25 @@ function modalFixture(t: test.TestContext, canRestart = true) {
   return { panel, bridge, state, details, checks: () => checks };
 }
 
+/** 设置页复用同一宿主快照，停用自动读取以单独验证首屏结论。 */
+function settingsFixture(t: test.TestContext, platform: "win32" | "darwin" = "win32") {
+  const f = modalFixture(t, true, platform);
+  const panel = setupComponent(t, "../src/features/settings/components/desktop-update-panel.vue", {
+    "../../../services/desktop": desktop, "../desktopUpdateLabels": labels,
+    "@ant-design/icons-vue": { ExportOutlined: {} },
+    "../../../utils/upgradeNotes": { openUpgradeNotes() {} },
+  });
+  panel.state.value = structuredClone(f.state);
+  panel.details.value = structuredClone(f.details);
+  return panel;
+}
+
 test("托盘弹框展示实际单一版本，prepared可重启，healthy已生效", async t => {
   const f = modalFixture(t);
   await f.panel.startCheck();
   assert.deepEqual(f.panel.currentRows.value, [{ label: "当前版本", value: "1.0.1108" }]);
-  assert.equal(f.panel.outcome.value.title, "重启即可完成更新");
+  assert.equal(f.panel.outcome.value.title, "重启并继续更新");
+  assert.match(f.panel.outcome.value.detail, /重启后.*检查桌面壳/u);
   assert.equal(f.panel.targetRows.value[0].value, "1.0.1109.2");
   assert.equal(f.panel.restartDisabled.value, false);
   f.details.bundle.result = "healthy";
@@ -247,7 +261,7 @@ test("仅发现目标和未知结果不能显示准备完成或最新，旧壳�
   assert.equal(f.panel.restartDisabled.value, true);
 });
 
-test("应用资源最新且桌面壳无结果时显示绿色最新结论，不暴露内部状态", async t => {
+test("应用资源和桌面壳均已检查才显示最新结论", async t => {
   const f = modalFixture(t);
   f.details.bundle = { requestId: null, target: null, phase: null, result: "none", failure: null };
   f.details.shell = { requestId: null, target: null, phase: null, result: "same", failure: null };
@@ -257,9 +271,99 @@ test("应用资源最新且桌面壳无结果时显示绿色最新结论，不�
   assert.equal(f.panel.outcome.value.detail, "无需下载或安装更新");
   f.details.shell = { requestId: null, target: null, phase: null, result: "unknown", failure: null };
   await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.tone, "info");
+  assert.match(f.panel.outcome.value.detail, /桌面壳尚未检查/u);
+  assert.match(f.panel.outcome.value.detail, /旧版安装可能需要.*完整安装包/u);
+  assert.equal(f.panel.primaryAction.value.kind, "check");
+  assert.doesNotMatch(f.panel.outcome.value.title, /最新版本/u);
+});
+
+test("资源已生效但桌面壳未检查时不能显示整个更新已完成", async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = "healthy";
+  f.details.shell.result = "unknown";
+  await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.tone, "info");
+  assert.match(f.panel.outcome.value.detail, /应用内容已更新.*桌面壳尚未检查/u);
+  assert.match(f.panel.outcome.value.detail, /旧版安装可能需要.*完整安装包/u);
+  assert.equal(f.panel.primaryAction.value.kind, "check");
+});
+
+test("资源已生效但桌面壳失败时保留部分成功与失败结论", async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = "healthy";
+  f.details.shell.result = "failure";
+  await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.tone, "error");
+  assert.match(f.panel.outcome.value.detail, /应用内容已更新.*桌面壳更新未完成/u);
+  assert.equal(f.panel.primaryAction.value.label, "重试");
+  f.state.shellUpdateFailure = { requestId: "shell:failed", rootCause: toUpdateDiagnosticCause(new Error("DESKTOP_UPDATE_TRANSPORT_FAILED")) };
+  await f.panel.startCheck();
+  assert.match(f.panel.outcome.value.detail, /应用内容已更新.*网络|应用内容已更新.*连接/u);
+});
+
+test("资源与桌面壳都已完成才显示更新已生效", async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = "healthy";
+  f.details.shell.result = "healthy";
+  await f.panel.startCheck();
   assert.equal(f.panel.outcome.value.tone, "success");
-  assert.equal(f.panel.outcome.value.title, "当前已是最新版本");
-  assert.equal(f.panel.outcome.value.detail, "无需下载或安装更新");
+  assert.equal(f.panel.outcome.value.title, "更新已生效");
+  f.details.bundle.result = "unknown";
+  await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.tone, "info");
+  assert.doesNotMatch(f.panel.outcome.value.title, /已生效/u);
+});
+
+test("macOS 资源准备及生效保留桌面壳人工安装提示", async t => {
+  const f = modalFixture(t, true, "darwin");
+  f.details.shell.result = "manual_required";
+  await f.panel.startCheck();
+  assert.equal(f.panel.primaryAction.value.kind, "restart");
+  assert.doesNotMatch(f.panel.outcome.value.detail, /检查桌面壳/u);
+  f.details.bundle.result = "healthy";
+  await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.tone, "info");
+  assert.match(f.panel.outcome.value.detail, /应用内容已更新.*完整安装包/u);
+  f.details.bundle.result = "same";
+  await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.title, "需要手动安装更新");
+});
+
+for (const result of ["unknown", "failure"] as const) test(`设置页资源已生效但桌面壳${result}时明确后续待处理`, t => {
+  const panel = settingsFixture(t);
+  panel.details.value.bundle.result = "healthy";
+  panel.details.value.shell.result = result;
+  assert.match(panel.statusSummary.value, result === "unknown" ? /应用内容已更新.*桌面壳尚未检查/u : /应用内容已更新.*桌面壳更新未完成/u);
+  assert.doesNotMatch(panel.statusSummary.value, /更新已生效/u);
+});
+
+test("设置页壳故障快照不能被成功详情遮住", t => {
+  const panel = settingsFixture(t);
+  panel.details.value.bundle.result = "healthy";
+  panel.state.value.shellUpdateFailure = { requestId: "shell:failed", rootCause: toUpdateDiagnosticCause(new Error("DESKTOP_UPDATE_TRANSPORT_FAILED")) };
+  assert.match(panel.statusSummary.value, /应用内容已更新.*桌面壳更新未完成/u);
+});
+
+test("设置页准备资源后说明重启还会继续检查桌面壳", t => {
+  const panel = settingsFixture(t);
+  assert.match(panel.statusSummary.value, /重启.*检查桌面壳/u);
+});
+
+test("设置页仅壳已生效不能代替资源完成事实", t => {
+  const panel = settingsFixture(t);
+  panel.details.value.bundle.result = "unknown";
+  panel.details.value.shell.result = "healthy";
+  assert.doesNotMatch(panel.statusSummary.value, /更新已生效/u);
+  panel.details.value.bundle.result = "healthy";
+  assert.match(panel.statusSummary.value, /更新已生效/u);
+});
+
+test("设置页 macOS 资源已生效仍提示人工安装桌面壳", t => {
+  const panel = settingsFixture(t, "darwin");
+  panel.details.value.bundle.result = "healthy";
+  panel.details.value.shell.result = "manual_required";
+  assert.match(panel.statusSummary.value, /应用内容已更新.*macOS.*手动/u);
 });
 
 test("已安装同包的检查结果显示最新版本并禁用重启更新", async t => {

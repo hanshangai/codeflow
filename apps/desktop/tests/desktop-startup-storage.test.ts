@@ -9,7 +9,7 @@ import vm from "node:vm";
 import crypto from "node:crypto";
 import ts from "typescript";
 import { DesktopStartupCleanupError } from "../src/desktopApplication.js";
-import { snapshotShellHandoffErrorContext } from "../src/shellHandoff.js";
+import { retireShellUpdateAttempt, snapshotShellHandoffErrorContext } from "../src/shellHandoff.js";
 import { cancelLegacyMigrationAccountForUninstall } from "../src/legacyClientMigration.js";
 import { loadOrCreateDeviceIdentity } from "../src/deviceIdentity.js";
 import { DatabaseSync } from "node:sqlite";
@@ -51,6 +51,7 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
   const maintenance: Partial<typeof import("../src/desktopMaintenanceRecord.js")> = imports.some(value => value.includes("desktopMaintenanceRecord")) ? await import("../src/desktopMaintenanceRecord.js") : {};
   const events: string[] = [], dataDirectories: string[] = [], shown: string[] = [], exits: number[] = [], workerRequests: Record<string, unknown>[] = [];
   const menuCalls: unknown[] = [];
+  let retiredShellAttempts = 0;
   const window = Object.assign(new EventEmitter(), { webContents: {} });
   let unregisterBridge: (() => void) | undefined;
   const executablePath = options.executablePath ?? path.join(f.installRoot, "CodeFlowAI.exe");
@@ -178,6 +179,11 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
     },
     startShellRecoveryController: async () => ({ assertHealthy() { events.push("recovery"); } }),
     createShellHandoffContinuation: () => ({ continuation: {}, started: async () => { events.push("handoff-started"); }, dispose() { events.push("handoff-disposed"); } }),
+    /** 计数后执行真实归档入口，保留无记录与进程门禁的真实行为。 */
+    async retireShellUpdateAttempt(input: Parameters<typeof retireShellUpdateAttempt>[0]) {
+      retiredShellAttempts++;
+      await retireShellUpdateAttempt(input);
+    },
     snapshotShellHandoffErrorContext, DesktopStartupCleanupError, describeUserFacingError,
     ipcMain: { handle() {}, removeHandler() {} }, bindMainFrameEvents: () => () => undefined,
     /** 保留真实main注册的窗口监听，并在测试应用退出时执行其释放入口。 */
@@ -214,7 +220,7 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
   finally { if (timer) clearTimeout(timer); }
   await startupFlight;
   await new Promise(resolve => setImmediate(resolve));
-  return { events, dataDirectories, shown, exits, menuCalls, workerRequests, settled: exitFlight,
+  return { events, dataDirectories, shown, exits, menuCalls, workerRequests, retiredShellAttempts, settled: exitFlight,
     windowListeners: [window.listenerCount("maximize"), window.listenerCount("unmaximize")] };
 }
 
@@ -239,7 +245,20 @@ for (const leftoverClient of [false, true]) test(`real main installation preflig
   assert.deepEqual(result.exits, [leftoverClient ? 1 : 0]);
   assert.equal(result.events.includes('application'), false); assert.equal(result.events.includes('start'), false);
   assert.equal(result.events.includes('handoff'), false);
+  assert.equal(result.retiredShellAttempts, leftoverClient ? 0 : 1);
   await assert.rejects(fs.access(path.join(f.userDataDir, 'desktop-data-location.json')), { code: 'ENOENT' });
+  await assert.rejects(fs.access(path.join(f.userDataDir, 'runtime')), { code: 'ENOENT' });
+});
+
+test("real main installation preflight without an attempt preserves an existing empty runtime", async t => {
+  const f = await fixture(t), runtime = path.join(f.userDataDir, "runtime");
+  await fs.mkdir(runtime);
+  const result = await runMain(f, {}, false, { installation: true,
+    maintenanceArgv: [path.join(f.installRoot, "CodeFlowAI.exe"), "--codeflow-check-installation"] });
+  assert.deepEqual(result.exits, [0]);
+  assert.equal(result.retiredShellAttempts, 1);
+  assert.deepEqual(await fs.readdir(runtime), []);
+  await assert.rejects(fs.access(path.join(f.userDataDir, "desktop-data-location.json")), { code: "ENOENT" });
 });
 
 /** 准备只有六字段定位与确空默认根的从未运行安装。 */

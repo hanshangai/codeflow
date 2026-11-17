@@ -62,7 +62,7 @@ const preparedTargetText = computed(() => {
 const restartDisabled = computed(() => !props.active || !capabilities.value.restart || !preparedTargetText.value || restarting.value || checkingBusy.value
   || stateLoading.value || detailsLoading.value || !!stateError.value || !!detailsError.value || !state.value
   || state.value.stoppingUpdates || state.value.shellOwned || state.value.operation === "exiting");
-/** 只把用户需要立即知道的状态放进首屏。 */
+/** 首屏按资源与壳各自事实展示，任一健康结果不能代替整体完成。 */
 const statusSummary = computed(() => {
   if (actionError.value) return "更新操作失败，请查看诊断。";
   if (stateError.value) return "更新状态读取失败，请稍后重试。";
@@ -70,14 +70,28 @@ const statusSummary = computed(() => {
   if (!state.value) return stateLoading.value ? "正在读取更新状态…" : "尚未读取更新状态。";
   if (state.value.transportConfigured === false) return "更新源尚未配置，当前无法检查更新。";
   if (state.value.stoppingUpdates || state.value.shellOwned || state.value.operation === "exiting") return "桌面应用正在停止或交接更新。";
-  if (preparedTargetText.value) return deferred.value ? "已保留待更新版本，下次正常启动时更新。" : "新版本已准备，重启应用后生效。";
   const current = details.value;
+  const bundleHealthy = current?.bundle.result === "healthy";
+  if (state.value.updateCheckFailure || state.value.shellUpdateFailure || current?.bundle.failure || current?.shell.failure
+    || current && (["failure", "manual_required", "unavailable", "revoked"].includes(current.bundle.result)
+      || ["failure", "unavailable", ...(isMacDesktop ? [] : ["manual_required"])].includes(current.shell.result))) {
+    return bundleHealthy ? "应用内容已更新，桌面壳更新未完成，请查看诊断。" : "更新未完成，请查看诊断。";
+  }
+  if (preparedTargetText.value) {
+    if (!isMacDesktop && current?.bundle.result === "prepared") {
+      return deferred.value ? "已保留待更新版本，下次正常启动时激活应用内容，并继续检查桌面壳更新。" : "应用内容已准备，重启后激活并继续检查桌面壳更新。";
+    }
+    return deferred.value ? "已保留待更新版本，下次正常启动时更新。" : "新版本已准备，重启应用后生效。";
+  }
   if (current) {
-    if (current.bundle.result === "healthy" || current.shell.result === "healthy") return "更新已生效，当前运行版本已通过健康检查。";
     const bundleLatest = current.bundle.result === "none" || current.bundle.result === "same";
     const shellLatest = current.shell.result === "none" || current.shell.result === "same";
-    if (isMacDesktop && bundleLatest) return "应用资源已是最新；macOS 桌面壳请手动下载安装。";
+    if (isMacDesktop && (bundleLatest || bundleHealthy)) return `${bundleHealthy ? "应用内容已更新" : "应用资源已是最新"}；macOS 桌面壳请手动下载安装。`;
     if (bundleLatest && shellLatest && !current.shell.target) return "当前已是最新版本。";
+    if ((bundleLatest || bundleHealthy) && current.shell.result === "unknown") {
+      return `${bundleHealthy ? "应用内容已更新" : "应用内容已是最新"}，桌面壳尚未检查，请重新检查。旧版安装可能需要通过完整安装包更新桌面壳。`;
+    }
+    if (bundleHealthy && shellLatest || (bundleLatest || bundleHealthy) && current.shell.result === "healthy") return "更新已生效，当前运行版本已通过健康检查。";
   }
   return "查看当前版本，按需检查并准备更新。";
 });

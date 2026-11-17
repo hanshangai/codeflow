@@ -2447,6 +2447,8 @@ function clearSubmittedDraftAfterSuccess(input: {
   chat.clearPendingLocalThreadDraft(input.threadId, undefined, {
     workspaceScopeToken: input.workspaceScopeToken,
   });
+  // 立即清本地远端草稿缓存，避免云端清理未完成时重挂载回填发送前内容。
+  chat.setThreadDraft(input.threadId, null);
   skipNextDraftWatch = true;
   draftDirty = false;
   draftEditSeq = 0;
@@ -2461,31 +2463,48 @@ function clearSubmittedDraftAfterSuccess(input: {
   closeImagePreview();
   closeTextFilePreview();
   clearAttachments();
-  void chat.clearThreadDraft(ctx.value, input.workspaceId, input.threadId, {
-    workspaceScopeToken: input.workspaceScopeToken,
-  }).catch((error) => {
-    if (isCancelledRequestError(error)) {
-      // 发送后切换会话/工作区会取消旧作用域的草稿清理；本地草稿已清，不能误报为清理失败。
-      console.warn("[composer.draft.clear.cancelled]", {
-        code: "THREAD_DRAFT_CLEAR_AFTER_SUBMIT_CANCELLED",
+  void clearRemoteDraftAfterSubmit(ctx.value, input);
+  settingsOpen.value = false;
+}
+
+/** 发送成功后清理远端草稿；瞬时失败重试一次，仍失败只告警，不误报发送失败。 */
+async function clearRemoteDraftAfterSubmit(
+  apiContext: ApiRequestContext,
+  input: { workspaceId: WorkspaceId; threadId: ThreadId; workspaceScopeToken: number; successLabel: string },
+): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await chat.clearThreadDraft(apiContext, input.workspaceId, input.threadId, {
+        workspaceScopeToken: input.workspaceScopeToken,
+      });
+      return;
+    } catch (error) {
+      if (isCancelledRequestError(error)) {
+        // 发送后切换会话/工作区会取消旧作用域的草稿清理；本地草稿已清，不能误报为清理失败。
+        console.warn("[composer.draft.clear.cancelled]", {
+          code: "THREAD_DRAFT_CLEAR_AFTER_SUBMIT_CANCELLED",
+          requestId: null,
+          workspaceId: String(input.workspaceId),
+          threadId: String(input.threadId),
+          cancelKind: error.kind,
+        });
+        return;
+      }
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        continue;
+      }
+      const rootCause = error instanceof Error ? error.message : String(error);
+      console.error("[composer.draft.clear.failed]", {
+        code: "THREAD_DRAFT_CLEAR_AFTER_SUBMIT_FAILED",
         requestId: null,
         workspaceId: String(input.workspaceId),
         threadId: String(input.threadId),
-        cancelKind: error.kind,
+        rootCause,
       });
-      return;
+      message.warning(`${input.successLabel}；草稿已在本机清除，云端草稿同步失败：${rootCause}`);
     }
-    const rootCause = error instanceof Error ? error.message : String(error);
-    console.error("[composer.draft.clear.failed]", {
-      code: "THREAD_DRAFT_CLEAR_AFTER_SUBMIT_FAILED",
-      requestId: null,
-      workspaceId: String(input.workspaceId),
-      threadId: String(input.threadId),
-      rootCause,
-    });
-    message.error(`${input.successLabel}，但草稿同步清理失败，刷新后可能重新出现草稿：${rootCause}`);
-  });
-  settingsOpen.value = false;
+  }
 }
 
 /** 调用现有 Codex compact API，不创建普通用户消息。 */

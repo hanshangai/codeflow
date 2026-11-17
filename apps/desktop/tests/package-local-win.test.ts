@@ -60,7 +60,7 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     assert.deepEqual(target, { platform: "win32", arch: "x64" });
     return { electronDist: path.join(f.root, "electron-dist"), electronVersion: "45.0.0" };
   };
-  // 真正的 builder 会启动打包并写工件；此替身只创建可核对的占位 exe。
+  // 隔离 Electron/NSIS 构建；布局钩子仍使用真实文件转换，仅启动器编译以夹具代替。
   const build = async (options: typeof calls[number]) => {
     calls.push(options);
     await fs.access(path.join(options.projectDir, "node_modules/dep/package.json"));
@@ -69,6 +69,18 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     const executable = path.join(config.directories.output, (options.targets as string[])[0] === "nsis" ? artifactName : "win-unpacked/CodeFlowAI.exe");
     await fs.mkdir(path.dirname(executable), { recursive: true });
     await fs.writeFile(executable, "fixture", "utf8");
+    const appOutDir = path.join(config.directories.output, "win-unpacked");
+    await fs.mkdir(appOutDir, { recursive: true });
+    if ((options.targets as string[])[0] === "nsis") await fs.writeFile(path.join(appOutDir, "CodeFlowAI.exe"), "electron", "ascii");
+    await fs.cp(f.resources, path.join(appOutDir, "resources"), { recursive: true });
+    await fs.writeFile(path.join(appOutDir, "resources/app.asar"), "application", "ascii");
+    if (config.afterSign) {
+      assert.equal(config.afterSign, path.join(f.shell, "scripts/windows-install-layout.mjs"));
+      const { prepareWindowsInstallLayout } = await import("../scripts/windows-install-layout.mjs");
+      const launcherExecutable = path.join(f.root, "fixed-launcher.exe");
+      await fs.writeFile(launcherExecutable, "fixed launcher", "ascii");
+      await prepareWindowsInstallLayout({ appOutDir, launcherExecutable });
+    }
     return builderResult ? await builderResult(executable) : [executable];
   };
   const source = script.replace(/^import .*;\r?\n/gmu, "")
@@ -392,13 +404,21 @@ for (const [target, options] of [
     assert.equal(message.target, `win32-x64-${target}`);
     assert.equal(message.signed, false); assert.equal(message.published, false);
     if (target === "nsis") {
+      assert.equal(await fs.readFile(path.join(output, "win-unpacked/CodeFlowAI.exe"), "ascii"), "fixed launcher");
+      assert.equal(await fs.readFile(path.join(output, "win-unpacked/shells/installation/CodeFlowAI.exe"), "ascii"), "electron");
+      assert.equal(await fs.readFile(path.join(output, "win-unpacked/shell-launch.ini"), "ascii"),
+        "[shell]\r\nschema=1\r\nactive=installation\r\nprevious=\r\nbaseline=installation\r\n");
       assert.equal(config.nsis.runAfterFinish, true);
       assert.equal(config.nsis.allowToChangeInstallationDirectory, true);
       assert.equal(config.artifactName, `CodeFlowAI-${localDisplayVersion()}-win32-x64.\${ext}`);
       assert.equal(message.displayVersion, localDisplayVersion());
       assert.equal(message.executable, undefined);
       assert.equal(message.installer, path.join(output, `CodeFlowAI-${localDisplayVersion()}-win32-x64.exe`));
-    } else assert.equal(message.executable, path.join(output, "win-unpacked/CodeFlowAI.exe"));
+    } else {
+      assert.equal(message.executable, path.join(output, "win-unpacked/CodeFlowAI.exe"));
+      assert.equal(config.afterSign, undefined);
+      await assert.rejects(fs.access(path.join(output, "win-unpacked/shells")), { code: "ENOENT" });
+    }
     assert.deepEqual(await snapshot(f.resources), before);
   });
 }

@@ -9,7 +9,8 @@ import { promisify } from "node:util";
 
 export type ShellUpdateFileRoot = { root: string; dev: string; ino: string };
 export type ShellUpdateFileRequest = { kind: "read" } | { kind: "checkExpected"; expected: unknown }
-  | { kind: "replace"; expected: unknown; next: unknown };
+  | { kind: "replace"; expected: unknown; next: unknown }
+  | { kind: "retire"; expected: unknown; facts: unknown };
 type Execute = (request: ShellUpdateFileRequest) => Promise<unknown>;
 export type ShellUpdateFileOwnerScope = { assertActive(): void; release(): Promise<void> };
 type Outcome = { ok: true; value: unknown } | { ok: false; error: unknown };
@@ -488,6 +489,7 @@ function validateRequest(input: unknown): ShellUpdateFileRequest {
   if (value.kind === "read") exact(value, ["kind"]);
   else if (value.kind === "checkExpected") exact(value, ["kind", "expected"]);
   else if (value.kind === "replace") exact(value, ["kind", "expected", "next"]);
+  else if (value.kind === "retire") exact(value, ["kind", "expected", "facts"]);
   else throw failure("REQUEST_INVALID");
   return value as ShellUpdateFileRequest;
 }
