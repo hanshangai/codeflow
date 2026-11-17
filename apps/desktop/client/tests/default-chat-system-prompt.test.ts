@@ -8,6 +8,10 @@ test("default chat system prompt keeps validated base rules", () => {
 
   assert.equal(prompt.split("\n").length, DEFAULT_CHAT_SYSTEM_PROMPT_RULES.length);
   assert.match(prompt, /必须使用中文沟通。/);
+  assert.match(prompt, /Codex 使用 `request_user_input`，Claude 使用 `AskUserQuestion`/);
+  assert.match(prompt, /必须暂停并调用当前引擎的结构化提问工具/);
+  assert.match(prompt, /不要只在普通回复中列出编号选项/);
+  assert.match(prompt, /上下文已明确或可以安全继续时自主处理/);
   assert.match(prompt, /除非用户明确要求为子 agent 指定其他模型，否则必须继承父 agent/);
   assert.match(prompt, /禁止隐式全量操作。/);
   assert.match(prompt, /优先使用当前引擎提供的原生文件编辑能力做最小差异修改/);

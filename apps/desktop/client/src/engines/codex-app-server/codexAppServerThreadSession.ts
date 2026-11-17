@@ -11105,8 +11105,8 @@ export function buildCodexDeveloperInstructions(input: {
   }
   if (input.providerNativeToolPolicy !== "deny") {
     blocks.push([
-      "需要用户补充关键信息或选择会影响需求、方案、执行边界的选项时，优先调用 request_user_input，通过补充输入弹框展示简短问题、选项和说明，并允许用户填写自定义回答；收到回答后继续当前任务。",
-      "已有上下文能够确定的事项继续自主处理，避免重复提问。",
+      "如果缺少的信息会实质影响需求、方案、执行范围或数据变更，且无法根据上下文合理判断，必须暂停并调用 request_user_input，通过补充输入弹框展示简短选项并允许用户补充；不要只在普通回复中列出编号选项或写“请确认”。",
+      "上下文已明确或可以安全继续时自主处理，不要为常规细节提问。",
     ].join(" "));
   }
   if (input.providerNativeToolPolicy === "allow" && (input.platform ?? process.platform) === "win32") {

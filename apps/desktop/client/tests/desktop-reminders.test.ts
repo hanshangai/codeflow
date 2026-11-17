@@ -9,15 +9,16 @@ import ts from "typescript";
 import { createDesktopLifecycle } from "../src/runtime/desktopLifecycle.ts";
 import { createClientRuntime } from "../../src/clientRuntime.ts";
 
-/** 仅提取 bootstrap 内两个闭包并编译真实实现；不复制业务 body，不启动完整 Client。 */
+/** 提取 bootstrap 的授权、发送和刷新闭包；不复制业务条件，不启动完整 Client。 */
 function reminderFlushFixture(input: { owner: boolean; hostScope: boolean; cloudAccepted?: boolean }) {
   const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+  const scopeStart = source.indexOf("  const hasDesktopReminderScope = ");
   const sendStart = source.indexOf("  const sendToServer = ");
   const sendEnd = source.indexOf("  const takeApiResponseDispatch", sendStart);
   const flushStart = source.indexOf("  const flushReminderDirtyWorkspaces = ");
   const flushEnd = source.indexOf("  /**", flushStart + 10);
-  assert.ok(sendStart >= 0 && sendEnd > sendStart && flushStart >= 0 && flushEnd > flushStart, "提醒真实闭包未定位");
-  const compiled = ts.transpileModule(source.slice(sendStart, sendEnd) + source.slice(flushStart, flushEnd), {
+  assert.ok(scopeStart >= 0 && sendStart > scopeStart && sendEnd > sendStart && flushStart >= 0 && flushEnd > flushStart, "提醒真实闭包未定位");
+  const compiled = ts.transpileModule(source.slice(scopeStart, sendEnd) + source.slice(flushStart, flushEnd), {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const workspaceId = "local:project", localEvents: unknown[] = [], cloudMessages: unknown[] = [], disconnects: Error[] = [], logs: any[] = [], invalidLogs: any[] = [];
@@ -27,6 +28,7 @@ function reminderFlushFixture(input: { owner: boolean; hostScope: boolean; cloud
     sanitizeClientToServerMessage: (value: unknown) => value,
     keepFullEventOutput: false,
     config: { clientId: "local" },
+    hasRemoteDataDemand: (kind: string, id: string) => kind === "reminders" && id === workspaceId,
     workspaces: new Map([[workspaceId, {}]]),
     desktopLifecycle: { publishEvent: (event: unknown) => { deliveryOrder.push("local"); localEvents.push(event); } },
     desktopHostScopes: input.hostScope ? [{ kind: "shared", clientId: "local", userId: "account-a", workspaceId, sharedWorkspaceId: "shared-project" }] : [],

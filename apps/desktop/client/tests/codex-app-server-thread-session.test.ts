@@ -4,10 +4,21 @@ import assert from "node:assert/strict";
 
 import type { ConversationEventInput, SessionId, TurnId, WorkspaceId } from "@codeflowai/shared";
 
-import { CodexAppServerThreadSession } from "../src/engines/codex-app-server/codexAppServerThreadSession.ts";
+import { buildCodexDeveloperInstructions, CodexAppServerThreadSession } from "../src/engines/codex-app-server/codexAppServerThreadSession.ts";
 import * as catalog from "../src/engines/engineModelCatalogRuntime.ts";
 import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
 import { buildCodexDynamicToolNameByToolId } from '../src/engines/codex-app-server/codexAppServerProtocol.js';
+
+test("Codex 原生提问提示只在允许交互时要求使用结构化问题", () => {
+  const allowed = buildCodexDeveloperInstructions({ accessMode: "current", providerNativeToolPolicy: "allow", responseFormat: "text" });
+  const interactiveOnly = buildCodexDeveloperInstructions({ accessMode: "current", providerNativeToolPolicy: "interactive-only", responseFormat: "text" });
+  const denied = buildCodexDeveloperInstructions({ accessMode: "current", providerNativeToolPolicy: "deny", responseFormat: "text" });
+
+  assert.match(allowed ?? "", /必须暂停并调用 request_user_input/);
+  assert.match(allowed ?? "", /不要只在普通回复中列出编号选项/);
+  assert.match(interactiveOnly ?? "", /必须暂停并调用 request_user_input/);
+  assert.doesNotMatch(denied ?? "", /必须暂停并调用 request_user_input/);
+});
 
 test('revoked builtin Codex credential rejects a new turn before provider setup', async () => {
   const denied = Object.assign(new Error('credential revoked'), { code: 'BUILT_IN_RELAY_REVALIDATION_REQUIRED' });

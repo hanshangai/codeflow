@@ -6,17 +6,19 @@ import test from "node:test";
 import ts from "typescript";
 import { openClientDb } from "../src/db/clientDb.ts";
 import { createLocalEventPersistence } from "../src/runtime/localEventPersistence.ts";
-import { createServerReminderNotifier } from "../src/notifications/serverReminderNotifier.ts";
+import { createReminderDeliveryOwner, createServerReminderNotifier } from "../src/notifications/serverReminderNotifier.ts";
+import { describeWorkspaceApiFailure } from "../src/app/handleApiRequest.ts";
 
 /** 提取实际 Host context 与统一发送入口，只替换外部连接和页面边界。 */
 function fixture(t: test.TestContext) {
   const source = fs.readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+  const scopeStart = source.indexOf("  const hasDesktopReminderScope = (");
   const sendStart = source.indexOf("  const sendToServer = (message:");
   const sendEnd = source.indexOf("  const takeApiResponseDispatch", sendStart);
   const hostStart = source.indexOf("    const desktopHostContext = (owner:");
   const hostEnd = source.indexOf("    /** 凭据资格同步撤销", hostStart);
-  assert.ok(sendStart > 0 && sendEnd > sendStart && hostStart > 0 && hostEnd > hostStart);
-  const compiled = ts.transpileModule(`${source.slice(sendStart, sendEnd)}\n${source.slice(hostStart, hostEnd)}\nreturn { ctx: desktopHostContext(owner), sendToServer };`,
+  assert.ok(scopeStart > 0 && sendStart > scopeStart && sendEnd > sendStart && hostStart > 0 && hostEnd > hostStart);
+  const compiled = ts.transpileModule(`${source.slice(scopeStart, sendEnd)}\n${source.slice(hostStart, hostEnd)}\nreturn { ctx: desktopHostContext(owner), sendToServer };`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "codeflow-host-offline-"));
   const db = openClientDb({ dbPath: path.join(directory, "client.db"), localCanonicalEvents: true });
@@ -32,6 +34,7 @@ function fixture(t: test.TestContext) {
   const owner = { generation: 1 }, stale = new Error("DESKTOP_CLOUD_OWNER_STALE_OR_UNAVAILABLE");
   const context = {
     owner, apiHandlerContext: {}, desktopRequestId: "offline-regression", keepFullEventOutput: false,
+    eventPipeline: null, describeWorkspaceApiFailure,
     config: { clientId: "desktop-device" }, workspaces: new Map([[workspaceId, directory]]), db, desktopHostScopes: scopes,
     sanitizeClientToServerMessage: (value: unknown) => value,
     /** 保留本地持久化失败，不能因断云而伪造成功。 */
@@ -93,9 +96,10 @@ test("原全局提醒入口在账号切换后只允许当前授权Host范围", a
     assert.equal(result.accepted, false);
     assert.equal(result.reason, "DESKTOP_HOST_REMINDER_SCOPE_REQUIRED");
   }
-  const notifier = createServerReminderNotifier({ sendToServer: f.sendToServer });
-  await assert.rejects(notifier.notifyCompletion(completion.notification as never), /DESKTOP_HOST_REMINDER_SCOPE_REQUIRED/u);
-  await assert.rejects(notifier.notifyAction(action.notification as never), /DESKTOP_HOST_REMINDER_SCOPE_REQUIRED/u);
+  const delivery = createReminderDeliveryOwner({ send: f.sendToServer, timeoutMs: 1000 });
+  const notifier = createServerReminderNotifier({ sendToServer: f.sendToServer, canSend: () => true, notifyOnServer: delivery.notify });
+  await assert.rejects(notifier.notifyCompletion(completion.notification as never), /REMINDER_DELIVERY_DISPATCH_REJECTED/u);
+  await assert.rejects(notifier.notifyAction(action.notification as never), /REMINDER_DELIVERY_DISPATCH_REJECTED/u);
   assert.deepEqual(f.sent, []);
   f.scopes.push({ workspaceId: f.workspaceId, sharedWorkspaceId: "shared-b", userId: "owner-b", clientId: "desktop-device" });
   assert.equal(f.sendToServer(completion).accepted, false);

@@ -1004,6 +1004,12 @@ async function main(options?: { apiKeyOverride?: unknown }) {
   const flushLocalEventRelay = (restart = false): void => {
     localEventRelay?.scheduleFlush(restart);
   };
+  /** 提醒准入和发送共用当前账号的 Host 授权；省略共享 ID 仅用于工作区脏标记。 */
+  const hasDesktopReminderScope = (workspaceId: WorkspaceId, sharedWorkspaceId?: string | null): boolean => {
+    const owner = desktopCloudAccount?.getOwner();
+    return Boolean(owner && desktopHostScopes.some(scope => scope.clientId === config.clientId && scope.userId === owner.ownerUserId
+      && scope.workspaceId === workspaceId && (sharedWorkspaceId === undefined || scope.sharedWorkspaceId === sharedWorkspaceId)));
+  };
   /** 桌面事实先本地提交；relay来源明确走远程投递，避免个人清理通知被本机分支截获。 */
   const sendToServer = (message: ClientToServerMessage, fromRelay = false): WsSendJsonResult => {
     const outbound = sanitizeClientToServerMessage(message, { keepFullOutput: keepFullEventOutput });
@@ -1071,11 +1077,9 @@ async function main(options?: { apiKeyOverride?: unknown }) {
     if (desktopLifecycle) {
       // 全局索引和脏标记也会发提醒，发送前统一核当前 Host 范围，避免旧账号数据串线。
       if (outbound.t === "reminder.completionNotification" || outbound.t === "reminder.actionNotification" || outbound.t === "reminders.changed") {
-        const owner = desktopCloudAccount?.getOwner();
         const workspaceId = outbound.t === "reminders.changed" ? outbound.workspaceId : outbound.notification.workspaceId;
-        const sharedWorkspaceId = outbound.t === "reminders.changed" ? null : outbound.notification.sharedWorkspaceId;
-        if (!owner || !desktopHostScopes.some(scope => scope.clientId === config.clientId && scope.userId === owner.ownerUserId
-          && scope.workspaceId === workspaceId && (outbound.t === "reminders.changed" || scope.sharedWorkspaceId === sharedWorkspaceId))) {
+        const sharedWorkspaceId = outbound.t === "reminders.changed" ? undefined : outbound.notification.sharedWorkspaceId ?? null;
+        if (!hasDesktopReminderScope(workspaceId, sharedWorkspaceId)) {
           return { accepted: false, messageType: outbound.t, readyState: null, bufferedAmount: null, bytes: 0,
             reason: "DESKTOP_HOST_REMINDER_SCOPE_REQUIRED", queuedAt: Date.now(), callbackError: null };
         }
@@ -1113,7 +1117,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
     sendToServer,
     notifyOnServer: reminderDelivery.notify,
     canSend: notification => hasRemoteDataDemand("reminders", notification.workspaceId)
-      && (!desktopLifecycle || Boolean(desktopCloudAccount?.getOwner())),
+      && (!desktopLifecycle || hasDesktopReminderScope(notification.workspaceId, notification.sharedWorkspaceId ?? null)),
   });
   const pendingReminderDirtyWorkspaces = new Set<WorkspaceId>();
   let reminderDirtyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1135,8 +1139,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         }
         desktopLifecycle.publishEvent({ t: "reminders.changed", workspaceId });
         pendingReminderDirtyWorkspaces.delete(workspaceId);
-        const owner = desktopCloudAccount?.getOwner();
-        if (!owner || !desktopHostScopes.some(scope => scope.clientId === config.clientId && scope.userId === owner.ownerUserId && scope.workspaceId === workspaceId)) continue;
+        if (!hasDesktopReminderScope(workspaceId)) continue;
       }
       if (!hasRemoteDataDemand("reminders", workspaceId)) {
         pendingReminderDirtyWorkspaces.delete(workspaceId);
