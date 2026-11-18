@@ -1,13 +1,48 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import vm from "node:vm";
+import ts from "typescript";
 
 import {
   shouldAllowComposerSend,
   shouldEnqueueInsteadOfSend,
+  shouldSubmitOnEnter,
 } from "../src/features/composer/send-guard.ts";
 
 const composerSource = readFileSync(new URL("../src/features/composer/components/chat-composer.vue", import.meta.url), "utf8");
+
+/** 执行真实键盘入口，确认手机回车直接发送且不会触发候选执行。 */
+test("手机及 H5 回车直接发送，桌面回车与辅助键行为保持不变", () => {
+  const script = composerSource.match(/<script setup[^>]*>([\s\S]*?)<\/script>/u)![1]!;
+  const ast = ts.createSourceFile("composer.ts", script, ts.ScriptTarget.Latest, true);
+  const handler = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "onInputKeydown");
+  assert.ok(handler);
+  for (const mobile of [true, false]) for (const surface of ["default", "h5"]) {
+    const calls: string[] = [];
+    const context = vm.createContext({ isMobile: mobile, props: { surface, runningTurnId: null, allowQueue: true }, shouldSubmitOnEnter,
+      handleInputActionKeydown: () => { calls.push("actions"); return false; },
+      handleMentionKeydown: () => { calls.push("mentions"); return false; },
+      insertLineBreakAtCursor: () => { calls.push("modified-newline"); }, send: () => { calls.push("send"); } });
+    vm.runInContext(ts.transpileModule(handler.getText(ast), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+      + "\nglobalThis.keydown = onInputKeydown;", context);
+    for (const shiftKey of [false, true]) {
+      calls.length = 0;
+      let prevented = false;
+      context.keydown({ key: "Enter", shiftKey, ctrlKey: false, metaKey: false, altKey: false, isComposing: false,
+        preventDefault() { prevented = true; } });
+      if (mobile || surface === "h5") {
+        if (shiftKey) assert.deepEqual(calls, ["actions", "mentions", "modified-newline"]);
+        else { assert.deepEqual(calls, ["actions", "mentions", "send"]); assert.equal(prevented, true); }
+      } else if (shiftKey) assert.deepEqual(calls, ["actions", "mentions", "modified-newline"]);
+      else { assert.deepEqual(calls, ["actions", "mentions", "send"]); assert.equal(prevented, true); }
+    }
+    calls.length = 0;
+    context.keydown({ key: "Enter", isComposing: true, preventDefault() { throw new Error("IME不应阻止默认输入"); } });
+    assert.equal(calls.includes("send"), false);
+  }
+  assert.match(composerSource, /:enterkeyhint="[^"\n]*'send'/u);
+});
 
 test("真实本机聊天无需云端会话即可发送，其他发送约束仍生效", () => {
   const input = { disabled: false, connected: false, hasWebSession: false, localReady: true, sending: false,
