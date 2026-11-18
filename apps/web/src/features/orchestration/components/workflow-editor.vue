@@ -454,8 +454,10 @@ function applyRestoredWorkflowDraft(): void {
 
 // 监听草稿内容而非 isDirty：isDirty 是布尔，只在第一次变脏时跳变一次，之后所有编辑都不会再触发暂存。
 watch(draftSnapshot, scheduleWorkflowDraftPersist);
-const visibleRoles = computed(() => props.roleDefinitions ?? orch.roles);
-const visibleKnowledgeBundles = computed(() => orch.knowledgeBundles);
+const visibleRoles = computed(() => (props.roleDefinitions ?? orch.roles).filter(role => props.previewReadonly === true
+  || !orch.assetListHostIds.role.includes(role.id) || orch.roles.find(item => item.id === role.id)?.kind === "builtin"));
+const visibleKnowledgeBundles = computed(() => orch.knowledgeBundles.filter(bundle => props.previewReadonly === true
+  || !orch.assetListHostIds.knowledge_bundle.includes(bundle.id) || bundle.kind === "builtin"));
 const permissionInput = computed(() => ({
   accountRole: config.accountRole,
   enterpriseId: config.userSummary?.enterpriseId ?? null,

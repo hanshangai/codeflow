@@ -5,6 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 
 import { createPinia, setActivePinia } from "pinia";
+import { computed } from "vue";
 import {
   ORCH_ASSET_BUNDLE_SCHEMA_VERSION,
   createDefaultRoleExecutionConfig,
@@ -231,6 +232,221 @@ test("asset list cache merges concurrent first reads and releases a failed reque
   await store.ensureAssetListLoaded(ctx, WORKSPACE_ID, "role");
   assert.equal(requestCount, 2);
   assert.equal(store.assetListLoaded.role, true);
+});
+
+for (const { assetType, path, listKey } of [
+  { assetType: "role", path: "/api/orch/roles", listKey: "roles" },
+  { assetType: "workflow", path: "/api/orch/workflows", listKey: "workflows" },
+  { assetType: "knowledge_bundle", path: "/api/orch/knowledge-bundles", listKey: "bundles" },
+  { assetType: "skill", path: "/api/orch/skills", listKey: "skills" },
+  { assetType: "toolset", path: "/api/orch/toolsets", listKey: "toolsets" },
+] as const) {
+  test(`共享资产库保留 Host 内置及共享自定义 ${assetType}，区分 Server 修订与 Host 只读来源`, async () => {
+    setActivePinia(createPinia());
+    const store = useOrchestrationStore(), workspaceId = "shared:project" as WorkspaceId;
+    const purposes: Array<string | null> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      assert.equal(url.pathname, path);
+      assert.equal(url.searchParams.get("workspaceId"), workspaceId);
+      const purpose = url.searchParams.get("purpose"); purposes.push(purpose);
+      return jsonResponse(purpose === "execution"
+        ? { ok: true, [listKey]: [{ id: "builtin-host", name: "Host builtin", kind: "builtin" }, { id: "shared-host", kind: "custom" }] }
+        : { ok: true, [listKey]: [{ id: "server-asset", kind: "custom" }], assetMetadata: [metadata(assetType, "server-asset", 3)] });
+    }) as typeof fetch;
+    await store.ensureAssetListLoaded(createApiContext(), workspaceId, assetType);
+    const collection = assetType === "knowledge_bundle" ? store.knowledgeBundles : store[listKey];
+    assert.deepEqual(collection.map(item => item.id), ["server-asset", "builtin-host", "shared-host"]);
+    assert.deepEqual(store.assetListHostIds[assetType], ["builtin-host", "shared-host"]);
+    assert.deepEqual(store.assetListMetadata[assetType]?.map(item => [item.assetId, item.revision]), [["server-asset", 3]]);
+    assert.deepEqual(purposes, [null, "execution"]);
+  });
+}
+
+test("共享 Host 内置列表读取失败明确拒绝，不把不完整列表缓存为成功", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore();
+  globalThis.fetch = (async (input: RequestInfo | URL) => jsonResponse(new URL(String(input)).searchParams.has("purpose")
+    ? { ok: false, code: "CLIENT_OFFLINE", message: "Host offline" }
+    : { ok: true, roles: [{ id: "server-role", kind: "custom" }], assetMetadata: [metadata("role", "server-role")] })) as typeof fetch;
+  await assert.rejects(store.ensureAssetListLoaded(createApiContext(), "shared:project" as WorkspaceId, "role"), ApiResultError);
+  assert.equal(store.assetListLoaded.role, false);
+  assert.deepEqual(store.roles.map(item => item.id), ["server-role"]);
+  assert.equal(store.assetListMetadata.role?.[0]?.assetId, "server-role");
+});
+
+for (const hostRoles of [null, [{ id: "bad", kind: "unknown" }], [{ id: "duplicate", kind: "custom" }, { id: "duplicate", kind: "custom" }]])
+test("Host 非法定义仍显式失败，Server 有效资产继续可见", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore();
+  globalThis.fetch = (async (input: RequestInfo | URL) => jsonResponse(new URL(String(input)).searchParams.has("purpose")
+    ? { ok: true, roles: hostRoles }
+    : { ok: true, roles: [{ id: "server-role", kind: "custom" }], assetMetadata: [metadata("role", "server-role")] })) as typeof fetch;
+  await assert.rejects(store.ensureAssetListLoaded(createApiContext(), "shared:project" as WorkspaceId, "role"), /Host/u);
+  assert.deepEqual(store.roles.map(item => item.id), ["server-role"]);
+  assert.equal(store.assetListLoaded.role, false);
+});
+
+test("Host 重试恢复共享自定义原件，同 ID 以 Server 修订为准且工作区切换清除来源", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "shared:project" as WorkspaceId;
+  let hostAttempts = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (!new URL(String(input)).searchParams.has("purpose")) return jsonResponse({ ok: true,
+      roles: [{ id: "same-id", kind: "custom", name: "Server" }], assetMetadata: [metadata("role", "same-id", 7)] });
+    hostAttempts++;
+    return jsonResponse(hostAttempts === 1 ? { ok: false, code: "CLIENT_OFFLINE", message: "Host offline" }
+      : { ok: true, roles: [{ id: "same-id", kind: "custom", name: "Host" }, { id: "host-custom", kind: "custom" }] });
+  }) as typeof fetch;
+  await assert.rejects(store.ensureAssetListLoaded(createApiContext(), workspaceId, "role"), ApiResultError);
+  await store.ensureAssetListLoaded(createApiContext(), workspaceId, "role");
+  assert.equal(store.assetListLoaded.role, true);
+  assert.deepEqual(store.roles.map(item => item.id), ["same-id", "host-custom"]);
+  assert.equal(store.roles[0].name, "Server");
+  assert.equal(store.assetListMetadata.role?.[0]?.revision, 7);
+  assert.deepEqual(store.assetListHostIds.role, ["host-custom"]);
+  store.resetForWorkspace(WORKSPACE_ID);
+  assert.deepEqual(store.assetListHostIds.role, []);
+});
+
+test("Host 自定义资产只读，不能将其误创建到 Server 或发送缺少修订的删除", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "shared:project" as WorkspaceId;
+  let writes = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "POST") { writes++; throw new Error("Unexpected mutation"); }
+    return jsonResponse(new URL(String(input)).searchParams.has("purpose")
+      ? { ok: true, roles: [executionAssetFixture("role", "host-custom")] }
+      : { ok: true, roles: [], assetMetadata: [] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(createApiContext(), workspaceId, "role");
+  assert.equal(store.roles[0]?.id, "host-custom");
+  await assert.rejects(store.saveRole(createApiContext(), workspaceId, store.roles[0]), /Host.*只读/u);
+  await assert.rejects(store.removeRole(createApiContext(), workspaceId, "host-custom" as RoleId), /Host.*只读/u);
+  assert.equal(writes, 0);
+});
+
+/** 提取真实组件 computed 声明，不启动页面或复制 UI 准入逻辑。 */
+function componentComputed(file: string, names: string[], dependencies: Record<string, unknown>) {
+  const source = readFileSync(new URL(`../src/features/orchestration/components/${file}`, import.meta.url), "utf8");
+  const tree = ts.createSourceFile(file, source.slice(source.indexOf(">") + 1, source.indexOf("</script>")), ts.ScriptTarget.Latest, true);
+  const statements = tree.statements.filter(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(item => ts.isIdentifier(item.name) && names.includes(item.name.text)));
+  assert.equal(statements.length, names.length);
+  return vm.runInNewContext(ts.transpileModule(statements.map(node => node.getText(tree)).join("\n")
+    + `\n({${names.join(",")}})`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText,
+  { computed, ...dependencies });
+}
+
+test("共享成员可打开 Host 只读详情，部分加载失败不遮挡已取得的 Server 资产", () => {
+  const view = componentComputed("orchestration-layout.vue", ["activeAssetDataAvailable", "selectedHostAsset", "selectedAssetReadonly", "assetPageLocked"], {
+    previewAssetType: { value: "role" }, orch: { roles: [{ id: "host-custom" }], selectedRoleId: "host-custom", assetListHostIds: { role: ["host-custom"] } },
+    selectedBuiltinAsset: { value: false }, assetMaintenanceLocked: { value: true }, activeAssetTab: { value: "roles" },
+    isSkillMarketView: { value: false }, activeAssetView: { value: "assets" }, activeAssetDataLoaded: { value: false },
+  });
+  assert.equal(view.activeAssetDataAvailable.value, true);
+  assert.equal(view.selectedAssetReadonly.value, true);
+  assert.equal(view.assetPageLocked.value, false);
+});
+
+test("Server 编辑器不提供无法保存的 Host 自定义依赖，Host 只读详情仍可解析其引用", () => {
+  const entries = [{ id: "server", kind: "custom" }, { id: "host-custom", kind: "custom" }, { id: "host-builtin", kind: "builtin" }];
+  const orch = { roles: entries, knowledgeBundles: entries, skills: entries, toolsets: entries,
+    assetListHostIds: { role: ["host-custom", "host-builtin"], knowledge_bundle: ["host-custom", "host-builtin"],
+      skill: ["host-custom", "host-builtin"], toolset: ["host-custom", "host-builtin"] } };
+  for (const previewReadonly of [false, true]) {
+    const workflow = componentComputed("workflow-editor.vue", ["visibleRoles", "visibleKnowledgeBundles"], { orch,
+      props: { previewReadonly }, isBuiltinReadonly: { value: previewReadonly } });
+    const role = componentComputed("role-definition-form.vue", ["visibleToolsets", "visibleKnowledgeBundles", "visibleSkills"], { orch,
+      props: { previewReadonly }, isBuiltinReadonly: { value: previewReadonly }, superAdminExtraCustomToolsets: { value: [] } });
+    for (const view of [workflow.visibleRoles, workflow.visibleKnowledgeBundles, role.visibleToolsets, role.visibleKnowledgeBundles, role.visibleSkills]) {
+      assert.deepEqual(Array.from(view.value, (item: { id: string }) => item.id), previewReadonly
+        ? ["server", "host-custom", "host-builtin"] : ["server", "host-builtin"]);
+    }
+  }
+});
+
+for (const { file, collection, type, variable, permission } of [
+  { file: "role-list.vue", collection: "roles", type: "role", variable: "exportableRoleIdSet", permission: "canExportBuiltinRole" },
+  { file: "workflow-sidebar.vue", collection: "workflows", type: "workflow", variable: "exportableWorkflowIdSet", permission: "canExportBuiltinWorkflow" },
+  { file: "knowledge-bundle-list.vue", collection: "knowledgeBundles", type: "knowledge_bundle", variable: "exportableKnowledgeBundleIdSet", permission: "canExportBuiltinKnowledgeBundle" },
+  { file: "skill-list.vue", collection: "skills", type: "skill", variable: "exportableSkillIdSet", permission: "canExportBuiltinSkill" },
+  { file: "toolset-list.vue", collection: "toolsets", type: "toolset", variable: "exportableToolsetIdSet", permission: "canExportBuiltinToolset" },
+]) test(`Server 导出 ${type} 不混入 Host 只读原件`, () => {
+  const view = componentComputed(file, [variable], { orch: { [collection]: [{ id: "server", kind: "custom" }, { id: "host", kind: "custom" }],
+    assetListHostIds: { [type]: ["host"] } }, [permission]: { value: true } });
+  assert.deepEqual(Array.from(view[variable].value), ["server"]);
+});
+
+test("共享 Server 空列表仍加载内置流程，legacy 与执行列表不重复读取 Host", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "shared:project" as WorkspaceId;
+  const purposes: Array<string | null> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const purpose = new URL(String(input)).searchParams.get("purpose"); purposes.push(purpose);
+    return jsonResponse(purpose === "execution"
+      ? { ok: true, workflows: [{ id: "builtin-host", kind: "builtin" }] }
+      : { ok: true, workflows: [], assetMetadata: [] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(createApiContext(), workspaceId, "workflow");
+  assert.deepEqual(store.workflows.map(item => item.id), ["builtin-host"]);
+  assert.deepEqual(store.assetListMetadata.workflow, []);
+  store.resetForWorkspace(workspaceId);
+  await store.ensureAssetListLoaded(createApiContext(), workspaceId, "workflow", "execution");
+  assert.deepEqual(purposes, [null, "execution", "execution"]);
+  store.resetForWorkspace(workspaceId);
+  globalThis.fetch = (async () => {
+    purposes.push(null);
+    return jsonResponse({ ok: true, workflows: [{ id: "legacy-builtin", kind: "builtin" }] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(createApiContext(), workspaceId, "workflow");
+  assert.equal(purposes.length, 4);
+  assert.equal(store.assetListMetadata.workflow, null);
+});
+
+test("共享内置请求迟到不能覆盖新工作区或污染其修订信息", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), hostResponse = createDeferred<Response>();
+  const hostRequested = createDeferred<void>();
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (url.searchParams.has("purpose")) { hostRequested.resolve(); return hostResponse.promise; }
+    const id = url.searchParams.get("workspaceId") === "shared:old" ? "old" : "current";
+    return jsonResponse({ ok: true, roles: [{ id, kind: "custom" }], assetMetadata: [metadata("role", id)] });
+  }) as typeof fetch;
+  const previous = store.ensureAssetListLoaded(createApiContext(), "shared:old" as WorkspaceId, "role");
+  await hostRequested.promise;
+  store.resetForWorkspace(WORKSPACE_ID);
+  await store.ensureAssetListLoaded(createApiContext(), WORKSPACE_ID, "role");
+  hostResponse.resolve(jsonResponse({ ok: true, roles: [{ id: "old-builtin", kind: "builtin" }] }));
+  await previous;
+  assert.deepEqual(store.roles.map(item => item.id), ["current"]);
+  assert.equal(store.assetListMetadata.role?.[0]?.assetId, "current");
+});
+
+test("共享列表中的 Host 内置资产不使 Server 保存和删除丢失乐观修订", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "shared:project" as WorkspaceId;
+  const role = executionAssetFixture("role", "server-role") as RoleDefinition;
+  const revisions: unknown[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (init?.method === "POST") {
+      const body = requestBody(init); revisions.push(body.expectedRevision);
+      return jsonResponse(url.pathname.endsWith("/delete") ? { ok: true, changeSeq: 5, cacheStatus: "pending" }
+        : { ok: true, role, changeSeq: 4, cacheStatus: "pending", assetMetadata: metadata("role", role.id, 4) });
+    }
+    return jsonResponse(url.searchParams.has("purpose")
+      ? { ok: true, roles: [{ id: "host-builtin", kind: "builtin" }] }
+      : { ok: true, roles: [role], assetMetadata: [metadata("role", role.id, 3)] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(createApiContext(), workspaceId, "role");
+  await store.saveRole(createApiContext(), workspaceId, role);
+  assert.equal(store.assetListMetadata.role?.[0]?.revision, 4);
+  await store.removeRole(createApiContext(), workspaceId, role.id);
+  assert.deepEqual(revisions, [3, 4]);
+  assert.deepEqual(store.roles.map(item => item.id), ["host-builtin"]);
+  assert.deepEqual(store.assetListMetadata.role, []);
 });
 
 for (const { assetType, path, listKey } of [

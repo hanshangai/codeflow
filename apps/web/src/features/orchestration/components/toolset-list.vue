@@ -56,7 +56,7 @@ const canExportBuiltinToolset = computed(() => canExportBuiltinSpecToolset(permi
 const exportableToolsetIdSet = computed(() =>
   new Set(
     orch.toolsets
-      .filter((toolset) => (canExportBuiltinToolset.value || toolset.kind !== "builtin"))
+      .filter((toolset) => !orch.assetListHostIds.toolset.includes(toolset.id) && (canExportBuiltinToolset.value || toolset.kind !== "builtin"))
       .map((toolset) => toolset.id),
   ),
 );

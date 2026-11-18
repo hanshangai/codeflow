@@ -357,6 +357,12 @@ const isSkillMarketView = computed(() => (
 ));
 const activeAssetTypes = computed(() => (isSkillMarketView.value ? [] : assetTypesByTab[activeAssetTab.value]));
 const activeAssetDataLoaded = computed(() => activeAssetTypes.value.every((assetType) => orch.assetListLoaded[assetType]));
+/** 当前分类有已取得的定义时，独立来源失败不遮住已可用的资产详情。 */
+const activeAssetDataAvailable = computed(() => {
+  const type = previewAssetType.value;
+  return (type === "role" ? orch.roles : type === "workflow" ? orch.workflows
+    : type === "knowledge_bundle" ? orch.knowledgeBundles : type === "skill" ? orch.skills : type === "toolset" ? orch.toolsets : []).length > 0;
+});
 /** 当前 Tab 是否确实有资产请求在进行，避免失效标记导致永久“加载中”。 */
 const activeAssetListLoading = computed(() => activeAssetTypes.value.some((assetType) => (
   assetType === "workflow" ? orch.workflowsLoading
@@ -391,6 +397,14 @@ const selectedAssetKind = computed(() => {
   return orch.selectedToolset?.kind ?? null;
 });
 const selectedBuiltinAsset = computed(() => selectedAssetKind.value === "builtin");
+/** Host 原件只读展示；其写入必须留在承载工作区，不能转成 Server 新资产。 */
+const selectedHostAsset = computed(() => {
+  const type = previewAssetType.value;
+  const id = type === "role" ? orch.selectedRoleId : type === "workflow" ? orch.selectedWorkflowId
+    : type === "knowledge_bundle" ? orch.selectedKnowledgeBundleId : type === "skill" ? orch.selectedSkillId : orch.selectedToolsetId;
+  return type != null && id != null && orch.assetListHostIds[type].includes(id);
+});
+const selectedAssetReadonly = computed(() => selectedBuiltinAsset.value || selectedHostAsset.value);
 const copyingBuiltinAssetId = ref<string | null>(null);
 const desktopCopyAssetType = computed<OrchAssetType | null>(() => {
   if (activeAssetTab.value === "workflows") return "workflow";
@@ -440,8 +454,8 @@ const assetPageLocked = computed(() => (
   && !isSkillMarketView.value
   && (
     activeAssetView.value !== "assets"
-    || !activeAssetDataLoaded.value
-    || !selectedBuiltinAsset.value
+    || (!activeAssetDataLoaded.value && !activeAssetDataAvailable.value)
+    || !selectedAssetReadonly.value
   )
 ));
 /** 横排资产标签复用会话列表 segmented 风格，仅展示资产类型名称。 */
@@ -1686,12 +1700,18 @@ function summaryToneClass(tone: string | null | undefined): string {
                 @click="onSkillViewChange(option.value)"
               >{{ option.label }}</button>
             </div>
-            <div v-if="assetPageLoading && !isSkillMarketView" class="orch-layout__asset-state">
+            <a-alert v-if="assetPageLoadError && activeAssetDataAvailable && !isSkillMarketView"
+              type="error" show-icon message="部分资产加载失败，已显示可用资产" :description="assetPageLoadError">
+              <template #action><a-button size="small" @click="retryAssetPageLoad">重新加载</a-button></template>
+            </a-alert>
+            <a-alert v-if="selectedHostAsset && !selectedBuiltinAsset" type="info" show-icon
+              message="Host 共享资产只读，请在承载工作区维护原定义" />
+            <div v-if="assetPageLoading && !activeAssetDataAvailable && !isSkillMarketView" class="orch-layout__asset-state">
               <a-spin size="large" />
               <span>资产加载中...</span>
             </div>
 
-            <div v-else-if="assetPageLoadError && !isSkillMarketView" class="orch-layout__asset-state orch-layout__asset-state--error">
+            <div v-else-if="assetPageLoadError && !activeAssetDataAvailable && !isSkillMarketView" class="orch-layout__asset-state orch-layout__asset-state--error">
               <strong>资产加载失败</strong>
               <p>{{ assetPageLoadError }}</p>
               <a-button type="primary" @click="retryAssetPageLoad">
@@ -1730,7 +1750,7 @@ function summaryToneClass(tone: string | null | undefined): string {
                 ref="assetEditorRef"
                 :workspace-id="workspaceId"
                 :bundle-id="orch.selectedKnowledgeBundleId"
-                :preview-readonly="selectedBuiltinAsset"
+                :preview-readonly="selectedAssetReadonly"
                 :save-label="desktopLocalWorkspace ? '保存' : '保存草稿'"
               />
               <div v-else class="orch-layout__empty">从左侧列表选择一个知识库，或先新建一个知识库。</div>
@@ -1742,7 +1762,7 @@ function summaryToneClass(tone: string | null | undefined): string {
                 ref="assetEditorRef"
                 :workspace-id="workspaceId"
                 :toolset-id="orch.selectedToolsetId"
-                :preview-readonly="selectedBuiltinAsset"
+                :preview-readonly="selectedAssetReadonly"
                 :save-label="desktopLocalWorkspace ? '保存' : '保存草稿'"
               />
               <div v-else class="orch-layout__empty">从左侧列表选择一个工具，或先新建一个工具。</div>
@@ -1754,7 +1774,7 @@ function summaryToneClass(tone: string | null | undefined): string {
                 ref="assetEditorRef"
                 :workspace-id="workspaceId"
                 :skill-id="orch.selectedSkillId"
-                :preview-readonly="selectedBuiltinAsset"
+                :preview-readonly="selectedAssetReadonly"
                 :save-label="desktopLocalWorkspace ? '保存' : '保存草稿'"
               />
               <div v-else-if="skillView === 'owned'" class="orch-layout__empty">从左侧列表选择一个 Skill，或先新建一个 Skill。</div>
@@ -1767,7 +1787,7 @@ function summaryToneClass(tone: string | null | undefined): string {
                 ref="assetEditorRef"
                 :workspace-id="workspaceId"
                 :role-id="orch.selectedRoleId"
-                :preview-readonly="selectedBuiltinAsset"
+                :preview-readonly="selectedAssetReadonly"
                 :save-label="desktopLocalWorkspace ? '保存' : '保存草稿'"
               />
               <div v-else class="orch-layout__empty">从左侧列表选择一个角色，或先新建一个角色。</div>
@@ -1779,7 +1799,7 @@ function summaryToneClass(tone: string | null | undefined): string {
                 ref="assetEditorRef"
                 :workspace-id="workspaceId"
                 :workflow-id="orch.selectedWorkflowId"
-                :preview-readonly="selectedBuiltinAsset"
+                :preview-readonly="selectedAssetReadonly"
                 :role-definitions="orch.roles"
                 save-label="保存"
               />

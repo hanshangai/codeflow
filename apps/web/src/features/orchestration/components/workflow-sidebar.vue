@@ -79,7 +79,7 @@ const canExportBuiltinWorkflow = computed(() => canExportBuiltinSpecWorkflow(per
 const exportableWorkflowIdSet = computed(() =>
   new Set(
     orch.workflows
-      .filter((workflow) => (canExportBuiltinWorkflow.value || workflow.kind !== "builtin"))
+      .filter((workflow) => !orch.assetListHostIds.workflow.includes(workflow.id) && (canExportBuiltinWorkflow.value || workflow.kind !== "builtin"))
       .map((workflow) => workflow.id),
   ),
 );

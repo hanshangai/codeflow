@@ -274,6 +274,8 @@ export type OrchestrationState = {
   assetListRefreshVersions: OrchestrationAssetListRefreshVersionState;
   /** 当前工作区内已成功读取的资产列表；空列表也会标记为已读取。 */
   assetListLoaded: OrchestrationAssetListLoadedState;
+  /** 当前共享列表中仅存于 Host 的定义；展示不授予 Server 修订写入权。 */
+  assetListHostIds: Record<OrchAssetType, string[]>;
   /** 首次读取中的列表请求，供快速切换 Tab 时复用。 */
   assetListLoadPromises: OrchestrationAssetListLoadPromiseState;
   /** 单份角色/流程快照的来源，执行候选不得复用管理资产 ID。 */
@@ -369,6 +371,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
     assetListWorkspaceEpoch: 0,
     assetListRefreshVersions: createEmptyAssetListRefreshVersionState(),
     assetListLoaded: createEmptyAssetListLoadedState(),
+    assetListHostIds: { role: [], workflow: [], knowledge_bundle: [], skill: [], toolset: [] },
     assetListLoadPromises: createEmptyAssetListLoadPromiseState(),
     assetListPurposes: { role: "catalog", workflow: "catalog" },
     intakes: [],
@@ -934,6 +937,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
       if (this.assetListPurposes[assetType] === nextPurpose) return;
       this.assetListPurposes[assetType] = nextPurpose;
       this.assetListMetadata[assetType] = null;
+      this.assetListHostIds[assetType] = [];
       this.assetListLoaded[assetType] = false;
       this.assetListLoadPromises[assetType] = null;
       this.assetListRefreshVersions[assetType] += 1;
@@ -991,10 +995,13 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchRoles(ctx, workspaceId, purpose);
         if (!isCurrentAssetListRefresh(this, "role", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = prepareAssetListSnapshot("role", res.roles, res.assetMetadata);
+        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "role", res.roles, res.assetMetadata, purpose);
+        if (!isCurrentAssetListRefresh(this, "role", workspaceEpoch, refreshVersion)) return;
         this.roles = snapshot.definitions;
         this.assetListMetadata.role = snapshot.metadata;
-        this.assetListLoaded.role = true;
+        this.assetListHostIds.role = snapshot.hostAssetIds ?? [];
+        this.assetListLoaded.role = !snapshot.hostFailure;
+        if (snapshot.hostFailure) throw snapshot.hostFailure.cause;
       } finally {
         if (isCurrentAssetListRefresh(this, "role", workspaceEpoch, refreshVersion)) this.rolesLoading = false;
 
@@ -1083,10 +1090,13 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchKnowledgeBundles(ctx, workspaceId);
         if (!isCurrentAssetListRefresh(this, "knowledge_bundle", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = prepareAssetListSnapshot("knowledge_bundle", res.bundles, res.assetMetadata);
+        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "knowledge_bundle", res.bundles, res.assetMetadata);
+        if (!isCurrentAssetListRefresh(this, "knowledge_bundle", workspaceEpoch, refreshVersion)) return;
         this.knowledgeBundles = snapshot.definitions;
         this.assetListMetadata.knowledge_bundle = snapshot.metadata;
-        this.assetListLoaded.knowledge_bundle = true;
+        this.assetListHostIds.knowledge_bundle = snapshot.hostAssetIds ?? [];
+        this.assetListLoaded.knowledge_bundle = !snapshot.hostFailure;
+        if (snapshot.hostFailure) throw snapshot.hostFailure.cause;
       } finally {
         if (isCurrentAssetListRefresh(this, "knowledge_bundle", workspaceEpoch, refreshVersion)) this.knowledgeBundlesLoading = false;
 
@@ -1173,10 +1183,13 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchSkills(ctx, workspaceId);
         if (!isCurrentAssetListRefresh(this, "skill", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = prepareAssetListSnapshot("skill", res.skills, res.assetMetadata);
+        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "skill", res.skills, res.assetMetadata);
+        if (!isCurrentAssetListRefresh(this, "skill", workspaceEpoch, refreshVersion)) return;
         this.skills = snapshot.definitions;
         this.assetListMetadata.skill = snapshot.metadata;
-        this.assetListLoaded.skill = true;
+        this.assetListHostIds.skill = snapshot.hostAssetIds ?? [];
+        this.assetListLoaded.skill = !snapshot.hostFailure;
+        if (snapshot.hostFailure) throw snapshot.hostFailure.cause;
       } finally {
         if (isCurrentAssetListRefresh(this, "skill", workspaceEpoch, refreshVersion)) this.skillsLoading = false;
 
@@ -1296,10 +1309,13 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchToolsets(ctx, workspaceId);
         if (!isCurrentAssetListRefresh(this, "toolset", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = prepareAssetListSnapshot("toolset", res.toolsets, res.assetMetadata);
+        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "toolset", res.toolsets, res.assetMetadata);
+        if (!isCurrentAssetListRefresh(this, "toolset", workspaceEpoch, refreshVersion)) return;
         this.toolsets = snapshot.definitions;
         this.assetListMetadata.toolset = snapshot.metadata;
-        this.assetListLoaded.toolset = true;
+        this.assetListHostIds.toolset = snapshot.hostAssetIds ?? [];
+        this.assetListLoaded.toolset = !snapshot.hostFailure;
+        if (snapshot.hostFailure) throw snapshot.hostFailure.cause;
       } finally {
         if (isCurrentAssetListRefresh(this, "toolset", workspaceEpoch, refreshVersion)) this.toolsetsLoading = false;
 
@@ -1386,10 +1402,13 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchWorkflows(ctx, workspaceId, purpose);
         if (!isCurrentAssetListRefresh(this, "workflow", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = prepareAssetListSnapshot("workflow", res.workflows, res.assetMetadata);
+        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "workflow", res.workflows, res.assetMetadata, purpose);
+        if (!isCurrentAssetListRefresh(this, "workflow", workspaceEpoch, refreshVersion)) return;
         this.workflows = snapshot.definitions;
         this.assetListMetadata.workflow = snapshot.metadata;
-        this.assetListLoaded.workflow = true;
+        this.assetListHostIds.workflow = snapshot.hostAssetIds ?? [];
+        this.assetListLoaded.workflow = !snapshot.hostFailure;
+        if (snapshot.hostFailure) throw snapshot.hostFailure.cause;
       } finally {
         if (isCurrentAssetListRefresh(this, "workflow", workspaceEpoch, refreshVersion)) this.workflowsLoading = false;
 
@@ -3005,6 +3024,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
       this.assetListMetadata = createEmptyAssetListMetadataState();
       this.assetListRefreshVersions = incrementAssetListRefreshVersions(this.assetListRefreshVersions);
       this.assetListLoaded = createEmptyAssetListLoadedState();
+      this.assetListHostIds = { role: [], workflow: [], knowledge_bundle: [], skill: [], toolset: [] };
       this.assetListLoadPromises = createEmptyAssetListLoadPromiseState();
       this.assetListPurposes = { role: "catalog", workflow: "catalog" };
       this.rolesLoading = false;
@@ -3265,6 +3285,7 @@ function prepareAssetMutationRequestMetadata(
   assetId: string,
   operation: "upsert" | "delete",
 ): AssetUpsertRequestMetadata | AssetDeleteRequestMetadata {
+  if (state.assetListHostIds[assetType].includes(assetId)) throw new Error("Host 资产只读，请在承载工作区维护原定义");
   const clientRequestId = createAssetClientRequestId();
   const metadata = state.assetListMetadata[assetType];
   if (metadata === null) return { clientRequestId };
@@ -3470,14 +3491,46 @@ function readServerAssetMutationMetadata<T extends OrchAssetType>(
   return { assetMetadata: snapshot.metadata![0]! };
 }
 
-/** Returns current definition IDs in the same order used by list metadata. */
+/** Server 修订排序排除仅供展示的 Host 原件，不把两种写入来源混用。 */
 function getAssetDefinitionIds(state: OrchestrationState, assetType: OrchAssetType): string[] {
-  switch (assetType) {
-    case "role": return state.roles.map((item) => item.id);
-    case "workflow": return state.workflows.map((item) => item.id);
-    case "knowledge_bundle": return state.knowledgeBundles.map((item) => item.id);
-    case "toolset": return state.toolsets.map((item) => item.id);
-    case "skill": return state.skills.map((item) => item.id);
+  const definitions = assetType === "role" ? state.roles : assetType === "workflow" ? state.workflows
+    : assetType === "knowledge_bundle" ? state.knowledgeBundles : assetType === "skill" ? state.skills : state.toolsets;
+  const hostIds = new Set(state.assetListHostIds[assetType]);
+  return definitions.filter(item => !hostIds.has(item.id)).map(item => item.id);
+}
+
+/** 合并当前授权 Host 的定义；Host 失败显式返回失败事实，Server 快照仍可展示。 */
+async function prepareSharedAssetListSnapshot<T extends OrchAssetType, D extends { id: string }>(
+  ctx: ApiRequestContext, workspaceId: WorkspaceId, assetType: T, definitions: D[],
+  metadata: OrchAssetListMetadata<T>[] | undefined, purpose?: "execution",
+): Promise<{ definitions: D[]; metadata: OrchAssetListMetadata<T>[] | null; hostAssetIds?: string[]; hostFailure?: { cause: unknown } }> {
+  const snapshot = prepareAssetListSnapshot(assetType, definitions, metadata);
+  if (!isSharedWorkspaceSelectionId(workspaceId) || purpose || snapshot.metadata === null) return snapshot;
+  const list = assetType === "role" ? listOrchRoles : assetType === "workflow" ? listOrchWorkflows
+    : assetType === "knowledge_bundle" ? listOrchKnowledgeBundles : assetType === "skill" ? listOrchSkills : listOrchToolsets;
+  try {
+    const response = await list(ctx, workspaceId, "execution");
+    if (!response.ok) throw createApiResultError(response);
+    const field = assetType === "role" ? "roles" : assetType === "workflow" ? "workflows"
+      : assetType === "knowledge_bundle" ? "bundles" : assetType === "skill" ? "skills" : "toolsets";
+    const hostAssets = (response as unknown as Record<string, unknown>)[field];
+    if (!Array.isArray(hostAssets)) throw invalidAssetListResponse(assetType, "Host 定义列表不是数组");
+    const ids = new Set(snapshot.definitions.map(item => item.id)), seenHostIds = new Set<string>();
+    const hostAssetIds: string[] = [], hostDefinitions: D[] = [];
+    for (const value of hostAssets) {
+      if (!value || (value.kind !== "builtin" && value.kind !== "custom") || typeof value.id !== "string"
+        || !value.id || value.id.trim() !== value.id || seenHostIds.has(value.id)) {
+        throw invalidAssetListResponse(assetType, "Host 资产身份或类型非法、重复");
+      }
+      seenHostIds.add(value.id);
+      if (ids.has(value.id)) continue;
+      hostAssetIds.push(value.id);
+      hostDefinitions.push({ ...value, workspaceId } as D);
+    }
+    return { ...snapshot, definitions: [...snapshot.definitions, ...hostDefinitions], hostAssetIds };
+  } catch (cause) {
+    // 已确认的独立来源失败：保留 Server 数据，调用者继续抛错并提供显式重试。
+    return { ...snapshot, hostFailure: { cause } };
   }
 }
 

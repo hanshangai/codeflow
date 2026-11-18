@@ -61,7 +61,7 @@ const canExportBuiltinKnowledgeBundle = computed(() => canExportBuiltinSpecKnowl
 const exportableKnowledgeBundleIdSet = computed(() =>
   new Set(
     orch.knowledgeBundles
-      .filter((bundle) => (canExportBuiltinKnowledgeBundle.value || bundle.kind !== "builtin"))
+      .filter((bundle) => !orch.assetListHostIds.knowledge_bundle.includes(bundle.id) && (canExportBuiltinKnowledgeBundle.value || bundle.kind !== "builtin"))
       .map((bundle) => bundle.id),
   ),
 );

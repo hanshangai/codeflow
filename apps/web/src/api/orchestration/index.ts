@@ -563,10 +563,11 @@ export function deleteOrchWorkflowExecutionDefault(ctx: ApiRequestContext, body:
 
 // ── Toolsets ────────────────────────────────────────────────────
 
-export function listOrchToolsets(ctx: ApiRequestContext, workspaceId: WorkspaceId) {
+/** 管理列表来自 Server；执行用途读取实际承载工作区的 Client。 */
+export function listOrchToolsets(ctx: ApiRequestContext, workspaceId: WorkspaceId, purpose?: "execution") {
   return requestJson<OrchToolsetsListResponseBody>(ctx, {
     method: "GET",
-    path: `/api/orch/toolsets?workspaceId=${encodeURIComponent(String(workspaceId))}`,
+    path: `/api/orch/toolsets?workspaceId=${encodeURIComponent(String(workspaceId))}${purpose ? "&purpose=execution" : ""}`,
   });
 }
 
@@ -588,10 +589,11 @@ export function deleteOrchToolset(ctx: ApiRequestContext, body: OrchToolsetsDele
 
 // ── Skills ─────────────────────────────────────────────────────
 
-export function listOrchSkills(ctx: ApiRequestContext, workspaceId: WorkspaceId) {
+/** 执行用途与角色/流程保持同一 Host 资产读取边界。 */
+export function listOrchSkills(ctx: ApiRequestContext, workspaceId: WorkspaceId, purpose?: "execution") {
   return requestJson<OrchSkillsListResponseBody>(ctx, {
     method: "GET",
-    path: `/api/orch/skills?workspaceId=${encodeURIComponent(String(workspaceId))}`,
+    path: `/api/orch/skills?workspaceId=${encodeURIComponent(String(workspaceId))}${purpose ? "&purpose=execution" : ""}`,
   });
 }
 
@@ -636,10 +638,11 @@ export function uninstallOrchSkillPackage(ctx: ApiRequestContext, body: OrchSkil
 
 // ── Knowledge Bundles ───────────────────────────────────────────
 
-export function listOrchKnowledgeBundles(ctx: ApiRequestContext, workspaceId: WorkspaceId) {
+/** 执行用途读取 Host 知识包，管理用途保留 Server 修订。 */
+export function listOrchKnowledgeBundles(ctx: ApiRequestContext, workspaceId: WorkspaceId, purpose?: "execution") {
   return requestJson<OrchKnowledgeBundlesListResponseBody>(ctx, {
     method: "GET",
-    path: `/api/orch/knowledge-bundles?workspaceId=${encodeURIComponent(String(workspaceId))}`,
+    path: `/api/orch/knowledge-bundles?workspaceId=${encodeURIComponent(String(workspaceId))}${purpose ? "&purpose=execution" : ""}`,
   });
 }
 

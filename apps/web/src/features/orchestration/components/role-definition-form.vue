@@ -141,7 +141,8 @@ const superAdminExtraCustomToolsetsLoadingWorkspaceId = ref<WorkspaceId | null>(
 let superAdminExtraCustomToolsetsRequestSeq = 0;
 const isSuperAdmin = computed(() => config.accountRole === "super_admin" && !isDesktopWorkspace(config, props.workspaceId));
 const visibleToolsets = computed<ToolsetDefinition[]>(() => {
-  const merged = [...orch.toolsets];
+  const merged = orch.toolsets.filter(toolset => props.previewReadonly === true
+    || !orch.assetListHostIds.toolset.includes(toolset.id) || toolset.kind === "builtin");
   const seen = new Set(merged.map((toolset) => toolset.id));
   for (const toolset of superAdminExtraCustomToolsets.value) {
     if (seen.has(toolset.id)) continue;
@@ -150,8 +151,10 @@ const visibleToolsets = computed<ToolsetDefinition[]>(() => {
   }
   return merged;
 });
-const visibleKnowledgeBundles = computed(() => orch.knowledgeBundles);
-const visibleSkills = computed(() => orch.skills);
+const visibleKnowledgeBundles = computed(() => orch.knowledgeBundles.filter(bundle => props.previewReadonly === true
+  || !orch.assetListHostIds.knowledge_bundle.includes(bundle.id) || bundle.kind === "builtin"));
+const visibleSkills = computed(() => orch.skills.filter(skill => props.previewReadonly === true
+  || !orch.assetListHostIds.skill.includes(skill.id) || skill.kind === "builtin"));
 const groupedTools = computed(() => visibleToolsets.value.map((toolset) => ({
   toolsetId: toolset.id,
   toolsetName: resolveVisibleToolsetName(toolset),

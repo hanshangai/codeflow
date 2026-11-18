@@ -82,7 +82,7 @@ const canExportBuiltinSkill = computed(() => canExportBuiltinSpecKnowledgeBundle
 const exportableSkillIdSet = computed(() =>
   new Set(
     orch.skills
-      .filter((skill) => (canExportBuiltinSkill.value || skill.kind !== "builtin"))
+      .filter((skill) => !orch.assetListHostIds.skill.includes(skill.id) && (canExportBuiltinSkill.value || skill.kind !== "builtin"))
       .map((skill) => skill.id),
   ),
 );

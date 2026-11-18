@@ -115,7 +115,7 @@ const canExportBuiltinRole = computed(() => canExportBuiltinSpecRole(permissionI
 const exportableRoleIdSet = computed(() =>
   new Set(
     orch.roles
-      .filter((role) => (canExportBuiltinRole.value || role.kind !== "builtin"))
+      .filter((role) => !orch.assetListHostIds.role.includes(role.id) && (canExportBuiltinRole.value || role.kind !== "builtin"))
       .map((role) => role.id),
   ),
 );
