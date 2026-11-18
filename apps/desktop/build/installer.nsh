@@ -30,6 +30,8 @@
     !else
       StrCpy $d16InstallExitCode $R9
       StrCpy $d16InstallCause "INSTALL_PROCESS_STOP_FAILED"
+      StrCpy $d16InstallStage "installation-process-stop"
+      StrCpy $d16InstallErrorCode DESKTOP_INSTALL_PROCESS_STOP_FAILED
       Call D16FailInstallation
     !endif
   ${EndIf}
@@ -55,19 +57,8 @@
     ${EndIf}
   !else
     ${If} ${FileExists} "$INSTDIR\CodeFlowAI.exe"
+      Call D16NewInstallRequestId
       !insertmacro D16StopInstalledProcesses false
-      ClearErrors
-      ExecWait '"$INSTDIR\CodeFlowAI.exe" --codeflow-check-installation' $0
-      ${If} ${Errors}
-        StrCpy $d16InstallExitCode "null"
-        StrCpy $d16InstallCause "PREFLIGHT_PROCESS_START_FAILED"
-        Call D16FailInstallation
-      ${EndIf}
-      ${If} $0 != 0
-        StrCpy $d16InstallExitCode $0
-        StrCpy $d16InstallCause "PREFLIGHT_PROCESS_EXIT_NONZERO"
-        Call D16FailInstallation
-      ${EndIf}
     ${EndIf}
   !endif
 !macroend
@@ -206,18 +197,28 @@ Var d16InstallLog
 Var d16InstallRequestId
 Var d16InstallCause
 Var d16InstallExitCode
+Var d16InstallStage
+Var d16InstallErrorCode
+
+Function D16NewInstallRequestId
+  System::Call 'kernel32::GetCurrentProcessId() i.r0'
+  System::Call 'kernel32::GetTickCount() i.r2'
+  StrCpy $d16InstallRequestId "nsis-install-$0-$2"
+FunctionEnd
 
 ; Persist only bounded NSIS diagnostics; a logging failure is a distinct failed install.
 Function D16FailInstallation
   System::Call 'kernel32::GetCurrentProcessId() i.r0'
   System::Call 'kernel32::GetTickCount() i.r2'
-  StrCpy $d16InstallRequestId "nsis-install-$0-$2"
+  ${If} $d16InstallRequestId == ""
+    StrCpy $d16InstallRequestId "nsis-install-$0-$2"
+  ${EndIf}
   ClearErrors
   GetTempFileName $d16InstallLog
   IfErrors diagnostic_failed
   FileOpen $1 "$d16InstallLog" w
   IfErrors diagnostic_failed
-  FileWrite $1 '{"errorCode":"DESKTOP_INSTALL_REGISTRATION_FAILED","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"installation-registration","rootCause":"$d16InstallCause","exitCode":$d16InstallExitCode}$\r$\n'
+  FileWrite $1 '{"errorCode":"$d16InstallErrorCode","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","exitCode":$d16InstallExitCode}$\r$\n'
   IfErrors diagnostic_close_failed
   System::Call 'kernel32::FlushFileBuffers(p r1) i.r2'
   ${If} $2 == 0
@@ -228,12 +229,12 @@ Function D16FailInstallation
     Goto diagnostic_failed
   ${EndIf}
   SetErrorLevel 1
-  MessageBox MB_ICONSTOP|MB_OK "CodeFlow 安装登记失败（$d16InstallRequestId）。日志：$d16InstallLog" /SD IDOK
+  MessageBox MB_ICONSTOP|MB_OK "CodeFlow 安装失败（$d16InstallRequestId）。日志：$d16InstallLog" /SD IDOK
   Abort
   diagnostic_close_failed:
     System::Call 'kernel32::CloseHandle(p r1) i.r2'
   diagnostic_failed:
-    DetailPrint '{"errorCode":"DESKTOP_INSTALL_DIAGNOSTIC_FAILED","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"installation-registration","registrationFailure":"$d16InstallCause","exitCode":$d16InstallExitCode}'
+    DetailPrint '{"errorCode":"DESKTOP_INSTALL_DIAGNOSTIC_FAILED","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","registrationFailure":"$d16InstallCause","exitCode":$d16InstallExitCode}'
     SetErrorLevel 2
     MessageBox MB_ICONSTOP|MB_OK "CodeFlow 安装登记失败，且诊断日志保存失败（$d16InstallCause）。" /SD IDOK
     Abort
@@ -241,9 +242,14 @@ FunctionEnd
 
 ; Register the installation only after the template has copied the executable.
 !macro customInstall
+  ${If} $d16InstallRequestId == ""
+    Call D16NewInstallRequestId
+  ${EndIf}
   StrCpy $d16InstallExitCode "null"
+  StrCpy $d16InstallStage "installation-registration"
+  StrCpy $d16InstallErrorCode DESKTOP_INSTALL_REGISTRATION_FAILED
   ClearErrors
-  ExecWait '"$INSTDIR\CodeFlowAI.exe" --codeflow-register-installation' $0
+  ExecWait '"$INSTDIR\CodeFlowAI.exe" --codeflow-register-installation "$d16InstallRequestId"' $0
   ${If} ${Errors}
     StrCpy $d16InstallCause "PROCESS_START_FAILED"
     Call D16FailInstallation

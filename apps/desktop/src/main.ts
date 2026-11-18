@@ -33,6 +33,7 @@ import { assertDesktopMaintenanceStartup, DesktopMaintenanceStartupError, prepar
   type MaintenanceRecord } from "./desktopMaintenanceRecord.js";
 import { loadOrCreateDeviceIdentity } from "./deviceIdentity.js";
 import { resolveActiveRelease, resolveBaselineRelease } from "./releaseBundleCoordinator.js";
+import { supersedeDesktopInstallationAttempt } from "./installationRepair.js";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 
@@ -521,11 +522,9 @@ if (process.versions.electron) {
           ? path.dirname(path.dirname(executableDirectory)) : executableDirectory;
       if (lifecycleRequest) lifecycleRunning = true;
       if (lifecycleRequest?.kind === 'check') {
-        // 覆盖前核定位及进程释放，旧壳尝试先受控归档；不登记或生成身份。
+        // 兼容旧安装器预检；旧任务在新文件复制后的安装登记阶段接管。
         const location = await resolveDesktopStorageLocation({ userDataDir, installRoot });
         await assertNoDesktopClientProcess(location.dataDir, installRoot);
-        await retireShellUpdateAttempt({ executablePath: process.execPath, pid: process.pid, parentPid: process.ppid,
-          dataDir: location.dataDir, installationDir: installRoot, userDataDir, sessionDataDir, argv: process.argv });
         lifecycleRunning = false; quitAllowed = true; app.exit(0); return;
       }
       if (lifecycleRequest?.kind === "installation") {
@@ -533,12 +532,13 @@ if (process.versions.electron) {
         await resolveVersionedShellStartup(process.execPath);
         let registered = await registerDesktopInstallation({ userDataDir, installRoot, beforePersist: async location => {
           await assertNoDesktopClientProcess(location.dataDir, installRoot);
-          await retireShellUpdateAttempt({ executablePath: process.execPath, pid: process.pid, parentPid: process.ppid,
-            dataDir: location.dataDir, installationDir: installRoot, userDataDir, sessionDataDir, argv: process.argv });
           if (location.clientId === null) await assertDesktopMaintenanceStartup({ userDataDir, location });
           else if (path.relative(location.installRoot, installRoot) === "") await rebindDesktopKeepInstallation({ userDataDir, location, installRoot });
         } });
         if (path.relative(registered.installRoot, installRoot) !== "") registered = await rebindDesktopKeepInstallation({ userDataDir, location: registered, installRoot });
+        const repair = await supersedeDesktopInstallationAttempt({ userDataDir, installationDir: installRoot, requestId: lifecycleRequest.requestId });
+        if (repair.outcome === "superseded") appendDesktopStartupDiagnostic(userDataDir, `${JSON.stringify({ at: new Date().toISOString(),
+          errorCode: "DESKTOP_INSTALL_ATTEMPT_SUPERSEDED", requestId: lifecycleRequest.requestId, archive: repair.archive, sha256: repair.sha256 })}\n`);
         dataDir = registered.dataDir;
         lifecycleRunning = false; quitAllowed = true; app.exit(0); return;
       }
@@ -981,7 +981,7 @@ if (process.versions.electron) {
 
 /** 安装与维护共用有限参数入口；不接受外来路径、静默删除或混用选项。 */
 function readDesktopLifecycleRequest(argv: string[], packaged: boolean, platform: string):
-  { kind: 'check' | "installation" } | { kind: "maintenance"; requestId: string; mode: "keep" | "remove"; resumePending?: true } | null {
+  { kind: 'check' } | { kind: "installation"; requestId: string } | { kind: "maintenance"; requestId: string; mode: "keep" | "remove"; resumePending?: true } | null {
   if (argv.some(argument => argument.startsWith('--codeflow-check-installation'))) {
     if (!packaged || platform !== 'win32' || argv.length !== 2 || argv[1] !== '--codeflow-check-installation') {
       throw Object.assign(new Error('DESKTOP_INSTALL_REQUEST_INVALID'), { code: 'DESKTOP_INSTALL_REQUEST_INVALID' });
@@ -990,10 +990,11 @@ function readDesktopLifecycleRequest(argv: string[], packaged: boolean, platform
   }
   const installation = argv.some(argument => argument.startsWith("--codeflow-register-installation"));
   if (installation) {
-    if (!packaged || platform !== "win32" || argv.length !== 2 || argv[1] !== "--codeflow-register-installation") {
+    if (!packaged || platform !== "win32" || (argv.length !== 2 && argv.length !== 3) || argv[1] !== "--codeflow-register-installation"
+      || argv.length === 3 && !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/u.test(argv[2]!)) {
       throw Object.assign(new Error("DESKTOP_INSTALL_REQUEST_INVALID"), { code: "DESKTOP_INSTALL_REQUEST_INVALID" });
     }
-    return { kind: "installation" };
+    return { kind: "installation", requestId: argv[2] ?? crypto.randomUUID() };
   }
   const positions = argv.flatMap((argument, index) => argument.startsWith("--codeflow-uninstall-maintenance") ? [index] : []);
   if (!positions.length && !argv.includes("--delete-app-data")) return null;

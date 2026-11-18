@@ -133,7 +133,9 @@ export async function authorizeDesktopMaintenance(input: MaintenanceInput, value
     }
     if (record.mode === "remove") {
       const roots = await inspectDesktopRemovalRoots(input.location); assertDesktopRemovalRoots(input.location, roots);
-      const authorized: MaintenanceRecord = { ...record, phase: "data_action_authorized", authorizedPaths: [...AUTHORIZED_PATHS], removalRoots: roots };
+      const archived = retiredUpdateAttemptArchives(record.dataDir);
+      const authorized: MaintenanceRecord = { ...record, phase: "data_action_authorized",
+        authorizedPaths: [...AUTHORIZED_PATHS, ...archived.map(name => `dataDir/${name}`)], removalRoots: roots };
       const inventory = inspectRemovalInventory(input, authorized, false);
       await replaceRecord(input.userDataDir, record, authorized, async () => {
         assertDesktopRemovalRoots(input.location, roots);
@@ -353,6 +355,7 @@ export async function finishDesktopReinstall(input: { userDataDir: string; locat
 }
 const BASE_FIELDS = ["schemaVersion", "appId", "requestId", "mode", "phase", "installRoot", "dataDir", "clientId", "oldDeviceId"];
 const UPDATE_PATHS = ["pending-release.json", "update-database-backup.json", "update-database-backups"];
+const RETIRED_UPDATE_ARCHIVE = /^shell-update-retired-(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|install-[A-Za-z0-9][A-Za-z0-9._+-]{0,127}(?:-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?)\.json$/u;
 const AUTHORIZED_PATHS = [...REMOVE_FILES, ...REMOVE_DIRECTORIES].map(name => `dataDir/${name}`).concat("userDataDir/desktop-data-location.json");
 // 历史清单保持原值；新增更新状态与备份目录只由本次新授权删除。
 const PRE_UPDATE_AUTHORIZED_PATHS = AUTHORIZED_PATHS.filter(value => !UPDATE_PATHS.some(name => value === `dataDir/${name}`));
@@ -360,6 +363,23 @@ const PREVIOUS_AUTHORIZED_PATHS = PRE_UPDATE_AUTHORIZED_PATHS.filter(value => va
 const LEGACY_AUTHORIZED_PATHS = PREVIOUS_AUTHORIZED_PATHS.filter(value => value !== "dataDir/legacy-client-migration"
   && !GENERATED_FILES.some(name => value === `dataDir/${name}`));
 const PHASES: MaintenancePhase[] = ["started", "data_action_authorized", "completed", "reinstalling", "consumed"];
+
+/** 已有壳更新归档仅在本次 remove 授权时按精确文件名纳入清理范围。 */
+function retiredUpdateAttemptArchives(dataDir: string): string[] {
+  return syncFs.readdirSync(dataDir).filter(isRetiredUpdateArchive);
+}
+
+/** 归档名必须是产品生成的 UUID 文件，不能把相似前缀的用户文件带入删除集合。 */
+function isRetiredUpdateArchive(name: string): boolean {
+  return RETIRED_UPDATE_ARCHIVE.test(name);
+}
+
+/** 历史归档只使用授权记录中的精确名称，不作目录通配删除。 */
+function removalFiles(record: MaintenanceRecord): string[] {
+  const archives = record.authorizedPaths?.filter(value => value.startsWith("dataDir/"))
+    .map(value => value.slice("dataDir/".length)).filter(isRetiredUpdateArchive) ?? [];
+  return [...REMOVE_FILES, ...archives];
+}
 
 /** 删除仅覆盖持久授权清单；默认工作区只核目录身份并保留，未知条目仍拒绝。 */
 function inspectRemovalInventory(input: MaintenanceInput, record: MaintenanceRecord, allowCapture = true) {
@@ -377,7 +397,7 @@ function inspectRemovalInventory(input: MaintenanceInput, record: MaintenanceRec
     }
   };
   guard();
-  const names = syncFs.readdirSync(record.dataDir), fixed = [...REMOVE_FILES, ...REMOVE_DIRECTORIES];
+  const names = syncFs.readdirSync(record.dataDir), fixed = [...removalFiles(record), ...REMOVE_DIRECTORIES];
   const identityPrefix = `device-identity.json.removing-${record.oldDeviceId.toLowerCase()}-`;
   const captures = names.filter(name => name.toLowerCase().startsWith("device-identity.json."));
   if (captures.length > 1 || captures.some(name => !allowCapture || !name.startsWith(identityPrefix) || !name.endsWith(".tmp")
@@ -395,7 +415,7 @@ function inspectRemovalInventory(input: MaintenanceInput, record: MaintenanceRec
     throw new DesktopMaintenanceStartupError("DESKTOP_MAINTENANCE_UNKNOWN_ENTRY", details);
   }
   if (locatorNames.length && (captures.length || !removalStat(path.join(record.dataDir, "device-identity.json"))
-    || REMOVE_FILES.some(name => removalStat(path.join(record.dataDir, name)))
+    || removalFiles(record).some(name => removalStat(path.join(record.dataDir, name)))
     || REMOVE_DIRECTORIES.some(name => name !== ".shell-update-file-auth" && removalStat(path.join(record.dataDir, name))))) {
     throw new DesktopMaintenanceStartupError("DESKTOP_MAINTENANCE_OWNERSHIP_MISMATCH", details);
   }
@@ -422,7 +442,7 @@ function inspectRemovalInventory(input: MaintenanceInput, record: MaintenanceRec
       }
     }
   };
-  for (const name of REMOVE_FILES) inspect(path.join(record.dataDir, name), false);
+  for (const name of removalFiles(record)) inspect(path.join(record.dataDir, name), false);
   for (const name of REMOVE_DIRECTORIES) inspect(path.join(record.dataDir, name), true);
   for (const name of ["device-identity.json", ...captures]) {
     const stat = removalStat(path.join(record.dataDir, name));
@@ -474,7 +494,7 @@ async function verifyRemovalIdentity(input: MaintenanceInput, record: Maintenanc
   const roots = record.removalRoots!, standard = path.join(record.dataDir, "device-identity.json");
   assertDesktopRemovalRoots(input.location, roots);
   const captures = syncFs.readdirSync(record.dataDir).filter(name => name.toLowerCase().startsWith("device-identity.json."));
-  if (captures.length && (REMOVE_FILES.some(name => removalStat(path.join(record.dataDir, name)))
+  if (captures.length && (removalFiles(record).some(name => removalStat(path.join(record.dataDir, name)))
     || REMOVE_DIRECTORIES.some(name => name !== ".shell-update-file-auth" && removalStat(path.join(record.dataDir, name)))
     || removalStat(path.join(input.userDataDir, "desktop-data-location.json"))
     || syncFs.readdirSync(input.userDataDir).some(name => name.toLowerCase().startsWith("desktop-data-location.json.")))) {
@@ -508,7 +528,7 @@ async function removePrivateTargets(input: MaintenanceInput, record: Maintenance
     for (const name of inventory.children.get(target) ?? []) append(path.join(target, name));
     order.push(target);
   };
-  for (const name of [...REMOVE_FILES, ...REMOVE_DIRECTORIES]) append(path.join(record.dataDir, name));
+  for (const name of [...removalFiles(record), ...REMOVE_DIRECTORIES]) append(path.join(record.dataDir, name));
   inventory.assertCurrent();
   for (const target of order) {
     assertDesktopRemovalRoots(input.location, roots);
@@ -782,8 +802,13 @@ function parseRecord(value: unknown): MaintenanceRecord {
       const paths = record.clientId === null ? ["userDataDir/desktop-data-location.json"] : AUTHORIZED_PATHS;
       // 历史授权只读接续原清单；新生成文件不因升级而获得旧授权的删除权。
       const supported = record.clientId === null ? [paths] : [paths, PRE_UPDATE_AUTHORIZED_PATHS, PREVIOUS_AUTHORIZED_PATHS, LEGACY_AUTHORIZED_PATHS];
+      const archiveExtended = record.clientId !== null && Array.isArray(authorized)
+        && AUTHORIZED_PATHS.every(value => authorized.includes(value))
+        && authorized.every(value => typeof value === "string" && (AUTHORIZED_PATHS.includes(value)
+          || value.startsWith("dataDir/") && isRetiredUpdateArchive(value.slice("dataDir/".length))));
       if (!Array.isArray(authorized) || new Set(authorized).size !== authorized.length
-        || !supported.some(known => authorized.length === known.length && authorized.every(value => typeof value === "string" && known.includes(value)))) throw invalid;
+        || !supported.some(known => authorized.length === known.length && authorized.every(value => typeof value === "string" && known.includes(value)))
+          && !archiveExtended) throw invalid;
       const roots = record.removalRoots as Record<string, unknown> | null;
       if (!roots || typeof roots !== "object" || Array.isArray(roots) || Object.keys(roots).length !== 2
         || Object.keys(roots).some(key => key !== "dataDir" && key !== "userDataDir")) throw invalid;

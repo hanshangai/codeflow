@@ -33,7 +33,7 @@ async function execute(file: string, args: string[], env = process.env) {
 }
 
 /** 将真实 hook 编进仅写标记的夹具，不包含安装、删除或注册表操作。 */
-async function fixture(kind: "missing" | "invalid" | "nonzero" | "success" | "preflight-busy" | "log-unavailable" | "close-failure" | "flush-failure") {
+async function fixture(kind: "missing" | "invalid" | "nonzero" | "success" | "preflight" | "log-unavailable" | "close-failure" | "flush-failure") {
   const parent = process.env.CF_NSIS_RUNTIME_ROOT ?? os.tmpdir();
   assert.ok(path.isAbsolute(parent));
   await fs.mkdir(parent, { recursive: true });
@@ -52,11 +52,10 @@ async function fixture(kind: "missing" | "invalid" | "nonzero" | "success" | "pr
   }
   const child = path.join(app, "CodeFlowAI.exe");
   if (kind === "invalid") await fs.writeFile(child, "not a PE executable", { encoding: "ascii", flag: "wx" });
-  if (kind === "nonzero" || kind === "success" || kind === 'preflight-busy') {
+  if (kind === "nonzero" || kind === "success" || kind === "preflight") {
     const executable = await compile("child", `!include "FileFunc.nsh"
 Section
   \${GetParameters} $0
-  ${kind === 'preflight-busy' ? 'StrCmp $0 "--codeflow-check-installation" 0 +3\n  SetErrorLevel 7\n  Quit' : ''}
   FileOpen $1 "$EXEDIR\\arguments.txt" w
   FileWrite $1 "$0"
   FileClose $1
@@ -65,7 +64,7 @@ Section
   Sleep 150
   FileWrite $1 "closed-work$\\r$\\n"
   FileClose $1
-  SetErrorLevel ${kind === "success" ? 0 : 7}
+  SetErrorLevel ${kind === "success" || kind === "preflight" ? 0 : 7}
 SectionEnd
 `);
     await fs.copyFile(executable, child, fs.constants.COPYFILE_EXCL);
@@ -92,7 +91,7 @@ Section
   StrCpy $INSTDIR "$EXEDIR\\app"
   StrCpy $0 0
   ClearErrors
-  ${kind === 'preflight-busy' ? '!ifmacrodef customCheckAppRunning\n  !insertmacro customCheckAppRunning\n  !endif' : ''}
+  ${kind === 'preflight' ? '!ifmacrodef customCheckAppRunning\n  !insertmacro customCheckAppRunning\n  !endif' : ''}
   !insertmacro customInstall
   FileOpen $1 "$INSTDIR\\order.txt" a
   FileSeek $1 0 END
@@ -107,13 +106,6 @@ FunctionEnd
 `);
   return { root, app, temporary, executable, env };
 }
-
-test('real NSIS preflight refuses an existing busy installation before registration or overwrite', { skip }, async () => {
-  const f = await fixture('preflight-busy');
-  const result = await execute(f.executable, [], f.env);
-  assert.equal(result.code, 1);
-  await assert.rejects(fs.access(path.join(f.app, 'order.txt')), { code: 'ENOENT' });
-});
 
 for (const kind of ["missing", "invalid", "nonzero"] as const) {
   test(`real NSIS registration rejects ${kind} executable before continuing`, { skip }, async () => {
@@ -144,9 +136,16 @@ for (const kind of ["missing", "invalid", "nonzero"] as const) {
 test("real NSIS registration waits for successful child work before continuing", { skip }, async () => {
   const f = await fixture("success"), result = await execute(f.executable, [], f.env);
   assert.equal(result.code, 0, result.stderr);
-  assert.equal(await fs.readFile(path.join(f.app, "arguments.txt"), "ascii"), "--codeflow-register-installation");
+  assert.match(await fs.readFile(path.join(f.app, "arguments.txt"), "ascii"), /^--codeflow-register-installation "nsis-install-/u);
   assert.equal(await fs.readFile(path.join(f.app, "order.txt"), "ascii"), "started\r\nclosed-work\r\ncontinued\r\n");
   assert.deepEqual(await fs.readdir(f.temporary), []);
+});
+
+test("real NSIS stops old processes but does not run old shell preflight before replacing files", { skip }, async () => {
+  const f = await fixture("preflight"), result = await execute(f.executable, [], f.env);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(await fs.readFile(path.join(f.app, "arguments.txt"), "ascii"), /^--codeflow-register-installation "nsis-install-/u);
+  assert.equal(await fs.readFile(path.join(f.app, "order.txt"), "ascii"), "started\r\nclosed-work\r\ncontinued\r\n");
 });
 
 test("real NSIS registration fails explicitly when its failure log cannot be created", { skip }, async () => {

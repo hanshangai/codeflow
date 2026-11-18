@@ -755,13 +755,24 @@ test("remove persists fixed authorization then deletes private targets locator a
 
 test("remove cleans generated crash and migration files while retaining the default workspace", async t => {
   const f = await removeInstallation(t), workspace = path.join(f.location.dataDir, "workspace");
+  const retiredAttempt = `shell-update-retired-${crypto.randomUUID()}.json`;
+  const retiredInstallationAttempt = `shell-update-retired-install-nsis-install-test-${crypto.randomUUID()}.json`;
+  const retiredInstallationAttemptLegacy = "shell-update-retired-install-nsis-install-legacy.json";
+  await fs.writeFile(path.join(f.location.dataDir, retiredAttempt), "retired update evidence");
+  await fs.writeFile(path.join(f.location.dataDir, retiredInstallationAttempt), "retired installation evidence");
+  await fs.writeFile(path.join(f.location.dataDir, retiredInstallationAttemptLegacy), "legacy installer evidence");
   await fs.mkdir(path.join(workspace, ".codeflow"), { recursive: true });
   await fs.writeFile(path.join(workspace, "project.txt"), "retained project");
   await fs.writeFile(path.join(workspace, ".codeflow/workspace.db"), "retained workspace history");
+  await fs.mkdir(path.join(f.location.dataDir, "logs"), { recursive: true });
+  await fs.writeFile(path.join(f.location.dataDir, "logs", "shell-update-retired-install-nsis-install-test-archive.json"), "old update evidence");
   for (const name of GENERATED_FILES) await fs.writeFile(path.join(f.location.dataDir, name), "generated data");
   await fs.mkdir(path.join(f.location.dataDir, "legacy-client-migration", "snapshot"), { recursive: true });
   await fs.writeFile(path.join(f.location.dataDir, "legacy-client-migration/snapshot/source.db"), "archived private data");
   const started = await f.api.beginDesktopMaintenance(f), authorized = await f.api.authorizeDesktopMaintenance(f, started);
+  assert.ok(authorized.authorizedPaths!.includes(`dataDir/${retiredAttempt}`));
+  assert.ok(authorized.authorizedPaths!.includes(`dataDir/${retiredInstallationAttempt}`));
+  assert.ok(authorized.authorizedPaths!.includes(`dataDir/${retiredInstallationAttemptLegacy}`));
   await f.api.completeDesktopMaintenance(f, authorized);
   assert.deepEqual(await fs.readdir(f.location.dataDir), ["workspace"]);
   assert.equal(await fs.readFile(path.join(workspace, "project.txt"), "utf8"), "retained project");
@@ -960,7 +971,7 @@ test(`remove authorization ${operation} failure leaves started and all private b
   assert.deepEqual(await fs.readFile(path.join(f.location.dataDir, "device-identity.json")), identity);
 });
 
-for (const name of ["backup.db", "config.json.tmp", "CODEFLOWAI.DB", ".update-db-unowned", ".shell-update-file-auth-init-unowned", ".shell-update-file-capability-unowned"])
+for (const name of ["backup.db", "config.json.tmp", "CODEFLOWAI.DB", "shell-update-retired-not-a-uuid.json", ".update-db-unowned", ".shell-update-file-auth-init-unowned", ".shell-update-file-capability-unowned"])
 test(`remove authorization refuses unknown root entry ${name} without expanding fixed targets`, async t => {
   const f = await removeInstallation(t), started = await f.api.beginDesktopMaintenance(f);
   const unknown = path.join(f.location.dataDir, name);

@@ -93,6 +93,7 @@ Function ReadLifecycleArguments
   classify_lifecycle:
     StrCmpS $lifecycleReserved true 0 free_arguments
     IntCmp $lifecycleArgc 2 registration_arguments
+    IntCmp $lifecycleArgc 3 registration_request_arguments
     IntCmp $lifecycleArgc 4 maintenance_arguments
     IntCmp $lifecycleArgc 5 resume_arguments invalid_arguments invalid_arguments
   resume_arguments:
@@ -100,6 +101,15 @@ Function ReadLifecycleArguments
   registration_arguments:
     StrCmpS $lifecycleFlag "--codeflow-register-installation" valid_arguments
     StrCmpS $lifecycleFlag "--codeflow-check-installation" valid_arguments invalid_arguments
+  registration_request_arguments:
+    StrCmpS $lifecycleFlag "--codeflow-register-installation" 0 invalid_arguments
+    StrCmpS $lifecycleRequest "--resume-pending" invalid_arguments
+    StrCpy $5 $lifecycleRequest 1
+    StrCmpS $5 "-" invalid_arguments
+    StrLen $4 $lifecycleRequest
+    IntCmp $4 1 registration_request_length_valid invalid_arguments registration_request_length_valid
+  registration_request_length_valid:
+    IntCmp $4 128 valid_arguments valid_arguments invalid_arguments
   maintenance_arguments:
     StrCmpS $lifecycleFlag "--codeflow-uninstall-maintenance" 0 invalid_arguments
     StrCmpS $lifecycleMode keep mode_valid

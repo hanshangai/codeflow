@@ -128,6 +128,7 @@ for (const [args, exitCode] of [
   [["--codeflow-check-installation"], 0],
   [["--codeflow-check-installation"], 7],
   [["--codeflow-register-installation"], 0],
+  [["--codeflow-register-installation", "nsis-install-123-456"], 0],
   [["--codeflow-register-installation"], 7],
   [["--codeflow-uninstall-maintenance", "nsis:request+1", "keep"], 0],
   [["--codeflow-uninstall-maintenance", "nsis:request+1", "remove"], 7],
@@ -148,8 +149,8 @@ for (const [args, exitCode] of [
 
 for (const args of [
   ['--codeflow-check-installation', 'extra'], ['--codeflow-check-installation=bad'],
-  ["--codeflow-register-installation", "extra"], ["--codeflow-register-installation=bad"],
-  ["--codeflow-register-installation", "--resume-pending"],
+  ["--codeflow-register-installation", "--resume-pending"], ["--codeflow-register-installation", "-bad"],
+  ["--codeflow-register-installation=bad"],
   ["--codeflow-uninstall-maintenance", "bad/request", "keep"],
   ["--codeflow-uninstall-maintenance", "request", "other"],
   ["--codeflow-uninstall-maintenance", "request", "KEEP"],

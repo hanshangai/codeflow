@@ -49,13 +49,14 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
   const imports = ast.statements.filter(ts.isImportDeclaration).map(statement => statement.moduleSpecifier.getText(ast));
   const storage = imports.some(value => value.includes("desktopStorageLocation")) ? await import("../src/desktopStorageLocation.js") : {};
   const maintenance: Partial<typeof import("../src/desktopMaintenanceRecord.js")> = imports.some(value => value.includes("desktopMaintenanceRecord")) ? await import("../src/desktopMaintenanceRecord.js") : {};
+  const installationRepair = imports.some(value => value.includes("installationRepair")) ? await import("../src/installationRepair.js") : {};
   const events: string[] = [], dataDirectories: string[] = [], shown: string[] = [], exits: number[] = [], workerRequests: Record<string, unknown>[] = [];
   const menuCalls: unknown[] = [];
   let retiredShellAttempts = 0;
   const window = Object.assign(new EventEmitter(), { webContents: {} });
   let unregisterBridge: (() => void) | undefined;
   const executablePath = options.executablePath ?? path.join(f.installRoot, "CodeFlowAI.exe");
-  const mainArgv = options.maintenanceArgv ?? (options.installation ? [executablePath, "--codeflow-register-installation"]
+  const mainArgv = options.maintenanceArgv ?? (options.installation ? [executablePath, "--codeflow-register-installation", "nsis-install-test"]
     : options.maintenance ? [executablePath, "--codeflow-uninstall-maintenance", "maintenance:keep", options.maintenanceMode ?? "keep"] : []);
   const listeners = new Map<string, (...args: any[]) => void>();
   let startupFlight: Promise<unknown> | undefined;
@@ -65,7 +66,7 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
   let exited!: () => void;
   const exitFlight = new Promise<void>(resolve => { exited = resolve; });
   vm.runInNewContext(compiled, {
-    Error, AggregateError, Promise, WeakSet, Date, Object, Reflect, TextDecoder, path, crypto, fs: syncFs, ...storage, ...maintenance,
+    Error, AggregateError, Promise, WeakSet, Date, Object, Reflect, TextDecoder, path, crypto, fs: syncFs, ...storage, ...maintenance, ...installationRepair,
     setTimeout: (callback: () => void, delay: number) => setTimeout(callback,
       options.workerTimeout && delay === 120_000 || options.browserTimeout && (delay === 120_000 || delay === 30_000) ? 10 : delay),
     clearTimeout, loadOrCreateDeviceIdentity, cancelLegacyMigrationAccountForUninstall, URL,
@@ -245,7 +246,7 @@ for (const leftoverClient of [false, true]) test(`real main installation preflig
   assert.deepEqual(result.exits, [leftoverClient ? 1 : 0]);
   assert.equal(result.events.includes('application'), false); assert.equal(result.events.includes('start'), false);
   assert.equal(result.events.includes('handoff'), false);
-  assert.equal(result.retiredShellAttempts, leftoverClient ? 0 : 1);
+  assert.equal(result.retiredShellAttempts, 0);
   await assert.rejects(fs.access(path.join(f.userDataDir, 'desktop-data-location.json')), { code: 'ENOENT' });
   await assert.rejects(fs.access(path.join(f.userDataDir, 'runtime')), { code: 'ENOENT' });
 });
@@ -256,7 +257,7 @@ test("real main installation preflight without an attempt preserves an existing 
   const result = await runMain(f, {}, false, { installation: true,
     maintenanceArgv: [path.join(f.installRoot, "CodeFlowAI.exe"), "--codeflow-check-installation"] });
   assert.deepEqual(result.exits, [0]);
-  assert.equal(result.retiredShellAttempts, 1);
+  assert.equal(result.retiredShellAttempts, 0);
   assert.deepEqual(await fs.readdir(runtime), []);
   await assert.rejects(fs.access(path.join(f.userDataDir, "desktop-data-location.json")), { code: "ENOENT" });
 });
@@ -291,6 +292,32 @@ test("real main installation registration preserves an initialized custom locato
   assert.deepEqual(await fs.readFile(target), before);
 });
 
+test("new installation registration archives an unfinished old shell attempt with request-linked evidence", { skip: process.platform !== "win32" }, async t => {
+  const { f, location } = await emptyInstallation(t), attemptPath = path.join(location.dataDir, "shell-update-attempt.json");
+  const original = Buffer.from('{"phase":"failed","recovery":{"direction":"original","terminalEvidence":null}}');
+  await fs.writeFile(attemptPath, original);
+  const result = await runMain(f, {}, false, { installation: true, maintenanceArgv: [path.join(f.installRoot, "CodeFlowAI.exe"),
+    "--codeflow-register-installation", "nsis-install-evidence"] });
+  assert.deepEqual(result.exits, [0]);
+  const archiveDirectory = path.join(location.dataDir, "logs");
+  const archived = (await fs.readdir(archiveDirectory)).find(name => name.startsWith("shell-update-retired-install-nsis-install-evidence-"));
+  assert.ok(archived);
+  assert.deepEqual(await fs.readFile(path.join(archiveDirectory, archived)), original);
+  const logs = (await fs.readFile(path.join(f.userDataDir, "logs", "desktop-errors.jsonl"), "utf8")).trim().split(/\r?\n/u).map(line => JSON.parse(line));
+  assert.ok(logs.some(row => row.errorCode === "DESKTOP_INSTALL_ATTEMPT_SUPERSEDED" && row.requestId === "nsis-install-evidence" && row.sha256));
+});
+
+test("new installation preserves an unfinished attempt when an old Client remains active", { skip: process.platform !== "win32" }, async t => {
+  const { f, location } = await emptyInstallation(t), attemptPath = path.join(location.dataDir, "shell-update-attempt.json");
+  const original = Buffer.from('{"phase":"failed","recovery":{"direction":"original","terminalEvidence":null}}');
+  await fs.writeFile(attemptPath, original);
+  const result = await runMain(f, {}, false, { installation: true, leftoverClient: true,
+    maintenanceArgv: [path.join(f.installRoot, "CodeFlowAI.exe"), "--codeflow-register-installation", "nsis-install-busy"] });
+  assert.deepEqual(result.exits, [1]);
+  assert.deepEqual(await fs.readFile(attemptPath), original);
+  assert.equal((await fs.readdir(location.dataDir)).some(name => name.startsWith("shell-update-retired-install-")), false);
+});
+
 test("real main installation registration refuses an occupied instance before any locator write", async t => {
   const f = await fixture(t), result = await runMain(f, {}, false, { installation: true, locked: false });
   assert.deepEqual(result.exits, [1]); assert.deepEqual(result.events, []);
@@ -307,10 +334,10 @@ test("real main installation refuses a leftover Client before creating runtime o
   await assert.rejects(fs.lstat(path.join(f.userDataDir, "runtime")), { code: "ENOENT" });
 });
 
-for (const extra of [["extra"], ["--codeflow-register-installation"], ["--delete-app-data"], ["--codeflow-uninstall-maintenance", "request", "keep"]]) {
+for (const extra of [["extra"], ["--codeflow-register-installation"], ["--delete-app-data"], ["--codeflow-uninstall-maintenance", "request", "keep"], ["bad/request"]]) {
   test(`real main installation rejects ambiguous argv ${extra.join(" ")} before side effects`, async t => {
     const f = await fixture(t), result = await runMain(f, {}, false, { installation: true,
-      maintenanceArgv: [path.join(f.installRoot, "CodeFlowAI.exe"), "--codeflow-register-installation", ...extra] });
+      maintenanceArgv: [path.join(f.installRoot, "CodeFlowAI.exe"), "--codeflow-register-installation", "nsis-install-test", ...extra] });
     assert.deepEqual(result.exits, [1]); assert.deepEqual(result.events, []);
     await assert.rejects(fs.lstat(path.join(f.userDataDir, "desktop-data-location.json")), { code: "ENOENT" });
   });
@@ -794,7 +821,7 @@ for (const kind of ["installation", "keep", "remove", "resume-keep", "resume-rem
     const { f } = kind === "installation" ? await emptyInstallation(t) : await maintenanceInstallation(t);
     const launcher = path.join(f.installRoot, "CodeFlowAI.exe"), executablePath = path.join(f.installRoot, "shells/current/CodeFlowAI.exe");
     const mode = kind.endsWith("remove") ? "remove" : "keep";
-    const tail = kind === "installation" ? ["--codeflow-register-installation"] : ["--codeflow-uninstall-maintenance", "maintenance:keep", mode,
+    const tail = kind === "installation" ? ["--codeflow-register-installation", "nsis-install-test"] : ["--codeflow-uninstall-maintenance", "maintenance:keep", mode,
       ...(kind.startsWith("resume-") ? ["--resume-pending"] : [])];
     const result = await runMain(f, {}, false, { executablePath, maintenanceArgv: [executablePath, ...tail],
       ...(kind === "installation" ? { installation: true } : { maintenance: true, maintenanceMode: mode }),
@@ -1117,7 +1144,9 @@ test("early quit during maintenance admission never persists a locator", async t
 /** 旧身份先由真实初始化登记，合法keep记录只写测试自有干净摘要。 */
 async function keepRecord(t: test.TestContext) {
   const f = await fixture(t); await runMain(f, { CODEFLOWAI_DESKTOP_DATA_DIR: f.custom }, false, { initialize: true });
-  const locator = JSON.parse(await fs.readFile(path.join(f.userDataDir, "desktop-data-location.json"), "utf8"));
+  let locator = JSON.parse(await fs.readFile(path.join(f.userDataDir, "desktop-data-location.json"), "utf8"));
+  await completeDesktopStorageLocation({ ...locator, userDataDir: f.userDataDir });
+  locator = JSON.parse(await fs.readFile(path.join(f.userDataDir, "desktop-data-location.json"), "utf8"));
   await fs.unlink(path.join(f.custom, "device-identity.json"));
   await fs.mkdir(path.join(f.installRoot, "client", "dist"), { recursive: true });
   await fs.writeFile(path.join(f.installRoot, "client", "dist", "desktopUninstallWorker.cjs"), "fixture worker boundary");
@@ -1148,7 +1177,11 @@ test("real main installation rebinds a retained custom root before F4 and consum
   assert.equal(JSON.parse(await fs.readFile(path.join(f.userDataDir, "desktop-data-location.json"), "utf8")).installRoot, nextRoot);
   await assert.rejects(fs.lstat(path.join(f.custom, "device-identity.json")), { code: "ENOENT" });
   const retry = await runMain(moved, {}, false, { installation: true }); assert.deepEqual(retry.exits, [0]); assert.deepEqual(retry.events, []);
-  const ordinary = await runMain(moved); assert.deepEqual(ordinary.shown, []);
+  const ordinary = await runMain(moved);
+  const ordinaryLog = await fs.readFile(path.join(f.userDataDir, "logs", "desktop-errors.jsonl"), "utf8");
+  const afterMaintenance = await fs.readFile(recordPath, "utf8");
+  const afterLocator = await fs.readFile(path.join(f.userDataDir, "desktop-data-location.json"), "utf8");
+  assert.deepEqual(ordinary.shown, [], `${ordinaryLog}\n${JSON.stringify({ events: ordinary.events, dataDirectories: ordinary.dataDirectories, workerRequests: ordinary.workerRequests })}\n${afterMaintenance}\n${afterLocator}`);
   assert.ok(ordinary.events.includes("worker-close")); assert.ok(ordinary.events.includes("application"));
   const consumed = JSON.parse(await fs.readFile(recordPath, "utf8"));
   assert.equal(consumed.phase, "consumed"); assert.equal(Object.hasOwn(consumed, "rebindFromInstallRoot"), false);
