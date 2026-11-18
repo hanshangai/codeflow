@@ -68,7 +68,7 @@ import {
   resolveModelProvider,
 } from "../../../composables/modelSelectOptions";
 import { useApiContext } from "../../../composables/useApiContext";
-import { registerWorkspaceDraftFlusher, useChatStore } from "../../../store/chat";
+import { registerWorkspaceDraftFlusher, sameThreadDraftPayloadContent, useChatStore } from "../../../store/chat";
 import { useConfigStore } from "../../../store/config";
 import { useAccountStore } from "../../../store/account";
 import { useOrchestrationStore } from "../../../store/orchestration";
@@ -2424,21 +2424,41 @@ function onModelDropdownVisibleChange(open: boolean): void {
   if (!open) modelSearchQuery.value = "";
 }
 
-/** 成功接受输入后立即清理本地草稿，远端同步不阻塞发送完成。 */
+/** 切走后的成功回包只清除仍与已发送内容一致的旧 thread 草稿。 */
 function clearSubmittedDraftAfterSuccess(input: {
   workspaceId: WorkspaceId;
   threadId: ThreadId;
   draftScopeEpoch: number;
   workspaceScopeToken: number;
   draftEditSeq: number;
+  draft: ThreadDraftPayload;
   successLabel: string;
 }): void {
-  const sentDraftStillCurrent = props.workspaceId === input.workspaceId
+  const workspaceScopeStillCurrent = props.workspaceId === input.workspaceId
+    && chat.isThreadDraftWorkspaceScopeCurrent(input.workspaceScopeToken);
+  const sentDraftStillCurrent = workspaceScopeStillCurrent
     && props.threadId === input.threadId
     && draftScopeEpoch === input.draftScopeEpoch
-    && chat.isThreadDraftWorkspaceScopeCurrent(input.workspaceScopeToken)
     && draftEditSeq === input.draftEditSeq;
-  if (!sentDraftStillCurrent) {
+  const returnedToSubmittedThread = workspaceScopeStillCurrent
+    && props.threadId === input.threadId
+    && draftScopeEpoch !== input.draftScopeEpoch
+    && sameThreadDraftPayloadContent(snapshotDraft(), input.draft);
+  if (!sentDraftStillCurrent && !returnedToSubmittedThread) {
+    const threadKey = String(input.threadId);
+    const pendingDraft = chat.pendingLocalThreadDraftByThreadId[threadKey];
+    const cachedDraft = chat.threadDraftByThreadId[threadKey] ?? null;
+    const retainedDraft = pendingDraft ?? cachedDraft;
+    if (workspaceScopeStillCurrent && props.threadId !== input.threadId && retainedDraft
+      && sameThreadDraftPayloadContent(retainedDraft, input.draft)) {
+      const pendingEpoch = pendingDraft ? chat.pendingLocalThreadDraftEpochByThreadId[threadKey] : undefined;
+      chat.clearPendingLocalThreadDraft(input.threadId, pendingEpoch, {
+        workspaceScopeToken: input.workspaceScopeToken,
+      });
+      chat.setThreadDraft(input.threadId, null);
+      void clearRemoteDraftAfterSubmit(ctx.value, input);
+      return;
+    }
     message.warning(`${input.successLabel}；执行期间会话已切换，原会话草稿已保留，请返回后确认。`);
     return;
   }
@@ -3175,6 +3195,7 @@ const send = async () => {
           draftScopeEpoch: sendDraftScopeEpoch,
           workspaceScopeToken: sendDraftWorkspaceScopeToken,
           draftEditSeq: sendDraftEditSeq,
+          draft: sendDraftSnapshot,
           successLabel: successMessage,
         });
       }
@@ -3310,6 +3331,7 @@ const send = async () => {
       draftScopeEpoch: sendDraftScopeEpoch,
       workspaceScopeToken: sendDraftWorkspaceScopeToken,
       draftEditSeq: sendDraftEditSeq,
+      draft: sendDraftSnapshot,
       successLabel: "消息已发送",
     });
   } catch (e) {
@@ -3560,7 +3582,7 @@ function handleMentionKeydown(ev: KeyboardEvent): boolean {
   return false;
 }
 
-/** Enter 发送；Shift/Ctrl/Cmd/Alt+Enter 显式换行（兼容 IME 输入）。 */
+/** 手机回车直接发送；带辅助键仍显式换行，桌面行为保持不变。 */
 function onInputKeydown(ev: KeyboardEvent): void {
   if (handleInputActionKeydown(ev)) return;
   if (Boolean((ev as any).isComposing)) return;
@@ -4197,6 +4219,7 @@ defineExpose({ prefill, appendText, attachTextFile, sendExternalText, canAcceptE
         :bordered="false"
         :auto-size="{ minRows: isMobile ? 1 : 2, maxRows: 10 }"
         :placeholder="composerPlaceholder"
+        :enterkeyhint="isMobile || props.surface === 'h5' ? 'send' : undefined"
         @keydown="onInputKeydown"
         @focus="closePreviewWindowsOnComposerFocus"
         @input="onComposerInput"
