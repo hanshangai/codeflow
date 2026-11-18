@@ -353,14 +353,14 @@ for (const width of [320, 390]) test(`avatar owns mobile settings and compact us
   await page.getByRole('button', { name: '打开个人信息' }).click();
   await expect(page.getByText('系统设置', { exact: true })).toHaveCount(0);
   const settings = page.locator('.h5-settings');
-  await expect(settings.locator('.h5-settings__row-copy strong')).toHaveText(['工作区管理', '模型与密钥', '流量统计', '支付订单', '消息通知', '个人信息', '密码与安全']);
+  await expect(settings.locator('.h5-settings__row-copy strong')).toHaveText(['工作区管理', '模型与密钥', '流量统计', '支付订单', '消息通知', '个人信息']);
   await expect(settings.getByRole('group', { name: '亮暗模式' }).getByRole('button')).toHaveText(['亮色', '暗色', '自动']);
   await expect(settings.getByRole('group', { name: '亮暗模式' }).locator('svg')).toHaveCount(0);
   await expect(settings.getByText('外观', { exact: true })).toHaveCount(0);
   await expect(settings.getByText('进入', { exact: true })).toHaveCount(0);
   await expect(settings.locator('.h5-settings__chevron, .anticon-right')).toHaveCount(0);
   const icons = settings.locator('.h5-settings__row-icon');
-  await expect(icons).toHaveCount(7);
+  await expect(icons).toHaveCount(6);
   expect(await icons.evaluateAll(nodes => nodes.every(node => {
     const style = getComputedStyle(node);
     return style.width === '40px' && style.height === '40px' && style.borderRadius === '13px' && style.color === 'rgb(255, 255, 255)' && style.backgroundImage !== 'none';
@@ -554,21 +554,19 @@ test('avatar account destinations and appearance remain functional after menu re
     } } });
   });
   await page.goto(`/chat?workspaceId=${workspaceId}`);
-  for (const name of ['个人信息', '密码与安全']) {
-    const profileDrawer = page.locator('.h5-profile-drawer');
-    const profileDrawerClass = await profileDrawer.count() ? await profileDrawer.first().getAttribute('class') : '';
-    if (!profileDrawerClass?.includes('ant-drawer-open')) {
-      await page.getByRole('button', { name: '打开个人信息', exact: true }).click();
-    }
-    await expect(page.locator('.h5-profile-drawer')).toHaveClass(/ant-drawer-open/);
-    await page.locator('.h5-settings').getByRole('button', { name: new RegExp(name) }).click();
-    await expect(page.locator('.account-drawer__h5-title strong')).toHaveText(name);
-    await expect(page.locator('.h5-profile-drawer')).not.toHaveClass(/ant-drawer-open/);
-    await page.getByRole('button', { name: '返回个人中心', exact: true }).click();
-    await expect(page.locator('.account-drawer__h5-title')).toBeHidden();
-    await expect(page.locator('.h5-profile-drawer')).toHaveClass(/ant-drawer-open/);
-    await expect(page.locator('.h5-settings')).toBeVisible();
+  const profileDrawer = page.locator('.h5-profile-drawer');
+  const profileDrawerClass = await profileDrawer.count() ? await profileDrawer.first().getAttribute('class') : '';
+  if (!profileDrawerClass?.includes('ant-drawer-open')) {
+    await page.getByRole('button', { name: '打开个人信息', exact: true }).click();
   }
+  await expect(page.locator('.h5-profile-drawer')).toHaveClass(/ant-drawer-open/);
+  await page.locator('.h5-settings').getByRole('button', { name: '个人信息' }).click();
+  await expect(page.locator('.account-drawer__h5-title strong')).toHaveText('个人信息');
+  await expect(page.locator('.h5-profile-drawer')).not.toHaveClass(/ant-drawer-open/);
+  await page.getByRole('button', { name: '返回个人中心', exact: true }).click();
+  await expect(page.locator('.account-drawer__h5-title')).toBeHidden();
+  await expect(page.locator('.h5-profile-drawer')).toHaveClass(/ant-drawer-open/);
+  await expect(page.locator('.h5-settings')).toBeVisible();
   const appearance = page.getByRole('group', { name: '亮暗模式' });
   await appearance.getByRole('button', { name: '暗色', exact: true }).click();
   await expect(appearance.getByRole('button', { name: '暗色', exact: true })).toHaveAttribute('aria-pressed', 'true');

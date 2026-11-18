@@ -9,7 +9,6 @@ import {
   PanelsTopLeft,
   ReceiptText,
   RefreshCw,
-  ShieldCheck,
   UserRound,
 } from "lucide-vue-next";
 
@@ -102,10 +101,6 @@ function setTheme(mode: ThemeMode): void {
           <button type="button" @click="emit('account', 'overview')">
             <span class="h5-settings__row-icon h5-settings__row-icon--profile"><UserRound /></span>
             <span class="h5-settings__row-copy"><strong>个人信息</strong><small>头像、姓名、手机号与账号 Key</small></span>
-          </button>
-          <button type="button" @click="emit('account', 'password')">
-            <span class="h5-settings__row-icon h5-settings__row-icon--security"><ShieldCheck /></span>
-            <span class="h5-settings__row-copy"><strong>密码与安全</strong><small>登录安全与密码修改</small></span>
           </button>
         </div>
       </section>
@@ -279,7 +274,6 @@ function setTheme(mode: ThemeMode): void {
 .h5-settings__row-icon--usage { --icon-color: #278798; }
 .h5-settings__row-icon--orders { --icon-color: #ae7931; }
 .h5-settings__row-icon--notifications { --icon-color: #bb6b43; }
-.h5-settings__row-icon--security { --icon-color: #287f69; }
 
 .h5-settings__row-copy strong {
   font-size: 14px;

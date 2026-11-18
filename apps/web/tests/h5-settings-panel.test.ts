@@ -68,7 +68,7 @@ test("桌面头像应用更新沿真实导航与返回层进入现有设置页",
 test("浏览器头像按工作台与个人中心顺序展示现行入口", t => {
   const f = profileFixture(t, false);
   assert.deepEqual(findNodes(f.tree(), "strong").map(nodeText),
-    ["工作区管理", "模型与密钥", "流量统计", "支付订单", "消息通知", "个人信息", "密码与安全"]);
+    ["工作区管理", "模型与密钥", "流量统计", "支付订单", "消息通知", "个人信息"]);
 });
 
 test("头像Key与工作区继续发出原页面栈导航和返回目标", t => {
@@ -111,56 +111,22 @@ test("H5 settings reuses theme and mobile page-stack owners", () => {
   assert.match(layoutSource, /WorkspaceManager[\s\S]+surface="isH5Surface \? 'h5' : 'default'"/u);
 });
 
-test("H5 personal center opens profile and security through the account owner", async t => {
+test("H5 personal center opens profile through the account owner", async t => {
   const f = profileFixture(t, false);
-  for (const label of ["个人信息", "密码与安全"]) {
-    const button = findNodes(f.tree(), "button").find(node => nodeText(node).includes(label));
-    assert.ok(button, `${label}必须提供独立入口`);
-    button.props!.onClick();
-  }
-  assert.deepEqual(f.events, [["account", "overview"], ["account", "password"]]);
-  // 账户注销已从移动版下线；资料和密码入口继续由账号抽屉负责。
+  const button = findNodes(f.tree(), "button").find(node => nodeText(node).includes("个人信息"));
+  assert.ok(button, "个人信息必须提供独立入口");
+  button.props!.onClick();
+  assert.deepEqual(f.events, [["account", "overview"]]);
+  // 账户注销与密码安全入口已从移动版下线；资料入口继续由账号抽屉负责。
   assert.doesNotMatch(panelSource, /account-cancel|账户注销/u);
   assert.match(homeSource, /@account="openAccountSection"/u);
   assert.match(accountDrawerSource, /account-drawer-host--h5/u);
-  const descriptor = parse(accountDrawerSource).descriptor;
-  const script = ts.createSourceFile("account-drawer.ts", descriptor.scriptSetup!.content, ts.ScriptTarget.Latest, true);
-  const navigation = script.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === "scrollToAccountSection");
-  assert.ok(navigation, "单页账号抽屉必须承接密码分区导航");
-  const scrolls: { section: string; options: ScrollIntoViewOptions }[] = [];
-  /** 记录真实导航选中的分区，隔离浏览器滚动与定时等待。 */
-  const section = (name: string) => vue.ref({ scrollIntoView: (options: ScrollIntoViewOptions) => scrolls.push({ section: name, options }) });
-  const code = ts.transpileModule(navigation.getText(script), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  const scrollToSection = new Function("nextTick", "passwordSectionRef", "cancelSectionRef", "window", `${code}; return scrollToAccountSection;`)(
-    vue.nextTick, section("password"), section("account-cancel"), { setTimeout: (callback: () => void) => callback() },
-  ) as (tab: string) => Promise<void>;
-  const watcher = script.statements.find(statement => ts.isExpressionStatement(statement)
-    && ts.isCallExpression(statement.expression) && statement.expression.expression.getText(script) === "watch"
-    && statement.expression.arguments[0]?.getText(script) === "() => props.initialTab");
-  assert.ok(watcher, "个人中心切换入口必须驱动账号分区导航");
-  const props = vue.reactive({ open: true, initialTab: "overview" }), activeTab = vue.ref("overview");
-  const stop = new Function("watch", "props", "activeTab", "scrollToAccountSection", `return ${watcher.getText(script)}`)(
-    vue.watch, props, activeTab, scrollToSection,
-  ) as vue.WatchStopHandle;
-  t.after(stop);
-  for (const [, tab] of f.events) {
-    props.initialTab = String(tab);
-    await vue.nextTick();
-  }
-  await vue.nextTick();
-  assert.equal(activeTab.value, "password");
-  assert.deepEqual(scrolls, [{ section: "password", options: { behavior: "smooth", block: "start" } }]);
-  props.open = false;
-  props.initialTab = "account-cancel";
-  await vue.nextTick();
-  assert.equal(activeTab.value, "password", "已关闭的抽屉不得继续导航");
-  assert.equal(scrolls.length, 1);
 });
 
 test("desktop profile keeps local entries first and one icon per settings row", t => {
   const f = profileFixture(t, true), tree = f.tree();
   assert.deepEqual(findNodes(tree, "strong").map(nodeText),
-    ["定时任务", "应用更新", "工作区管理", "模型与密钥", "流量统计", "支付订单", "消息通知", "个人信息", "密码与安全"]);
+    ["定时任务", "应用更新", "工作区管理", "模型与密钥", "流量统计", "支付订单", "消息通知", "个人信息"]);
   const rows = findNodes(tree, "button").filter(node => findNodes(node, "strong").length > 0);
   for (const row of rows) {
     const icons = findNodes(row, "span").filter(node => String(node.props?.class ?? "").split(/\s+/u).includes("h5-settings__row-icon"));
