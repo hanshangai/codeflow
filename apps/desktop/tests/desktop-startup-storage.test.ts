@@ -53,7 +53,9 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
   const events: string[] = [], dataDirectories: string[] = [], shown: string[] = [], exits: number[] = [], workerRequests: Record<string, unknown>[] = [];
   const menuCalls: unknown[] = [];
   let retiredShellAttempts = 0;
-  const window = Object.assign(new EventEmitter(), { webContents: {} });
+  const window = Object.assign(new EventEmitter(), { webContents: Object.assign(new EventEmitter(), {
+    mainFrame: { url: "codeflow://desktop/" }, isDestroyed: () => false, isLoading: () => false, send() {},
+  }) });
   let unregisterBridge: (() => void) | undefined;
   const executablePath = options.executablePath ?? path.join(f.installRoot, "CodeFlowAI.exe");
   const mainArgv = options.maintenanceArgv ?? (options.installation ? [executablePath, "--codeflow-register-installation", "nsis-install-test"]
@@ -1178,10 +1180,7 @@ test("real main installation rebinds a retained custom root before F4 and consum
   await assert.rejects(fs.lstat(path.join(f.custom, "device-identity.json")), { code: "ENOENT" });
   const retry = await runMain(moved, {}, false, { installation: true }); assert.deepEqual(retry.exits, [0]); assert.deepEqual(retry.events, []);
   const ordinary = await runMain(moved);
-  const ordinaryLog = await fs.readFile(path.join(f.userDataDir, "logs", "desktop-errors.jsonl"), "utf8");
-  const afterMaintenance = await fs.readFile(recordPath, "utf8");
-  const afterLocator = await fs.readFile(path.join(f.userDataDir, "desktop-data-location.json"), "utf8");
-  assert.deepEqual(ordinary.shown, [], `${ordinaryLog}\n${JSON.stringify({ events: ordinary.events, dataDirectories: ordinary.dataDirectories, workerRequests: ordinary.workerRequests })}\n${afterMaintenance}\n${afterLocator}`);
+  assert.deepEqual(ordinary.shown, []);
   assert.ok(ordinary.events.includes("worker-close")); assert.ok(ordinary.events.includes("application"));
   const consumed = JSON.parse(await fs.readFile(recordPath, "utf8"));
   assert.equal(consumed.phase, "consumed"); assert.equal(Object.hasOwn(consumed, "rebindFromInstallRoot"), false);
