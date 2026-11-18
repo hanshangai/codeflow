@@ -246,6 +246,16 @@ function providerHasActive(p: ProviderDescriptor): boolean {
   return scopedKeys.value.some((k) => k.engine === p.engine && k.providerId === p.providerId && k.isActive);
 }
 
+/** 已启用任意 Key 后，自动启用内置中转的失败提示已过时，不再打扰。 */
+const hasActiveEngineKey = computed(() => scopedKeys.value.some((k) => k.isActive));
+watch(
+  () => [hasActiveEngineKey.value, effectiveWorkspaceId.value, autoEnableNotice.value?.kind] as const,
+  () => {
+    if (autoEnableNotice.value?.kind === "failure" && hasActiveEngineKey.value) dismissAutoEnableNotice();
+  },
+  { immediate: true },
+);
+
 /** 当前选中 provider 静态支持的内置中转 target，用于识别历史本地 Key。 */
 const selectedRelayTarget = computed<BuiltInRelayTarget | null>(() => selectedProvider.value?.builtInTarget ?? null);
 

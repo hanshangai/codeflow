@@ -23,6 +23,7 @@ import { readCandidateShellHealthRequest, executeCandidateShellHealth, assertCan
 import { DESKTOP_WEB_ENTRY, createDesktopWebHandler, isTrustedDesktopUrl, assertTrustedDesktopSender, resolveDesktopInitialEntry } from "./webProtocol.js";
 import { readShellHandoffStartup, createShellHandoffContinuation, startShellRecoveryController, readShellUpdateHostFacts, retireShellUpdateAttempt,
   snapshotShellHandoffErrorContext, type ShellRecoveryControllerOwner } from "./shellHandoff.js";
+import { abandonStalledShellUpdateRecovery } from "./shellUpdateRecoveryAbandon.js";
 import { processSnapshot, type ProcessIdentity } from "./windowsProcessIdentity.js";
 import { resolveDesktopStorageLocation, persistDesktopStorageLocation, completeDesktopStorageLocation,
   verifyDesktopStorageLocation, registerDesktopInstallation, appendDesktopStartupDiagnostic,
@@ -595,8 +596,23 @@ if (process.versions.electron) {
       }
       if (handoffStartup.kind === "recovery-control") {
         // controller 不创建 application/Client；同 attempt 接管确认后沿正常退出释放单实例锁/profile。
-        recoveryOwner = await startShellRecoveryController({ ...handoffInput, onOwned: owner => { recoveryOwner = owner; } });
-        recoveryOwner.assertHealthy(); quitAllowed = true; app.quit(); return;
+        try {
+          recoveryOwner = await startShellRecoveryController({ ...handoffInput, onOwned: owner => { recoveryOwner = owner; } });
+          recoveryOwner.assertHealthy(); quitAllowed = true; app.quit(); return;
+        } catch (error) {
+          // 恢复连续失败时不再永久阻塞启动；安全条件不满足或归档失败仍按原错误退出。
+          let abandon;
+          try {
+            abandon = await abandonStalledShellUpdateRecovery({ dataDir, executablePath: process.execPath, pid: process.pid,
+              parentPid: process.ppid, ownerReleased: !recoveryOwner || recoveryOwner.released });
+          } catch (abandonError) {
+            throw new AggregateError([error, abandonError], "DESKTOP_SHELL_RECOVERY_ABANDON_FAILED");
+          }
+          if (!abandon?.abandoned) throw error;
+          recoveryOwner = undefined;
+          logError(Object.assign(new Error("DESKTOP_SHELL_RECOVERY_ABANDONED"), { code: "DESKTOP_SHELL_RECOVERY_ABANDONED" }),
+            { errorCode: "DESKTOP_SHELL_RECOVERY_ABANDONED", requestId: abandon.requestId ?? startupRequestId });
+        }
       }
       const startup = app.isPackaged && process.platform === "win32" ? await resolveVersionedShellStartup(process.execPath) : null;
       if (quitAllowed) return;

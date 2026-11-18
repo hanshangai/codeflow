@@ -162,6 +162,10 @@ export function preflightProcessInventory(input: { inventory: ShellProcessInvent
       if (!parent || !processes.some(item => sameIdentity(item, parent)) || excluded.some(item => item.pid === parent.pid)) continue;
       if ([...roots, ...excluded].some(item => item.pid === child.pid)) observationInvalid("CHILD_ROLE_CONFLICT", child);
       if (predatesAllParents(child, [...historical, ...complete])) continue;
+      // 刚创建的可认领子进程可能暂时读不到路径/命令行；交给同一有界预算重查，超时仍按身份无效失败。
+      if (child.pid > 0 && child.created > 0 && (!child.executable || !child.commandLine)) {
+        pending.push({ ...child }); continue;
+      }
       const identity = observedIdentity(child, "CHILD_IDENTITY_INVALID");
       if (identity.created < parent.created) observationInvalid("CHILD_PREDATES_PARENT", identity);
       if (inventory.owned.length + complete.length >= MAX_OWNED) capacity();

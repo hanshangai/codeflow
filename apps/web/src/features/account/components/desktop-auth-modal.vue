@@ -323,7 +323,7 @@ function sendLabel(purpose: "register" | "forgot_password"): string {
                 <a-input-password v-model:value="login.password" size="large" placeholder="请输入密码"
                   autocomplete="current-password" @press-enter="submitLogin" />
               </label>
-              <div class="auth-field">
+              <div class="auth-field" @keydown.enter="submitLogin">
                 <span>数字验证码</span>
                 <NumericCaptchaField ref="loginCaptchaRef" v-model="loginCaptcha" />
               </div>

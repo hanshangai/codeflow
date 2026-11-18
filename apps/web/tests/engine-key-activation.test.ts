@@ -307,3 +307,9 @@ for (const action of ["doActivate", "doSubmit", "doDeactivate", "doDelete"] as c
     assert.deepEqual(fixture.errors, []);
   });
 }
+
+test("已启用任意 Key 后自动清除内置中转自动启用失败提示", () => {
+  assert.match(panelSource, /const hasActiveEngineKey = computed\(\(\) => scopedKeys\.value\.some\(\(k\) => k\.isActive\)\)/u);
+  assert.match(panelSource, /autoEnableNotice\.value\?\.kind === "failure" && hasActiveEngineKey\.value/u);
+  assert.match(panelSource, /dismissAutoEnableNotice\(\)/u);
+});
