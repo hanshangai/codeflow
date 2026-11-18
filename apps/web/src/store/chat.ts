@@ -135,6 +135,7 @@ const inFlightReadByKey = new Map<string, {
   cleanup: () => void;
 }>();
 const threadDraftMutationTailByKey = new Map<string, Promise<void>>();
+const threadDraftMutationEpochByKey = new Map<string, number>();
 const threadPrefsSaveTailByKey = new Map<string, Promise<void>>();
 const threadPrefsMutationEpochByThreadId = new Map<string, number>();
 const threadPrefsWriteEpochByThreadId = new Map<string, number>();
@@ -286,7 +287,7 @@ function hasThreadDraftPayloadContent(draft: ThreadDraftPayload): boolean {
 }
 
 /** 比较草稿正文与附件，避免相同的本地待确认内容重复推进 epoch。 */
-function sameThreadDraftPayloadContent(left: ThreadDraftPayload, right: ThreadDraftPayload): boolean {
+export function sameThreadDraftPayloadContent(left: ThreadDraftPayload, right: ThreadDraftPayload): boolean {
   if (left.text !== right.text
     || (left.inputKind ?? null) !== (right.inputKind ?? null)
     || left.images.length !== right.images.length
@@ -1059,6 +1060,9 @@ export const useChatStore = defineStore("chat", {
       opts: { reason: AbortKind; read?: boolean; resource?: boolean },
     ): void {
       const key = String(threadId);
+      if (opts.reason === "clear" || opts.reason === "delete") {
+        invalidateQueuedThreadDraftMutations(key);
+      }
       if (opts.read !== false) {
         bumpScopeEpoch(threadReadScopeEpochByThreadId, key);
         bumpScopeEpoch(threadHistoryScopeEpochByThreadId, key);
@@ -1176,6 +1180,7 @@ export const useChatStore = defineStore("chat", {
       const isNewBarrier = barrier > previousBarrier;
       this.setThreadRollbackEventSeqBarrier(threadId, barrier);
       if (isNewBarrier) {
+        invalidateQueuedThreadDraftMutations(key);
         this.invalidateThreadScopes(threadId, { reason: "thread-invalidated" });
         this.clearThreadReplayState(threadId);
       }
@@ -1207,6 +1212,7 @@ export const useChatStore = defineStore("chat", {
       } catch (cause) {
         result.barrierError = cause;
         shouldReload = Boolean(this.loadedThreads[key] || this.conversations[key]);
+        invalidateQueuedThreadDraftMutations(key);
         if (shouldReload) {
           this.invalidateThreadScopes(body.threadId, { reason: "thread-invalidated" });
           this.clearThreadReplayState(body.threadId);
@@ -3011,6 +3017,7 @@ export const useChatStore = defineStore("chat", {
         ? (this.prepareThreadRollbackHistoryReload(body.threadId, res.rollbackEventSeqBarrier) || !rollbackBarrierAlreadyLoaded)
         : true;
       if (res.rollbackEventSeqBarrier == null) {
+        invalidateQueuedThreadDraftMutations(String(body.threadId));
         this.invalidateThreadScopes(body.threadId, { reason: "thread-invalidated" });
         this.clearThreadReplayState(body.threadId);
       }
@@ -4991,6 +4998,7 @@ function canApplyThreadDraftMutationResponse(input: {
 
 /**
  * 同一 workspace/thread 的草稿 mutation 按调用顺序执行，避免旧请求最后写回远端。
+ * 会话切换不取消已排队的持久化，工作区代际变化仍会取消旧 mutation。
  * workspace 失效后默认取消；显式 remote-only 时只完成旧 workspace 写入，不投影当前 Store。
  */
 function runThreadDraftMutation<T>(
@@ -5002,13 +5010,19 @@ function runThreadDraftMutation<T>(
 ): Promise<T> {
   const key = `${String(workspaceId)}::${String(threadId)}`;
   const scope = captureThreadReadScope(workspaceId, threadId);
+  const mutationEpoch = threadDraftMutationEpochByKey.get(key) ?? 0;
   const previous = threadDraftMutationTailByKey.get(key) ?? Promise.resolve();
   const result = previous.then(() => {
     const applyLocalProjection = isThreadDraftWorkspaceScopeCurrent(workspaceScopeToken);
     if (!applyLocalProjection && !opts?.allowStaleWorkspaceRemoteMutation) {
       assertThreadDraftWorkspaceScope(workspaceScopeToken);
     }
-    if (applyLocalProjection) assertThreadReadScope(scope);
+    if (applyLocalProjection && scope.generation !== chatReadGeneration) {
+      throw createCancelledRequestError("workspace-switch");
+    }
+    if ((threadDraftMutationEpochByKey.get(key) ?? 0) !== mutationEpoch) {
+      throw createCancelledRequestError("clear");
+    }
     return mutation(scope, applyLocalProjection);
   });
   const tail = result.then(
@@ -5017,9 +5031,20 @@ function runThreadDraftMutation<T>(
   );
   threadDraftMutationTailByKey.set(key, tail);
   void tail.finally(() => {
-    if (threadDraftMutationTailByKey.get(key) === tail) threadDraftMutationTailByKey.delete(key);
+    if (threadDraftMutationTailByKey.get(key) === tail) {
+      threadDraftMutationTailByKey.delete(key);
+      threadDraftMutationEpochByKey.delete(key);
+    }
   });
   return result;
+}
+
+/** Clear/delete invalidates only mutations already queued for the affected thread. */
+function invalidateQueuedThreadDraftMutations(threadId: string): void {
+  for (const key of threadDraftMutationTailByKey.keys()) {
+    if (!key.endsWith(`::${threadId}`)) continue;
+    threadDraftMutationEpochByKey.set(key, (threadDraftMutationEpochByKey.get(key) ?? 0) + 1);
+  }
 }
 
 /** 移除 undefined 字段，保持省略与显式 null 的补丁语义。 */
