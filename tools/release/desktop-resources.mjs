@@ -13,9 +13,9 @@ export function currentDesktopPlatform() {
   throw new Error(`DESKTOP_BUILD_PLATFORM_UNSUPPORTED: ${process.platform}/${process.arch}`);
 }
 
-/** 按环境固定账号域名；测试遵循 HTTP/WS，生产继续使用 TLS。 */
+/** 按环境固定账号域名；测试与生产均使用 TLS。 */
 export function resolveDesktopWebBuildEnv(plan, baseEnv = process.env) {
-  const origins = { test: "ws://codeflow-test.hanshangai.com", production: "wss://codeflow.hanshangai.com" };
+  const origins = { test: "wss://codeflow-test.hanshangai.com", production: "wss://codeflow.hanshangai.com" };
   const origin = origins[plan.environment];
   if (!origin) throw new Error("DESKTOP_WEB_BUILD_ENVIRONMENT_INVALID");
   const env = { ...baseEnv, VITE_CODEFLOWAI_SERVER_WS_ORIGIN: origin };
