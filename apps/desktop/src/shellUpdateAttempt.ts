@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertReleaseId, type DesktopClientHealth } from "@codeflowai/shared";
 import { assertDesktopUpdateFailureRecord, type ShellUpdateFailureRecord } from "@codeflowai/shared/desktop-update-failure";
-import { parseShellLaunchState, serializeShellLaunchState, type ShellLaunchState } from "./shellLaunchState.js";
+import { parseShellLaunchState, readShellLaunchState, serializeShellLaunchState, type ShellLaunchState } from "./shellLaunchState.js";
 import { snapshotUpdateNetworkDurableState, type UpdateNetworkDurableAdapter, type UpdateNetworkDurableState, type UpdateNetworkSlot } from "./updateNetworkRetry.js";
 import { sameIdentity, type ProcessIdentity, type ProcessSnapshotContext } from "./windowsProcessIdentity.js";
 import { activeProcessInventory, assertProcessInventoryReleased, createProcessInventory, observeProcessInventory,
@@ -87,8 +87,8 @@ export type ShellUpdateRecoveryBindFacts = ShellUpdateRecoveryRuntimeFacts & { m
 export type ShellUpdateRecoveryClaimFacts = ShellUpdateRecoveryFacts & { helper: ProcessIdentity; processes: ProcessIdentity[];
   knownOwned: { status: "known"; identities: ProcessIdentity[] } | { status: "unknown" } };
 export type ShellUpdateAttemptStore = {
-  /** 仅已释放的准备/充分终态可归档，未完成交接不能被资源或安装覆盖绕过。 */
-  retire(expected: unknown, facts: { processes: ProcessIdentity[]; caller?: ProcessIdentity }): Promise<void>;
+  /** 准备/终态正常归档；连续失败的未准入恢复须另核原壳与完整库存。 */
+  retire(expected: unknown, facts: { processes: ProcessIdentity[]; caller?: ProcessIdentity; recoveryFailures?: number }): Promise<void>;
   read(): Promise<ShellUpdateAttempt | null>;
   replace(expected: unknown, next: unknown): Promise<ShellUpdateAttempt>;
   /** 新helper以同一真实根和严格reader保留物理owner，释放前不允许嵌套。 */
@@ -156,7 +156,8 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
       try {
         if (!expected) invalid();
         const facts = fields(request.facts, undefined), caller = Object.hasOwn(facts, "caller") ? readProcess(facts.caller) : undefined;
-        fields(facts, ["processes", ...(caller ? ["caller"] : [])]);
+        const recoveryFailures = Object.hasOwn(facts, "recoveryFailures") ? integer(facts.recoveryFailures, 3) : undefined;
+        fields(facts, ["processes", ...(caller ? ["caller"] : []), ...(recoveryFailures !== undefined ? ["recoveryFailures"] : [])]);
         const processes = readProcessList(facts.processes, true);
         if (caller && (!processes.some(item => sameIdentity(item, caller))
           || ![expected.originalState.activeShellId, expected.candidateState?.activeShellId].some(id => id && caller.executable === shellExecutable(expected!, id)))) invalid();
@@ -171,9 +172,15 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
         }
         if (isShellUpdateHandoffAttempt(expected)) {
           const terminal = expected.recovery ? expected.recovery.terminalEvidence !== null : ["completed", "restored"].includes(expected.phase);
-          if (!terminal) invalid();
+          if (recoveryFailures !== undefined) {
+            if (!caller || expected.admission !== null || expected.terminalEvidence !== null || expected.recovery?.terminalEvidence
+              || caller.executable !== shellExecutable(expected, expected.originalState.activeShellId)) invalid();
+            const launch = await readShellLaunchState(expected.installationDir);
+            if (!equal(launch.state, expected.originalState) || launch.executablePath !== caller.executable) invalid();
+          } else if (!terminal) invalid();
           assertShellUpdateInventoryReleased(expected, processes, retained);
         } else {
+          if (recoveryFailures !== undefined) invalid();
           // 明确网络失败尚未交接；原失败事实完整归档，仍须证明 Client 和引擎已退出。
           if (expected.schemaVersion !== 5 || !["preparing", "no-update"].includes(expected.phase)
             && !(expected.phase === "failed" && expected.network?.status === "failed")) invalid();
@@ -241,8 +248,9 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
     async retire(expectedInput, factsInput) {
       const expected = readAttempt(expectedInput), facts = fields(factsInput, undefined);
       const copied = { processes: readProcessList(facts.processes, true),
-        ...(Object.hasOwn(facts, "caller") ? { caller: readProcess(facts.caller) } : {}) };
-      fields(facts, ["processes", ...(copied.caller ? ["caller"] : [])]);
+        ...(Object.hasOwn(facts, "caller") ? { caller: readProcess(facts.caller) } : {}),
+        ...(Object.hasOwn(facts, "recoveryFailures") ? { recoveryFailures: integer(facts.recoveryFailures, 3) } : {}) };
+      fields(facts, ["processes", ...(copied.caller ? ["caller"] : []), ...(copied.recoveryFailures !== undefined ? ["recoveryFailures"] : [])]);
       await physical({ kind: "retire", expected, facts: copied });
     },
     /** 仅转接现有根与execute；作用域结束后仍由协调器核资源释放结果。 */
@@ -468,7 +476,10 @@ export function shellUpdateProcessSnapshotContext(attempt: InventoryAttempt, ext
 /** 所有执行共用保守释放核验，角色根不受普通库存释放豁免。 */
 export function assertShellUpdateInventoryReleased(attempt: InventoryAttempt, processes: ProcessIdentity[], excluded: ProcessIdentity[] = [], includeRecovery = true): void {
   const snapshot = readProcessList(processes, true);
-  if (attempt.schemaVersion === 3) { assertReleased(shellUpdateProcessInventory(attempt, includeRecovery), snapshot, excluded); return; }
+  if (attempt.schemaVersion === 3) {
+    assertReleased(shellUpdateProcessInventory(attempt, includeRecovery).filter(identity => !excluded.some(item => sameIdentity(item, identity))), snapshot, excluded);
+    return;
+  }
   for (const item of lifecycleInventories(attempt, includeRecovery)) assertProcessInventoryReleased({ ...item, processes: snapshot, excluded });
   assertReleased(handoffEvidenceMains(attempt).filter(main => !excluded.some(identity => sameIdentity(identity, main))), snapshot, excluded);
 }

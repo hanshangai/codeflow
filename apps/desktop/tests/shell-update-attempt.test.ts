@@ -9,6 +9,8 @@ import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import { createUpdateFailureJournal } from "../src/updateFailureJournal.js";
 import { retireShellUpdateAttempt } from "../src/shellHandoff.js";
+import { serializeShellLaunchState } from "../src/shellLaunchState.js";
+import { abandonStalledShellUpdateRecovery } from "../src/shellUpdateRecoveryAbandon.js";
 import { digestUpdateFailureRecord } from "@codeflowai/shared/desktop-update-failure";
 import type { ProcessIdentity } from "../src/windowsProcessIdentity.js";
 import { createUpdateNetworkRetry, type UpdateNetworkAction } from "../src/updateNetworkRetry.js";
@@ -204,6 +206,100 @@ test("retirement refuses an unfinished handoff even after its processes disappea
   assert.equal(typeof (f.owner as any).retire, "function");
   await assert.rejects((f.owner as any).retire(handoff, { processes: [] }));
   assert.deepEqual(await f.owner.read(), handoff);
+});
+
+/** 只建立测试壳布局；归档仍使用产品的物理 owner 和持久 expected。 */
+async function writeRecoveryLaunch(attempt: AnyAttempt) {
+  for (const shell of new Set([attempt.originalState.activeShellId, attempt.originalState.previousShellId,
+    attempt.originalState.baselineShellId, attempt.candidateState?.activeShellId])) {
+    if (!shell) continue;
+    const directory = path.join(attempt.installationDir, "shells", shell);
+    await fs.mkdir(directory, { recursive: true }); await fs.writeFile(path.join(directory, "CodeFlowAI.exe"), "fixture");
+  }
+  const resources = path.join(attempt.installationDir, "shells", attempt.originalState.baselineShellId, "resources");
+  for (const entry of ["web/index.html", "client/dist/index.cjs", "release-trust.json"]) {
+    const file = path.join(resources, entry); await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, "fixture");
+  }
+  await fs.writeFile(path.join(attempt.installationDir, "shell-launch.ini"), serializeShellLaunchState(attempt.originalState));
+}
+
+test("stalled recovery retires through the physical owner while retaining only the current original controller", async () => {
+  const { owner, previous, facts, methods } = await recoveryFixture();
+  const caller = handoffProcess(previous, 201, 1, previous.originalState.activeShellId);
+  const helper = { ...facts.helper, executable: caller.executable };
+  const claimed = await methods.beginRecovery(previous, { ...facts, caller, helper, processes: [caller, helper] });
+  await writeRecoveryLaunch(claimed);
+  await owner.retire(claimed, { processes: [caller], caller, recoveryFailures: 3 });
+  assert.equal(await owner.read(), null);
+});
+
+for (const violation of ["threshold", "live-client", "admission", "candidate-state", "stale-expected"] as const)
+test(`stalled recovery retirement refuses ${violation} and preserves the current attempt`, async () => {
+  const f = await preparedHandoffFixture(), client = handoffProcess(f.prepared, 401, f.facts.oldMain.pid);
+  const attempt = await f.owner.beginHandoff(f.prepared, { ...f.facts, lifecycle: true as const,
+    processes: [f.facts.oldMain, f.facts.helper, client], knownOwned: [client] });
+  await writeRecoveryLaunch(attempt);
+  const caller = handoffProcess(attempt, 501, 1);
+  let expected: AnyAttempt = attempt;
+  if (violation === "candidate-state") await fs.writeFile(path.join(attempt.installationDir, "shell-launch.ini"), serializeShellLaunchState(attempt.candidateState));
+  if (violation === "admission") expected = { ...attempt, admission: {} } as AnyAttempt;
+  if (violation === "stale-expected") expected = { ...attempt, revision: attempt.revision + 1 };
+  const before = await fs.readFile(path.join(f.directory, filename));
+  await assert.rejects(f.owner.retire(expected, { processes: [caller, ...(violation === "live-client" ? [client] : [])],
+    caller, recoveryFailures: violation === "threshold" ? 2 : 3 }));
+  assert.deepEqual(await fs.readFile(path.join(f.directory, filename)), before);
+});
+
+test("recovery counter accepts colon request IDs and never bypasses the signed resource binding", async () => {
+  const f = await preparedHandoffFixture(), selected = { ...f.prepared, requestId: "attempt:counter" };
+  const dataDir = await fs.realpath(await fs.mkdtemp(path.join(root, "counter-data-")));
+  // 另一个请求从正常准备事实创建，不改变已存在更新的请求身份。
+  const initial = { ...selected, dataDir, revision: 0, phase: "preparing" as const, target: null, candidateState: null, network: null, retriesUsed: 0 };
+  const owner = store(initial.dataDir); await owner.replace(null, initial);
+  const adapter = createShellUpdateAttemptNetworkAdapter(owner);
+  const action = { actionKey: "manifest", requestSha256: "d".repeat(64), status: "dispatching" as const };
+  await adapter.replace(await adapter.read(), { retriesUsed: 0, network: action });
+  await adapter.replace(await adapter.read(), { retriesUsed: 0, network: { ...action, status: "succeeded", evidence: { kind: "shell-manifest", sha256: "e".repeat(64) } } });
+  const discovered = await owner.read(); assert.ok(discovered);
+  const prepared = await owner.replace(discovered, { ...discovered, revision: discovered.revision + 1, target: selected.target, candidateState: selected.candidateState });
+  const attempt = await owner.beginHandoff(prepared, f.facts); await writeRecoveryLaunch(attempt);
+  for (const directory of [attempt.userDataDir, attempt.sessionDataDir]) await fs.mkdir(directory, { recursive: true });
+  const trust = path.join(path.dirname(f.facts.oldMain.executable), "resources", "release-trust.json");
+  await fs.mkdir(path.dirname(trust), { recursive: true }); await fs.writeFile(trust, "{}");
+  const input = { dataDir: initial.dataDir, userDataDir: attempt.userDataDir, sessionDataDir: attempt.sessionDataDir,
+    executablePath: f.facts.oldMain.executable, pid: 501, parentPid: 1, argv: [], ownerReleased: true };
+  for (const failures of [1, 2]) {
+    const result = await abandonStalledShellUpdateRecovery(input); assert.equal(result.failures, failures); assert.equal(result.abandoned, false);
+    assert.deepEqual(await owner.read(), attempt);
+  }
+  await assert.rejects(abandonStalledShellUpdateRecovery(input));
+  assert.deepEqual(await owner.read(), attempt);
+});
+
+test("recovery counter rejects a corrupt record without resetting failures or changing the attempt", async () => {
+  const f = await preparedHandoffFixture(), attempt = await f.owner.beginHandoff(f.prepared, f.facts);
+  const directory = path.join(f.directory, "logs"); await fs.mkdir(directory);
+  const file = path.join(directory, "shell-update-recovery-failures.json"), bytes = "{broken-counter";
+  await fs.writeFile(file, bytes);
+  await assert.rejects(abandonStalledShellUpdateRecovery({ dataDir: f.directory, userDataDir: attempt.userDataDir,
+    sessionDataDir: attempt.sessionDataDir, executablePath: f.facts.oldMain.executable, pid: 501, parentPid: 1, argv: [], ownerReleased: true }));
+  assert.equal(await fs.readFile(file, "utf8"), bytes); assert.deepEqual(await f.owner.read(), attempt);
+});
+
+test("recovery counter refuses a log directory replaced by a junction before writing", { skip: process.platform !== "win32" }, async t => {
+  const f = await preparedHandoffFixture(), attempt = await f.owner.beginHandoff(f.prepared, f.facts);
+  const external = await fs.mkdtemp(path.join(root, "counter-external-")), logs = path.join(f.directory, "logs"), mkdir = fs.mkdir;
+  let changed = false;
+  t.mock.method(fs, "mkdir", async (...args: Parameters<typeof fs.mkdir>) => {
+    const result = await mkdir(...args);
+    if (!changed && String(args[0]) === logs) {
+      changed = true; await fs.rename(logs, `${logs}-original`); await fs.symlink(external, logs, "junction");
+    }
+    return result;
+  });
+  await assert.rejects(abandonStalledShellUpdateRecovery({ dataDir: f.directory, userDataDir: attempt.userDataDir,
+    sessionDataDir: attempt.sessionDataDir, executablePath: f.facts.oldMain.executable, pid: 501, parentPid: 1, argv: [], ownerReleased: true }));
+  assert.equal(changed, true); assert.deepEqual(await fs.readdir(external), []); assert.deepEqual(await f.owner.read(), attempt);
 });
 
 test("retirement cannot use a historical restored phase to bypass an unfinished recovery", async () => {
@@ -2486,10 +2582,15 @@ test("Windows rename validation time consumes the budget before another rename c
 });
 
 test("rename does not start its first attempt after initial validation has exhausted the scheduling budget", async t => {
-  const { directory, attempt } = await fixture(), owner = store(directory), rename = fs.rename;
+  const { directory, attempt } = await fixture(), owner = store(directory), rename = fs.rename, lstat = fs.lstat;
   await owner.replace(null, attempt);
-  let clockReads = 0, attempts = 0;
-  t.mock.method(performance, "now", () => ++clockReads === 1 ? 0 : 1000);
+  let now = 0, temporaryChecks = 0, attempts = 0;
+  t.mock.method(performance, "now", () => now);
+  t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    const stat = await lstat(...args);
+    if (String(args[0]).endsWith(".tmp") && ++temporaryChecks === 2) now = 1000;
+    return stat;
+  });
   t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => { attempts++; await rename(...args); });
   await assert.rejects(owner.replace(attempt, next(attempt)), error => {
     failure(error, "REPLACE", "replace");

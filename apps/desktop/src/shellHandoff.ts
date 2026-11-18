@@ -61,13 +61,14 @@ export async function readShellUpdateHostFacts(input: Pick<StartupInput, "execut
   return { installationDir, userDataDir: input.userDataDir, sessionDataDir: input.sessionDataDir, main: structuredClone(main) };
 }
 
-/** 绑定变化前核原安装/资源与进程释放，证据由原物理 owner 归档；交接中不允许覆盖。 */
-export async function retireShellUpdateAttempt(input: StartupInput & { installationDir: string }): Promise<void> {
+/** 归档前核原安装/资源与进程释放；未准入恢复仅接受显式失败次数和原记录。 */
+export async function retireShellUpdateAttempt(input: StartupInput & { installationDir: string; recoveryFailures?: number; expectedAttempt?: ShellUpdateHandoffAttempt }): Promise<void> {
   // 无尝试记录时不创建 owner 认证目录，安装预检仍保持只读。
   try { await fs.lstat(path.join(input.dataDir, "shell-update-attempt.json")); }
-  catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT") return; throw cause; }
+  catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT" && !input.expectedAttempt) return; throw cause; }
   const store = createShellUpdateAttemptStore(input.dataDir), attempt = await store.read();
-  if (!attempt) return;
+  if (!attempt) { if (input.expectedAttempt) fail("STATE_CONFLICT"); return; }
+  if (input.expectedAttempt && !equal(attempt, input.expectedAttempt)) fail("STATE_CONFLICT");
   if (attempt.installationDir !== input.installationDir || attempt.schemaVersion < 3) fail("RETIRE_FACTS_INVALID");
   await matchingProfile(input, attempt);
   const launch = await readShellLaunchState(input.installationDir);
@@ -78,7 +79,7 @@ export async function retireShellUpdateAttempt(input: StartupInput & { installat
   const processes = await (input.snapshot ?? processSnapshot)(shellUpdateProcessSnapshotContext(attempt));
   const caller = processes.find(item => item.pid === input.pid);
   if (!caller || caller.parentPid !== input.parentPid || caller.executable !== input.executablePath) fail("PROCESS_IDENTITY_INVALID");
-  await store.retire(attempt, { processes, caller });
+  await store.retire(attempt, { processes, caller, ...(input.recoveryFailures !== undefined ? { recoveryFailures: input.recoveryFailures } : {}) });
 }
 
 /** 主进程日志只投影稳定上下文、短码和已核诊断；不执行访问器或记录进程正文。 */

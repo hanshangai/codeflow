@@ -582,7 +582,7 @@ if (process.versions.electron) {
       const handoffInput = { executablePath: process.execPath, pid: process.pid, parentPid: process.ppid, dataDir,
         userDataDir, sessionDataDir, argv: process.argv, channel: process };
       if (maintenanceRequest) maintenanceStage = "handoff";
-      const handoffStartup = maintenanceRequest && location.clientId === null
+      let handoffStartup = maintenanceRequest && location.clientId === null
         ? { kind: "ordinary" as const } : await readShellHandoffStartup(handoffInput);
       if (maintenanceRequest && handoffStartup.kind !== "ordinary") throw new DesktopMaintenanceStartupError("DESKTOP_UNINSTALL_HANDOFF_PENDING");
       if (handoffStartup.kind === "held-candidate") {
@@ -603,14 +603,15 @@ if (process.versions.electron) {
           // 恢复连续失败时不再永久阻塞启动；安全条件不满足或归档失败仍按原错误退出。
           let abandon;
           try {
-            abandon = await abandonStalledShellUpdateRecovery({ dataDir, executablePath: process.execPath, pid: process.pid,
+            abandon = await abandonStalledShellUpdateRecovery({ ...handoffInput,
               parentPid: process.ppid, ownerReleased: !recoveryOwner || recoveryOwner.released });
           } catch (abandonError) {
             throw new AggregateError([error, abandonError], "DESKTOP_SHELL_RECOVERY_ABANDON_FAILED");
           }
           if (!abandon?.abandoned) throw error;
           recoveryOwner = undefined;
-          logError(Object.assign(new Error("DESKTOP_SHELL_RECOVERY_ABANDONED"), { code: "DESKTOP_SHELL_RECOVERY_ABANDONED" }),
+          handoffStartup = { kind: "ordinary" };
+          logError(Object.assign(new Error("DESKTOP_SHELL_RECOVERY_ABANDONED", { cause: error }), { code: "DESKTOP_SHELL_RECOVERY_ABANDONED" }),
             { errorCode: "DESKTOP_SHELL_RECOVERY_ABANDONED", requestId: abandon.requestId ?? startupRequestId });
         }
       }
