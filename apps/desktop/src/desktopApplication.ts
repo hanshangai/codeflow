@@ -401,6 +401,15 @@ export function createDesktopApplication(input: {
     currentBundleVersion = snapshotBundleVersion(active.manifest);
   };
 
+  /** 安装基线与在线更新共用资源数字版本口径，不接受通用比较器的文本回退。 */
+  const compareResourceVersions = (candidate: string, current: string, requestId?: string): number => {
+    if (!/^\d+(?:\.\d+){2,3}$/u.test(candidate) || !/^\d+(?:\.\d+){2,3}$/u.test(current)) {
+      throw Object.assign(new Error("DESKTOP_RESOURCE_VERSION_INVALID"), { code: "DESKTOP_RESOURCE_VERSION_INVALID", requestId,
+        candidateVersion: candidate, currentVersion: current });
+    }
+    return compareNumericVersion(candidate, current);
+  };
+
   /** 资源只比较包版本；同一发布的摘要冲突仍作为完整性错误拒绝。 */
   const isCurrentRelease = (manifest: DownloadedRelease["manifest"], requestId: string): boolean => {
     if (manifest.releaseId === currentReleaseId && currentArchiveSha256 !== undefined && manifest.archiveSha256 !== currentArchiveSha256) {
@@ -408,10 +417,7 @@ export function createDesktopApplication(input: {
     }
     const current = currentBundleVersion?.version;
     if (!current) return false;
-    if (!/^\d+(?:\.\d+){2,3}$/u.test(manifest.version) || !/^\d+(?:\.\d+){2,3}$/u.test(current)) {
-      throw Object.assign(new Error("DESKTOP_RESOURCE_VERSION_INVALID"), { code: "DESKTOP_RESOURCE_VERSION_INVALID", requestId });
-    }
-    return compareNumericVersion(manifest.version, current) <= 0;
+    return compareResourceVersions(manifest.version, current, requestId) <= 0;
   };
 
   /** 壳只维护当前运行时的一条订阅，事件不在此缓存或重放。 */
@@ -1413,15 +1419,30 @@ export function createDesktopApplication(input: {
         await reportStartup("正在校验安装资源…");
         const needsRepairBaseline = recordedPending?.databaseSchemaVersion !== undefined
           && (activeRelease?.manifest.dbSchemaVersion ?? 0) < recordedPending.databaseSchemaVersion;
-        // 当前可信资源独立可用；只有首次安装、原交接或修复向前迁移才读取离线基线。
-        const baselineRelease = continuation || needsRepairBaseline || !activeRelease && (input.requireBaseline || pending)
-          ? await resolveBaselineRelease(baselineReleaseDir, releaseTrust) : null;
+        // 完整安装存在基线时参与选择；可信 active 的普通启动仍允许安装基线缺失。
+        const baselineRelease = input.requireBaseline || continuation || needsRepairBaseline || !activeRelease && pending
+          ? await resolveBaselineRelease(baselineReleaseDir, releaseTrust).catch((error: unknown) => {
+            const failure = error as { code?: unknown; path?: unknown };
+            const missing = failure.code === "DESKTOP_RELEASE_BASELINE_MISSING" || failure.code === "ENOENT"
+              && failure.path === path.resolve(baselineReleaseDir);
+            // 延续 active 独立启动；只接受根目录或证明缺失，资源缺文件和验签失败仍原样抛出。
+            if (activeRelease && !continuation && !needsRepairBaseline && missing) return null;
+            throw error;
+          }) : null;
         assertStartupRunning();
         // 已验签修复基线可接管不兼容旧活动包；磁盘指针等真实健康后再清理。
         const repairingDatabase = Boolean(recordedPending?.databaseSchemaVersion && baselineRelease
           && baselineRelease.manifest.dbSchemaVersion >= recordedPending.databaseSchemaVersion
           && (!activeRelease || activeRelease.manifest.dbSchemaVersion < recordedPending.databaseSchemaVersion));
-        const startupActiveRelease = repairingDatabase ? null : activeRelease;
+        // 壳接续只消费原授权绑定；普通完整安装按资源版本接管，不能降低已知数据库结构。
+        const newerBaseline = Boolean(!continuation && input.requireBaseline && baselineRelease && activeRelease
+          && compareResourceVersions(baselineRelease.manifest.version, activeRelease.manifest.version) > 0);
+        if (newerBaseline && baselineRelease && activeRelease && baselineRelease.manifest.dbSchemaVersion < activeRelease.manifest.dbSchemaVersion) {
+          throw Object.assign(new Error("DESKTOP_DB_SCHEMA_DOWNGRADE_FORBIDDEN"), { code: "DESKTOP_DB_SCHEMA_DOWNGRADE_FORBIDDEN",
+            releaseId: baselineRelease.manifest.releaseId, activeReleaseId: activeRelease.releaseId,
+            databaseSchemaVersion: activeRelease.manifest.dbSchemaVersion, targetDatabaseSchemaVersion: baselineRelease.manifest.dbSchemaVersion });
+        }
+        const startupActiveRelease = repairingDatabase || newerBaseline ? null : activeRelease;
         const currentSchema = startupActiveRelease?.manifest.dbSchemaVersion ?? baselineRelease?.manifest.dbSchemaVersion;
         // 修复安装先独立完成，不能改变壳交接已绑定的旧活动资源身份。
         if (recordedPending?.databaseSchemaVersion && (currentSchema === undefined || currentSchema < recordedPending.databaseSchemaVersion
@@ -1440,7 +1461,7 @@ export function createDesktopApplication(input: {
             await reportStartup("正在确认更新兼容性…");
             // 上方已完整核验依赖；这里只复核即将启动的核心文件与 held marker。
             await resolveBaselineRelease(baselineReleaseDir, { ...releaseTrust, verification: "startup", requireHeldStartup: true });
-            if (activeRelease) await resolveActiveRelease(input.dataDir, { ...releaseTrust, verification: "startup", requireHeldStartup: true });
+            if (startupActiveRelease) await resolveActiveRelease(input.dataDir, { ...releaseTrust, verification: "startup", requireHeldStartup: true });
             startupHeldId = crypto.randomUUID();
             initialStartup = { mode: "held", continuationId: startupHeldId };
           } catch (error) {
@@ -1575,8 +1596,14 @@ export function createDesktopApplication(input: {
           await reloadWeb(releaseDir);
         }
         assertStartupRunning();
+        if (repairingDatabase || newerBaseline) {
+          const current = runtime.snapshot();
+          if (current.status !== "ready" || current.health?.database !== "ready") throw new Error("DESKTOP_CURRENT_RUNTIME_NOT_HEALTHY");
+          // 基线和页面健康后再清旧指针，使后续更新及其恢复都以当前安装资源为准。
+          await clearIncompatibleActiveRelease(input.dataDir, activeRelease?.releaseId ?? null);
+        }
         if (pending) {
-          await activatePendingAtStartup(pending, activeRelease);
+          await activatePendingAtStartup(pending, startupActiveRelease);
           if (bundleDetails.result === "healthy" && !updateCheckFailure) {
             input.host.onUpdateApplied?.({ version: currentVersion });
           }
@@ -1611,9 +1638,6 @@ export function createDesktopApplication(input: {
           await continueHeldRuntime(continuation.continuationId);
         }
         if (repairingDatabase) {
-          const current = runtime.snapshot();
-          if (current.status !== "ready" || current.health?.database !== "ready") throw new Error("DESKTOP_CURRENT_RUNTIME_NOT_HEALTHY");
-          await clearIncompatibleActiveRelease(input.dataDir, activeRelease?.releaseId ?? null);
           await clearPendingRelease(input.dataDir);
         }
         window.show();

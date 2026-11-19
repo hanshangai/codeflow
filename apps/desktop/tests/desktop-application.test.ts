@@ -664,6 +664,138 @@ async function heldApplicationFixture(t: test.TestContext, options: Parameters<t
   return { ...f, baseline, manifest };
 }
 
+for (const scenario of [
+  { baseline: "2026.11.19.02", active: "2026.11.18.02", selected: "baseline", held: false },
+  { baseline: "2026.11.19.02", active: "2026.11.20.01", selected: "active-1", held: false },
+  { baseline: "2026.11.19.02", active: "2026.11.19.02", selected: "active-1", held: false },
+  { baseline: "2026.11.19.02", active: "2026.11.18.02", selected: "active-1", held: true },
+] as const) test(`完整安装按资源版本选择且交接保持原绑定：${JSON.stringify(scenario)}`, async t => {
+  const f = await heldApplicationFixture(t, { version: scenario.baseline });
+  const activeDir = path.join(f.dataDir, "releases", "active-1");
+  await createHeldRelease(activeDir, { releaseId: "active-1", version: scenario.active });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  let selectedEntry: string | undefined, selectedRelease: string | undefined, loadedDir: string | undefined;
+  f.host.loadWeb = async (_window, directory) => { loadedDir = directory; };
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys,
+    createRuntime: (entry, expectation) => { selectedEntry = entry; selectedRelease = expectation?.releaseId; return f.runtime; },
+    ...(scenario.held ? { startupContinuation: { continuationId: "candidate-1", async authorizeReady(facts) {
+      assert.equal(facts.active?.releaseId, "active-1"); assert.equal(facts.web.releaseDir, activeDir);
+    } } } : {}) });
+  await app.start();
+  const selectedDir = scenario.selected === "baseline" ? f.baseline : activeDir;
+  assert.equal(selectedRelease, scenario.selected);
+  assert.equal(selectedEntry, path.join(selectedDir, "client", "dist", "index.cjs"));
+  assert.equal(loadedDir, selectedDir);
+  assert.equal(await readActivePointer(f.dataDir), scenario.selected === "baseline" ? null : "active-1");
+  assert.equal((await app.getUpdateDetails()).current.bundle?.version, scenario.selected === "baseline" ? scenario.baseline : scenario.active);
+  await app.exit();
+});
+
+for (const corruption of ["signature", "payload", "missing-payload"] as const) test(`完整安装存在active仍拒绝损坏基线：${corruption}`, async t => {
+  const f = await heldApplicationFixture(t, { version: "2.0.0" });
+  await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  const proof = path.join(f.baseline, "baseline-release-manifest.json");
+  if (corruption === "signature") await fs.writeFile(proof, JSON.stringify({ ...f.manifest, version: "3.0.0" }), "utf8");
+  else if (corruption === "missing-payload") await fs.rm(path.join(f.baseline, "client", "dist", "index.cjs"));
+  else await fs.writeFile(path.join(f.baseline, "client", "dist", "index.cjs"), "tampered", "utf8");
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
+  await assert.rejects(app.start());
+  assert.equal(f.actions.includes("start"), false);
+  assert.equal(f.actions.includes("load-web"), false);
+  assert.equal(await readActivePointer(f.dataDir), "active-1");
+});
+
+for (const invalid of ["baseline", "active"] as const) test(`完整安装不把非数字${invalid}资源版本当作可比较版本`, async t => {
+  const f = await heldApplicationFixture(t, { version: invalid === "baseline" ? "invalid" : "2.0.0" });
+  await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1", version: invalid === "active" ? "invalid" : "1.0.0" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
+  await assert.rejects(app.start(), /DESKTOP_RESOURCE_VERSION_INVALID/u);
+  assert.equal(f.actions.includes("start"), false);
+  assert.equal(await readActivePointer(f.dataDir), "active-1");
+});
+
+test("完整安装较新基线不得降低active数据库结构", async t => {
+  const f = await heldApplicationFixture(t, { version: "2.0.0", dbSchemaVersion: 88 });
+  await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1", dbSchemaVersion: 89 });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
+  await assert.rejects(app.start(), /DESKTOP_DB_SCHEMA_DOWNGRADE_FORBIDDEN/u);
+  assert.equal(f.actions.includes("start"), false);
+  assert.equal(await readActivePointer(f.dataDir), "active-1");
+});
+
+test("完整安装仍服从比基线更高的持久数据库围栏", async t => {
+  const f = await heldApplicationFixture(t, { version: "2.0.0", dbSchemaVersion: 89 });
+  await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  await fs.writeFile(path.join(f.dataDir, "pending-release.json"), JSON.stringify({ schemaVersion: 1,
+    requestId: "a795cc4e-2c1f-4a3f-8611-31c54f0943d3", releaseId: "active-1", stagingName: "active-1", databaseSchemaVersion: 90 }), "utf8");
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
+  await assert.rejects(app.start(), /DESKTOP_DB_SCHEMA_FORWARD_ONLY/u);
+  assert.equal(f.actions.includes("start"), false);
+  assert.equal(await readActivePointer(f.dataDir), "active-1");
+  assert.equal((await readPendingRelease(f.dataDir))?.databaseSchemaVersion, 90);
+});
+
+test("完整安装升级数据库时Client失败只中止，不自动启动旧active", async t => {
+  const f = await heldApplicationFixture(t, { version: "2.0.0", dbSchemaVersion: 89 });
+  await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  const started: string[] = [];
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, createRuntime: (_entry, expectation) => {
+      f.runtime.start = async () => { started.push(expectation!.releaseId); throw new Error("BASELINE_CLIENT_FAILED"); };
+      return f.runtime;
+    } });
+  await assert.rejects(app.start(), /BASELINE_CLIENT_FAILED/u);
+  assert.deepEqual(started, ["baseline"]);
+  assert.equal(await readActivePointer(f.dataDir), "active-1");
+});
+
+test("完整安装基线失败保留旧指针，健康后清理再收口旧active的pending", async t => {
+  const f = await heldApplicationFixture(t, { version: "2.0.0" });
+  const activeDir = path.join(f.dataDir, "releases", "active-1");
+  await createHeldRelease(activeDir, { releaseId: "active-1" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  await fs.writeFile(path.join(f.dataDir, "pending-release.json"), JSON.stringify({ schemaVersion: 1,
+    requestId: "a795cc4e-2c1f-4a3f-8611-31c54f0943d3", releaseId: "active-1", stagingName: "active-1" }), "utf8");
+  let failWeb = true;
+  const entries: string[] = [], receipts: string[] = [];
+  f.host.loadWeb = async (_window, directory) => {
+    assert.equal(directory, f.baseline);
+    assert.equal(await readActivePointer(f.dataDir), "active-1");
+    if (failWeb) throw new Error("BASELINE_WEB_FAILED");
+  };
+  const options: Parameters<typeof createDesktopApplication>[0] = { dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, reportReceipt: async receipt => { receipts.push(receipt.stage); },
+    createRuntime: (entry, _expectation, startup) => {
+      entries.push(entry);
+      f.runtime.snapshot = () => ({ status: "ready", requestId: "ready", releaseId: "baseline", errorCode: null, pid: 123,
+        health: { protocolVersion: 1, clientVersion: "1.0.0", dbSchemaVersion: 88, database: "ready" },
+        ...(startup?.mode === "held" ? { startup: { continuationId: startup.continuationId, admission: "paused" } } : {}) });
+      return f.runtime;
+    } };
+  await assert.rejects(createDesktopApplication(options).start(), /BASELINE_WEB_FAILED/u);
+  assert.equal(await readActivePointer(f.dataDir), "active-1");
+  assert.ok(await readPendingRelease(f.dataDir));
+  failWeb = false;
+  const app = createDesktopApplication(options);
+  await app.start();
+  assert.equal(entries.every(entry => entry === path.join(f.baseline, "client", "dist", "index.cjs")), true);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.equal((await app.getUpdateDetails()).bundle.result, "same");
+  assert.deepEqual(receipts, []);
+  await app.exit();
+});
+
 for (const mode of ["missing-baseline", "wrong-baseline", "old-baseline", "wrong-baseline-marker", "old-active", "wrong-active-marker", "wrong-active-signature"] as const) {
   test(`held artifact gate rejects ${mode} before spawning and preserves the active binding`, async t => {
     const f = await heldApplicationFixture(t, { marker: mode === "old-baseline" ? false : mode === "wrong-baseline-marker" ? { heldStartupProtocol: 2 } : undefined });
@@ -1074,6 +1206,28 @@ test("another cold restart preserves activated resources without reopening their
   await f.app.exit();
 });
 
+test("完整安装接管后较新pending失败只恢复当前基线", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.available = false;
+  await f.app.checkForUpdates();
+  const baseline = path.join(f.dataDir, "installation", "shells", "baseline", "resources");
+  await createHeldRelease(baseline, { baseline: true, version: "1.5.0" });
+  await createHeldRelease(path.join(f.dataDir, "releases", "old-active"), { releaseId: "old-active" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "old-active" }), "utf8");
+  const loaded: string[] = [];
+  f.host.loadWeb = async (_window, directory) => {
+    loaded.push(directory);
+    if (directory === path.join(f.dataDir, "releases", "hot-release")) throw new Error("PENDING_WEB_FAILED");
+  };
+  await f.restart();
+  assert.deepEqual(loaded, [baseline, path.join(f.dataDir, "releases", "hot-release"), baseline]);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "restored");
+  assert.equal((await f.app.getUpdateDetails()).current.bundle?.releaseId, "baseline");
+  assert.ok(f.app.updateCheckFailure);
+  await f.app.exit();
+});
+
 test("a historical shell no-update binding is archived before activating new resources", async t => {
   const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false; f.control.available = false;
   await f.app.checkForUpdates();
@@ -1442,11 +1596,12 @@ test("closing the window keeps Client alive, explicit exit drains before destruc
   assert.deepEqual(f.actions.slice(-5), ["drain", "unregister", "tray-destroy", "window-destroy", "quit"]);
 });
 
-test("a trusted active resource starts without a permanently required installation baseline", async t => {
+for (const missing of ["directory", "manifest"] as const) test(`a trusted active resource starts without a permanently required installation baseline: ${missing}`, async t => {
   const f = await fixture(t), activeDirectory = path.join(f.dataDir, "releases", "active-independent");
   await loadOrCreateDeviceIdentity(f.dataDir);
   await createHeldRelease(activeDirectory, { releaseId: "active-independent" });
   await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-independent" }));
+  if (missing === "manifest") await fs.mkdir(path.join(f.dataDir, "missing-old-baseline"));
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: path.join(f.dataDir, "missing-old-baseline"),
     requireBaseline: true, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
   await app.start();

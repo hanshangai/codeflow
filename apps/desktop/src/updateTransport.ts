@@ -4,7 +4,9 @@ import { signDevicePayload, type DeviceIdentity } from "./deviceIdentity.js";
 import { preserveUpdateNetworkCancellation, type UpdateNetworkRetry } from "./updateNetworkRetry.js";
 
 type UpdateRequest = { method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD"; path: string; body?: unknown;
-  range?: string | null; ifMatch?: string | null; requestId?: string; signal?: AbortSignal };
+  range?: string | null; ifMatch?: string | null; requestId?: string; signal?: AbortSignal;
+  /** 仅文件下载显式启用正文空闲预算；默认含 raw JSON 均保留总超时。 */
+  streamResponse?: true };
 const REMOTE_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
 /** 固定 origin 与唯一 signer 供更新下载、阶段回执和错误补报复用，不自动联网。 */
@@ -22,8 +24,8 @@ export function createDesktopUpdateTransport(input: { dataDir: string; identity:
   const timeoutMs = input.timeoutMs ?? 30_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new Error("DESKTOP_UPDATE_TIMEOUT_INVALID");
 
-  /** 对确切正文签名；HTTP 失败分别保留本地传输类型和远端业务码。 */
-  const send = async (request: UpdateRequest, body: Uint8Array, raw = false): Promise<Response> => {
+  /** 对确切正文签名；文件单独约束响应头等待，JSON 保持整次响应总超时。 */
+  const send = async (request: UpdateRequest, body: Uint8Array, raw = false, streaming = false): Promise<Response> => {
     request.signal?.throwIfAborted();
     if (registrationHttp && (request.method !== "POST" || request.path !== "/api/software/desktop/devices/register")) throw new Error("DESKTOP_UPDATE_ORIGIN_INVALID");
     desktopDeviceRequestTarget(request.path);
@@ -39,13 +41,22 @@ export function createDesktopUpdateTransport(input: { dataDir: string; identity:
     if (body.byteLength) headers["content-type"] = "application/json";
     if (request.range != null) headers.range = request.range;
     if (request.ifMatch != null) headers["if-match"] = request.ifMatch;
+    const timeout = streaming ? new AbortController() : undefined;
+    const timer = timeout ? setTimeout(() => timeout.abort(new DOMException("Update response headers timed out", "TimeoutError")), timeoutMs) : undefined;
+    timer?.unref();
+    const signal = AbortSignal.any([timeout?.signal ?? AbortSignal.timeout(timeoutMs), ...(request.signal ? [request.signal] : [])]);
     let response: Response;
     try {
       response = await fetch(url, { method: request.method, headers, body: body.byteLength ? Buffer.from(body) : undefined,
-        redirect: "error", credentials: "omit", signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(request.signal ? [request.signal] : [])]) });
+        redirect: "error", credentials: "omit", signal });
     } catch (cause) {
+      clearTimeout(timer);
       throw Object.assign(new Error("DESKTOP_UPDATE_TRANSPORT_FAILED", { cause: preserveUpdateNetworkCancellation(cause, request.signal) }),
         { code: "DESKTOP_UPDATE_TRANSPORT_FAILED", requestId: metadata.requestId });
+    }
+    if (streaming && response.ok) {
+      clearTimeout(timer);
+      return withBodyTimeout(response, timeout!, signal, metadata.requestId);
     }
     if (!raw && !response.ok) {
       const retryAfter = response.headers.get("retry-after");
@@ -56,12 +67,57 @@ export function createDesktopUpdateTransport(input: { dataDir: string; identity:
           : preserveUpdateNetworkCancellation(cause, request.signal) }),
           { code: "DESKTOP_UPDATE_HTTP_FAILED", requestId: metadata.requestId, status: response.status, retryAfter });
       }
+      finally { clearTimeout(timer); }
       const value = failure && typeof failure === "object" ? failure as Record<string, unknown> : {};
       throw Object.assign(new Error("DESKTOP_UPDATE_HTTP_FAILED"),
         { code: safeRemoteErrorCode(value.code, "DESKTOP_UPDATE_HTTP_FAILED"), transportCode: "DESKTOP_UPDATE_HTTP_FAILED",
           requestId: metadata.requestId, status: response.status, retryAfter });
     }
     return response;
+  };
+
+  /** 只为等待下一段正文计空闲时间；消费方处理数据不占网络预算，取消与根因原样保留。 */
+  const withBodyTimeout = (response: Response, timeout: AbortController, signal: AbortSignal, requestId: string): Response => {
+    if (!response.body) return response;
+    const reader = response.body.getReader();
+    let finished = false;
+    /** 读流主因保留；取消和释放的独立失败聚合，清理错误不能被当作可重试网络故障。 */
+    const closeReader = async (cancel: boolean, reason?: unknown, failure?: { cause: unknown }): Promise<void> => {
+      try { if (cancel) await reader.cancel(reason); }
+      catch (cause) {
+        if (!failure || !Object.is(cause, failure.cause)) failure = { cause: new AggregateError(failure ? [failure.cause, cause] : [cause], "DESKTOP_UPDATE_BODY_CANCEL_FAILED") };
+      }
+      try { reader.releaseLock(); }
+      catch (cause) { failure = { cause: new AggregateError(failure ? [failure.cause, cause] : [cause], "DESKTOP_UPDATE_BODY_RELEASE_FAILED") }; }
+      if (failure) throw preserveUpdateNetworkCancellation(failure.cause, signal);
+    };
+    const body = new ReadableStream<Uint8Array>({
+      /** 按需读取防止提前缓存；每次收到字节后结束本次等待预算。 */
+      async pull(controller) {
+        const timer = setTimeout(() => timeout.abort(Object.assign(new DOMException("Update response body stalled", "TimeoutError"), { requestId })), timeoutMs);
+        timer.unref();
+        let next!: ReadableStreamReadResult<Uint8Array>, failure: { cause: unknown } | undefined;
+        try {
+          next = await reader.read();
+        } catch (cause) { failure = { cause }; }
+        finally { clearTimeout(timer); }
+        if (failure) {
+          if (finished) throw preserveUpdateNetworkCancellation(failure.cause, signal);
+          finished = true;
+          await closeReader(true, undefined, failure);
+          return;
+        }
+        if (finished) return;
+        if (next.done) { finished = true; await closeReader(false); controller.close(); }
+        else controller.enqueue(next.value);
+      },
+      /** 消费方放弃时同步取消上游，清理失败交回 owner。 */
+      async cancel(reason) {
+        finished = true;
+        await closeReader(true, reason);
+      },
+    }, { highWaterMark: 0 });
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
   };
 
   /** 固定本次 ID 与确切正文，普通/raw/JSON 入口共同使用同一序列化。 */
@@ -89,12 +145,12 @@ export function createDesktopUpdateTransport(input: { dataDir: string; identity:
     /** 单次物理发送，非 2xx 也只交响应；完整正文、HTTP 失败和清理由外层 owner 负责。 */
     async requestRaw(request: UpdateRequest): Promise<Response> {
       const { requestId, body } = prepare(request);
-      return await send({ ...request, requestId }, body, true);
+      return await send({ ...request, requestId }, body, true, request.streamResponse === true);
     },
     /** 正文与 requestId 固定一次；只重试取得响应，归档读流由下载器负责。 */
     async request(request: UpdateRequest): Promise<Response> {
       const { requestId, body } = prepare(request);
-      return await runNetwork(request.signal, async signal => await send({ ...request, requestId, signal }, body));
+      return await runNetwork(request.signal, async signal => await send({ ...request, requestId, signal }, body, false, request.streamResponse === true));
     },
     /** JSON 结构及业务失败保留请求标识，回执和错误补报不能把 HTTP 200 当成业务成功。 */
     async requestJson<T extends object>(input: UpdateRequest): Promise<T & { ok: true }> {

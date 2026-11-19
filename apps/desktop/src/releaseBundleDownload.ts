@@ -261,7 +261,7 @@ async function receiveArchiveOnce(input: DownloadOptions, file: FileHandle, star
   };
   try {
     const response = await input.transport.request({ method: "GET", path: input.archivePath, requestId,
-      ifMatch: `"${manifest.archiveSha256}"`, ...(start ? { range: `bytes=${start}-` } : {}),
+      ifMatch: `"${manifest.archiveSha256}"`, ...(start ? { range: `bytes=${start}-` } : {}), streamResponse: true,
       signal: input.signal ? AbortSignal.any([input.signal, abort.signal]) : abort.signal });
     reader = response.body?.getReader();
     assertResponse(response, start, manifest, requestId);

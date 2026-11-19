@@ -25,6 +25,7 @@
     "release:desktop": "node tools/release/desktop-release.mjs"
   },
   "pnpm": {
+    "patchedDependencies": { "undici@7.30.1": "patches/undici@7.30.1.patch" },
     "overrides": { "pino>thread-stream": "4.2.0", "thread-stream@4.2.0>real-require": "1.0.0" },
     "onlyBuiltDependencies": ["esbuild", "core-js", "node-pty", "@napi-rs/keyring"]
   },

@@ -11,6 +11,78 @@ import { loadOrCreateDeviceIdentity } from "../src/deviceIdentity.js";
 import { createDesktopUpdateTransport } from "../src/updateTransport.js";
 import { createUpdateNetworkRetry } from "../src/updateNetworkRetry.js";
 
+test("download transport bounds inactivity without imposing a total transfer deadline", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-download-timeout-"));
+  const identity = await loadOrCreateDeviceIdentity(dataDir);
+  const server = http.createServer((request, response) => {
+    verifyDesktopDeviceSignature(identity.publicKeyBase64, buildDesktopDevicePayload({ deviceId: identity.deviceId,
+      method: request.method!, url: request.url!, body: Buffer.alloc(0), requestId: String(request.headers["x-codeflow-request-id"]),
+      timestamp: Number(request.headers["x-codeflow-timestamp"]), range: request.headers.range ?? null, ifMatch: request.headers["if-match"] ?? null }),
+    String(request.headers["x-codeflow-signature"]));
+    if (request.url === "/api/software/desktop/headers") return;
+    const json = request.url === "/api/software/desktop/json" || request.url === "/api/software/desktop/http-error";
+    response.writeHead(request.url === "/api/software/desktop/http-error" ? 503 : request.headers.range ? 206 : 200,
+      { etag: '"download"', ...(request.headers.range ? { "content-range": "bytes 1-8/9" } : {}) });
+    response.write(json ? '{"ok":true,"padding":"' : "x");
+    if (request.url === "/api/software/desktop/stalled") return;
+    let chunks = 1;
+    const timer = setInterval(() => {
+      response.write("x");
+      if (++chunks === 8) { clearInterval(timer); response.end(json ? '"}' : ""); }
+    }, 50);
+    response.on("close", () => clearInterval(timer));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await fs.rm(dataDir, { recursive: true, force: true });
+  });
+  const transport = createDesktopUpdateTransport({ dataDir, identity, timeoutMs: 200,
+    configuredServerOrigin: `http://127.0.0.1:${(server.address() as { port: number }).port}` });
+  for (const method of ["request", "requestRaw"] as const) await t.test(`${method} accepts continuous progress beyond the header budget`, async () => {
+    const response = await transport[method]({ method: "GET", path: "/api/software/desktop/download", range: "bytes=1-", ifMatch: '"download"', streamResponse: true });
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get("content-range"), "bytes 1-8/9");
+    assert.equal(response.headers.get("etag"), '"download"');
+    assert.equal(await response.text(), "xxxxxxxx");
+  });
+  await t.test("waiting for response headers remains bounded", { timeout: 2_000 }, async () => {
+    await assert.rejects(transport.requestRaw({ method: "GET", path: "/api/software/desktop/headers", requestId: "header-timeout", streamResponse: true }),
+      (error: any) => error.requestId === "header-timeout" && error.cause?.name === "TimeoutError");
+  });
+  await t.test("a stalled body fails within its inactivity budget", { timeout: 2_000 }, async () => {
+    const response = await transport.request({ method: "GET", path: "/api/software/desktop/stalled", requestId: "stalled-download", streamResponse: true });
+    await assert.rejects(response.text(), (error: any) => error.name === "TimeoutError" && error.requestId === "stalled-download");
+  });
+  for (const reason of [new Error("download cancelled by user"), "cancelled-by-user"]) await t.test(`user cancellation preserves its original ${typeof reason} reason during body reads`, async () => {
+    const abort = new AbortController();
+    const response = await transport.requestRaw({ method: "GET", path: "/api/software/desktop/download", signal: abort.signal, streamResponse: true });
+    const reader = response.body!.getReader();
+    assert.equal((await reader.read()).done, false);
+    const pending = reader.read();
+    abort.abort(reason);
+    await assert.rejects(pending, error => error === reason || (error as Error).cause === reason);
+    reader.releaseLock();
+  });
+  await t.test("JSON keeps its total timeout even with continuous progress", async () => {
+    await assert.rejects(transport.requestJson({ method: "GET", path: "/api/software/desktop/json" }),
+      (error: any) => error.code === "DESKTOP_UPDATE_RESPONSE_INVALID" && error.cause?.name === "TimeoutError");
+  });
+  for (const method of ["request", "requestRaw"] as const) await t.test(`${method} keeps the total timeout unless streaming is explicit`, async () => {
+    const response = await transport[method]({ method: "GET", path: "/api/software/desktop/json" });
+    await assert.rejects(response.text(), (error: any) => error.name === "TimeoutError");
+  });
+  await t.test("HTTP error JSON keeps its total timeout even with continuous progress", async () => {
+    await assert.rejects(transport.request({ method: "GET", path: "/api/software/desktop/http-error", streamResponse: true }),
+      (error: any) => error.code === "DESKTOP_UPDATE_HTTP_FAILED" && error.cause?.name === "TimeoutError");
+  });
+  await t.test("raw HTTP error JSON keeps its total timeout for explicit downloads", async () => {
+    const response = await transport.requestRaw({ method: "GET", path: "/api/software/desktop/http-error", streamResponse: true });
+    await assert.rejects(response.text(), (error: any) => error.name === "TimeoutError");
+  });
+});
+
 test("账号 Server 的 HTTP 例外仅允许设备签名登记，不开放更新请求", async t => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-account-registration-"));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
@@ -38,26 +110,38 @@ test("账号 Server 的 HTTP 例外仅允许设备签名登记，不开放更新
   assert.throws(() => createDesktopUpdateTransport({ dataDir, identity, configuredServerOrigin: "http://test-server.invalid:39280" }), /DESKTOP_UPDATE_ORIGIN_INVALID/u);
 });
 
-test("raw request returns non-2xx headers without reading its body or entering transport retry", async t => {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-raw-transport-")), identity = await loadOrCreateDeviceIdentity(dataDir);
-  const response = new Response('{"remote":"malformed private body"', { status: 503, headers: { "retry-after": "2" } });
-  let sent = 0, contexts = 0;
-  t.mock.method(response, "json", () => { throw new Error("RAW_MUST_NOT_PARSE_JSON"); });
-  t.mock.method(globalThis, "fetch", async (_url: string | URL | Request, options: RequestInit) => {
-    sent++; assert.equal(options.redirect, "error"); assert.equal(options.credentials, "omit");
-    const headers = options.headers as Record<string, string>;
-    assert.equal(headers["x-codeflow-request-id"], "raw-request");
-    verifyDesktopDeviceSignature(identity.publicKeyBase64, buildDesktopDevicePayload({ deviceId: identity.deviceId,
-      method: "GET", url: "/api/software/desktop/raw", body: Buffer.alloc(0), requestId: "raw-request", timestamp: Number(headers["x-codeflow-timestamp"]) }), headers["x-codeflow-signature"]!);
-    return response;
+test("raw request returns headers without reading its body or entering transport retry", async t => {
+  for (const status of [200, 503]) await t.test(String(status), async t => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-raw-transport-")), identity = await loadOrCreateDeviceIdentity(dataDir);
+    let cancelled: unknown;
+    const response = new Response(new ReadableStream({
+      /** raw 返回响应头时不得提前读取正文。 */
+      pull() { assert.fail("RAW_MUST_NOT_READ_BODY"); },
+      /** owner 放弃正文时必须把同一取消原因交给上游。 */
+      cancel(reason) { cancelled = reason; },
+    }, { highWaterMark: 0 }), { status, headers: { "retry-after": "2" } });
+    let sent = 0, contexts = 0;
+    t.mock.method(response, "json", () => { throw new Error("RAW_MUST_NOT_PARSE_JSON"); });
+    t.mock.method(globalThis, "fetch", async (_url: string | URL | Request, options: RequestInit) => {
+      sent++; assert.equal(options.redirect, "error"); assert.equal(options.credentials, "omit");
+      const headers = options.headers as Record<string, string>;
+      assert.equal(headers["x-codeflow-request-id"], "raw-request");
+      verifyDesktopDeviceSignature(identity.publicKeyBase64, buildDesktopDevicePayload({ deviceId: identity.deviceId,
+        method: "GET", url: "/api/software/desktop/raw", body: Buffer.alloc(0), requestId: "raw-request", timestamp: Number(headers["x-codeflow-timestamp"]) }), headers["x-codeflow-signature"]!);
+      return response;
+    });
+    const transport = createDesktopUpdateTransport({ dataDir, identity, configuredServerOrigin: "http://127.0.0.1:39280",
+      getNetworkContext: () => { contexts++; throw new Error("RAW_MUST_NOT_ENTER_INTERNAL_RETRY"); } });
+    const raw = (transport as unknown as { requestRaw?: (value: unknown) => Promise<Response> }).requestRaw;
+    assert.equal(typeof raw, "function", "single-send requestRaw must exist");
+    const actual = await raw!({ method: "GET", path: "/api/software/desktop/raw", requestId: "raw-request", streamResponse: true });
+    assert.equal(actual.status, status); assert.equal(actual.headers.get("retry-after"), "2");
+    assert.equal(actual.bodyUsed, false); assert.equal(sent, 1); assert.equal(contexts, 0);
+    const reason = new Error("owner rejected response headers");
+    await actual.body!.cancel(reason);
+    assert.equal(cancelled, reason); assert.equal(response.body!.locked, false);
+    await fs.rm(dataDir, { recursive: true, force: true });
   });
-  const transport = createDesktopUpdateTransport({ dataDir, identity, configuredServerOrigin: "http://127.0.0.1:39280",
-    getNetworkContext: () => { contexts++; throw new Error("RAW_MUST_NOT_ENTER_INTERNAL_RETRY"); } });
-  const raw = (transport as unknown as { requestRaw?: (value: unknown) => Promise<Response> }).requestRaw;
-  assert.equal(typeof raw, "function", "single-send requestRaw must exist");
-  const actual = await raw!({ method: "GET", path: "/api/software/desktop/raw", requestId: "raw-request" });
-  assert.equal(actual, response); assert.equal(actual.status, 503); assert.equal(actual.bodyUsed, false); assert.equal(sent, 1); assert.equal(contexts, 0);
-  await actual.body!.cancel(); await fs.rm(dataDir, { recursive: true, force: true });
 });
 
 test("transport sends signed requests only to its configured origin and verifies registration acknowledgement", async () => {

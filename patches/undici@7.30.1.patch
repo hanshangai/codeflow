@@ -1,0 +1,28 @@
+--- a/lib/dispatcher/client-h1.js
++++ b/lib/dispatcher/client-h1.js
+@@ -371,9 +371,24 @@
+   finish () {
+     assert(currentParser === null)
+     assert(this.ptr != null)
+-    assert(!this.paused)
+ 
+     const { llhttp } = this
++
++    // Backport https://github.com/nodejs/undici/pull/5474: drain before EOF validation.
++    if (this.paused) {
++      let data
++      do {
++        llhttp.llhttp_resume(this.ptr)
++        this.paused = false
++        data = this.socket.read() || EMPTY_BUF
++        this.execute(data)
++      } while (this.paused && data.length > 0)
++
++      if (this.paused) {
++        llhttp.llhttp_resume(this.ptr)
++        this.paused = false
++      }
++    }
+ 
+     let ret
+ 

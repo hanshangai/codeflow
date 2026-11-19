@@ -24,6 +24,7 @@
     "pino-roll": "^4.0.0",
     "ppt-codec": "2.2.23",
     "saxes": "5.0.1",
+    "undici": "7.30.1",
     "unpdf": "1.9.1",
     "word-extractor": "1.0.4",
     "xlsx": "0.18.5"

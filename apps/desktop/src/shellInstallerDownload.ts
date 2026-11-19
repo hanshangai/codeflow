@@ -10,7 +10,7 @@ import { preserveUpdateNetworkCancellation } from "./updateNetworkRetry.js";
 
 type InstallerInput = {
   directory: string; manifest: unknown; trustedKeys: TrustedReleaseKeys; requestId: string; signal?: AbortSignal; now?: () => number;
-  transport: { request(input: { method: "GET"; path: string; requestId: string; range?: string; ifMatch: string; signal?: AbortSignal }): Promise<Response> };
+  transport: { request(input: { method: "GET"; path: string; requestId: string; range?: string; ifMatch: string; signal?: AbortSignal; streamResponse?: true }): Promise<Response> };
 };
 export type DownloadedShellInstaller = { installerPath: string; sha256: string; size: number };
 type Directory = { path: string; identity: BigIntStats };
@@ -140,7 +140,7 @@ async function receive(input: InstallerInput, manifest: ShellReleaseManifest, ta
   const signal = input.signal ? AbortSignal.any([input.signal, abort.signal]) : abort.signal;
   try {
     const response = await input.transport.request({ method: "GET", path: `/api/software/desktop/shell-releases/${manifest.shellId}/installer`,
-      requestId: input.requestId, ifMatch: `"${manifest.installerSha256}"`, ...(start ? { range: `bytes=${start}-` } : {}), signal });
+      requestId: input.requestId, ifMatch: `"${manifest.installerSha256}"`, ...(start ? { range: `bytes=${start}-` } : {}), signal, streamResponse: true });
     reader = response.body?.getReader();
     if (response.status !== (start ? 206 : 200) || response.headers.get("etag") !== `"${manifest.installerSha256}"`
       || response.headers.get("content-length") !== String(manifest.installerSize - start)
