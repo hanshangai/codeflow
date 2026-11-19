@@ -344,7 +344,9 @@ async function restoreMigrationAccount(input: { dataDir: string; identity: Devic
   ws.protocol = ws.protocol === "wss:" ? "https:" : "http:";
   const serverOrigin = ws.origin;
   const signal = AbortSignal.timeout(30_000);
-  await createDesktopUpdateTransport({ ...input, configuredServerOrigin: serverOrigin }).register({ signal });
+  // 迁移发生在运行时就绪前，没有可上报的资源版本；固定 unknown 以满足新登记协议。
+  await createDesktopUpdateTransport({ ...input, configuredServerOrigin: serverOrigin,
+    getVersions: () => ({ shellVersion: "unknown", webVersion: "unknown", clientVersion: "unknown", releaseId: "unknown" }) }).register({ signal });
   const unsigned = { schemaVersion: 1 as const, migrationId: record.migrationId!, sourceClientId: source.sourceClientId,
     targetClientId: record.targetClientId, deviceId: input.identity.deviceId, publicKey: input.identity.publicKeyBase64,
     timestamp: Date.now(), nonce: record.nonce };
