@@ -5,6 +5,16 @@ import path from "node:path";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
 import { createDesktopReleasePlan, readDesktopReleasePlan } from "../../tools/release/desktop-release-plan.mjs";
+import { allocateDesktopShellVersion } from "../../tools/release/desktop-shell-version.mjs";
+
+test("the shipped package baseline prevents a formal history reset below previously installed test shells", async () => {
+  const desktop = JSON.parse(await fs.readFile(new URL("../../apps/desktop/package.json", import.meta.url), "utf8"));
+  const fingerprint = "a".repeat(64);
+  const version = allocateDesktopShellVersion({ baselineVersion: desktop.version, shellInputFingerprint: fingerprint,
+    plans: [{ shellVersion: "1.1", shellInputFingerprint: fingerprint }] });
+  const [major, minor] = version.split(".").map(Number);
+  assert.ok(major! > 1 || major === 1 && minor! > 8, "installed test shells through 1.8 must all receive a newer official version");
+});
 
 /** 使用真实临时 Git 提交，验证壳与资源的来源隔离。 */
 async function fixture(t: test.TestContext) {
