@@ -9864,10 +9864,10 @@ export class CodexAppServerThreadSession implements ThreadEngineSession {
     } catch (cause) { throw this.retainDiagnosticFailure(cause); }
   }
 
-  /** 同一会话保留诊断根因，停止重试并拒绝活动等待，不影响其它 W。 */
+  /** 同一会话保留异步失败根因并停止owner；业务错误不得包装成日志失败。 */
   private retainDiagnosticFailure(cause: unknown): Error {
     if (this.diagnosticFailure) return this.diagnosticFailure.reason;
-    const failure = isEngineWorkspaceLogFailure(cause) ? cause as Error : createEngineWorkspaceLogFailure(cause);
+    const failure = cause instanceof Error ? cause : new Error("Codex 会话异步处理失败", { cause });
     this.diagnosticFailure = { reason: failure };
     this.clearReconnectRecovery();
     this.pendingSteerOwnershipRecoveryRequested = false;
@@ -9889,7 +9889,11 @@ export class CodexAppServerThreadSession implements ThreadEngineSession {
       active.lastNonRetryableTurnError = failure;
       active.timeoutController.stop();
       try { active.reject(failure); }
-      catch (secondary) { this.diagnosticFailure.reason = createEngineWorkspaceLogFailure(new AggregateError([failure, secondary], "Codex 回合和诊断收口均失败", { cause: failure })); }
+      catch (secondary) {
+        const aggregate = new AggregateError([failure, secondary], "Codex 回合与异步失败收口均失败", { cause: failure });
+        this.diagnosticFailure.reason = isEngineWorkspaceLogFailure(failure) || isEngineWorkspaceLogFailure(secondary)
+          ? createEngineWorkspaceLogFailure(aggregate) : aggregate;
+      }
     }
     return this.diagnosticFailure.reason;
   }

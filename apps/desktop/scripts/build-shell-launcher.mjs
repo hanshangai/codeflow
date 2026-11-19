@@ -59,7 +59,15 @@ function readWindowsVersion(version) {
 
 /** 在新独占目录编译启动器；可选图标/版本须在编译时写入，避免破坏 NSIS CRC。 */
 export async function buildShellLauncher(input) {
+  return await buildShellNativeTool(input, "launcher");
+}
+
+/** 原生壳工具共享编译与路径防护，仅接受仓内固定源码，不执行生成物。 */
+export async function buildShellNativeTool(input, kind) {
   if (process.platform !== "win32") throw new Error("DESKTOP_SHELL_BUILD_WINDOWS_REQUIRED");
+  if (kind !== "launcher" && kind !== "switch") throw new Error("DESKTOP_SHELL_BUILD_TOOL_INVALID");
+  const toolSource = kind === "launcher" ? sourcePath : fileURLToPath(new URL("../build/shell-switch.nsi", import.meta.url));
+  const outputName = kind === "launcher" ? "CodeFlowAI.exe" : "shell-switch.exe";
   const sharedCache = !input.cacheDir;
   const outputDir = await resolveNewPath(input.outputDir), cacheDir = await resolveNewPath(input.cacheDir ?? resolveSharedShellBuilderCache());
   const requireBuilder = createRequire(import.meta.resolve("electron-builder"));
@@ -69,7 +77,7 @@ export async function buildShellLauncher(input) {
     assertSeparate(cacheDir, protectedDir);
   }
   assertSeparate(outputDir, cacheDir);
-  await fs.access(sourcePath);
+  await fs.access(toolSource);
   const metadata = [];
   if (input.iconPath !== undefined) {
     const icon = await fs.realpath(input.iconPath), stat = await fs.lstat(input.iconPath);
@@ -100,9 +108,9 @@ export async function buildShellLauncher(input) {
   const relative = path.relative(cacheDir, compilerPath);
   if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("DESKTOP_SHELL_COMPILER_OUTSIDE_CACHE");
   assertSeparate(outputDir, path.dirname(compilerPath));
-  const output = path.join(outputDir, "CodeFlowAI.exe");
-  await run(compilerPath, ["/V2", `/DOUTPUT_FILE=${output}`, "/INPUTCHARSET", "UTF8", ...metadata, sourcePath], { ...env, ...compiler.env });
-  const executable = path.join(outputDir, "CodeFlowAI.exe");
+  const output = path.join(outputDir, outputName);
+  await run(compilerPath, ["/V2", `/DOUTPUT_FILE=${output}`, "/INPUTCHARSET", "UTF8", ...metadata, toolSource], { ...env, ...compiler.env });
+  const executable = path.join(outputDir, outputName);
   if (!(await fs.lstat(executable)).isFile()) throw new Error("DESKTOP_SHELL_LAUNCHER_OUTPUT_INVALID");
   return executable;
 }

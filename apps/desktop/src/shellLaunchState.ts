@@ -211,14 +211,9 @@ async function readStateBytes(file: FileHandle): Promise<Buffer> {
   return bytes.subarray(0, length);
 }
 
-/** 当前与候选选择使用同一最低布局，不代替完整库存或签名健康检查。 */
+/** 只核真正执行的壳；历史壳和Client/Web故障不能挡住当前壳的恢复入口。 */
 async function assertLayout(root: string, state: ShellLaunchState): Promise<void> {
-  for (const id of new Set([state.activeShellId, state.previousShellId, state.baselineShellId])) {
-    if (id !== null) await assertEntry(root, ["shells", id, "CodeFlowAI.exe"]);
-  }
-  for (const entry of [["web", "index.html"], ["client", "dist", "index.cjs"], ["release-trust.json"]]) {
-    await assertEntry(root, ["shells", state.baselineShellId, "resources", ...entry]);
-  }
+  await assertEntry(root, ["shells", state.activeShellId, "CodeFlowAI.exe"]);
 }
 
 /** 只比较复制后的三个数据字段，恢复时不会丢失原 previous。 */

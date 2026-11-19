@@ -9,6 +9,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { compileFunction } from "node:vm";
 import { formatDesktopVersion } from "@codeflowai/shared";
 import { createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion } from "../scripts/package-local-builder.mjs";
+import { createDesktopReleasePlan, readDesktopReleasePlan } from "../../../tools/release/desktop-release-plan.mjs";
+import { readDesktopShellInputs } from "../../../tools/release/desktop-shell-version.mjs";
 
 const script = await fs.readFile(new URL("../scripts/package-local-mac.mjs", import.meta.url), "utf8");
 const builderEntry = createRequire(import.meta.url).resolve("electron-builder");
@@ -29,6 +31,7 @@ async function fixture(t: TestContext) {
     "resources/client/cli-runtime.json": JSON.stringify({ schemaVersion: 1, npm: { version: "12.2.2" }, engines: {} }),
     "resources/release-trust.json": "{}",
     "desktop/dist/main.js": "main", "desktop/dist/preload.cjs": "preload", "desktop/dist/macosUninstallHelper.cjs": "helper",
+    "desktop/build/icon.png": "fixed shell icon",
     "desktop/package.json": '{"version":"1.0"}',
     "desktop/electron-builder.yml": JSON.stringify({ files: ["dist/**", "package.json"], mac: { target: "dmg", artifactName: "CodeFlowAI-${version}-${os}-${arch}.${ext}" } }),
   };
@@ -67,11 +70,13 @@ async function runScript(f: Fixture, output: string, extra: string[] = []) {
   const execute = compileFunction(`return (async () => {${source}\n})();`,
     ["fs", "path", "crypto", "createRequire", "fileURLToPath", "build", "Platform", "Arch", "process", "console",
       "formatDesktopVersion", "createBuilderProject", "removeBuilderProject", "resolveElectronVersion", "toBuilderVersion",
-      "assertTrustedReleaseKeys", "verifyReleaseBundlePayload"]);
+      "assertTrustedReleaseKeys", "verifyReleaseBundlePayload", "readDesktopReleasePlan", "readDesktopShellInputs"]);
   await execute(fs, { ...path, resolve: (...segments: string[]) => path.resolve(f.root, ...segments) }, crypto, createRequire,
     fileURLToPath, build, { MAC: { createTarget: (target: string, arch: number) => [target, arch] } }, { x64: 1, arm64: 2 }, state,
     { log: (line: string) => messages.push(JSON.parse(line)), error: (line: string) => messages.push(JSON.parse(line)) },
-    formatDesktopVersion, createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion, () => ({}), () => ({}));
+    formatDesktopVersion, createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion, () => ({}), () => ({}),
+    (options: Parameters<typeof readDesktopReleasePlan>[0]) => readDesktopReleasePlan({ ...options, root: fileURLToPath(new URL("../../..", import.meta.url)) }),
+    () => readDesktopShellInputs(fileURLToPath(new URL("../../..", import.meta.url))));
   return { state, messages, calls };
 }
 
@@ -80,6 +85,18 @@ test("macOS 打包声明最低系统为 Ventura", async () => {
   const { load } = requireBuilderLibrary("js-yaml");
   const config = load(await fs.readFile(new URL("../electron-builder.yml", import.meta.url), "utf8"));
   assert.equal(config.mac.minimumSystemVersion, "13.0");
+});
+
+test("macOS planned packaging consumes the allocated shell version", async t => {
+  const f = await fixture(t);
+  const { file, plan } = await createDesktopReleasePlan({ root: fileURLToPath(new URL("../../..", import.meta.url)),
+    platforms: ["darwin/arm64"], keyId: "fixture", planDir: path.join(f.root, "plans"), allowDirty: true });
+  const result = await runScript(f, path.join(f.root, "planned"), ["--plan", file, "--allow-dirty"]);
+  assert.equal(result.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY");
+  assert.equal(result.messages[0]?.shellVersion, plan.shellVersion);
+  const config = JSON.parse(await fs.readFile(result.calls[0]!.config, "utf8"));
+  assert.equal(config.extraMetadata.version, `${plan.shellVersion}.0`);
+  assert.equal(JSON.parse(await fs.readFile(path.join(f.shell, "package.json"), "utf8")).version, "1.0");
 });
 
 test("macOS 本地包拒绝与输入重叠的输出目录", async t => {
@@ -101,6 +118,8 @@ test("macOS 未签名 dir 包禁用签名并携带本地标记", async t => {
   assert.equal(result.messages[0]?.baseline, false);
   const config = JSON.parse(await fs.readFile(result.calls[0]!.config, "utf8"));
   assert.equal(config.mac.identity, null);
+  const icon = config.extraResources.find((entry: { to: string }) => entry.to === "shell-icon.png");
+  assert.equal(await fs.readFile(icon.from, "ascii"), "fixed shell icon");
   assert.equal(config.mac.hardenedRuntime, false);
   assert.match(String(config.afterPack).replaceAll("\\", "/"), /\/scripts\/adhoc-sign-mac\.cjs$/u);
   assert.deepEqual(config.dmg.contents, [

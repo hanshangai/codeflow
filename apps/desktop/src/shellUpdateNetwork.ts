@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
-import type { ShellReleaseManifest } from "@codeflowai/shared";
+import { compareNumericVersion, type ShellReleaseManifest } from "@codeflowai/shared";
 import { assertDesktopDeviceIdentity, desktopDevicePublicKeySha256, readDesktopDevicePlatform } from "@codeflowai/shared/desktop-device-auth";
 import type { TrustedReleaseKeys } from "@codeflowai/shared/desktop-release-signing";
 import { verifyShellReleaseSignature } from "@codeflowai/shared/desktop-shell-release-signing";
@@ -11,15 +11,17 @@ import { createDesktopUpdateTransport } from "./updateTransport.js";
 import { createShellUpdateAttemptNetworkAdapter, isShellUpdateHandoffAttempt, type ShellUpdateAttemptStore, type ShellUpdatePreparationAttempt, type ShellUpdateHandoffAttempt, type ShellUpdateTarget } from "./shellUpdateAttempt.js";
 import { createUpdateNetworkRetry, preserveUpdateNetworkCancellation, type UpdateNetworkAction, type UpdateNetworkEvidence } from "./updateNetworkRetry.js";
 import { downloadShellInstaller, recoverShellInstaller, type DownloadedShellInstaller } from "./shellInstallerDownload.js";
-import { matchesInstalledShellRelease } from "./shellReleaseArtifact.js";
 
 type Registration = { ok: true; deviceId: string; publicKeySha256: string };
 type Discovery = { ok: true; available: false; deviceId: string; requestId: string }
   | { ok: true; available: true; deviceId: string; requestId: string; manifest: ShellReleaseManifest };
+export type ShellDiscovery = Discovery;
 export type ShellUpdateDiscoveryResult = { status: "no-update"; attempt: ShellUpdatePreparationAttempt; reason?: "none" | "same" }
   | { status: "target"; attempt: ShellUpdatePreparationAttempt; manifest: ShellReleaseManifest };
 type Directory = { directory: string; identity: BigIntStats };
 type NetworkInput = { store: ShellUpdateAttemptStore; identity: DeviceIdentity; configuredServerOrigin: string;
+  currentShellVersion?: string;
+  discovery?: (requestId: string) => Promise<ShellDiscovery>;
   trustedKeys: TrustedReleaseKeys; signal: AbortSignal;
   onRetry: (context: { retry: number; delayMs: number; error: unknown }) => void | Promise<void>;
   onExhausted?: (error: unknown) => void };
@@ -90,22 +92,30 @@ export function createShellUpdateNetwork(input: NetworkInput) {
           const recovered = await discoveryAction.recoverResult(later ? null : slot!.status === "succeeded" ? slot!.evidence : null);
           if (recovered.status !== "verified") throw failure("DESKTOP_SHELL_NETWORK_RESULT_UNKNOWN");
           found = recovered.value;
-        } else found = await retry.run(async () => discovery(await readResponse(await transport.requestRaw({ method: "GET", path: DISCOVER,
-          requestId, signal: input.signal }), input.signal, requestId!)), discoveryAction);
+        } else found = await retry.run(async () => discovery(input.discovery ? await input.discovery(requestId!)
+          : await readResponse(await transport.requestRaw({ method: "GET", path: DISCOVER,
+            requestId, signal: input.signal }), input.signal, requestId!)), discoveryAction);
         input.signal.throwIfAborted();
         const attempt = await current(input.store);
         if (attempt.requestId !== requestId || ["schemaVersion", "installationDir", "dataDir", "userDataDir", "sessionDataDir", "originalState", "binding",
           ...(initial.schemaVersion === 5 ? ["preparationMains", "owned", "ownedLifecycle"] : [])]
           .some(key => JSON.stringify((attempt as unknown as Record<string, unknown>)[key]) !== JSON.stringify((initial as unknown as Record<string, unknown>)[key]))) throw failure("DESKTOP_SHELL_NETWORK_STATE_CONFLICT");
-        // 完整安装初始标识可不同；同一签名库存不重复下载或改写启动选择。
-        const sameInstalled = found.available && attempt.target === null && found.manifest.shellId !== attempt.originalState.activeShellId
-          && await matchesInstalledShellRelease({ manifest: found.manifest, trustedKeys: input.trustedKeys,
-            candidateDirectory: path.join(attempt.installationDir, "shells", attempt.originalState.activeShellId) });
-        if (!found.available || found.manifest.shellId === attempt.originalState.activeShellId || sameInstalled) {
+        // 是否更新只比较独立壳版本；已有目标仍沿原尝试恢复，不重新选择版本。
+        let newer = false;
+        if (found.available && attempt.target === null) {
+          if (!/^\d+(?:\.\d+){1,3}$/u.test(input.currentShellVersion ?? "") || !/^\d+(?:\.\d+){1,3}$/u.test(found.manifest.version)) {
+            throw failure("DESKTOP_SHELL_VERSION_INVALID");
+          }
+          const currentVersion = input.currentShellVersion!.split(".").length === 2 ? `${input.currentShellVersion}.0` : input.currentShellVersion!;
+          const targetVersion = found.manifest.version.split(".").length === 2 ? `${found.manifest.version}.0` : found.manifest.version;
+          newer = compareNumericVersion(targetVersion, currentVersion) > 0;
+        }
+        if (!found.available || attempt.target === null && !newer) {
           if (attempt.target !== null) throw failure("DESKTOP_SHELL_NETWORK_STATE_CONFLICT");
           const terminal = attempt.phase === "no-update" ? attempt : await input.store.replace(attempt, { ...attempt, revision: attempt.revision + 1, phase: "no-update" }) as ShellUpdatePreparationAttempt;
           input.signal.throwIfAborted(); return { status: "no-update", attempt: terminal, reason: found.available ? "same" : "none" };
         }
+        if (found.manifest.shellId === attempt.originalState.activeShellId) throw failure("DESKTOP_SHELL_VERSION_ID_CONFLICT");
         if (attempt.phase !== "preparing") throw failure("DESKTOP_SHELL_NETWORK_STATE_CONFLICT");
         const manifest = found.manifest, target = { shellId: manifest.shellId, manifestSha256: sha256(JSON.stringify(manifest)),
           installerSha256: manifest.installerSha256, installerSize: manifest.installerSize };

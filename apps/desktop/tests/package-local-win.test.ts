@@ -10,6 +10,8 @@ import { compileFunction } from "node:vm";
 import { formatDesktopVersion } from "@codeflowai/shared";
 import { assertTrustedReleaseKeys, verifyReleaseBundlePayload, readReleaseBundleFiles, computeReleaseDirectorySha256, computeReleasePackageSha256, signReleaseBundleManifest } from "@codeflowai/shared/desktop-release-signing";
 import { createBuilderProject, removeBuilderProject, toBuilderVersion } from "../scripts/package-local-builder.mjs";
+import { createDesktopReleasePlan, readDesktopReleasePlan } from "../../../tools/release/desktop-release-plan.mjs";
+import { readDesktopShellInputs } from "../../../tools/release/desktop-shell-version.mjs";
 
 const script = await fs.readFile(new URL("../scripts/package-local-win.mjs", import.meta.url), "utf8");
 const builderEntry = createRequire(import.meta.url).resolve("electron-builder");
@@ -35,6 +37,7 @@ async function fixture(t: TestContext) {
     "resources/client/cli-runtime.json": JSON.stringify({ schemaVersion: 1, npm: { version: "12.2.2" }, engines: {} }),
     "resources/release-trust.json": "{}",
     "desktop/dist/main.js": "main", "desktop/dist/preload.cjs": "preload",
+    "desktop/build/icon.png": "fixed shell icon",
     "desktop/node_modules/dep/package.json": "{}",
     "desktop/package.json": '{"version":"1.0"}', "desktop/electron-builder.yml": JSON.stringify({ files: ["dist/**", "package.json"],
       nsis: { allowToChangeInstallationDirectory: true }, win: { target: "nsis" }, mac: { target: "dmg" } }),
@@ -49,20 +52,32 @@ async function fixture(t: TestContext) {
 
 /** 执行原完整 CLI；隔离本机 Electron 和 builder 边界，所有写入留在独占夹具。 */
 async function runScript(f: Fixture, output: string, input = f.resources, extra: string[] = [], argv = [input, output, ...extra],
-  builderResult?: (executable: string) => Promise<string[]>) {
+  builderResult?: (executable: string) => Promise<string[]>, installedElectronVersion = "45.0.0", nativeFailure?: Error) {
   const state: { argv: string[]; platform: string; env: Record<string, string>; exitCode?: number } = {
     argv: [process.execPath, path.join(f.shell, "scripts/package-local-win.mjs"), ...argv], platform: "win32", env: {},
   };
   const messages: Array<Record<string, unknown>> = [];
   const calls: Array<{ projectDir: string; targets: unknown; publish: string; config: string }> = [];
+  const manifests: Array<{ version: string; shellVersion: string }> = [];
+  const nativeTools: Array<{ outputDir: string; version: string }> = [];
+  /** 仅隔离 NSIS 编译；实际资源装配和临时项目清理继续执行原逻辑。 */
+  const buildShellSwitch = async (input: { outputDir: string; version: string }) => {
+    nativeTools.push(input);
+    await fs.mkdir(input.outputDir);
+    const executable = path.join(input.outputDir, "shell-switch.exe");
+    await fs.writeFile(executable, "native shell switch", "ascii");
+    if (nativeFailure) throw nativeFailure;
+    return executable;
+  };
   /** 目录选择和 PE 校验另有真实测试；此处只隔离构建机依赖并核对打包目标。 */
   const resolveInstalledElectronDist = async (target: { platform: string; arch: string }) => {
     assert.deepEqual(target, { platform: "win32", arch: "x64" });
-    return { electronDist: path.join(f.root, "electron-dist"), electronVersion: "45.0.0" };
+    return { electronDist: path.join(f.root, "electron-dist"), electronVersion: installedElectronVersion };
   };
   // 隔离 Electron/NSIS 构建；布局钩子仍使用真实文件转换，仅启动器编译以夹具代替。
   const build = async (options: typeof calls[number]) => {
     calls.push(options);
+    manifests.push(JSON.parse(await fs.readFile(path.join(options.projectDir, "package.json"), "utf8")));
     await fs.access(path.join(options.projectDir, "node_modules/dep/package.json"));
     const config = JSON.parse(await fs.readFile(options.config, "utf8"));
     const artifactName = String(config.artifactName).replaceAll("${ext}", "exe").replaceAll("${arch}", "x64").replaceAll("${os}", "win");
@@ -73,6 +88,10 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     await fs.mkdir(appOutDir, { recursive: true });
     if ((options.targets as string[])[0] === "nsis") await fs.writeFile(path.join(appOutDir, "CodeFlowAI.exe"), "electron", "ascii");
     await fs.cp(f.resources, path.join(appOutDir, "resources"), { recursive: true });
+    const nativeTool = config.extraResources.find((entry: { to: string }) => entry.to === "shell-switch.exe");
+    if (nativeTool) await fs.copyFile(nativeTool.from, path.join(appOutDir, "resources/shell-switch.exe"));
+    const icon = config.extraResources.find((entry: { to: string }) => entry.to === "shell-icon.png");
+    if (icon) await fs.copyFile(icon.from, path.join(appOutDir, "resources/shell-icon.png"));
     await fs.writeFile(path.join(appOutDir, "resources/app.asar"), "application", "ascii");
     if (config.afterSign) {
       assert.equal(config.afterSign, path.join(f.shell, "scripts/windows-install-layout.mjs"));
@@ -89,14 +108,33 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
   const execute = compileFunction(`return (async () => {${source}\n})();`,
     ["fs", "path", "crypto", "createRequire", "fileURLToPath", "build", "Platform", "Arch", "process", "console", "formatDesktopVersion",
       "createBuilderProject", "removeBuilderProject", "resolveInstalledElectronDist", "toBuilderVersion",
-      "assertTrustedReleaseKeys", "verifyReleaseBundlePayload"]);
+      "assertTrustedReleaseKeys", "verifyReleaseBundlePayload", "readDesktopReleasePlan", "readDesktopShellInputs", "buildShellSwitch"]);
   await execute(fs, { ...path, resolve: (...segments: string[]) => path.resolve(f.root, ...segments) }, crypto, createRequire, fileURLToPath, build,
     { WINDOWS: { createTarget: (target: string, arch: number) => [target, arch] } }, { x64: 1 }, state,
     { log: (line: string) => messages.push(JSON.parse(line)), error: (line: string) => messages.push(JSON.parse(line)) }, formatDesktopVersion,
     createBuilderProject, removeBuilderProject, resolveInstalledElectronDist, toBuilderVersion,
-    assertTrustedReleaseKeys, verifyReleaseBundlePayload);
-  return { state, messages, calls };
+    assertTrustedReleaseKeys, verifyReleaseBundlePayload,
+    (options: Parameters<typeof readDesktopReleasePlan>[0]) => readDesktopReleasePlan({ ...options, root: fileURLToPath(new URL("../../..", import.meta.url)) }),
+    () => readDesktopShellInputs(fileURLToPath(new URL("../../..", import.meta.url))), buildShellSwitch);
+  return { state, messages, calls, manifests, nativeTools };
 }
+
+test("planned packaging injects the exact allocated shell version and refuses a different installed Electron", async t => {
+  const f = await fixture(t), output = path.join(f.root, "planned-output");
+  const { file, plan } = await createDesktopReleasePlan({ root: fileURLToPath(new URL("../../..", import.meta.url)),
+    platforms: ["win32/x64"], keyId: "fixture", planDir: path.join(f.root, "plans"), allowDirty: true });
+  const extra = ["--plan", file, "--allow-dirty"];
+  const result = await runScript(f, output, f.resources, extra);
+  assert.equal(result.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY");
+  assert.equal(result.messages[0]?.shellVersion, plan.shellVersion);
+  assert.deepEqual({ version: result.manifests[0]?.version, shellVersion: result.manifests[0]?.shellVersion }, { version: `${plan.shellVersion}.0`, shellVersion: plan.shellVersion });
+  assert.equal(JSON.parse(await fs.readFile(path.join(f.shell, "package.json"), "utf8")).version, "1.0");
+  const wrong = path.join(f.root, "wrong-electron");
+  const failure = await runScript(f, wrong, f.resources, extra, [f.resources, wrong, ...extra], undefined, "44.0.0");
+  assert.equal(failure.messages[0]?.rootCause, "DESKTOP_SHELL_ELECTRON_LOCK_MISMATCH");
+  assert.equal(failure.calls.length, 0);
+  await assert.rejects(fs.access(wrong), { code: "ENOENT" });
+});
 
 /** 记录真实文件字节和链接目标，不遍历链接，避免把检测本身变成目录复制。 */
 async function snapshot(directory: string): Promise<Record<string, string>> {
@@ -396,6 +434,12 @@ for (const [target, options] of [
     assert.equal(result.calls.length, 1);
     assert.deepEqual(result.calls[0]!.targets, [target, 1]);
     assert.equal(result.calls[0]!.publish, "never");
+    assert.equal(result.nativeTools.length, 1);
+    assert.equal(result.nativeTools[0]?.version, "1.0");
+    const nativeResource = target === "nsis" ? "win-unpacked/shells/installation/resources/shell-switch.exe" : "win-unpacked/resources/shell-switch.exe";
+    assert.equal(await fs.readFile(path.join(output, nativeResource), "ascii"), "native shell switch");
+    assert.equal(await fs.readFile(path.join(output, path.dirname(nativeResource), "shell-icon.png"), "ascii"), "fixed shell icon");
+    await assert.rejects(fs.access(result.nativeTools[0]!.outputDir), { code: "ENOENT" });
     const config = JSON.parse(await fs.readFile(result.calls[0]!.config, "utf8"));
     assert.equal(config.win.signAndEditExecutable, undefined);
     assert.equal(config.win.signExecutable, false);
@@ -422,6 +466,16 @@ for (const [target, options] of [
     assert.deepEqual(await snapshot(f.resources), before);
   });
 }
+
+test("native switch compilation failure stops packaging and removes the temporary project", async t => {
+  const f = await fixture(t), output = path.join(f.root, "native-failure");
+  const result = await runScript(f, output, f.resources, [], [f.resources, output], undefined, "45.0.0", new Error("native compile failed"));
+  assert.equal(result.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_FAILED");
+  assert.equal(result.messages[0]?.rootCause, "native compile failed");
+  assert.equal(result.calls.length, 0);
+  assert.equal(result.nativeTools.length, 1);
+  await assert.rejects(fs.access(result.nativeTools[0]!.outputDir), { code: "ENOENT" });
+});
 
 for (const invalid of ["none", "multiple", "outside", "missing"] as const) {
   test(`invalid NSIS result ${invalid} fails without publishing success or changing inputs`, async t => {

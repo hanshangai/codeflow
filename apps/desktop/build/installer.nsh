@@ -3,33 +3,32 @@
 !include "FileFunc.nsh"
 !include "nsDialogs.nsh"
 
-!ifndef CODEFLOW_STOP_INSTALLED_HELPER
-  !define CODEFLOW_STOP_INSTALLED_HELPER "${__FILEDIR__}\stop-installed-processes.ps1"
+!ifndef CODEFLOW_STOP_INSTALLED_INCLUDE
+  !define CODEFLOW_STOP_INSTALLED_INCLUDE "${__FILEDIR__}\stop-installed-processes.nsh"
 !endif
+!include "${CODEFLOW_STOP_INSTALLED_INCLUDE}"
 
+; Native ownership checks and held process handles are independent of Electron, Client and PowerShell.
 !macro D16StopInstalledProcesses UNINSTALL
-  InitPluginsDir
-  ClearErrors
-  File /oname=$PLUGINSDIR\stop-installed-processes.ps1 "${CODEFLOW_STOP_INSTALLED_HELPER}"
-  GetTempFileName $R8
-  StrCpy $R9 -1
-  ${IfNot} ${Errors}
-    StrCpy $R7 "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
-    ${If} ${FileExists} "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
-      StrCpy $R7 "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+  !if "${UNINSTALL}" == "true"
+    StrCpy $d16StopRequest $d16RequestId
+    Call un.D16StopNativeProcesses
+  !else
+    ${If} $d16InstallRequestId == ""
+      Call D16NewInstallRequestId
     ${EndIf}
-    ExecWait '"$R7" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop-installed-processes.ps1" -InstallDirectory "$INSTDIR" -LogPath "$R8"' $R9
-  ${EndIf}
+    StrCpy $d16StopRequest $d16InstallRequestId
+    Call D16StopNativeProcesses
+  !endif
   DetailPrint "CodeFlow process stop diagnostic: $R8"
-  ${If} ${Errors}
-  ${OrIf} $R9 != 0
+  ${If} $d16StopFailure != ""
     !if "${UNINSTALL}" == "true"
       StrCpy $d16FailureCode DESKTOP_INSTALL_PROCESS_STOP_FAILED
-      StrCpy $d16FailureDetails '"stage":"installation-process-stop","rootCause":"PROCESS_STOP_FAILED","exitCode":$R9'
+      StrCpy $d16FailureDetails '"stage":"installation-process-stop","rootCause":"$d16StopFailure","processId":$d16StopPid,"win32Error":$d16StopError'
       Call un.D16FailUninstall
     !else
-      StrCpy $d16InstallExitCode $R9
-      StrCpy $d16InstallCause "INSTALL_PROCESS_STOP_FAILED"
+      StrCpy $d16InstallExitCode "null"
+      StrCpy $d16InstallCause $d16StopFailure
       StrCpy $d16InstallStage "installation-process-stop"
       StrCpy $d16InstallErrorCode DESKTOP_INSTALL_PROCESS_STOP_FAILED
       Call D16FailInstallation
@@ -42,36 +41,23 @@
     ${If} ${isUpdated}
       Call un.D16NewRequestId
       !insertmacro D16StopInstalledProcesses true
-      ClearErrors
-      ExecWait '"$INSTDIR\CodeFlowAI.exe" --codeflow-check-installation' $0
-      ${If} ${Errors}
-        StrCpy $d16FailureCode DESKTOP_INSTALL_PREFLIGHT_FAILED
-        StrCpy $d16FailureDetails '"stage":"installation-preflight","rootCause":"PROCESS_START_FAILED","exitCode":null'
-        Call un.D16FailUninstall
-      ${EndIf}
-      ${If} $0 != 0
-        StrCpy $d16FailureCode DESKTOP_INSTALL_PREFLIGHT_FAILED
-        StrCpy $d16FailureDetails '"stage":"installation-preflight","rootCause":"PROCESS_EXIT_NONZERO","exitCode":$0'
-        Call un.D16FailUninstall
-      ${EndIf}
     ${EndIf}
   !else
-    ${If} ${FileExists} "$INSTDIR\CodeFlowAI.exe"
+    !include "${CODEFLOW_UPGRADE_INSTALLED_INCLUDE}"
+    ${If} ${FileExists} "$INSTDIR\*.*"
       Call D16NewInstallRequestId
       !insertmacro D16StopInstalledProcesses false
     ${EndIf}
   !endif
 !macroend
 
+
 !ifdef BUILD_UNINSTALLER
-  Var d16KeepData
   Var d16RequestId
-  Var d16Mode
   Var d16Parameters
   Var d16FailureLog
   Var d16FailureCode
   Var d16FailureDetails
-  Var d16ChoiceCause
 
 ; Persist bounded failure context before exiting; never create a maintenance result.
 Function un.D16FailUninstall
@@ -102,15 +88,6 @@ Function un.D16FailUninstall
     Quit
 FunctionEnd
 
-; Preserve the choice-failure contract while sharing the uninstall diagnostic boundary.
-Function un.D16FailChoice
-    System::Call 'kernel32::GetCurrentProcessId() i.r0'
-    System::Call 'kernel32::GetTickCount() i.r2'
-    StrCpy $d16RequestId "nsis-choice-$0-$2"
-    StrCpy $d16FailureCode DESKTOP_UNINSTALL_CHOICE_INVALID
-    StrCpy $d16FailureDetails '"stage":"uninstall-choice","rootCause":"$d16ChoiceCause"'
-    Call un.D16FailUninstall
-FunctionEnd
 !endif
 
 ; Generate a short request id without reading or writing a result file.
@@ -125,7 +102,6 @@ FunctionEnd
 ; Use the template's upgrade predicate and actual silent state before any file removal.
 !ifdef BUILD_UNINSTALLER
 !macro customUnInit
-  !insertmacro customCheckAppRunning
   ${GetParameters} $d16Parameters
   ClearErrors
   ${GetOptions} $d16Parameters "--delete-app-data" $0
@@ -136,20 +112,15 @@ FunctionEnd
     Call un.D16FailUninstall
   ${EndIf}
   ${If} ${isUpdated}
+    !insertmacro customCheckAppRunning
     Return
-  ${EndIf}
-  ${If} ${Silent}
-    Call un.D16NewRequestId
-    StrCpy $d16FailureCode DESKTOP_UNINSTALL_INVOCATION_REJECTED
-    StrCpy $d16FailureDetails '"stage":"uninstall-init","rootCause":"SILENT_UNINSTALL_UNSUPPORTED"'
-    Call un.D16FailUninstall
   ${EndIf}
 !macroend
 
-; The single uninstall choice defaults to retaining application data.
+; Program removal preserves all user data; destructive data maintenance is a separate action.
 !macro customUnWelcomePage
-  UninstPage custom un.D16UninstallWelcomePage un.D16UninstallWelcomeLeave
-  ; Explain the private-data scope before choosing; skip this page for upgrades.
+  UninstPage custom un.D16UninstallWelcomePage
+  ; Explain the exact retention boundary; upgrades skip this page.
   Function un.D16UninstallWelcomePage
     ${If} ${isUpdated}
       Abort
@@ -157,38 +128,16 @@ FunctionEnd
     nsDialogs::Create 1018
     Pop $0
     ${If} $0 == error
-      Abort
+      Call un.D16NewRequestId
+      StrCpy $d16FailureCode DESKTOP_UNINSTALL_PAGE_FAILED
+      StrCpy $d16FailureDetails '"stage":"uninstall-page","rootCause":"DIALOG_CREATE_FAILED"'
+      Call un.D16FailUninstall
     ${EndIf}
-    ${NSD_CreateLabel} 0 0u 100% 24u "仅影响本机应用数据；项目和工作区 .codeflow 始终保留。"
+    ${NSD_CreateLabel} 0 0u 100% 36u "仅卸载程序，账号、设备身份、配置和业务任务原样保留。"
     Pop $0
-    ${NSD_CreateCheckbox} 0 32u 100% 12u "保留本机应用数据"
-    Pop $d16KeepData
-    ${NSD_CreateLabel} 0 56u 100% 40u "两种选择都会移除安装身份；保留数据中的敏感凭据需重新录入。"
+    ${NSD_CreateLabel} 0 48u 100% 36u "项目和工作区 .codeflow 始终保留。若需清理数据，请先在应用内显式操作并确认清理结果。"
     Pop $0
-    ${If} $d16Mode == ""
-      StrCpy $d16Mode keep
-    ${EndIf}
-    ${If} $d16Mode == keep
-      ${NSD_Check} $d16KeepData
-    ${EndIf}
     nsDialogs::Show
-  FunctionEnd
-
-  ; Read the choice while its window is still alive; never infer remove from a dead handle.
-  Function un.D16UninstallWelcomeLeave
-    System::Call 'user32::IsWindow(p $d16KeepData) i.r0'
-    ${If} $0 != 0
-      ${NSD_GetState} $d16KeepData $0
-      ${If} $0 == ${BST_CHECKED}
-        StrCpy $d16Mode keep
-        Return
-      ${ElseIf} $0 == ${BST_UNCHECKED}
-        StrCpy $d16Mode remove
-        Return
-      ${EndIf}
-    ${EndIf}
-    StrCpy $d16ChoiceCause CONTROL_INVALID
-    Call un.D16FailChoice
   FunctionEnd
 !macroend
 
@@ -199,6 +148,14 @@ Var d16InstallCause
 Var d16InstallExitCode
 Var d16InstallStage
 Var d16InstallErrorCode
+Var d16InstallNativeError
+Var d16InstallMarkerHandle
+Var d16InstallMarkerTemporary
+
+!ifndef CODEFLOW_UPGRADE_INSTALLED_INCLUDE
+  !define CODEFLOW_UPGRADE_INSTALLED_INCLUDE "${__FILEDIR__}\upgrade-installed-files.nsh"
+!endif
+!include "${CODEFLOW_UPGRADE_INSTALLED_INCLUDE}"
 
 Function D16NewInstallRequestId
   System::Call 'kernel32::GetCurrentProcessId() i.r0'
@@ -208,6 +165,9 @@ FunctionEnd
 
 ; Persist only bounded NSIS diagnostics; a logging failure is a distinct failed install.
 Function D16FailInstallation
+  ${If} $d16InstallNativeError == ""
+    StrCpy $d16InstallNativeError 0
+  ${EndIf}
   System::Call 'kernel32::GetCurrentProcessId() i.r0'
   System::Call 'kernel32::GetTickCount() i.r2'
   ${If} $d16InstallRequestId == ""
@@ -218,7 +178,7 @@ Function D16FailInstallation
   IfErrors diagnostic_failed
   FileOpen $1 "$d16InstallLog" w
   IfErrors diagnostic_failed
-  FileWrite $1 '{"errorCode":"$d16InstallErrorCode","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","exitCode":$d16InstallExitCode}$\r$\n'
+  FileWrite $1 '{"errorCode":"$d16InstallErrorCode","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","exitCode":$d16InstallExitCode,"win32Error":$d16InstallNativeError}$\r$\n'
   IfErrors diagnostic_close_failed
   System::Call 'kernel32::FlushFileBuffers(p r1) i.r2'
   ${If} $2 == 0
@@ -234,56 +194,102 @@ Function D16FailInstallation
   diagnostic_close_failed:
     System::Call 'kernel32::CloseHandle(p r1) i.r2'
   diagnostic_failed:
-    DetailPrint '{"errorCode":"DESKTOP_INSTALL_DIAGNOSTIC_FAILED","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","registrationFailure":"$d16InstallCause","exitCode":$d16InstallExitCode}'
+    DetailPrint '{"errorCode":"DESKTOP_INSTALL_DIAGNOSTIC_FAILED","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","exitCode":$d16InstallExitCode}'
     SetErrorLevel 2
-    MessageBox MB_ICONSTOP|MB_OK "CodeFlow 安装登记失败，且诊断日志保存失败（$d16InstallCause）。" /SD IDOK
+    MessageBox MB_ICONSTOP|MB_OK "CodeFlow 安装失败，且诊断日志保存失败（$d16InstallCause）。" /SD IDOK
     Abort
 FunctionEnd
 
-; Register the installation only after the template has copied the executable.
-!macro customInstall
+; Commit only a durable program-copy fact; business repair and marker consumption belong to normal startup.
+Function D16RecordInstallation
+  StrCpy $d16InstallStage installation-files-completed
+  StrCpy $d16InstallErrorCode DESKTOP_INSTALL_COMPLETION_FAILED
+  StrCpy $d16InstallExitCode "null"
+  StrCpy $d16InstallNativeError 0
   ${If} $d16InstallRequestId == ""
     Call D16NewInstallRequestId
   ${EndIf}
-  StrCpy $d16InstallExitCode "null"
-  StrCpy $d16InstallStage "installation-registration"
-  StrCpy $d16InstallErrorCode DESKTOP_INSTALL_REGISTRATION_FAILED
-  ClearErrors
-  ExecWait '"$INSTDIR\CodeFlowAI.exe" --codeflow-register-installation "$d16InstallRequestId"' $0
-  ${If} ${Errors}
-    StrCpy $d16InstallCause "PROCESS_START_FAILED"
+  StrCpy $d16StopFailure ""
+  Call D16ValidateStopRoot
+  ${If} $d16StopFailure != ""
+    StrCpy $d16InstallCause $d16StopFailure
     Call D16FailInstallation
   ${EndIf}
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\installation-completed.ini") i.r0 ?e'
+  Pop $d16InstallNativeError
+  ${If} $0 == -1
+    IntCmp $d16InstallNativeError 2 marker_create marker_path_invalid marker_path_invalid
+  ${EndIf}
+  IntOp $0 $0 & 0x410
+  IntCmp $0 0 +1 marker_path_invalid marker_path_invalid
+  System::Call 'kernel32::CreateFileW(w "$INSTDIR\installation-completed.ini", i 0x80000000, i 1, p 0, i 3, i 0x00200080, p 0) p.s ?e'
+  Pop $d16InstallNativeError
+  Pop $d16InstallMarkerHandle
+  IntCmp $d16InstallMarkerHandle -1 marker_path_invalid
+  System::Alloc 52
+  Pop $2
+  StrCmp $2 0 marker_identity_close
+  System::Call 'kernel32::GetFileInformationByHandle(p $d16InstallMarkerHandle, p r2) i.r0 ?e'
+  Pop $d16InstallNativeError
+  StrCpy $3 0
   ${If} $0 != 0
-    StrCpy $d16InstallExitCode $0
-    StrCpy $d16InstallCause "PROCESS_EXIT_NONZERO"
-    Call D16FailInstallation
+    IntOp $0 $2 + 40
+    System::Call '*$0(i .r3)'
+    System::Call '*$2(i .r0)'
+    IntOp $0 $0 & 0x410
+    ${If} $0 != 0
+      StrCpy $3 0
+    ${EndIf}
   ${EndIf}
+  System::Free $2
+  System::Call 'kernel32::CloseHandle(p $d16InstallMarkerHandle) i.r0 ?e'
+  Pop $d16InstallNativeError
+  IntCmp $0 0 marker_path_invalid
+  IntCmp $3 1 marker_create marker_path_invalid marker_path_invalid
+  marker_identity_close:
+    System::Call 'kernel32::CloseHandle(p $d16InstallMarkerHandle) i.r0'
+    Goto marker_path_invalid
+  marker_create:
+    StrCpy $d16InstallMarkerTemporary "$INSTDIR\installation-completed.ini.$d16InstallRequestId.tmp"
+    System::Call 'kernel32::CreateFileW(w "$d16InstallMarkerTemporary", i 0x40000000, i 0, p 0, i 1, i 0x00200080, p 0) p.s ?e'
+    Pop $d16InstallNativeError
+    Pop $d16InstallMarkerHandle
+    IntCmp $d16InstallMarkerHandle -1 marker_write_failed
+    ClearErrors
+    FileWrite $d16InstallMarkerHandle "[installation]$\r$\nschema=1$\r$\nrequestId=$d16InstallRequestId$\r$\n"
+    IfErrors marker_write_close_failed
+    System::Call 'kernel32::FlushFileBuffers(p $d16InstallMarkerHandle) i.r0 ?e'
+    Pop $d16InstallNativeError
+    IntCmp $0 0 marker_write_close_failed
+    System::Call 'kernel32::CloseHandle(p $d16InstallMarkerHandle) i.r0 ?e'
+    Pop $d16InstallNativeError
+    IntCmp $0 0 marker_write_failed
+    System::Call 'kernel32::MoveFileExW(w "$d16InstallMarkerTemporary", w "$INSTDIR\installation-completed.ini", i 9) i.r0 ?e'
+    Pop $d16InstallNativeError
+    IntCmp $0 0 marker_write_failed
+    Return
+  marker_write_close_failed:
+    System::Call 'kernel32::CloseHandle(p $d16InstallMarkerHandle) i.r0'
+  marker_write_failed:
+    StrCpy $d16InstallCause INSTALLATION_MARKER_WRITE_FAILED
+    Call D16FailInstallation
+  marker_path_invalid:
+    StrCpy $d16InstallCause INSTALLATION_MARKER_PATH_INVALID
+    Call D16FailInstallation
+FunctionEnd
+
+; Record completed program files without starting Electron or touching any profile.
+!macro customInstall
+  Call D16RecordInstallation
 !macroend
 !endif
 
 !ifdef BUILD_UNINSTALLER
-; Run one synchronous maintenance request and stop the template on any failure.
+; Stop only this installation's processes; never open or mutate business data.
 !macro customUnInstall
   ${IfNot} ${isUpdated}
-    ${If} $d16Mode != keep
-    ${AndIf} $d16Mode != remove
-      StrCpy $d16ChoiceCause MODE_UNCONFIRMED
-      Call un.D16FailChoice
-    ${EndIf}
     Call un.D16NewRequestId
-    ClearErrors
-    ExecWait '"$INSTDIR\CodeFlowAI.exe" --codeflow-uninstall-maintenance "$d16RequestId" "$d16Mode" --resume-pending' $0
-    ${If} ${Errors}
-      StrCpy $d16FailureCode DESKTOP_UNINSTALL_MAINTENANCE_FAILED
-      StrCpy $d16FailureDetails '"stage":"uninstall-maintenance","mode":"$d16Mode","rootCause":"PROCESS_START_FAILED","exitCode":null'
-      Call un.D16FailUninstall
-    ${EndIf}
-    ${If} $0 != 0
-      StrCpy $d16FailureCode DESKTOP_UNINSTALL_MAINTENANCE_FAILED
-      StrCpy $d16FailureDetails '"stage":"uninstall-maintenance","mode":"$d16Mode","rootCause":"PROCESS_EXIT_NONZERO","exitCode":$0'
-      Call un.D16FailUninstall
-    ${EndIf}
+    !insertmacro D16StopInstalledProcesses true
   ${EndIf}
 !macroend
 !endif

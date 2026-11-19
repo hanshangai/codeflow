@@ -2,7 +2,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { readPendingRelease, savePendingRelease, clearPendingRelease, markPendingDatabaseMigration, type PendingRelease } from "./pendingRelease.js";
 import { createReleaseDatabaseBackup } from "./releaseDatabaseBackup.js";
-import { assertReleaseBundleManifest, compareNumericVersion, snapshotDesktopStartupMode, snapshotDesktopStartupReady, type DesktopApiRequest, type DesktopStartupMode, type DesktopEvent, type DesktopUpdateDiagnostics, type DesktopUpdateState, type DesktopUpdateDetails, type DesktopBundleVersion, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress, type DesktopUpdateClientErrorReport } from "@codeflowai/shared";
+import { assertReleaseBundleManifest, assertShellReleaseManifest, compareNumericVersion, snapshotDesktopStartupMode, snapshotDesktopStartupReady, type DesktopApiRequest, type DesktopStartupMode, type DesktopEvent, type DesktopUpdateDiagnostics, type DesktopUpdateState, type DesktopUpdateDetails, type DesktopBundleVersion, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress, type DesktopUpdateClientErrorReport } from "@codeflowai/shared";
 import { toUpdateDiagnosticCause, toShellUpdateDiagnosticCause } from "@codeflowai/shared/desktop-update-failure";
 
 import { loadOrCreateDeviceIdentity, type DeviceIdentity } from "./deviceIdentity.js";
@@ -24,13 +24,14 @@ import { deliverDesktopCrashReports } from "./crashReportDelivery.js";
 import { downloadReleaseBundle, verifyDownloadManifest, type DownloadOptions } from "./releaseBundleDownload.js";
 import { createUpdateNetworkRetry, type UpdateNetworkRetry } from "./updateNetworkRetry.js";
 import { runShellUpdateOperation, type ShellUpdateHostFacts, type ShellUpdateOperationBoundary, type ShellUpdateHelperOwner } from "./shellUpdateOperation.js";
-import { createShellUpdateAttemptStore, isShellUpdateHandoffAttempt } from "./shellUpdateAttempt.js";
+import type { ShellDiscovery } from "./shellUpdateNetwork.js";
 import { retireShellUpdateAttempt } from "./shellHandoff.js";
 import { createUpdateNoticeController, type PreparedUpdateNotice } from "./updateNotice.js";
 
 type ApplicationDownloadOptions = Omit<DownloadOptions, "transport" | "rootDir" | "trustedReleaseKeys" | "receivedReporter">;
 type ApplicationDiscoveryOptions = { requestId?: string; signal?: AbortSignal };
 type DownloadedRelease = Awaited<ReturnType<typeof downloadReleaseBundle>>;
+type CombinedUpdateDiscovery = { resource: { manifest: DownloadedRelease['manifest']; manifestBytes: Uint8Array } | null; shell: ShellDiscovery };
 type DesktopWindow = {
   show(): void;
   focus(): void;
@@ -145,17 +146,19 @@ export function createDesktopApplication(input: {
   let updatesSuppressed = false;
   let stoppingUpdates = false;
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
+  let telemetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let telemetryFlight: Promise<void> | undefined;
   let updateFlight: Promise<ActiveRelease | null> | undefined;
   /** 手动检查复用进行中的自动轮次时，结束后仍需按“已查看”刷新提醒节流。 */
   let updateFlightManualRequested = false;
   let updateSettled: Promise<void> | undefined;
   let updateController: AbortController | undefined;
   let networkContext: { signal: AbortSignal; retry: UpdateNetworkRetry } | undefined;
+  let checkDiscoveries: Map<string, Promise<CombinedUpdateDiscovery>> | undefined;
   let pendingUpdate: { requestId: string; manifest: DownloadedRelease["manifest"]; manifestBytes: Uint8Array; downloaded?: DownloadedRelease } | undefined;
   let preparedUpdate: PreparedRelease | undefined;
   let restartRequested = false;
   let startupHeldId: string | undefined;
-  let startupShellPending = false;
   const databaseBackup = createReleaseDatabaseBackup(input.dataDir);
   let switchCommitted = false;
   let updateCheckFailure: { requestId: string; error: unknown } | null = null;
@@ -304,10 +307,8 @@ export function createDesktopApplication(input: {
         await receiptJournal.record(following);
         unsettledReceipt = undefined;
       }
-      if (!receiptDelivery && !input.reportReceipt) throw new Error("DESKTOP_UPDATE_UNAVAILABLE");
-      if (input.reportReceipt && !input.configuredServerOrigin) await input.reportReceipt(receipt);
-      if (receiptDelivery) await receiptDelivery.flush();
-      receiptDeliveryFailure = null;
+      // 已批准隔离：本地回执是更新事实，远端交付另行重试，不参与文件提交。
+      scheduleTelemetry();
     } catch (error) {
       receiptDeliveryFailure = { errorCode: readReceiptErrorCode(error), requestId: readReceiptErrorRequestId(error) ?? receipt.requestId };
       throw error;
@@ -317,7 +318,17 @@ export function createDesktopApplication(input: {
   const reportReceipt = async (receipt: DesktopUpdateReceipt): Promise<void> => {
     if (operation !== "idle") throw new Error("DESKTOP_OPERATION_IN_PROGRESS");
     operation = "flushing";
-    try { await reportReceiptInternal(receipt); }
+    try {
+      await reportReceiptInternal(receipt);
+      if (input.reportReceipt && !input.configuredServerOrigin) await input.reportReceipt(receipt);
+      else if (receiptDelivery) await receiptDelivery.flush();
+      else throw new Error("DESKTOP_UPDATE_UNAVAILABLE");
+      receiptDeliveryFailure = null;
+    }
+    catch (error) {
+      receiptDeliveryFailure = { errorCode: readReceiptErrorCode(error), requestId: readReceiptErrorRequestId(error) ?? receipt.requestId };
+      throw error;
+    }
     finally { operation = "idle"; }
   };
   /** 诊断只读真实身份的原日志；错误保留根因和设备，交原 IPC 边界记录。 */
@@ -389,13 +400,17 @@ export function createDesktopApplication(input: {
     currentBundleVersion = snapshotBundleVersion(active.manifest);
   };
 
-  /** 内置与活动发布共用同包判断；相同发布 ID 的摘要冲突必须失败。 */
+  /** 资源只比较包版本；同一发布的摘要冲突仍作为完整性错误拒绝。 */
   const isCurrentRelease = (manifest: DownloadedRelease["manifest"], requestId: string): boolean => {
-    if (manifest.releaseId !== currentReleaseId || currentArchiveSha256 === undefined) return false;
-    if (manifest.archiveSha256 !== currentArchiveSha256) {
+    if (manifest.releaseId === currentReleaseId && currentArchiveSha256 !== undefined && manifest.archiveSha256 !== currentArchiveSha256) {
       throw Object.assign(new Error("DESKTOP_RELEASE_CACHE_CONFLICT"), { code: "DESKTOP_RELEASE_CACHE_CONFLICT", requestId });
     }
-    return true;
+    const current = currentBundleVersion?.version;
+    if (!current) return false;
+    if (!/^\d+(?:\.\d+){2,3}$/u.test(manifest.version) || !/^\d+(?:\.\d+){2,3}$/u.test(current)) {
+      throw Object.assign(new Error("DESKTOP_RESOURCE_VERSION_INVALID"), { code: "DESKTOP_RESOURCE_VERSION_INVALID", requestId });
+    }
+    return compareNumericVersion(manifest.version, current) <= 0;
   };
 
   /** 壳只维护当前运行时的一条订阅，事件不在此缓存或重放。 */
@@ -451,8 +466,9 @@ export function createDesktopApplication(input: {
     const config = input.shellUpdate;
     if (!config) return;
     const currentRuntime = runtime;
+    const nativeUpdate = !config.boundary?.spawnHelper;
     let active: ActiveRelease | null;
-    try { active = await resolveActiveRelease(input.dataDir, { trustedReleaseKeys: input.trustedReleaseKeys }); }
+    try { active = nativeUpdate ? null : await resolveActiveRelease(input.dataDir, { trustedReleaseKeys: input.trustedReleaseKeys }); }
     catch (cause) { throw Object.assign(new Error("DESKTOP_SHELL_OPERATION_FAILED", { cause }), { code: "DESKTOP_SHELL_OPERATION_FAILED",
       requestId, deviceId: identity!.deviceId, shellId: null, failurePhase: "prepare", recovery: "not_needed" }); }
     const releaseDir = active?.releaseDir ?? input.initialReleaseDir, expectation = active?.manifest ?? initialExpectation;
@@ -462,9 +478,10 @@ export function createDesktopApplication(input: {
       if (pending && pending.releaseId === active?.releaseId) await clearPendingRelease(input.dataDir);
     };
     let interrupted = false;
-    const result = await runShellUpdateOperation({ dataDir: input.dataDir, initialReleaseDir: input.initialReleaseDir, identity: identity!,
+    const result = await runShellUpdateOperation({ shellVersion: input.shellVersion, dataDir: input.dataDir, initialReleaseDir: input.initialReleaseDir, identity: identity!,
       configuredServerOrigin: input.configuredServerOrigin!, trustedKeys: input.trustedReleaseKeys ?? {}, requestId, signal,
       facts: config.facts, boundary: config.boundary, timeoutMs: config.timeoutMs, getClient: () => runtime.snapshot(),
+      discovery: async discoveryRequestId => (await discoverUpdatesInternal({ requestId: discoveryRequestId, signal })).shell,
       manual,
       /** 仅原日志的真实历史可授权人工新周期，ACK过的旧证据仍须存在。 */
       getFailureEvidence(failedRequestId, shellId) {
@@ -490,20 +507,32 @@ export function createDesktopApplication(input: {
         /** 在helper创建前确认，稍后保持同一schema2可继续。 */
         async prepare() {
           if (!allowRestart) return false;
+          if (nativeUpdate && currentRuntime.snapshot().status !== "ready") return true;
           if (startupHeldId) { await finishResourcePending(); return true; }
           signal.throwIfAborted(); const activity = await controlUpdate(currentRuntime, "runtime.update.prepare");
           if (typeof activity.hasRunningSessions !== "boolean") throw new Error("DESKTOP_UPDATE_ACTIVITY_INVALID");
           if (activity.hasRunningSessions) {
             if (!input.host.confirmUpdate) throw new Error("DESKTOP_UPDATE_CONFIRMATION_UNAVAILABLE");
             const confirmed = await input.host.confirmUpdate(window!, signal); signal.throwIfAborted();
-            if (!confirmed) { updatesSuppressed = true; return false; }
+            if (!confirmed) {
+              if (!config.boundary?.spawnHelper) await controlUpdate(currentRuntime, "runtime.update.cancel");
+              updatesSuppressed = true; return false;
+            }
           }
           signal.throwIfAborted(); await finishResourcePending(); return true;
         },
         /** accepted后不可再由外部abort取消持久交接；真实drain成功才记录本轮事实。 */
-        async drain() { interrupted = true; if (!startupHeldId) await controlUpdate(currentRuntime, "runtime.update.interrupt"); await currentRuntime.drain(); shellDrainedRuntime = currentRuntime; },
+        async drain() {
+          interrupted = true;
+          if (!startupHeldId && (!nativeUpdate || currentRuntime.snapshot().status === "ready")) await controlUpdate(currentRuntime, "runtime.update.interrupt");
+          await currentRuntime.drain(); shellDrainedRuntime = currentRuntime;
+        },
         /** helper确认释放且S0完整复核后才走恢复入口，绝不另造准入位。 */
-        async resume() { if (!allowRestart) return; if (interrupted) { await restartClient(releaseDir, expectation); interrupted = false; } else if (!startupHeldId) await controlUpdate(currentRuntime, "runtime.update.cancel"); },
+        async resume() {
+          if (!allowRestart) return;
+          if (interrupted) { await restartClient(releaseDir, expectation); interrupted = false; }
+          else if (!startupHeldId && (!nativeUpdate || currentRuntime.snapshot().status === "ready")) await controlUpdate(currentRuntime, "runtime.update.cancel");
+        },
         /** 与hot相同的退出等待边界，accepted后退出只等待交接结果。 */
         committed() { switchCommitted = true; },
       } });
@@ -556,8 +585,8 @@ export function createDesktopApplication(input: {
   };
 
   /** 补报已有错误证据；启动阶段失败保留本地待报并由主边界显式反馈。 */
-  const flushFailures = async (allowInternal = false): Promise<void> => {
-    if (operation !== "idle" && !(allowInternal && (operation === "starting" || operation === "checking"))) throw new Error("DESKTOP_OPERATION_IN_PROGRESS");
+  const flushFailures = async (allowInternal = false, detached = false): Promise<void> => {
+    if (!detached && operation !== "idle" && !(allowInternal && (operation === "starting" || operation === "checking"))) throw new Error("DESKTOP_OPERATION_IN_PROGRESS");
     if (!failureJournal || !identity) throw new Error("DESKTOP_UPDATE_UNAVAILABLE");
     const pending = failureJournal.pending(identity.deviceId);
     if (!transport) {
@@ -568,7 +597,7 @@ export function createDesktopApplication(input: {
     }
     if (!pending.length) return;
     const previousOperation = operation;
-    if (operation !== "checking") operation = "flushing";
+    if (!detached && operation !== "checking") operation = "flushing";
     try {
       await deliverDesktopUpdateFailures({ journal: failureJournal, deviceId: identity.deviceId, transport,
         signal: AbortSignal.timeout(30_000) });
@@ -578,7 +607,7 @@ export function createDesktopApplication(input: {
       failureDeliveryFailure = { errorCode: readFailureErrorCode(error), requestId, deviceId: identity.deviceId };
       throw error;
     } finally {
-      operation = previousOperation;
+      if (!detached) operation = previousOperation;
     }
   };
 
@@ -610,6 +639,35 @@ export function createDesktopApplication(input: {
     }
   };
 
+  /** 已批准的交付隔离：失败保留本地待报和可查询状态，后台交付不占业务生命周期。 */
+  function scheduleTelemetry(): void {
+    if (telemetryTimer || telemetryFlight || stoppingUpdates || !input.configuredServerOrigin) return;
+    telemetryTimer = setTimeout(() => {
+      telemetryTimer = undefined;
+      if (stoppingUpdates || operation === "exiting") return;
+      const report = async (action: () => Promise<void>, code: string): Promise<void> => {
+        try { await action(); }
+        catch (error) {
+          // 本操作允许交付失败；证据仍在原日志，下次检查/启动重试，失败明确发布到更新诊断。
+          const requestId = readReceiptErrorRequestId(error) ?? identity?.deviceId ?? "telemetry";
+          try { input.host.onUpdateError?.(error, { requestId, deviceId: identity!.deviceId, logOnly: true }); }
+          catch (reportError) { updateCheckFailure = { requestId, error: new AggregateError([error, reportError], code) }; }
+        }
+      };
+      telemetryFlight = (async () => {
+        if (receiptDelivery) await report(async () => {
+          try { await receiptDelivery!.flush(); receiptDeliveryFailure = null; }
+          catch (error) {
+            receiptDeliveryFailure = { errorCode: readReceiptErrorCode(error), requestId: readReceiptErrorRequestId(error) ?? "telemetry" }; throw error;
+          }
+        }, "DESKTOP_RECEIPT_REPORT_FAILED");
+        if (failureJournal && identity) await report(() => flushFailures(true, true), "DESKTOP_FAILURE_REPORT_FAILED");
+        if (input.crashJournal && identity) await report(flushCrashReports, "DESKTOP_CRASH_REPORT_FAILED");
+      })().finally(() => { telemetryFlight = undefined; });
+    }, 1000);
+    telemetryTimer.unref?.();
+  }
+
   /** 两个下载入口复用同一落盘和 received 事实，不重复安装状态或回执副本。 */
   const downloadReleaseInternal = async (options: ApplicationDownloadOptions) => {
     return await downloadReleaseBundle({ ...options, rootDir: input.dataDir, transport: transport!, trustedReleaseKeys: input.trustedReleaseKeys ?? {},
@@ -630,10 +688,44 @@ export function createDesktopApplication(input: {
     });
   };
 
-  /** 内部发现不取得生命周期锁；窄响应严格绑定设备与尝试，旧清单保持原字节。 */
+  /** 同轮按真实尝试标识缓存组合响应；历史壳恢复使用原标识复查，绝不改写授权信封。 */
+  const discoverUpdatesInternal = (options: { requestId: string; signal?: AbortSignal }): Promise<CombinedUpdateDiscovery> => {
+    const cached = checkDiscoveries?.get(options.requestId);
+    if (cached) return cached;
+    const flight = (async (): Promise<CombinedUpdateDiscovery> => {
+      await transport!.register(options);
+      const response = await transport!.requestJson<Record<string, unknown>>({ method: 'GET', path: '/api/software/desktop/update-availability', ...options });
+      /** 合同错误绑定原检查请求，禁止继续任一工件下载。 */
+      const invalid = (): never => { throw Object.assign(new Error('DESKTOP_UPDATE_RESPONSE_INVALID'), { code: 'DESKTOP_UPDATE_RESPONSE_INVALID', requestId: options.requestId }); };
+      const fields = ['ok', 'deviceId', 'requestId', 'resource', 'shell'];
+      if (response.ok !== true || response.deviceId !== identity!.deviceId || response.requestId !== options.requestId
+        || Object.keys(response).length !== fields.length || Object.keys(response).some(field => !fields.includes(field))) invalid();
+      /** 每个通道明确表达是否可用；不可用不得携带不可信或陈旧清单。 */
+      const availability = (value: unknown): { available: boolean; manifest?: unknown } => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return invalid();
+        const item = value as Record<string, unknown>, fields = ['available', ...(item.available === true ? ['manifest'] : [])];
+        if (typeof item.available !== 'boolean' || Object.keys(item).length !== fields.length || Object.keys(item).some(field => !fields.includes(field))) return invalid();
+        return item as { available: boolean; manifest?: unknown };
+      };
+      const resource = availability(response.resource), shell = availability(response.shell);
+      const manifest = resource.available ? assertReleaseBundleManifest(resource.manifest) : null;
+      return { resource: manifest ? { manifest, manifestBytes: Buffer.from(JSON.stringify(manifest), 'utf8') } : null,
+        shell: shell.available ? { ok: true, available: true, deviceId: identity!.deviceId, requestId: options.requestId,
+          manifest: assertShellReleaseManifest(shell.manifest) } : { ok: true, available: false, deviceId: identity!.deviceId, requestId: options.requestId } };
+    })();
+    checkDiscoveries?.set(options.requestId, flight);
+    return flight;
+  };
+
+  /** 检查轮次复用组合响应；独立下载入口保留原发现合同和原始清单字节。 */
   const discoverReleaseInternal = async (options: { requestId: string; signal?: AbortSignal }, conditional: boolean, excludeReleaseId?: string) => {
     bundleDetails.requestId = options.requestId;
     bundleDetails.phase = "discovery";
+    if (conditional && operation === 'checking') {
+      const discovered = (await discoverUpdatesInternal(options)).resource;
+      if (!discovered || discovered.manifest.releaseId === excludeReleaseId) { bundleDetails.result = 'none'; bundleDetails.target = null; return null; }
+      return discovered;
+    }
     await transport!.register(options);
     let manifestBytes: Uint8Array;
     if (conditional) {
@@ -837,7 +929,7 @@ export function createDesktopApplication(input: {
       || Reflect.ownKeys(body).length !== 1 || !ok || !("value" in ok) || ok.value !== true) throw new Error("DESKTOP_STARTUP_CONTINUATION_FAILED");
   };
 
-  /** 启动时激活持久候选；提交未确认或回执失败均保留 pending，供完整重启恢复。 */
+  /** 启动时独立提交资源候选；本地事实完成才清 pending，远端交付不延长本地事务。 */
   const activatePendingAtStartup = async (pending: PendingRelease, activeAtStartup: ActiveRelease | null): Promise<void> => {
     let candidate: PreparedRelease | undefined;
     const committedAtStartup = activeAtStartup?.releaseId === pending.releaseId;
@@ -848,14 +940,6 @@ export function createDesktopApplication(input: {
         : await coordinator.resume(pending, currentArchiveSha256 === undefined ? undefined
           : { releaseId: currentReleaseId, archiveSha256: currentArchiveSha256 });
       bundleDetails = { requestId: pending.requestId, target: snapshotBundleVersion(candidate.manifest), phase: "prepare", result: "prepared", failure: null };
-      // 安装基线已高于暂存候选时放弃旧版本，避免降级和陈旧候选反复阻断检查。
-      if (!committedAtStartup && currentVersion !== "unknown" && compareNumericVersion(candidate.manifest.webVersion, currentVersion) < 0) {
-        await clearPendingRelease(input.dataDir);
-        preparedUpdate = undefined;
-        pendingUpdate = undefined;
-        bundleDetails.result = "same";
-        return;
-      }
       // 完整安装已包含候选时只收口旧标记，不能伪造资源切换和健康回执。
       if (!committedAtStartup && isCurrentRelease(candidate.manifest, pending.requestId)) {
         await clearPendingRelease(input.dataDir);
@@ -885,7 +969,7 @@ export function createDesktopApplication(input: {
           await reportReceiptInternal(receipts[0]!, receipts[1]!);
           await reportReceiptInternal(receipts[1]!);
         }
-        if (!input.shellUpdate) await clearPendingRelease(input.dataDir);
+        await clearPendingRelease(input.dataDir);
         pendingUpdate = undefined;
         return;
       }
@@ -947,7 +1031,7 @@ export function createDesktopApplication(input: {
       });
       syncActiveRelease(active);
       await databaseBackup.recover(active.releaseId);
-      if (!input.shellUpdate) await clearPendingRelease(input.dataDir);
+      await clearPendingRelease(input.dataDir);
       preparedUpdate = undefined;
       pendingUpdate = undefined;
     } catch (error) {
@@ -986,7 +1070,7 @@ export function createDesktopApplication(input: {
   };
 
   /** 每轮独占原 operation；手动消费者复用同一 Promise，网络预算不跨轮次。 */
-  const beginUpdateCheck = (manual: boolean, allowRestart = false, shellOnly = false): Promise<ActiveRelease | null> => {
+  const beginUpdateCheck = (manual: boolean, allowRestart = false): Promise<ActiveRelease | null> => {
     if (updateFlight) {
       if (manual) updateFlightManualRequested = true;
       return updateFlight;
@@ -1003,8 +1087,9 @@ export function createDesktopApplication(input: {
     updateController = new AbortController();
     const signal = updateController.signal;
     const requestId = crypto.randomUUID();
+    checkDiscoveries = new Map();
     const deviceId = identity.deviceId;
-    if (!shellOnly) bundleDetails = { requestId, target: null, phase: null, result: "unknown", failure: null };
+    bundleDetails = { requestId, target: null, phase: null, result: "unknown", failure: null };
     shellDetails = { requestId: null, target: null, phase: null,
       result: input.shellUpdate || process.platform !== "darwin" ? "unknown" : "manual_required", failure: null };
     let checkingShell = false;
@@ -1020,16 +1105,9 @@ export function createDesktopApplication(input: {
       let active: ActiveRelease | null = null;
       try {
         if (unsettledReceipt) await reportReceiptInternal(unsettledReceipt.receipt, unsettledReceipt.following);
-        try { await receiptDelivery!.flush(); receiptDeliveryFailure = null; }
-        catch (error) {
-          receiptDeliveryFailure = { errorCode: readReceiptErrorCode(error), requestId: readReceiptErrorRequestId(error) ?? requestId };
-          throw error;
-        }
         signal.throwIfAborted();
-        await flushFailures(true);
-        signal.throwIfAborted();
+        scheduleTelemetry();
         let downloaded: DownloadedRelease | null = null;
-        if (!shellOnly) {
         if (preparedUpdate) {
           bundleDetails = { requestId: preparedUpdate.requestId, target: snapshotBundleVersion(preparedUpdate.manifest), phase: "prepare", result: "prepared", failure: null };
           if (!await authorizeReleaseSwitch(preparedUpdate.manifest, preparedUpdate.requestId, signal)) {
@@ -1045,7 +1123,6 @@ export function createDesktopApplication(input: {
           preparedUpdate = prepared;
           bundleDetails.result = "prepared";
         }
-        }
       } catch (error) { failure = error; throw error; }
       finally {
         if (pendingUpdate) {
@@ -1060,7 +1137,7 @@ export function createDesktopApplication(input: {
       }
       if (updatesSuppressed) return active;
       // 优先完成已准备的资源；同轮创建壳绑定会在下次资源激活后失效。
-      if (preparedUpdate && !shellOnly) return active;
+      if (preparedUpdate) return active;
       switchCommitted = false;
       signal.throwIfAborted();
       checkingShell = Boolean(input.shellUpdate);
@@ -1089,6 +1166,7 @@ export function createDesktopApplication(input: {
       updateFlight = undefined;
       updateController = undefined;
       networkContext = undefined;
+      checkDiscoveries = undefined;
       switchCommitted = false;
       operation = stoppingUpdates ? "exiting" : "idle";
       scheduleUpdateCheck();
@@ -1164,17 +1242,8 @@ export function createDesktopApplication(input: {
     },
     /** 手动恢复自动提醒并共享已有后台轮次，失败仍由调用者收到拒绝。 */
     checkForUpdates(): Promise<ActiveRelease | null> { return beginUpdateCheck(true); },
-    /** 仅启动阶段接续已有壳尝试；held 围栏内不会恢复或中断用户任务。 */
+    /** 兼容原宿主调用；普通启动不执行壳更新，已准备工件只由显式重启消费。 */
     async resumeStartupUpdate(): Promise<boolean> {
-      if (!startupShellPending) return false;
-      try { await beginUpdateCheck(false, true, true); }
-      catch (error) {
-        if (!shellUpdateFailure || shellOwner || runtime.snapshot().status !== "ready") throw error;
-        // 已确认的失败恢复：保留明确壳失败与证据，继续当前可用版本。
-      }
-      if (!window) return true;
-      if (startupHeldId) { await continueHeldRuntime(startupHeldId); startupHeldId = undefined; }
-      startupShellPending = false;
       return false;
     },
     /** 显式重启检查中新发现资源时，仍沿同一确认和退出入口完成重启。 */
@@ -1279,9 +1348,6 @@ export function createDesktopApplication(input: {
         }
         const recoveredDatabase = await databaseBackup.recover(await readActivePointer(input.dataDir));
         assertStartupRunning();
-        const shellAttempt = !continuation && input.shellUpdate ? await createShellUpdateAttemptStore(input.dataDir).read() : null;
-        startupShellPending = Boolean(shellAttempt && !isShellUpdateHandoffAttempt(shellAttempt)
-          && shellAttempt.phase === "preparing" && shellAttempt.target);
         // pending 同时持有原库的迁移围栏；所有启动入口必须读取，损坏时禁止启动旧版。
         const recordedPending = await readPendingRelease(input.dataDir);
         // 资源先激活；已有壳准备记录在停旧 Client 后归档，再绑定新活动资源。
@@ -1289,13 +1355,15 @@ export function createDesktopApplication(input: {
         let startupUpdateError: { requestId: string; error: unknown } | undefined;
         assertStartupRunning();
         const releaseTrust = { trustedReleaseKeys: input.trustedReleaseKeys, requireHeldStartup: Boolean(continuation),
-          verification: !continuation && !pending && !startupShellPending && !startupUpdateError && !recoveredDatabase ? "startup" as const : "full" as const };
-        await reportStartup("正在校验安装资源…");
-        const baselineRelease = input.requireBaseline || continuation || pending || startupShellPending
-          ? await resolveBaselineRelease(baselineReleaseDir, releaseTrust) : null;
-        assertStartupRunning();
+          verification: !continuation && !pending && !startupUpdateError && !recoveredDatabase ? "startup" as const : "full" as const };
         await reportStartup("正在校验当前版本…");
         const activeRelease = await resolveActiveRelease(input.dataDir, releaseTrust);
+        await reportStartup("正在校验安装资源…");
+        const needsRepairBaseline = recordedPending?.databaseSchemaVersion !== undefined
+          && (activeRelease?.manifest.dbSchemaVersion ?? 0) < recordedPending.databaseSchemaVersion;
+        // 当前可信资源独立可用；只有首次安装、原交接或修复向前迁移才读取离线基线。
+        const baselineRelease = continuation || needsRepairBaseline || !activeRelease && (input.requireBaseline || pending)
+          ? await resolveBaselineRelease(baselineReleaseDir, releaseTrust) : null;
         assertStartupRunning();
         // 已验签修复基线可接管不兼容旧活动包；磁盘指针等真实健康后再清理。
         const repairingDatabase = Boolean(recordedPending?.databaseSchemaVersion && baselineRelease
@@ -1305,7 +1373,7 @@ export function createDesktopApplication(input: {
         const currentSchema = startupActiveRelease?.manifest.dbSchemaVersion ?? baselineRelease?.manifest.dbSchemaVersion;
         // 修复安装先独立完成，不能改变壳交接已绑定的旧活动资源身份。
         if (recordedPending?.databaseSchemaVersion && (currentSchema === undefined || currentSchema < recordedPending.databaseSchemaVersion
-          || (repairingDatabase && (continuation || startupShellPending)))) {
+          || (repairingDatabase && continuation))) {
           throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY：数据库可能已升级，已停止旧版本启动，请使用支持该数据结构的修复版本。"),
             { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY", requestId: recordedPending.requestId, releaseId: recordedPending.releaseId,
               databaseSchemaVersion: recordedPending.databaseSchemaVersion });
@@ -1315,7 +1383,7 @@ export function createDesktopApplication(input: {
           await markPendingDatabaseMigration(input.dataDir, recordedPending!, baselineRelease!.manifest.dbSchemaVersion);
           pending = null;
         }
-        if (pending || startupShellPending) {
+        if (pending) {
           try {
             await reportStartup("正在确认更新兼容性…");
             // 上方已完整核验依赖；这里只复核即将启动的核心文件与 held marker。
@@ -1324,13 +1392,12 @@ export function createDesktopApplication(input: {
             startupHeldId = crypto.randomUUID();
             initialStartup = { mode: "held", continuationId: startupHeldId };
           } catch (error) {
-            startupUpdateError = { requestId: pending?.requestId ?? shellAttempt?.requestId ?? crypto.randomUUID(), error };
+            startupUpdateError = { requestId: pending.requestId, error };
             pending = null;
-            startupShellPending = false;
           }
         }
         assertStartupRunning();
-        const applyingUpdate = Boolean(pending || startupShellPending);
+        const applyingUpdate = Boolean(pending);
         await reportStartup(applyingUpdate ? "正在准备更新…" : "正在启动…");
         const startupArtifacts = continuation ? JSON.stringify([baselineRelease, activeRelease]) : undefined;
         const releaseDir = startupActiveRelease?.releaseDir ?? baselineRelease?.releaseDir ?? input.initialReleaseDir;
@@ -1457,13 +1524,10 @@ export function createDesktopApplication(input: {
         }
         assertStartupRunning();
         if (pending) {
-          const preparedShellPending = startupShellPending;
-          startupShellPending = false;
           await activatePendingAtStartup(pending, activeRelease);
           if (bundleDetails.result === "healthy" && !updateCheckFailure) {
-            if (input.shellUpdate) startupShellPending = true;
-            else input.host.onUpdateApplied?.({ version: currentVersion });
-          } else if (bundleDetails.result === "same") startupShellPending = preparedShellPending;
+            input.host.onUpdateApplied?.({ version: currentVersion });
+          }
         }
         if (startupUpdateError) {
           updateCheckFailure = startupUpdateError;
@@ -1473,7 +1537,7 @@ export function createDesktopApplication(input: {
           input.host.onUpdateError?.(startupUpdateError.error, { requestId: startupUpdateError.requestId, deviceId: identity.deviceId });
           // 已确认更新故障可保留当前完整版本；损坏的待更新事实不改变当前资源和数据库。
         }
-        if (startupHeldId && !startupShellPending) {
+        if (startupHeldId) {
           await continueHeldRuntime(startupHeldId);
           startupHeldId = undefined;
         }
@@ -1501,20 +1565,7 @@ export function createDesktopApplication(input: {
           await clearPendingRelease(input.dataDir);
         }
         window.show();
-        if (failureJournal.pending(identity.deviceId).length) {
-          try { await flushFailures(true); }
-          catch (error) {
-            if (!failureDeliveryFailure) throw error;
-            // 预期网络/确认失败保留待报，由主进程边界记录固定上下文；日志读取错误继续阻止启动。
-          }
-        }
-        if (input.crashJournal) {
-          try { await flushCrashReports(); }
-          catch (error) {
-            if (!crashDeliveryFailure) throw error;
-            // 崩溃补报失败不阻断壳启动；待报保留到下一次启动，由主进程记录固定上下文。
-          }
-        }
+        scheduleTelemetry();
       } catch (error) {
         if (startupExitRequested) {
           try { await startupExitFlight; }
@@ -1549,6 +1600,8 @@ export function createDesktopApplication(input: {
       if (exitFlight) return await exitFlight;
       if (operation !== "idle" && operation !== "checking" && !(operation === "starting" && (migration || window)) || stoppingUpdates) throw new Error("DESKTOP_OPERATION_IN_PROGRESS");
       stoppingUpdates = true;
+      if (telemetryTimer) clearTimeout(telemetryTimer);
+      telemetryTimer = undefined;
       cancelCloudLinkPreparation();
       if (operation === "starting") startupExitRequested = true;
       automaticUpdates = false;

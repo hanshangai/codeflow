@@ -37,6 +37,7 @@ class CodexStdoutThreadQueue {
   private head = 0;
   queuedBytes = 0;
   paused = false;
+  waiting = false;
   pause: (() => void) | null = null;
   resume: (() => void) | null = null;
   canPause: (() => boolean) | null = null;
@@ -68,6 +69,11 @@ class CodexStdoutThreadQueue {
       this.head = 0;
     }
     return task;
+  }
+
+  /** 等待持久化容量期间保留队首，避免排空屏障提前完成。 */
+  peek(): CodexStdoutDispatchTask | null {
+    return this.values[this.head] ?? null;
   }
 
   /** 丢弃未分发项并复位背压计数。 */
@@ -106,6 +112,7 @@ class CodexStdoutDispatcher {
       queuedMessages: number,
       queuedBytes: number,
     ) => void,
+    private readonly waitForCapacity?: (threadId: ThreadId) => Promise<void> | undefined,
   ) {
     this.batchMessages = resolvePositiveInteger(limits?.batchMessages, DEFAULT_STDOUT_BATCH_MESSAGES);
     this.batchBytes = resolvePositiveInteger(limits?.batchBytes, DEFAULT_STDOUT_BATCH_BYTES);
@@ -125,16 +132,7 @@ class CodexStdoutDispatcher {
       this.activeThreadIds.push(threadId);
     }
     queue.push({ ...task, bytes: Math.max(0, Math.floor(task.bytes)) });
-    if (
-      !queue.paused
-      && (queue.length >= this.highWaterMessages || queue.queuedBytes >= this.highWaterBytes)
-      && queue.pause
-      && (queue.canPause?.() ?? true)
-    ) {
-      queue.pause();
-      queue.paused = true;
-      this.onFlowState(threadId, "paused", queue.length, queue.queuedBytes);
-    }
+    this.pauseIfBackpressured(threadId, queue);
     this.schedule();
   }
 
@@ -177,6 +175,7 @@ class CodexStdoutDispatcher {
     this.draining = true;
     let dispatchedMessages = 0;
     let dispatchedBytes = 0;
+    let waitingThreads = 0;
     const startedAt = performance.now();
     try {
       while (
@@ -192,25 +191,41 @@ class CodexStdoutDispatcher {
           this.activeThreadIds.splice(this.cursor, 1);
           continue;
         }
-        const task = queue.shift();
+        if (queue.waiting) {
+          this.cursor = (this.cursor + 1) % this.activeThreadIds.length;
+          if (++waitingThreads >= this.activeThreadIds.length) break;
+          continue;
+        }
+        waitingThreads = 0;
+        const task = queue.peek();
         if (!task) {
           this.finishThreadQueue(threadId, queue);
           continue;
         }
-        dispatchedMessages += 1;
-        dispatchedBytes += task.bytes;
         try {
+          const capacity = this.waitForCapacity?.(threadId);
+          if (capacity) {
+            queue.waiting = true;
+            void capacity.then(() => {
+              queue.waiting = false;
+              this.schedule();
+            }, cause => {
+              queue.waiting = false;
+              this.failDispatchTask(threadId, queue, task, cause);
+              this.schedule();
+            });
+            this.pauseIfBackpressured(threadId, queue);
+            continue;
+          }
+          queue.shift();
+          dispatchedMessages += 1;
+          dispatchedBytes += task.bytes;
           task.run();
           this.resumeIfBelowLowWater(threadId, queue);
           if (queue.length === 0) this.finishThreadQueue(threadId, queue);
           else this.cursor = (this.cursor + 1) % this.activeThreadIds.length;
         } catch (cause) {
-          let failure: unknown = cause;
-          try { task.onFailure?.(cause); }
-          catch (secondary) { failure = new AggregateError([cause, secondary], "Codex stdout 分发与收口均失败", { cause }); }
-          const error = failure instanceof Error ? failure : new Error("Codex stdout 分发失败", { cause: failure });
-          // 仅熔断抛错的 thread 队列；不能让 setImmediate 异常扩大为 Client 进程未处理异常。
-          this.failThreadQueue(threadId, queue, error);
+          this.failDispatchTask(threadId, queue, task, cause);
           continue;
         }
       }
@@ -218,6 +233,24 @@ class CodexStdoutDispatcher {
       this.draining = false;
       if (this.activeThreadIds.length > 0) this.schedule();
     }
+  }
+
+  /** 分发或容量等待失败统一交回原任务owner，再拒绝该thread的排空屏障。 */
+  private failDispatchTask(threadId: ThreadId, queue: CodexStdoutThreadQueue, task: CodexStdoutDispatchTask, cause: unknown): void {
+    let failure: unknown = cause;
+    try { task.onFailure?.(cause); }
+    catch (secondary) { failure = new AggregateError([cause, secondary], "Codex stdout 分发与收口均失败", { cause }); }
+    const error = failure instanceof Error ? failure : new Error("Codex stdout 分发失败", { cause: failure });
+    this.failThreadQueue(threadId, queue, error);
+  }
+
+  /** 通知或持久化积压时暂停该thread；控制RPC在途时始终保留读取通道。 */
+  private pauseIfBackpressured(threadId: ThreadId, queue: CodexStdoutThreadQueue): void {
+    if (queue.paused || !queue.pause || !(queue.canPause?.() ?? true)) return;
+    if (!queue.waiting && queue.length < this.highWaterMessages && queue.queuedBytes < this.highWaterBytes) return;
+    queue.pause();
+    queue.paused = true;
+    this.onFlowState(threadId, "paused", queue.length, queue.queuedBytes);
   }
 
   /** 完成空队列并唤醒 thread 排空等待者。 */
@@ -238,7 +271,7 @@ class CodexStdoutDispatcher {
 
   /** 低水位后恢复该 thread 的 stdout，不影响其它 thread 或公共 Server WS。 */
   private resumeIfBelowLowWater(threadId: ThreadId, queue: CodexStdoutThreadQueue): void {
-    if (!queue.paused || !queue.resume) return;
+    if (queue.waiting || !queue.paused || !queue.resume) return;
     if (queue.length > this.lowWaterMessages || queue.queuedBytes > this.lowWaterBytes) return;
     queue.resume();
     queue.paused = false;
@@ -271,7 +304,7 @@ class CodexStdoutDispatcher {
 
   /** 在下一轮 check 阶段继续分发。 */
   private schedule(): void {
-    if (this.immediate || this.draining || this.activeThreadIds.length === 0) return;
+    if (this.immediate || this.draining || !this.activeThreadIds.some(threadId => !this.queues.get(threadId)?.waiting)) return;
     this.immediate = setImmediate(() => this.drainBatch());
     if (this.waiters.size === 0) this.immediate.unref?.();
   }
@@ -299,6 +332,8 @@ export class CodexAppServerManager {
     clientInfo: { name: string; title: string; version: string };
     /** 为每个 app-server 提供当前活动 Codex Key 的运行时配置。 */
     resolveCodexRuntimeConfig?: (threadId: ThreadId) => CodexRuntimeConfig | null | Promise<CodexRuntimeConfig | null>;
+    /** 输出派发前等待原工作区事件持久化释放容量；无压力时保持同步快速路径。 */
+    waitForEventCapacity?: (workspaceId: WorkspaceId) => Promise<void> | undefined;
     stdoutDispatchLimits?: {
       batchMessages?: number;
       batchBytes?: number;
@@ -316,6 +351,10 @@ export class CodexAppServerManager {
       if (!record) throw new Error(`Missing Codex stdout workspace owner: threadId=${threadId}`);
       writeEngineWorkspaceLog(this.opts.writeWorkspaceLog, record.workspaceId, () => ({ level: state === "paused" ? "warn" : "info",
         tag: "codex-app-server", message: `stdout ${state}`, data: { threadId, queuedMessages, queuedBytes, scope: "thread_app_server_stdout" } }));
+    }, threadId => {
+      const record = this.byThreadId.get(threadId);
+      if (!record) throw new Error(`Missing Codex event pipeline owner: threadId=${threadId}`);
+      return this.opts.waitForEventCapacity?.(record.workspaceId);
     });
   }
 

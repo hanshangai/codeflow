@@ -26,13 +26,14 @@ async function execute(file: string, args: string[], env: NodeJS.ProcessEnv) {
   });
 }
 
-/** 复用真实页面与维护宏，仅在 Show 前注入定时点击，不替换选择或维护分支。 */
-async function fixture(choice: "default" | "remove" | "cancel" | "back" | "upgrade" | "unconfirmed" | "invalid") {
+/** 复用真实保留说明页，仅注入定时点击；夹具不调用业务维护。 */
+async function fixture(choice: "default" | "cancel" | "back" | "upgrade") {
   const parent = process.env.CF_NSIS_RUNTIME_ROOT ?? os.tmpdir();
   assert.ok(path.isAbsolute(parent));
   await fs.mkdir(parent, { recursive: true });
   const root = await fs.mkdtemp(path.join(parent, `nsis-page-${choice}-`));
   const temporary = path.join(root, "temporary"); await fs.mkdir(temporary);
+  await fs.writeFile(path.join(root, "profile.json"), '{"account":"账号","deviceId":"keep","tasks":[1]}', "utf8");
   const env = { ...process.env, TEMP: temporary, TMP: temporary };
   /** 保留完整输入与编译诊断；夹具不包含任何删除或注册表指令。 */
   async function compile(name: string, body: string) {
@@ -59,6 +60,7 @@ SectionEnd
   await fs.writeFile(inputHook, current.replace(anchor, `    \${NSD_CreateTimer} un.TestNext 80\n${anchor}`), { encoding: "utf8", flag: "wx" });
   const generator = await compile("generator", `SilentInstall silent
 !define BUILD_UNINSTALLER
+!define CODEFLOW_STOP_INSTALLED_INCLUDE "${fileURLToPath(new URL("../build/stop-installed-processes.nsh", import.meta.url))}"
 !include "MUI2.nsh"
 !include "${inputHook}"
 !define isUpdated '"${choice === "upgrade" ? "updated" : "ordinary"}" == "updated"'
@@ -89,22 +91,29 @@ FunctionEnd
 Function un.TestNext
   \${NSD_KillTimer} un.TestNext
   IntOp $visits $visits + 1
-  ${choice === "remove" || choice === "back" ? `\${If} $visits == 1\n    \${NSD_Uncheck} $d16KeepData\n  \${EndIf}` : ""}
-  \${NSD_GetState} $d16KeepData $0
   FileOpen $1 "$EXEDIR\\page-state.txt" a
   FileSeek $1 0 END
-  FileWrite $1 "$0$\\r$\\n"
+  FileWrite $1 "$visits$\\r$\\n"
   FileClose $1
   FileOpen $1 "$EXEDIR\\page-copy.txt" a
   FileSeek $1 0 END
-  System::Call 'user32::GetWindow(p $d16KeepData, i 3) p.r2'
+  System::Call 'user32::GetWindow(p $HWNDPARENT, i 5) p.r2'
+  scan_dialog:
+  StrCmp $2 0 page_copy_done
+  System::Call 'user32::GetWindow(p r2, i 5) p.r4'
+  scan_label:
+  StrCmp $4 0 next_dialog
+  System::Call 'user32::GetWindowTextW(p r4, w .r0, i 1024) i.r3'
+  FileWriteUTF16LE $1 "$0$\\r$\\n"
+  System::Call 'user32::GetWindow(p r4, i 2) p.r4'
+  Goto scan_label
+  next_dialog:
   System::Call 'user32::GetWindowTextW(p r2, w .r0, i 1024) i.r3'
   FileWriteUTF16LE $1 "$0$\\r$\\n"
-  System::Call 'user32::GetWindow(p $d16KeepData, i 2) p.r2'
-  System::Call 'user32::GetWindowTextW(p r2, w .r0, i 1024) i.r3'
-  FileWriteUTF16LE $1 "$0$\\r$\\n"
+  System::Call 'user32::GetWindow(p r2, i 2) p.r2'
+  Goto scan_dialog
+  page_copy_done:
   FileClose $1
-  ${choice === "invalid" ? `System::Call 'user32::DestroyWindow(p $d16KeepData) i.r0'\n  SetSilent silent` : ""}
   GetDlgItem $0 $HWNDPARENT ${choice === "cancel" ? 2 : 1}
   System::Call 'user32::PostMessageW(p r0, i \${BM_CLICK}, p 0, p 0) i.r1'
 FunctionEnd
@@ -124,18 +133,17 @@ SectionEnd
   return { root, env, executable: path.join(root, "page-stub.exe") };
 }
 
-for (const [choice, expected, states] of [["default", "keep", "1\r\n"], ["remove", "remove", "0\r\n"], ["back", "remove", "0\r\n0\r\n"]] as const) {
-  test(`real uninstall page preserves ${choice} choice after leaving its control`, { skip }, async () => {
+for (const [choice, states] of [["default", "1\r\n"], ["back", "1\r\n2\r\n"]] as const) {
+  test(`real uninstall page preserves all data on ${choice} navigation`, { skip }, async () => {
     const f = await fixture(choice), result = await execute(f.executable, [`_?=${f.root}`], f.env);
     assert.equal(result.code, 0, JSON.stringify({ root: f.root, ...result }));
     assert.equal(await fs.readFile(path.join(f.root, "page-state.txt"), "ascii"), states);
     const copy = await fs.readFile(path.join(f.root, "page-copy.txt"), "utf16le");
-    assert.match(copy, /仅影响本机应用数据/u);
+    assert.match(copy, /账号、设备身份、配置和业务任务原样保留/u);
     assert.match(copy, /项目和工作区 \.codeflow 始终保留/u);
-    assert.match(copy, /两种选择都会移除安装身份/u);
-    assert.match(copy, /敏感凭据需重新录入/u);
-    const args = await fs.readFile(path.join(f.root, "maintenance.txt"), "ascii");
-    assert.match(args, new RegExp(`^--codeflow-uninstall-maintenance "nsis-[0-9-]+" "${expected}" --resume-pending$`, "u"));
+    assert.match(copy, /在应用内显式操作并确认清理结果/u);
+    await assert.rejects(fs.access(path.join(f.root, "maintenance.txt")), { code: "ENOENT" });
+    assert.equal(await fs.readFile(path.join(f.root, "profile.json"), "utf8"), '{"account":"账号","deviceId":"keep","tasks":[1]}');
     assert.equal(await fs.readFile(path.join(f.root, "continued.txt"), "ascii"), "continued");
   });
 }
@@ -153,24 +161,3 @@ test("real upgrade skips the choice page and maintenance while continuing its se
   for (const file of ["page-state.txt", "maintenance.txt"]) await assert.rejects(fs.access(path.join(f.root, file)), { code: "ENOENT" });
   assert.equal(await fs.readFile(path.join(f.root, "continued.txt"), "ascii"), "continued");
 });
-
-for (const choice of ["unconfirmed", "invalid"] as const) {
-  test(`real uninstall rejects ${choice} choice without calling maintenance`, { skip }, async () => {
-    const f = await fixture(choice), args = [...(choice === "unconfirmed" ? ["/S"] : []), `_?=${f.root}`];
-    const result = await execute(f.executable, args, f.env);
-    assert.equal(result.code, 1, `invalid choice must fail after recording its diagnostic: ${f.root}`);
-    for (const file of ["maintenance.txt", "continued.txt"]) await assert.rejects(fs.access(path.join(f.root, file)), { code: "ENOENT" });
-    const records = [];
-    for (const file of await fs.readdir(f.env.TEMP)) {
-      const target = path.join(f.env.TEMP, file);
-      if ((await fs.lstat(target)).isFile()) records.push(JSON.parse(await fs.readFile(target, "utf8")));
-    }
-    assert.equal(records.length, 1, "one persistent choice failure record is required");
-    assert.equal(records[0].errorCode, "DESKTOP_UNINSTALL_CHOICE_INVALID");
-    assert.equal(records[0].appId, "ai.codeflow.codeflowai");
-    assert.equal(records[0].stage, "uninstall-choice");
-    assert.match(records[0].requestId, /^nsis-choice-[A-Za-z0-9._-]+$/u);
-    assert.equal(records[0].rootCause, choice === "invalid" ? "CONTROL_INVALID" : "MODE_UNCONFIRMED");
-    assert.deepEqual(Object.keys(records[0]).sort(), ["appId", "errorCode", "requestId", "rootCause", "stage"]);
-  });
-}

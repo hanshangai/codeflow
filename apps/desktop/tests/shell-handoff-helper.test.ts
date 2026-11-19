@@ -874,7 +874,7 @@ async function recoverySession(direction: "original" | "candidate", variant = "s
   await fs.writeFile(path.join(base.installationDir, "shell-launch.ini"), serializeShellLaunchState(base.candidateState));
   if (variant === "missing-exe") await fs.unlink(path.join(base.installationDir, "shells", "new", "CodeFlowAI.exe"));
   if (variant === "missing-resources") await fs.rm(path.join(base.installationDir, "shells", "new", "resources"), { recursive: true });
-  if (variant === "missing-original-previous") await fs.unlink(path.join(base.installationDir, "shells", "previous", "CodeFlowAI.exe"));
+  if (variant === "missing-original-active") await fs.unlink(path.join(base.installationDir, "shells", base.originalState.activeShellId, "CodeFlowAI.exe"));
   let launchState = base.candidateState;
   if (lifecycle) base = await f.store.observeHandoffOwned(base, { caller: f.helper, processes: [f.helper] });
   if (variant === "second-claim" || variant === "history-truncated") {
@@ -1180,8 +1180,8 @@ test("admitted recovery with physically missing resources fails real signed arti
   assert.equal(await fs.readFile(path.join(actual.installationDir, "shell-launch.ini"), "utf8"), serializeShellLaunchState(actual.candidateState));
 });
 
-test("original recovery cannot ignore a physically missing original previous shell", async () => {
-  const s = await recoverySession("original", "missing-original-previous"); await assert.rejects(s.running);
+test("original recovery cannot ignore a physically missing original active shell", async () => {
+  const s = await recoverySession("original", "missing-original-active"); await assert.rejects(s.running);
   const actual = await s.f.store.read() as ShellUpdateAttemptV3;
   assert.equal(s.counts().starts, 0); assert.equal(actual.recovery?.terminalEvidence, null); assert.equal(s.events.includes("permit"), false);
   assert.equal(await fs.readFile(path.join(actual.installationDir, "shell-launch.ini"), "utf8"), serializeShellLaunchState(actual.candidateState));

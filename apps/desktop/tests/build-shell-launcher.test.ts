@@ -199,19 +199,19 @@ if (launcher) {
   }
 
   for (const relative of ["shells/current/resources/web/index.html", "shells/current/resources/client/dist/index.cjs", "shells/current/resources/release-trust.json"]) {
-    test(`real launcher rejects missing baseline ${relative}`, async t => {
+    test(`real launcher opens the active shell with missing business resource ${relative}`, async t => {
       const f = await launchFixture(t);
       await fs.unlink(path.join(f.root, relative));
-      const record = await assertLaunchFailure(f);
-      assert.equal(record.win32Error, 2);
-      assert.equal(typeof record.relativeEntity, "string");
+      assert.equal((await execute(f.executable, [f.capture], f.env)).code, 0);
+      assert.deepEqual(await capturedArguments(f.marker), []);
     });
   }
 
-  test("real launcher rejects missing previous shell", async t => {
+  test("real launcher opens the active shell with missing previous shell", async t => {
     const f = await launchFixture(t);
     await fs.writeFile(path.join(f.root, "shell-launch.ini"), f.state.toString().replace("previous=", "previous=old"));
-    await assertLaunchFailure(f);
+    assert.equal((await execute(f.executable, [f.capture], f.env)).code, 0);
+    assert.deepEqual(await capturedArguments(f.marker), []);
   });
 
   test("real launcher preserves sharing violation when opening state fails", async t => {

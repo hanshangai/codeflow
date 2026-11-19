@@ -16,13 +16,14 @@ import { readShellLaunchState, replaceShellLaunchState, type ShellLaunchState } 
 import { runCandidateShellHealth } from "./candidateShellHealth.js";
 import { startShellHandoffHelper, sendShellHandoffMessage, DEFAULT_SHELL_HANDOFF_TIMEOUT_MS, type ShellHandoffInbox, type ShellHandoffMessage } from "./shellHandoff.js";
 import { processSnapshot, sameIdentity, stopIdentity, type ProcessIdentity } from "./windowsProcessIdentity.js";
+import { runNativeShellUpdate } from "./shellNativeUpdate.js";
 
 export type ShellUpdateHostFacts = { installationDir: string; userDataDir: string; sessionDataDir: string; main: ProcessIdentity; temporaryParentDir?: string };
 type NetworkInput = Parameters<typeof createShellUpdateNetwork>[0];
 type InstallInput = { manifest: ShellReleaseManifest; trustedKeys: TrustedReleaseKeys; installerPath: string; installationDir: string;
   expectedState: ShellLaunchState; requestId: string; signal?: AbortSignal; timeoutMs?: number; temporaryParentDir?: string };
 export type ShellUpdateOperationBoundary = {
-  createNetwork(input: NetworkInput): Pick<ReturnType<typeof createShellUpdateNetwork>, "prepare" | "downloadInstaller">;
+  createNetwork(input: NetworkInput): Pick<ReturnType<typeof createShellUpdateNetwork>, "prepare" | "downloadInstaller"> & Partial<Pick<ReturnType<typeof createShellUpdateNetwork>, "authorizeSwitch">>;
   install(input: InstallInput): Promise<{ manifest: ShellReleaseManifest; candidateDirectory: string }>;
   health: typeof runCandidateShellHealth;
   snapshot: typeof processSnapshot;
@@ -30,6 +31,8 @@ export type ShellUpdateOperationBoundary = {
   stop: typeof stopIdentity;
 };
 export type ShellUpdateOperationInput = {
+  shellVersion?: string;
+  discovery?: NetworkInput["discovery"];
   dataDir: string; initialReleaseDir: string; identity: DeviceIdentity; trustedKeys: TrustedReleaseKeys; configuredServerOrigin: string;
   requestId: string; signal: AbortSignal; facts: ShellUpdateHostFacts; getClient(): ClientRuntimeSnapshot;
   onRetry: NetworkInput["onRetry"]; boundary?: Partial<ShellUpdateOperationBoundary>; timeoutMs?: number;
@@ -47,8 +50,9 @@ export type ShellUpdateOperationResult = { status: "no-update" | "postponed"; re
   | { status: "handoff"; requestId: string; owner: ShellUpdateHelperOwner };
 type Owned = { child: ChildProcess; identity?: ProcessIdentity; inbox?: ShellHandoffInbox; closed: Promise<void>; didClose: boolean; errors: unknown[] };
 
-/** 只串联既有owner；调用方持有唯一operation和D09准入，helper持有后续INI/新main/intent。 */
+/** 默认走独立原生文件事务；显式旧 helper 边界保留历史交接兼容。 */
 export async function runShellUpdateOperation(input: ShellUpdateOperationInput): Promise<ShellUpdateOperationResult> {
+  if (!input.boundary?.spawnHelper) return await runNativeShellUpdate(input);
   input = { ...input, facts: structuredClone(input.facts) };
   const store = createShellUpdateAttemptStore(input.dataDir);
   const timeout = input.timeoutMs ?? DEFAULT_SHELL_HANDOFF_TIMEOUT_MS;
@@ -199,7 +203,7 @@ export async function runShellUpdateOperation(input: ShellUpdateOperationInput):
     requestId = attempt.requestId;
     recovery = "not_needed"; observe("prepare");
     const network = (input.boundary?.createNetwork ?? createShellUpdateNetwork)({ store, identity: input.identity, configuredServerOrigin: input.configuredServerOrigin,
-      trustedKeys: input.trustedKeys, signal: input.signal, onRetry: input.onRetry,
+      discovery: input.discovery, currentShellVersion: input.shellVersion, trustedKeys: input.trustedKeys, signal: input.signal, onRetry: input.onRetry,
       onExhausted() { manualRequired = true; observe(failurePhase, "manual_required"); } });
     const prepared = await network.prepare();
     if (!samePreparation(prepared.attempt, attempt)) fail("ATTEMPT_CHANGED");

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { allocateDesktopShellVersion, assertShellVersion, readDesktopShellInputs } from "./desktop-shell-version.mjs";
 
 const requireRelease = createRequire(import.meta.url);
 const releaseVersioning = requireRelease("./release-versioning.cjs");
@@ -51,30 +52,46 @@ export async function createDesktopReleasePlan({ root, platforms, keyId, expires
   if (!Number.isFinite(expiry.getTime()) || expiry.getTime() <= now.getTime()) throw new Error("DESKTOP_PLAN_EXPIRY_INVALID");
   const facts = await readDesktopPlanFacts(root, { allowDirty });
   const directory = planDir ?? path.join(root, "release", "desktop-plans");
-  const packageJson = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
-  let version = releaseVersioning.computeNextReleaseVersion(packageJson.version, now);
-  const used = new Set(await existingPlanVersions(directory));
-  for (let attempt = 0; attempt < 1000 && used.has(version); attempt++) version = releaseVersioning.computeNextReleaseVersion(version, now);
-  if (used.has(version)) throw new Error("DESKTOP_PLAN_VERSION_EXHAUSTED");
-  const plan = {
-    schemaVersion: PLAN_SCHEMA_VERSION,
-    environment,
-    releaseId: `desktop-${version}`,
-    version,
-    webVersion: version,
-    clientVersion: version,
-    protocolVersion: 1,
-    capabilityVersion: 1,
-    dbSchemaVersion: facts.dbSchemaVersion,
-    platformSet: normalizePlatforms(platforms),
-    sourceCommit: facts.sourceCommit,
-    keyId,
-    createdAt: now.toISOString(),
-    expiresAt: expiry.toISOString(),
-  };
-  const file = path.join(directory, `${version}.json`);
-  await writeExclusive(file, plan);
-  return { file, plan };
+  await fs.mkdir(directory, { recursive: true });
+  const lockPath = path.join(directory, ".allocation.lock");
+  const lock = await fs.open(lockPath, "wx");
+  let failure;
+  try {
+    const inputs = await readDesktopShellInputs(root);
+    const versions = await existingPlanVersions(directory);
+    const history = await Promise.all(versions.map(async version => JSON.parse(await fs.readFile(path.join(directory, `${version}.json`), "utf8"))));
+    const shellVersion = allocateDesktopShellVersion({ ...inputs, plans: history });
+    const packageJson = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
+    let version = releaseVersioning.computeNextReleaseVersion(packageJson.version, now);
+    const used = new Set(versions);
+    for (let attempt = 0; attempt < 1000 && used.has(version); attempt++) version = releaseVersioning.computeNextReleaseVersion(version, now);
+    if (used.has(version)) throw new Error("DESKTOP_PLAN_VERSION_EXHAUSTED");
+    const plan = {
+      schemaVersion: PLAN_SCHEMA_VERSION,
+      environment,
+      releaseId: `desktop-${version}`,
+      version,
+      webVersion: version,
+      clientVersion: version,
+      protocolVersion: 1,
+      capabilityVersion: 1,
+      dbSchemaVersion: facts.dbSchemaVersion,
+      platformSet: normalizePlatforms(platforms),
+      sourceCommit: facts.sourceCommit,
+      shellVersion,
+      shellInputFingerprint: inputs.shellInputFingerprint,
+      keyId,
+      createdAt: now.toISOString(),
+      expiresAt: expiry.toISOString(),
+    };
+    const file = path.join(directory, `${version}.json`);
+    await writeExclusive(file, plan);
+    return { file, plan };
+  } catch (error) { failure = error; throw error; }
+  finally {
+    try { await lock.close(); await fs.unlink(lockPath); }
+    catch (cleanup) { throw failure ? new AggregateError([failure, cleanup], "DESKTOP_PLAN_LOCK_CLEANUP_FAILED") : cleanup; }
+  }
 }
 
 /** 读取并校验计划；Mac 构建必须和 Windows 分配时处于同一提交、同一 schema。 */
@@ -97,5 +114,9 @@ export async function readDesktopReleasePlan({ root, file, allowDirty = false })
     || plan.platformSet.some(item => !DESKTOP_PLAN_PLATFORMS.includes(item))) throw new Error("DESKTOP_PLAN_INVALID");
   if (plan.sourceCommit !== facts.sourceCommit) throw new Error("DESKTOP_PLAN_COMMIT_MISMATCH");
   if (plan.dbSchemaVersion !== facts.dbSchemaVersion) throw new Error("DESKTOP_PLAN_SCHEMA_MISMATCH");
+  if (plan.shellVersion === undefined && plan.shellInputFingerprint === undefined) throw new Error("DESKTOP_PLAN_LEGACY_SHELL_BASELINE_ONLY");
+  assertShellVersion(plan.shellVersion);
+  if (!/^[a-f0-9]{64}$/u.test(plan.shellInputFingerprint)) throw new Error("DESKTOP_PLAN_SHELL_INPUT_INVALID");
+  if ((await readDesktopShellInputs(root)).shellInputFingerprint !== plan.shellInputFingerprint) throw new Error("DESKTOP_PLAN_SHELL_INPUT_MISMATCH");
   return plan;
 }

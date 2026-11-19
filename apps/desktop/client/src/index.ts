@@ -1343,6 +1343,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
   };
   const sessions = new ThreadSessionManager({
     withLegacyDatabase: withDatabase,
+    waitForEventCapacity: workspaceId => eventPipeline?.waitForCapacity(workspaceId),
     writeWorkspaceLog: (workspaceId, entry) => db.writeWorkspaceLog(workspaceId, entry),
     ...(desktopLifecycle ? { builtInRelayCredentials } : {}),
     workspaces,

@@ -18,6 +18,7 @@ const implementation = existsSync(fileURLToPath(new URL("../src/shellUpdateNetwo
 const evidence = await fs.mkdtemp(path.join(os.tmpdir(), "cf-d13-shell-discovery-"));
 after(() => { process.stdout.write(`D13 shell discovery evidence: ${evidence}\n`); });
 type NetworkInput = { store: ShellUpdateAttemptStore; identity: DeviceIdentity; configuredServerOrigin: string;
+  currentShellVersion: string;
   trustedKeys: Record<string, crypto.KeyObject | string>; signal: AbortSignal;
   onRetry: (context: { retry: number; delayMs: number; error: unknown }) => void | Promise<void> };
 type Result = { status: "no-update" | "target"; attempt: ShellUpdatePreparationAttempt; manifest?: unknown; reason?: "none" | "same" };
@@ -84,18 +85,32 @@ async function fixture(t: test.TestContext, options: { sameShell?: boolean; matc
   const configuredServerOrigin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   const controller = new AbortController();
   const input: NetworkInput = { store, identity, configuredServerOrigin, trustedKeys: { "test-key": keys.publicKey }, signal: controller.signal,
-    onRetry: () => {} };
+    currentShellVersion: options.sameShell ? "2.0.0" : "1.0", onRetry: () => {} };
   return { dataDir, identity, keys, manifest, installer, initial, store, main, client, calls, server, ack, discovery, input, controller,
     respond(handler: typeof respond) { respond = handler; },
     resultDirectory: path.join(dataDir, ".staging", "shell-update", crypto.createHash("sha256").update(initial.requestId).digest("hex")) };
 }
 
-test("a full installation matching the signed shell inventory is same despite a different shell ID", async t => {
+test("a higher shell version updates without comparing the installed file inventory", async t => {
   const f = await fixture(t, { matchingInstalled: true });
   const result = await network(f.input).prepare();
-  assert.equal(result.status, "no-update"); assert.equal(result.reason, "same");
-  assert.equal(result.attempt.target, null); assert.equal((await f.store.read())?.phase, "no-update");
+  assert.equal(result.status, "target");
+  assert.equal(result.attempt.target?.shellId, "shell-next");
   assert.equal(f.calls.some(call => call.path.endsWith("/installer")), false);
+});
+
+for (const version of ["2.0.0", "3.0"])
+test(`shell target at or below installed version ${version} is not downloaded`, async t => {
+  const f = await fixture(t); f.input.currentShellVersion = version;
+  const result = await network(f.input).prepare();
+  assert.equal(result.status, "no-update"); assert.equal(result.attempt.target, null);
+});
+
+test("unknown shell version is a check failure, never an implicit upgrade from zero", async t => {
+  const f = await fixture(t); f.input.currentShellVersion = "unknown";
+  await assert.rejects(network(f.input).prepare(), error => (error as Error).cause instanceof Error
+    && ((error as Error).cause as Error).message === "DESKTOP_SHELL_VERSION_INVALID");
+  assert.equal((await f.store.read())?.target, null);
 });
 
 test("schema5 network preserves preparation proofs across discovery installer and a new process", async t => {
@@ -146,7 +161,7 @@ async function resumeInNode(f: Awaited<ReturnType<typeof fixture>>, action = "pr
   const script = path.join(f.dataDir, "resume.mjs");
   await fs.writeFile(script, `import { createShellUpdateNetwork } from ${JSON.stringify(new URL("../src/shellUpdateNetwork.ts", import.meta.url).href)};\n`
     + `import { createShellUpdateAttemptStore } from ${JSON.stringify(new URL("../src/shellUpdateAttempt.ts", import.meta.url).href)};\n`
-    + `const result = await createShellUpdateNetwork({store:createShellUpdateAttemptStore(${JSON.stringify(f.dataDir)}),identity:${JSON.stringify(f.identity)},configuredServerOrigin:${JSON.stringify(f.input.configuredServerOrigin)},trustedKeys:${JSON.stringify({ "test-key": f.keys.publicKey.export({ format: "pem", type: "spki" }).toString() })},signal:new AbortController().signal,onRetry:()=>{}}).${action}();\n`
+    + `const result = await createShellUpdateNetwork({store:createShellUpdateAttemptStore(${JSON.stringify(f.dataDir)}),currentShellVersion:${JSON.stringify(f.input.currentShellVersion)},identity:${JSON.stringify(f.identity)},configuredServerOrigin:${JSON.stringify(f.input.configuredServerOrigin)},trustedKeys:${JSON.stringify({ "test-key": f.keys.publicKey.export({ format: "pem", type: "spki" }).toString() })},signal:new AbortController().signal,onRetry:()=>{}}).${action}();\n`
     + "console.log(JSON.stringify(result));\n", "utf8");
   const child = spawn(process.execPath, ["--conditions=development", "--import", "tsx", script], { cwd: fileURLToPath(new URL("..", import.meta.url)), windowsHide: true, env: process.env });
   let stdout = "", stderr = ""; child.stdout.on("data", value => { stdout += value; }); child.stderr.on("data", value => { stderr += value; });

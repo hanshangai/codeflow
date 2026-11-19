@@ -7,6 +7,9 @@ import { build, Platform, Arch } from "electron-builder";
 import { formatDesktopVersion } from "@codeflowai/shared";
 import { assertTrustedReleaseKeys, verifyReleaseBundlePayload } from "@codeflowai/shared/desktop-release-signing";
 import { createBuilderProject, removeBuilderProject, resolveInstalledElectronDist, toBuilderVersion } from "./package-local-builder.mjs";
+import { readDesktopReleasePlan } from "../../../tools/release/desktop-release-plan.mjs";
+import { readDesktopShellInputs } from "../../../tools/release/desktop-shell-version.mjs";
+import { buildShellSwitch } from "./build-shell-switch.mjs";
 
 const requestId = crypto.randomUUID();
 
@@ -72,30 +75,33 @@ async function verifyBaselineProof(resources, required) {
 /** 仅接受本地 dir/nsis 目标，选项重复、缺值和未知项均在写前拒绝。 */
 function readPackageArguments(argv) {
   const [input, output, ...options] = argv;
-  const usage = "用法：package-local-win.mjs <完整资源目录> <新独占输出目录> [--require-baseline-proof] [--target dir|nsis]";
+  const usage = "用法：package-local-win.mjs <完整资源目录> <新独占输出目录> [--require-baseline-proof] [--target dir|nsis] [--plan <file>] [--allow-dirty]";
   if (!input || !output || input.startsWith("--") || output.startsWith("--")) throw new Error(usage);
-  let required = false, target = "dir", targetSeen = false;
+  let required = false, target = "dir", targetSeen = false, planFile, allowDirty = false;
   for (let index = 0; index < options.length; index++) {
     const option = options[index];
     if (option === "--require-baseline-proof" && !required) required = true;
     else if (option === "--target" && !targetSeen && ["dir", "nsis"].includes(options[index + 1])) {
       target = options[++index]; targetSeen = true;
-    } else throw new Error(usage);
+    } else if (option === "--plan" && !planFile && options[index + 1] && !options[index + 1].startsWith("--")) planFile = path.resolve(options[++index]);
+    else if (option === "--allow-dirty" && !allowDirty) allowDirty = true;
+    else throw new Error(usage);
   }
-  return { input, output, required, target };
+  return { input, output, required, target, planFile, allowDirty };
 }
 
-/** 安装包始终使用实际壳版本；主版本统一为 1.0 两位，资源发布不得修改它。 */
-async function resolveLocalPackageVersion(desktopDir) {
+/** 发布构建使用已验来源计划；无计划仅保留原本地打包入口。 */
+async function resolveLocalPackageVersion(desktopDir, planFile, allowDirty) {
+  if (planFile) return (await readDesktopReleasePlan({ root: path.resolve(desktopDir, "../.."), file: planFile, allowDirty })).shellVersion;
   const { version } = JSON.parse(await fs.readFile(path.join(desktopDir, "package.json"), "utf8"));
-  if (typeof version !== "string" || !/^\d+\.\d+$/.test(version)) throw new Error("DESKTOP_SHELL_VERSION_INVALID");
+  if (typeof version !== "string" || !/^\d+\.\d+(?:\.\d+)?$/.test(version)) throw new Error("DESKTOP_SHELL_VERSION_INVALID");
   return version;
 }
 
 
 /** 完整资源及维护 Worker 须齐备；安装包强制携带基线证明，所有检查先于输出写入。 */
 async function packageLocalWindows() {
-  const { input, output, required, target } = readPackageArguments(process.argv.slice(2));
+  const { input, output, required, target, planFile, allowDirty } = readPackageArguments(process.argv.slice(2));
   if (process.platform !== "win32") throw new Error("DESKTOP_LOCAL_WINDOWS_REQUIRED");
   const resources = await fs.realpath(path.resolve(input));
   const outputDir = path.resolve(output);
@@ -104,7 +110,7 @@ async function packageLocalWindows() {
     await fs.access(path.join(resources, entry));
   }
   const desktopDir = fileURLToPath(new URL("..", import.meta.url));
-  const shellVersion = await resolveLocalPackageVersion(desktopDir);
+  const shellVersion = await resolveLocalPackageVersion(desktopDir, planFile, allowDirty);
   await fs.access(path.join(desktopDir, "dist/main.js"));
   await fs.access(path.join(desktopDir, "dist/preload.cjs"));
   await assertSeparatePackagingOutput(resources, desktopDir, outputDir);
@@ -117,6 +123,9 @@ async function packageLocalWindows() {
   if (!worker.isFile() || worker.isSymbolicLink() || worker.nlink !== 1) throw new Error("DESKTOP_UNINSTALL_WORKER_INVALID");
   const baselineProof = await verifyBaselineProof(resources, required || target === "nsis");
   const { electronDist, electronVersion } = await resolveInstalledElectronDist({ platform: "win32", arch: "x64" });
+  if (planFile && (await readDesktopShellInputs(path.resolve(desktopDir, "../.."))).electronVersion !== electronVersion) {
+    throw new Error("DESKTOP_SHELL_ELECTRON_LOCK_MISMATCH");
+  }
   const hasBaselineProof = baselineProof !== null;
   /** 对外文件名与界面共用同一展示版本；非日期基线退回打包用三段壳版本，避免文件名与安装后版本脱节。 */
   const composedVersion = baselineProof && formatDesktopVersion(shellVersion, baselineProof.version);
@@ -129,8 +138,12 @@ async function packageLocalWindows() {
   const { load } = requireBuilderLibrary("js-yaml");
   const original = load(await fs.readFile(path.join(desktopDir, "electron-builder.yml"), "utf8"));
   const configPath = path.join(outputDir, "local-builder.json");
-  // 独立配置复用原 YAML，避免 builder 深合并数组后把旧资源再复制一次。
-  await fs.writeFile(configPath, `${JSON.stringify({ ...original,
+  const builderProjectDir = await createBuilderProject(desktopDir, shellVersion);
+  let artifacts, buildError;
+  try {
+    const shellSwitch = await buildShellSwitch({ outputDir: path.join(builderProjectDir, "native-tools"), version: shellVersion });
+    // 独立配置复用原 YAML，避免 builder 深合并数组后把旧资源再复制一次。
+    await fs.writeFile(configPath, `${JSON.stringify({ ...original,
       directories: { output: outputDir }, extraMetadata: { version: toBuilderVersion(shellVersion) },
       electronVersion, electronDist,
       artifactName: `CodeFlowAI-${displayVersion}-win32-x64.\${ext}`,
@@ -141,6 +154,8 @@ async function packageLocalWindows() {
       ...(target === "nsis" ? { nsis: { ...original.nsis, runAfterFinish: true },
         afterSign: path.join(desktopDir, "scripts/windows-install-layout.mjs") } : {}),
       extraResources: [
+        { from: shellSwitch, to: "shell-switch.exe" },
+        { from: path.join(desktopDir, "build/icon.png"), to: "shell-icon.png" },
         { from: resources, to: ".", filter: ["desktop-update.json"] },
         { from: path.join(resources, "release-trust.json"), to: "release-trust.json" },
         { from: path.join(resources, "client"), to: "client" },
@@ -149,9 +164,6 @@ async function packageLocalWindows() {
         ...(hasBaselineProof ? [{ from: path.join(resources, "baseline-release-manifest.json"), to: "baseline-release-manifest.json" }] : []),
       ],
     }, null, 2)}\n`, "utf8");
-  const builderProjectDir = await createBuilderProject(desktopDir, shellVersion);
-  let artifacts, buildError;
-  try {
     artifacts = await build({ projectDir: builderProjectDir, targets: Platform.WINDOWS.createTarget(target, Arch.x64), publish: "never", config: configPath });
   } catch (error) {
     buildError = error;

@@ -57,8 +57,9 @@ async function readPlan(options) {
   return { file: path.resolve(options.plan), plan: await readDesktopReleasePlan({ root, file: path.resolve(options.plan), allowDirty: Boolean(options["allow-dirty"]) }) };
 }
 
+/** 资源与完整包共用计划；完整包显式传递精确壳号的唯一来源。 */
 async function build(options) {
-  const { plan } = await readPlan(options);
+  const { plan, file } = await readPlan(options);
   if (!options["private-key"] || !options.trust) throw new Error("build 需要 --private-key 与 --trust");
   const target = currentDesktopPlatform();
   if (options.platform && platformKey(options.platform) !== target.key) throw new Error(`构建机平台不匹配：${options.platform}`);
@@ -74,11 +75,11 @@ async function build(options) {
   if (mode === "installer") {
     const installerDir = path.join(outputDir, "installer");
     runNode(path.join(root, "apps/desktop/scripts/package-local-win.mjs"),
-      [result.resourcesDir, installerDir, "--require-baseline-proof", "--target", "nsis"]);
+      [result.resourcesDir, installerDir, "--require-baseline-proof", "--target", "nsis", "--plan", file, ...(options["allow-dirty"] ? ["--allow-dirty"] : [])]);
   } else if (mode === "dmg") {
     const dmgDir = path.join(outputDir, "dmg");
     runNode(path.join(root, "apps/desktop/scripts/package-local-mac.mjs"),
-      [result.resourcesDir, dmgDir, "--require-baseline-proof", "--target", "dmg"]);
+      [result.resourcesDir, dmgDir, "--require-baseline-proof", "--target", "dmg", "--plan", file, ...(options["allow-dirty"] ? ["--allow-dirty"] : [])]);
   }
   if (options["shared-dir"]) {
     const sharedDir = path.resolve(options["shared-dir"]);

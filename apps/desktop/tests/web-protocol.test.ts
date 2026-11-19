@@ -66,7 +66,9 @@ test("Electron navigation with only an HTML Accept header resolves the SPA route
 test("default file responses preserve long-path module bytes and static MIME types", async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-desktop-web-long-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const webDir = path.join(root, ...Array.from({ length: 5 }, () => "release-resources-".repeat(2)), "web");
+  let webDir = root;
+  while (path.join(webDir, "web", "app.js").length <= 300) webDir = path.join(webDir, "release-resources-".repeat(2));
+  webDir = path.join(webDir, "web");
   await fs.mkdir(webDir, { recursive: true });
   const failures: unknown[] = [];
   const handler = createDesktopWebHandler({ getWebDir: () => webDir, onError: error => { failures.push(error); } });

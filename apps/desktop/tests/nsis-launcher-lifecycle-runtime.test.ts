@@ -213,3 +213,15 @@ test("real launcher reads short native arguments without crossing their guarded 
   assert.equal((await execute(f.executable, ["--codeflow-register-installation"], f.env)).code, 0);
   assert.equal(await fs.readFile(path.join(f.shell, "done.txt"), "ascii"), "done");
 });
+
+for (const missing of ["web/index.html", "client/dist/index.cjs", "release-trust.json", "historical-shells"] as const) {
+  test(`real launcher opens the current shell independently of missing ${missing}`, { skip }, async () => {
+    const f = await fixture();
+    if (missing === "historical-shells") {
+      await fs.writeFile(path.join(f.root, "shell-launch.ini"), "[shell]\r\nschema=1\r\nactive=current\r\nprevious=missing-old\r\nbaseline=missing-baseline\r\n", "ascii");
+    } else await fs.unlink(path.join(f.shell, "resources", missing));
+    assert.equal((await execute(f.executable, ["ordinary-open"], f.env)).code, 0, f.root);
+    await waitForFile(path.join(f.shell, "done.txt"));
+    assert.equal(await fs.readFile(path.join(f.shell, "arguments.txt"), "ascii"), "ordinary-open");
+  });
+}

@@ -8,6 +8,8 @@ import test from "node:test";
 import { formatDesktopVersion } from "@codeflowai/shared";
 import { verifyReleaseBundlePayload } from "@codeflowai/shared/desktop-release-signing";
 import { prepareRelease, verifyPreparedRelease } from "../scripts/prepare-release.mjs";
+import { createDesktopReleasePlan } from "../../../tools/release/desktop-release-plan.mjs";
+import { fileURLToPath } from "node:url";
 
 /** 仅外部安装器构建用替身，其余编号、签名、文件与复验使用真实临时资源。 */
 async function fixture(t) {
@@ -69,6 +71,31 @@ test("one candidate binds real resource, complete installer and notes and reuses
     packageInstaller: async () => { throw new Error("finished candidate must not rebuild"); } });
   assert.equal(second.directory, first.directory);
   assert.deepEqual(await fs.readdir(f.outputRoot), ["2026.11.09.01"]);
+});
+
+test("a planned candidate consumes its allocated resource and shell versions without modifying the workspace manifest", async t => {
+  const f = await fixture(t);
+  const { file: planFile, plan } = await createDesktopReleasePlan({ root: fileURLToPath(new URL("../../..", import.meta.url)),
+    platforms: ["win32/x64"], keyId: "fixture", planDir: path.join(f.root, "plans"), allowDirty: true });
+  const before = await fs.readFile(path.join(f.desktopDir, "package.json"), "utf8");
+  let attempts = 0;
+  const input = { ...f, planFile, planRoot: fileURLToPath(new URL("../../..", import.meta.url)), allowDirty: true,
+    packageInstaller: async ({ resourcesDir, outputDir, planFile: usedPlan }) => {
+      assert.equal(usedPlan, planFile);
+      const proof = JSON.parse(await fs.readFile(path.join(resourcesDir, "baseline-release-manifest.json"), "utf8"));
+      assert.equal(proof.version, plan.version);
+      if (++attempts === 1) throw new Error("planned build failed");
+      await fs.mkdir(outputDir);
+      const installer = path.join(outputDir, "planned.exe");
+      await fs.writeFile(installer, "planned installer", "utf8");
+      return { installer, shellVersion: plan.shellVersion, displayVersion: formatDesktopVersion(plan.shellVersion, plan.version) };
+    } };
+  await assert.rejects(prepareRelease(input), /planned build failed/);
+  const candidate = await prepareRelease(input);
+  assert.equal(candidate.shellVersion, plan.shellVersion);
+  assert.equal(candidate.metadata.version, plan.version);
+  assert.equal(candidate.sourceCommit, plan.sourceCommit);
+  assert.equal(await fs.readFile(path.join(f.desktopDir, "package.json"), "utf8"), before);
 });
 
 test("changed content requires an explicit candidate and increments the same-day patch", async t => {

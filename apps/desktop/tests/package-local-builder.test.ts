@@ -91,9 +91,11 @@ test("stages a normalized shell manifest and cleans links without touching sourc
     await fs.mkdir(path.dirname(file), { recursive: true });
     await fs.writeFile(file, text, "utf8");
   }
-  const stage = await createBuilderProject(desktop, "1.0");
+  const stage = await createBuilderProject(desktop, "1.7");
   try {
-    assert.equal(JSON.parse(await fs.readFile(path.join(stage, "package.json"), "utf8")).version, "1.0.0");
+    const staged = JSON.parse(await fs.readFile(path.join(stage, "package.json"), "utf8"));
+    assert.equal(staged.version, "1.7.0");
+    assert.equal(staged.shellVersion, "1.7");
     assert.equal(await fs.readFile(path.join(stage, "dist/main.js"), "utf8"), "main");
     assert.equal(await fs.readFile(path.join(stage, "node_modules/dep/package.json"), "utf8"), "{}");
     await fs.access(path.join(stage, "build/installer.nsh"));

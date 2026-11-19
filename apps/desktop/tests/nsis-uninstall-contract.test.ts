@@ -5,20 +5,23 @@ import test from "node:test";
 const source = await fs.readFile(new URL("../build/installer.nsh", import.meta.url), "utf8");
 const builderConfig = await fs.readFile(new URL("../electron-builder.yml", import.meta.url), "utf8");
 
-test("NSIS hooks keep installation registration and synchronous maintenance boundaries", () => {
+test("NSIS program lifecycle never starts Electron registration or business maintenance", () => {
   assert.match(source, /!include "nsDialogs\.nsh"/u);
   assert.doesNotMatch(source, /StrFunc\.nsh|FUNCTION_STRING_StrStr/u);
-  assert.match(source, /!macro customInstall[\s\S]*?--codeflow-register-installation[\s\S]*?!macroend/u);
-  assert.match(source, /!macro customUnInstall[\s\S]*?--codeflow-uninstall-maintenance[\s\S]*?!macroend/u);
+  assert.doesNotMatch(source, /--codeflow-register-installation|--codeflow-uninstall-maintenance|--codeflow-check-installation/u);
   assert.match(source, /Function un\.D16NewRequestId[\s\S]*?Call un\.D16NewRequestId/u);
-  assert.match(source, /ExecWait .*--codeflow-uninstall-maintenance/u);
+  assert.match(source, /Call un\.D16StopNativeProcesses/u);
+  assert.doesNotMatch(source, /powershell\.exe|ExecWait/u);
   assert.match(source, /MessageBox MB_ICONSTOP\|MB_OK[\s\S]*?Abort/u);
   assert.doesNotMatch(source, /Stop-Process|taskkill/iu);
 });
 
-test("NSIS hooks retain the choice page and finite maintenance mode", () => {
-  assert.match(source, /!macro customUnWelcomePage[\s\S]*?UninstPage custom[\s\S]*?NSD_Check/u);
-  assert.match(source, /!macro customUnInstall[\s\S]*?\$\{IfNot\} \$\{isUpdated\}[\s\S]*?\$d16Mode/u);
+test("NSIS uninstall page explains exact retention and keeps data deletion outside program removal", () => {
+  assert.match(source, /!macro customUnWelcomePage[\s\S]*?UninstPage custom/u);
+  assert.doesNotMatch(source, /NSD_CreateCheckbox|d16KeepData|d16Mode/u);
+  assert.match(source, /账号、设备身份、配置和业务任务原样保留/u);
+  assert.match(source, /在应用内显式操作并确认清理结果/u);
+  assert.match(source, /DELETE_APP_DATA_UNSUPPORTED/u);
   assert.doesNotMatch(source.match(/!macro customUnInstall[\s\S]*?!macroend/u)?.[0] ?? "", /Return/u);
 });
 

@@ -19,7 +19,7 @@ function mainLogDeclarations(ast: ts.SourceFile): ts.VariableStatement[] {
     declaration.initializer && ts.isNewExpression(declaration.initializer) && declaration.initializer.expression.getText(ast) === "WeakSet"));
 }
 
-/** 执行真实main启动与日志分支；指定shellDirectory时读取实际相邻壳包元数据。 */
+/** 执行真实main启动与日志分支；可选安装标记缺失，指定shellDirectory时读取实际壳元数据。 */
 async function startupFailure(options: { attempt?: object; error?: Error; beforeHeld?: boolean; ordinary?: boolean; expectedLogCount?: number;
   environmentOrigin?: string; installedOrigin?: string; originError?: Error; packaged?: boolean; maintenance?: boolean;
   maintenanceRelease?: "active" | "baseline"; shellDirectory?: string; electronVersion?: string } = {}) {
@@ -46,9 +46,11 @@ async function startupFailure(options: { attempt?: object; error?: Error; before
       execPath: path.resolve("installation/CodeFlowAI.exe"), pid: 1, ppid: 2,
       argv: options.maintenance ? [path.resolve("installation/CodeFlowAI.exe"), "--codeflow-uninstall-maintenance", "nsis:audit", "keep", "--resume-pending"] : [] },
     crypto: { randomUUID: () => startupId },
-    fs: { existsSync: () => false, mkdirSync() {}, readFileSync: options.shellDirectory ? readFileSync : () => Buffer.from('{"version":"7.8.9-fixture"}'),
+    fs: { existsSync: () => false, mkdirSync() {},
+      lstatSync(_file: string, input: { throwIfNoEntry?: boolean }) { assert.equal(input.throwIfNoEntry, false); return undefined; },
+      readFileSync: options.shellDirectory ? readFileSync : () => Buffer.from('{"version":"7.8.9-fixture"}'),
       appendFileSync(_file: string, line: string) { logs.push(JSON.parse(line)); } },
-    app: { isPackaged: options.packaged ?? Boolean(options.maintenance), getPath: (name: string) => path.resolve(name), setPath() {},
+    app: { isPackaged: options.packaged ?? Boolean(options.maintenance), getPath: (name: string) => path.resolve(name), setPath() {}, setAppUserModelId() {},
       requestSingleInstanceLock: () => true, on() {}, whenReady: () => Promise.resolve(), getVersion: () => options.electronVersion ?? "test",
       exit(code: number) { exits.push(code); } },
     protocol: { registerSchemesAsPrivileged() {}, handle() {} },
@@ -153,18 +155,21 @@ test('main invalid installed configuration fails before shell facts with a Chine
   assert.match(f.shown[0] ?? "", /更新配置无效/u);
 });
 
-/** 执行真实更新错误回调和日志函数，只替换磁盘与Electron弹框边界。 */
+/** 执行真实更新错误回调及其窗口/通知闭包，只替换磁盘、弹框与不支持通知的平台边界。 */
 async function updateErrorBoundary(failFirstWrite?: Error) {
   const source = await fs.readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const ast = ts.createSourceFile("main.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   let callback: ts.Expression | undefined;
+  let windowDeclaration: ts.VariableStatement | undefined, notification: ts.FunctionDeclaration | undefined;
   /** 从实际host配置定位回调，避免在夹具中镜像分支。 */
   const findCallback = (node: ts.Node): void => {
     if (ts.isPropertyAssignment(node) && node.name.getText(ast) === "onUpdateError") callback = node.initializer;
+    if (ts.isVariableStatement(node) && node.declarationList.declarations.some(declaration => declaration.name.getText(ast) === "normalWindow")) windowDeclaration = node;
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "notifyDesktopUpdate") notification = node;
     ts.forEachChild(node, findCallback);
   };
-  findCallback(ast); assert.ok(callback);
-  const statements = [...mainLogDeclarations(ast), ...ast.statements.filter(ts.isFunctionDeclaration)];
+  findCallback(ast); assert.ok(callback); assert.ok(windowDeclaration); assert.ok(notification);
+  const statements = [...mainLogDeclarations(ast), windowDeclaration, notification, ...ast.statements.filter(ts.isFunctionDeclaration)];
   const compiled = ts.transpileModule(statements.map(statement => statement.getFullText(ast)).join("\n"),
     { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
   const callbackCode = ts.transpileModule(`const updateError = ${callback.getText(ast)};`,
@@ -179,6 +184,7 @@ async function updateErrorBoundary(failFirstWrite?: Error) {
       logs.push(JSON.parse(line));
     } },
     dialog: { showErrorBox(_title: string, message: string) { shown.push(message); } },
+    Notification: { isSupported: () => false },
   });
   vm.runInContext(compiled + callbackCode, context);
   return { logs, shown,

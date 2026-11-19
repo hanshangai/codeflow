@@ -11,6 +11,8 @@ export type DesktopReleasePlan = {
   dbSchemaVersion: number;
   platformSet: string[];
   sourceCommit: string;
+  shellVersion: string;
+  shellInputFingerprint: string;
   keyId: string;
   createdAt: string;
   expiresAt: string;

@@ -299,7 +299,7 @@ FunctionEnd
   StrCmp $failure "" 0 failed
 !macroend
 
-; All launchable version references must retain a normal directory and executable.
+; Validate the selected executable; historical references are checked only when selected for execution.
 !macro CheckShell ID
   !insertmacro CheckObject "shells\${ID}" 16
   !insertmacro CheckObject "shells\${ID}\CodeFlowAI.exe" 0
@@ -504,17 +504,6 @@ Section
     StrCpy $stage "layout"
     !insertmacro CheckObject "shells" 16
     !insertmacro CheckShell "$activeId"
-    StrCmp $previousId "" no_previous
-      !insertmacro CheckShell "$previousId"
-    no_previous:
-    !insertmacro CheckShell "$baselineId"
-    !insertmacro CheckObject "shells\$baselineId\resources" 16
-    !insertmacro CheckObject "shells\$baselineId\resources\web" 16
-    !insertmacro CheckObject "shells\$baselineId\resources\web\index.html" 0
-    !insertmacro CheckObject "shells\$baselineId\resources\client" 16
-    !insertmacro CheckObject "shells\$baselineId\resources\client\dist" 16
-    !insertmacro CheckObject "shells\$baselineId\resources\client\dist\index.cjs" 0
-    !insertmacro CheckObject "shells\$baselineId\resources\release-trust.json" 0
     StrCpy $stage "execute"
     StrCpy $relativeEntity "shells\$activeId\CodeFlowAI.exe"
     StrCpy $checkedPath "$EXEDIR\$relativeEntity"

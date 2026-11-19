@@ -60,7 +60,8 @@ function readUnsignedLocalMarker(): boolean {
 function readRunningShellVersion(): string {
   try {
     const metadata: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(path.resolve(currentDirectory, "../package.json"))));
-    const version = metadata && typeof metadata === "object" && !Array.isArray(metadata) ? (metadata as { version?: unknown }).version : undefined;
+    const version = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+      ? (metadata as { shellVersion?: unknown }).shellVersion ?? (metadata as { version?: unknown }).version : undefined;
     if (typeof version !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$/u.test(version)) throw new Error("Shell package version is missing or invalid");
     return version;
   } catch (cause) {
@@ -123,8 +124,8 @@ function createDefaultWindow(webEntry: string, onError: (error: unknown) => void
 /** 托盘命令交给应用唯一 owner；失败保留应用并展示原因。 */
 function createTray(open: () => void, exit: () => Promise<void>, onExitError: (error: unknown) => void, checkForUpdates?: () => void, openFeedback?: () => void,
   uninstall?: () => void): Tray {
-  const iconPath = app.isPackaged ? path.join(process.resourcesPath, "web", "favicon-32x32.png")
-    : path.resolve(currentDirectory, "../../web/public/favicon-32x32.png");
+  const iconPath = app.isPackaged ? path.join(process.resourcesPath, "shell-icon.png")
+    : path.resolve(currentDirectory, "../build/icon.png");
   const image = nativeImage.createFromPath(iconPath);
   if (image.isEmpty()) throw new Error("DESKTOP_TRAY_ICON_INVALID");
   const icon = image.resize({ width: 16, height: 16 });
@@ -311,6 +312,30 @@ async function exitCandidateFailure(request: CandidateShellHealthRequest | null,
 }
 
 if (process.versions.electron) {
+  // 候选壳只测自身窗口能力；独立临时profile，不读取账号、Client或业务库。
+  if (process.argv.some(value => value.startsWith("--codeflow-shell-self-test"))) {
+    void (async () => {
+      if (process.argv.length !== 3 || process.argv[1] !== "--codeflow-shell-self-test") throw new Error("DESKTOP_SHELL_SELF_TEST_ARGUMENT_INVALID");
+      const temporaryRoot = process.argv[2]!;
+      if (!path.isAbsolute(temporaryRoot) || !path.basename(temporaryRoot).startsWith("cf-shell-selftest-")
+        || fs.realpathSync.native(temporaryRoot) !== temporaryRoot || !fs.lstatSync(temporaryRoot).isDirectory()
+        || fs.lstatSync(temporaryRoot).isSymbolicLink() || fs.readdirSync(temporaryRoot).length) throw new Error("DESKTOP_SHELL_SELF_TEST_PROFILE_INVALID");
+      fs.mkdirSync(path.join(temporaryRoot, "user-data"));
+      fs.mkdirSync(path.join(temporaryRoot, "session-data"));
+      app.setPath("userData", path.join(temporaryRoot, "user-data"));
+      app.setPath("sessionData", path.join(temporaryRoot, "session-data"));
+      await app.whenReady();
+      const window = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+      try {
+        await window.loadURL("data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Ctitle%3ECodeFlow%20shell%3C%2Ftitle%3E");
+        if (window.webContents.isDestroyed()) throw new Error("DESKTOP_SHELL_SELF_TEST_WINDOW_INVALID");
+      } finally { window.destroy(); }
+      app.exit(0);
+    })().catch(error => {
+      fs.writeSync(2, `${JSON.stringify({ code: "DESKTOP_SHELL_SELF_TEST_FAILED", rootCause: error instanceof Error ? error.message : "UNKNOWN" })}\n`);
+      app.exit(1);
+    });
+  } else {
   let candidateRequest: CandidateShellHealthRequest | null = null;
   let candidateRequestFailed = false;
   try { candidateRequest = readCandidateShellHealthRequest(process.argv); }
@@ -336,7 +361,7 @@ if (process.versions.electron) {
   protocol.registerSchemesAsPrivileged([{ scheme: "codeflow", privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }]);
   // Electron 对 @scope/name 包名会生成混合分隔符路径，存储安全校验要求规范化路径。
   const userDataDir = path.resolve(app.getPath("userData"));
-  const sessionDataDir = path.resolve(app.getPath("sessionData"));
+  const sessionDataDir = readShellSessionDataDirectory(process.argv) ?? path.resolve(app.getPath("sessionData"));
   app.setPath("userData", userDataDir);
   app.setPath("sessionData", sessionDataDir);
   let dataDir = path.join(userDataDir, "runtime");
@@ -521,6 +546,8 @@ if (process.versions.electron) {
         ? path.dirname(path.dirname(executableDirectory))
         : path.basename(path.dirname(executableDirectory)).toLowerCase() === "shells"
           ? path.dirname(path.dirname(executableDirectory)) : executableDirectory;
+      const installationMarker = app.isPackaged && process.platform === "win32" && !lifecycleRequest
+        ? readCompletedInstallation(installRoot) : null;
       if (lifecycleRequest) lifecycleRunning = true;
       if (lifecycleRequest?.kind === 'check') {
         // 兼容旧安装器预检；旧任务在新文件复制后的安装登记阶段接管。
@@ -560,9 +587,9 @@ if (process.versions.electron) {
       let location = maintenanceStartup?.kind === "authorized" ? maintenanceStartup.location
         : await resolveDesktopStorageLocation({ userDataDir, installRoot,
           configuredDataDir: maintenanceRequest ? undefined : process.env.CODEFLOWAI_DESKTOP_DATA_DIR,
-          allowInstallRootChange: process.platform === "darwin" });
+          allowInstallRootChange: process.platform === "darwin" || installationMarker !== null });
       // 移动或转译后的 .app 先写回定位安装根，后续归属校验仍按当前根进行。
-      if (process.platform === "darwin") await rebindDesktopInstallRoot(location);
+      if (process.platform === "darwin" || installationMarker) await rebindDesktopInstallRoot(location);
       currentLocation = location;
       dataDir = location.dataDir;
       if (maintenanceStartup?.kind === "authorized") {
@@ -578,11 +605,24 @@ if (process.versions.electron) {
         } else if (!maintenanceRequest) await assertDesktopMaintenanceStartup({ userDataDir, location });
       }
       if (quitAllowed) return;
+      if (installationMarker) {
+        await assertNoDesktopClientProcess(location.dataDir, installRoot);
+        await supersedeDesktopInstallationAttempt({ userDataDir, installationDir: installRoot, requestId: installationMarker.requestId });
+        const current = fs.lstatSync(installationMarker.file, { bigint: true });
+        if (current.dev !== installationMarker.stat.dev || current.ino !== installationMarker.stat.ino
+          || current.mtimeNs !== installationMarker.stat.mtimeNs || current.size !== installationMarker.stat.size) {
+          throw new Error("DESKTOP_INSTALL_MARKER_CHANGED");
+        }
+        fs.unlinkSync(installationMarker.file);
+      }
       // 先读唯一attempt；磁盘或启动参数不能改指既有真实profile，也不能绕过恢复控制启动Client。
       const handoffInput = { executablePath: process.execPath, pid: process.pid, parentPid: process.ppid, dataDir,
         userDataDir, sessionDataDir, argv: process.argv, channel: process };
       if (maintenanceRequest) maintenanceStage = "handoff";
-      let handoffStartup = maintenanceRequest && location.clientId === null
+      const nativeShellStartup = app.isPackaged && process.platform === "win32" && !maintenanceRequest
+        && !process.argv.includes("--codeflow-shell-handoff")
+        && fs.existsSync(path.join(executableDirectory, "resources", "shell-switch.exe"));
+      let handoffStartup = nativeShellStartup || maintenanceRequest && location.clientId === null
         ? { kind: "ordinary" as const } : await readShellHandoffStartup(handoffInput);
       if (maintenanceRequest && handoffStartup.kind !== "ordinary") throw new DesktopMaintenanceStartupError("DESKTOP_UNINSTALL_HANDOFF_PENDING");
       if (handoffStartup.kind === "held-candidate") {
@@ -949,6 +989,26 @@ if (process.versions.electron) {
         errorCode: readDesktopErrorCode(error, "DESKTOP_STARTUP_FAILED"), requestId: typeof error?.requestId === "string"
           && /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/u.test(error.requestId) ? error.requestId : startupRequestId };
       showDesktopError(userDataDir, maintenanceRequest ? "CodeFlow 卸载失败" : "CodeFlow 启动失败", error, errorContext);
+      if (app.isPackaged && process.platform === "win32" && !lifecycleRequest && !(error instanceof DesktopStartupCleanupError)
+        && (!recoveryOwner || recoveryOwner.released) && (!maintenanceOwner || maintenanceOwner.released)) {
+        // 业务/历史状态故障保留内置恢复入口；不创建Client，不依赖Web资源或远端服务。
+        const recovery = new BrowserWindow({ width: 640, height: 420, show: true,
+          webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
+        const code = errorContext.errorCode ?? "DESKTOP_STARTUP_FAILED";
+        recovery.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+        recovery.webContents.on("will-navigate", (event, url) => {
+          event.preventDefault();
+          if (url === "codeflow-recovery://retry") { quitAllowed = true; app.relaunch(); app.exit(0); }
+          else if (url === "codeflow-recovery://close") { quitAllowed = true; app.exit(1); }
+        });
+        recovery.on("closed", () => { quitAllowed = true; app.exit(1); });
+        const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>body{font:16px system-ui;padding:36px;line-height:1.8}a{display:inline-block;margin:16px 20px 0 0}</style><h2>CodeFlow 暂时无法加载工作台</h2><p>壳仍可运行，当前业务资源或本机数据需要修复。可以重新启动，或使用完整安装包修复程序；卸载程序会保留本机数据。</p><p>错误编号：${code}</p><a href="codeflow-recovery://retry">重新启动</a><a href="codeflow-recovery://close">关闭</a>`;
+        void recovery.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).catch(pageError => {
+          showDesktopError(userDataDir, "CodeFlow 恢复页加载失败", new AggregateError([error, pageError], "DESKTOP_RECOVERY_PAGE_FAILED"), errorContext);
+          quitAllowed = true; app.exit(1);
+        });
+        return;
+      }
       if (!(error instanceof DesktopStartupCleanupError) && (!recoveryOwner || recoveryOwner.released)) {
         // 超时只结束启动等待；维护资源真正关闭后才释放主进程和单实例锁。
         if (maintenanceBrowserFlight) {
@@ -994,6 +1054,32 @@ if (process.versions.electron) {
     if (application) application.openWindow(); else pendingOpen = true;
   });
   }
+}
+
+}
+
+/** 只接收独立切换器传入的原session路径，不复制其他历史启动参数。 */
+function readShellSessionDataDirectory(argv: string[]): string | undefined {
+  const args = argv.filter(value => value.startsWith("--codeflow-session-data-dir"));
+  if (!args.length) return undefined;
+  const directory = args[0]?.slice("--codeflow-session-data-dir=".length);
+  if (args.length !== 1 || !args[0]!.startsWith("--codeflow-session-data-dir=") || !directory || !path.isAbsolute(directory)
+    || /[\x00-\x1f]/u.test(directory) || path.resolve(directory) !== directory
+    || fs.realpathSync.native(directory) !== directory || fs.lstatSync(directory).isSymbolicLink() || !fs.lstatSync(directory).isDirectory()) {
+    throw new Error("DESKTOP_SESSION_PROFILE_INVALID");
+  }
+  return directory;
+}
+
+/** 完整安装器只写成功事实；旧更新记录在首次正常启动中按该代次独立归档。 */
+function readCompletedInstallation(installRoot: string): { file: string; requestId: string; stat: fs.BigIntStats } | null {
+  const file = path.join(installRoot, "installation-completed.ini"), stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  if (!stat) return null;
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || stat.size > 512n) throw new Error("DESKTOP_INSTALL_MARKER_INVALID");
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(file));
+  const match = /^\[installation\]\r\nschema=1\r\nrequestId=(nsis-install-[A-Za-z0-9._+-]{1,100})\r\n$/u.exec(text);
+  if (!match) throw new Error("DESKTOP_INSTALL_MARKER_INVALID");
+  return { file, requestId: match[1]!, stat };
 }
 
 /** 安装与维护共用有限参数入口；不接受外来路径、静默删除或混用选项。 */

@@ -791,7 +791,7 @@ export class CodexAppServerWorkspace {
     this.opts.scheduleThreadMessage({
       run,
       onFailure: cause => {
-        this.retainDiagnosticFailure(cause);
+        this.retainDiagnosticFailure(cause, false);
         this.failOutputReader(sourceChild!, sourceGeneration, "stdout", cause);
       },
       bytes: Buffer.byteLength(line),
@@ -1169,12 +1169,17 @@ export class CodexAppServerWorkspace {
       data: { threadId: this.opts.localThreadId, ...data() } }), business);
   }
 
-  /** 复用原终止失败事实，阻止后续副作用并让 kill/ensureStarted 消费诊断失败。 */
-  private retainDiagnosticFailure(cause: unknown): Error {
+  /** 诊断边界保留聚合日志标记；分发边界显式传false，保留原业务错误分类。 */
+  private retainDiagnosticFailure(cause: unknown, diagnostic = true): Error {
     const previous = this.terminationFailure;
-    const failure = isEngineWorkspaceLogFailure(cause) ? cause as Error : createEngineWorkspaceLogFailure(cause);
-    this.terminationFailure = previous && previous !== failure
-      ? createEngineWorkspaceLogFailure(new AggregateError([previous, failure], "Codex 进程诊断失败", { cause: previous })) : failure;
+    const failure = diagnostic
+      ? isEngineWorkspaceLogFailure(cause) ? cause as Error : createEngineWorkspaceLogFailure(cause)
+      : cause instanceof Error ? cause : new Error("Codex 输出分发失败", { cause });
+    if (previous && previous !== failure) {
+      const aggregate = new AggregateError([previous, failure], "Codex 进程异步处理失败", { cause: previous });
+      this.terminationFailure = isEngineWorkspaceLogFailure(previous) || isEngineWorkspaceLogFailure(failure)
+        ? createEngineWorkspaceLogFailure(aggregate) : aggregate;
+    } else this.terminationFailure = failure;
     return this.terminationFailure;
   }
 

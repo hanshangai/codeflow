@@ -27,7 +27,7 @@ async function fixture(t: test.TestContext) {
   return { root, userDataDir, installRoot, custom };
 }
 
-/** 执行实际main；独立记录外部依赖，并暴露真实退出供超时用例等待。 */
+/** 执行实际main；原生打包模式保留真实argv及安装事实，暴露实际退出供超时等待。 */
 async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<string, string> = {}, interrupt = false,
   options: { locked?: boolean; kind?: "ordinary" | "held-candidate" | "recovery-control"; initialize?: boolean; cleanupFailure?: Error;
     onStart?: () => Promise<void>; runtimeStatus?: string; heldShell?: boolean; candidate?: boolean; earlyQuit?: boolean; quitDuringAdmission?: boolean;
@@ -38,7 +38,7 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
     maintenanceSecondInstance?: boolean; leftoverClient?: boolean; processQueryFailure?: Error;
     processRows?: ProcessIdentity[]; processSelf?: Partial<ProcessIdentity>; executablePath?: string;
     browserGate?: Promise<void>; browserStorageGate?: Promise<void>; browserStorageRejection?: unknown;
-    browserTimeout?: boolean; activeReleaseFailure?: Error; onHandoff?: () => Promise<void> } = {}) {
+    browserTimeout?: boolean; activeReleaseFailure?: Error; nativePackaged?: boolean; onHandoff?: () => Promise<void> } = {}) {
   const source = await fs.readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const ast = ts.createSourceFile("main.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const declarations = ast.statements.filter(ts.isVariableStatement).filter(statement => statement.declarationList.declarations.some(declaration =>
@@ -59,7 +59,8 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
   let unregisterBridge: (() => void) | undefined;
   const executablePath = options.executablePath ?? path.join(f.installRoot, "CodeFlowAI.exe");
   const mainArgv = options.maintenanceArgv ?? (options.installation ? [executablePath, "--codeflow-register-installation", "nsis-install-test"]
-    : options.maintenance ? [executablePath, "--codeflow-uninstall-maintenance", "maintenance:keep", options.maintenanceMode ?? "keep"] : []);
+    : options.maintenance ? [executablePath, "--codeflow-uninstall-maintenance", "maintenance:keep", options.maintenanceMode ?? "keep"]
+      : options.nativePackaged ? [executablePath] : []);
   const listeners = new Map<string, (...args: any[]) => void>();
   let startupFlight: Promise<unknown> | undefined;
   let activeWorker: EventEmitter | undefined;
@@ -142,10 +143,10 @@ async function runMain(f: Awaited<ReturnType<typeof fixture>>, env: Record<strin
       if (options.quitDuringAdmission) { listeners.get("before-quit")!({ preventDefault() { throw new Error("UNEXPECTED_QUIT_BLOCKED"); } }); setImmediate(done); }
     },
     currentDirectory: path.join(f.installRoot, "dist"),
-    process: { versions: { electron: "test" }, env, platform: options.maintenance || options.installation ? "win32" : "linux", resourcesPath: f.installRoot,
+    process: { versions: { electron: "test" }, env, platform: options.maintenance || options.installation || options.nativePackaged ? "win32" : "linux", resourcesPath: f.installRoot,
       execPath: executablePath, pid: 1, ppid: 2,
       argv: mainArgv },
-    app: { isPackaged: !!options.maintenance || !!options.installation, getPath: (name: string) => name === "userData" ? f.userDataDir : path.join(f.userDataDir, name),
+    app: { isPackaged: !!options.maintenance || !!options.installation || !!options.nativePackaged, getPath: (name: string) => name === "userData" ? f.userDataDir : path.join(f.userDataDir, name),
       setAppUserModelId() {},
       requestSingleInstanceLock: () => options.locked !== false, on(name: string, listener: (...args: any[]) => void) { listeners.set(name, listener); },
       whenReady: () => ({ then(onReady: () => Promise<unknown>) {
@@ -452,6 +453,32 @@ async function maintenanceInstallation(t: test.TestContext) {
   const oldIdentity = await fs.readFile(path.join(f.custom, "device-identity.json"));
   return { f, oldIdentity };
 }
+
+for (const completedInstall of [false, true]) test(`native packaged startup isolates old attempts and preserves profile bytes; installationFact=${completedInstall}`, { skip: process.platform !== "win32" }, async t => {
+  const { f } = await maintenanceInstallation(t);
+  await fs.mkdir(path.join(f.installRoot, "resources"));
+  await fs.writeFile(path.join(f.installRoot, "resources", "shell-switch.exe"), "native executor presence only");
+  const attempt = path.join(f.custom, "shell-update-attempt.json"), originalAttempt = Buffer.from('{broken historical attempt 账号');
+  await fs.writeFile(attempt, originalAttempt);
+  const marker = path.join(f.installRoot, "installation-completed.ini"), requestId = "nsis-install-native-startup";
+  if (completedInstall) await fs.writeFile(marker, `[installation]\r\nschema=1\r\nrequestId=${requestId}\r\n`, "ascii");
+  const protectedFiles = [path.join(f.userDataDir, "desktop-data-location.json"),
+    ...["device-identity.json", "config.json", "codeflowai.db", "codeflowai.db.meta.json"].map(name => path.join(f.custom, name))];
+  const before = await Promise.all(protectedFiles.map(file => fs.readFile(file)));
+  let handoffReads = 0;
+  const result = await runMain(f, {}, false, { nativePackaged: true, onHandoff: async () => { handoffReads++; throw new Error("LEGACY_HANDOFF_MUST_NOT_RUN"); } });
+  assert.deepEqual(result.shown, []); assert.deepEqual(result.exits, []);
+  assert.ok(result.events.includes("start")); assert.ok(result.events.includes("updates"));
+  assert.equal(result.events.includes("worker-spawn"), false); assert.equal(result.events.includes("recovery"), false);
+  assert.equal(handoffReads, 0);
+  for (let index = 0; index < protectedFiles.length; index++) assert.deepEqual(await fs.readFile(protectedFiles[index]!), before[index]);
+  if (completedInstall) {
+    await assert.rejects(fs.access(marker), { code: "ENOENT" });
+    await assert.rejects(fs.access(attempt), { code: "ENOENT" });
+    const archive = (await fs.readdir(path.join(f.custom, "logs"))).filter(name => name.startsWith(`shell-update-retired-install-${requestId}-`));
+    assert.equal(archive.length, 1); assert.deepEqual(await fs.readFile(path.join(f.custom, "logs", archive[0]!)), originalAttempt);
+  } else assert.deepEqual(await fs.readFile(attempt), originalAttempt);
+});
 
 /** 只在真实已清理安装写原维护授权，模拟删除中断而不伪造任意路径载荷。 */
 async function authorizedRemoval(t: test.TestContext) {

@@ -52,50 +52,49 @@ test("请求失败证据只保codeflow路径和安全网络错误码，查询凭
   assert.match(unsafe.errorTextSha256, /^[a-f0-9]{64}$/u); assert.doesNotMatch(JSON.stringify(unsafe), /PRIVATE|password|example/u);
 });
 
-test("实际编译Modal模板保留应用更新桌面页签、窄窗同面板和开关激活语义", async () => {
+test("实际编译独立更新弹框保留开关、重启禁用和下载进度语义", async () => {
   const requireWeb = createRequire(new URL("../../web/package.json", import.meta.url)), vue = requireWeb("vue"), { parse, compileTemplate } = requireWeb("vue/compiler-sfc");
-  const filename = new URL("../../web/src/components/app-shell/app-shell-modals.vue", import.meta.url), parsed = parse(await fs.readFile(filename, "utf8"));
+  const filename = new URL("../../web/src/features/settings/components/desktop-update-check-modal.vue", import.meta.url), parsed = parse(await fs.readFile(filename, "utf8"));
   assert.deepEqual(parsed.errors, []);
-  /** 仅定位真实设置Modal，不复制产品分支或激活表达式。 */
+  /** 定位当前独立更新弹框，编译原模板分支和事件。 */
   function findModal(nodes: any[]): any {
     for (const node of nodes) {
       if (node.type !== 1) continue;
-      if (node.tag === "a-modal" && node.props.some((prop: any) => prop.type === 7 && prop.arg?.content === "open" && prop.exp?.content === "shell.settingsOpen")) return node;
+      if (node.tag === "a-modal" && node.props.some((prop: any) => prop.type === 7 && prop.arg?.content === "open" && prop.exp?.content === "open")) return node;
       const found = findModal(node.children); if (found) return found;
     }
   }
   const modal = findModal(parsed.descriptor.template.ast.children); assert.ok(modal);
   const compiled = compileTemplate({ source: modal.loc.source, filename: filename.pathname, id: "update-page-modal", compilerOptions: { mode: "function", prefixIdentifiers: true,
-    isCustomElement: (tag: string) => !["a-modal", "a-alert", "a-tabs"].includes(tag), bindingMetadata: { AModal: "setup-const", AAlert: "setup-const", ATabs: "setup-const" } } });
+    isCustomElement: (tag: string) => !["a-modal", "a-button"].includes(tag), bindingMetadata: { AModal: "setup-const", AButton: "setup-const" } } });
   assert.deepEqual(compiled.errors, []);
   const compiledRender = new Function("Vue", compiled.code)(vue);
   /** 仅为有slot的UI容器提供标签，仍执行原模板绑定和事件。 */
-  const render = (context: unknown, cache: unknown[]) => compiledRender(context, cache, {}, { AModal: "a-modal", AAlert: "a-alert", ATabs: "a-tabs" });
-  const shell = { settingsOpen: true, settingsActiveTab: "workspaces", isMobileModalViewport: false, config: { isDesktop: true, connected: false, canManageWorkspaces: true } };
-  const context = { shell, isBoundedSettingsPanel: false, showConnectionGuide: false, isDesktopWorkspace: () => false, isCurrentSharedWorkspace: false };
-  /** 遍历编译结果的实际VNode，保留原v-model回调。 */
+  const render = (context: unknown, cache: unknown[]) => compiledRender(context, cache, {}, { AModal: "a-modal", AButton: "a-button" });
+  const context = { open: true, restarting: false, checking: false, prepared: false, capabilities: { check: true, restart: true },
+    presentation: { tone: "success", title: "当前已是最新版本", detail: "无需更新" }, versionRows: [], downloadPercent: null as number | null,
+    downloadSize: "1 MB", primaryAction: { kind: "close", label: "关闭", disabled: false },
+    close() { context.open = false; }, openNotes() {}, startCheck() {}, performPrimaryAction() {} };
+  /** 遍历编译结果的实际 VNode 和默认插槽，不替换产品分支。 */
   function nodes(node: any): any[] {
     if (!node || typeof node !== "object") return [];
     if (Array.isArray(node)) return node.flatMap(nodes);
     return [node, ...nodes(typeof node.children?.default === "function" ? node.children.default() : node.children)];
   }
-  let tree = render(context, []), list = nodes(tree);
-  const tabs = list.find(node => node.type === "a-tabs"); assert.ok(tabs);
-  assert.equal(list.find(node => node.type === "a-tab-pane" && node.key === "app-update")?.props.tab, "应用更新");
-  tabs.props["onUpdate:activeKey"]("app-update");
-  assert.equal(shell.settingsActiveTab, "app-update");
-  assert.equal(nodes(render(context, [])).find(node => node.type === "DesktopUpdatePanel")?.props.active, true);
-  shell.isMobileModalViewport = true;
-  tree = render(context, []); list = nodes(tree);
-  assert.equal(list.some(node => node.type === "a-tabs"), false);
-  assert.equal(list.filter(node => node.type === "DesktopUpdatePanel").length, 1);
-  assert.equal(list.find(node => node.type === "DesktopUpdatePanel")?.props.active, true);
-  tree.props.onCancel(); assert.equal(shell.settingsOpen, false);
-  assert.equal(nodes(render(context, [])).find(node => node.type === "DesktopUpdatePanel")?.props.active, false);
-  shell.settingsOpen = true; shell.config.isDesktop = false;
-  assert.equal(nodes(render(context, [])).some(node => node.type === "DesktopUpdatePanel"), false);
-  shell.isMobileModalViewport = false;
-  assert.equal(nodes(render(context, [])).some(node => node.type === "a-tab-pane" && node.key === "app-update"), false);
+  let tree = render(context, []);
+  assert.equal(tree.props.open, true);
+  assert.equal(tree.props.title, "软件更新");
+  assert.equal(tree.props.closable, true);
+  tree.props.onCancel(); assert.equal(context.open, false);
+  assert.equal(render(context, []).props.open, false);
+  context.open = true; context.restarting = true;
+  tree = render(context, []);
+  assert.equal(tree.props.closable, false);
+  assert.equal(tree.props.keyboard, false);
+  assert.equal(nodes(tree).find(node => node.type === "a-button" && node.props?.type === "link")?.props.disabled, true);
+  assert.equal(nodes(tree).some(node => node.props?.["aria-label"] === "下载进度"), false);
+  context.downloadPercent = 25;
+  assert.equal(nodes(render(context, [])).find(node => node.type === "a-progress")?.props.percent, 25);
 });
 
 test("工件门槛要求真实handoff、独审绑定和完整新页面来源", async () => {

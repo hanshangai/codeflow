@@ -173,6 +173,8 @@ export class ThreadSessionManager {
       writeWorkspaceLog: EngineWorkspaceLogWriter;
       threads: ThreadStore;
       withLegacyDatabase?: <T>(requestId: string, operation: () => T) => Promise<T>;
+      /** 持久化背压沿原工作区传给Codex stdout调度，不占用数据库许可。 */
+      waitForEventCapacity?: (workspaceId: WorkspaceId) => Promise<void> | undefined;
       clearPersistedSessionBinding?: (
         threadId: ThreadId,
         expectedSessionId?: SessionId,
@@ -209,6 +211,7 @@ export class ThreadSessionManager {
   ) {
     this.codexAppServer = new CodexAppServerManager({
       writeWorkspaceLog: opts.writeWorkspaceLog,
+      waitForEventCapacity: opts.waitForEventCapacity,
       // 对齐 Codex CLI：不注入 CodeFlow 标识，保持 UA/originator 与 CLI 一致，便于上游代理识别。
       clientInfo: { name: "codex_cli_rs", title: "Codex CLI", version: "0.98.0" },
       resolveCodexRuntimeConfig: threadId => opts.withLegacyDatabase

@@ -6,21 +6,23 @@ import { performance } from "node:perf_hooks";
 import type { ThreadId, WorkspaceId } from "@codeflowai/shared";
 
 import { CodexAppServerManager } from "../src/engines/codex-app-server/codexAppServerManager.ts";
+import { createLocalEventPipeline } from "../src/runtime/localEventPersistence.js";
 
 const WORKSPACE_ID = "client-test:ws-codex-manager" as WorkspaceId;
 const WORKSPACE_PATH = "Z:/code/aidt-code";
 
-/** 创建不启动真实子进程的 Manager。 */
+/** 创建不启动真实子进程的Manager，可注入持久化容量屏障。 */
 function createManager(stdoutDispatchLimits?: {
   batchMessages?: number;
   batchBytes?: number;
   highWaterMessages?: number;
   highWaterBytes?: number;
-}): CodexAppServerManager {
+}, waitForEventCapacity?: (workspaceId: WorkspaceId) => Promise<void> | undefined): CodexAppServerManager {
   return new CodexAppServerManager({
     writeWorkspaceLog: testEngineWorkspaceLog,
     clientInfo: { name: "codeflowai-test", title: "CodeFlow Test", version: "0.0.0" },
     stdoutDispatchLimits,
+    waitForEventCapacity,
   });
 }
 
@@ -424,6 +426,105 @@ test("单 thread 10746 条 stdout 洪峰分批让出且不饿死其它 thread", 
   assert.equal(noisyCalls, 10_746);
   assert.equal(siblingCalls, 1);
   await manager.killAllWorkspaces();
+});
+
+test("慢写入下10746条stdout等待事件容量，最终无丢失且保持顺序", async t => {
+  t.mock.method(performance, "now", () => 0);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const published: number[] = [], failures: unknown[] = [];
+  let admitted = 0;
+  const pipeline = createLocalEventPipeline({
+    writer: {
+      async submit(batch) {
+        await gate;
+        return { batchId: batch.batchId, digest: "test", indexedCount: 0, indexedThroughSeq: 0,
+          messages: batch.events.map(message => ({ ...message, event: { ...message.event, schema: 1, seq: 1 } })) as any };
+      },
+      async completeIndexes() { return 1; }, async withLegacyDatabase(_requestId, operation) { return operation(); },
+      failIndexes() { assert.fail("unexpected index failure"); },
+    },
+    apply() {}, publish(message) { published.push((message.event as any).data.seq); },
+    onFailure(error) { failures.push(error); },
+  });
+  const manager = createManager(undefined, workspaceId => pipeline.waitForCapacity(workspaceId));
+  const handle = manager.forThread("thread-stdout-slow-storage" as ThreadId);
+  const workspace = handle.getOrCreate(WORKSPACE_ID, WORKSPACE_PATH);
+  markWorkspaceRunning(workspace);
+  t.after(async () => { release(); await manager.killAllWorkspaces(); await pipeline.close(); });
+  workspace.registerThread("provider-slow-storage", message => {
+    if (message.method !== "item/commandExecution/outputDelta") return;
+    pipeline.enqueue({ t: "raw.event", event: { workspaceId: WORKSPACE_ID, threadId: "thread-stdout-slow-storage" as ThreadId,
+      ts: 1, engine: "codex", source: "test", data: { seq: (message.params as any).seq },
+      handled: true, action: "mapped", emittedTypes: [] } }, null, 1);
+    admitted++;
+  });
+  for (let seq = 0; seq < 10_746; seq++) {
+    (workspace as any).onStdoutLine(JSON.stringify({ method: "item/commandExecution/outputDelta", params: { threadId: "provider-slow-storage", seq } }));
+  }
+  for (let tick = 0; tick < 120; tick++) await nextImmediate();
+  assert.ok(admitted > 0 && admitted <= 2048, `写入阻塞时仍准入了 ${admitted} 条事件`);
+  assert.deepEqual(published, []);
+  release();
+  await handle.drainMessages();
+  await pipeline.flush(WORKSPACE_ID);
+  assert.equal(admitted, 10_746);
+  assert.deepEqual(published, Array.from({ length: 10_746 }, (_, index) => index));
+  assert.deepEqual(failures, []);
+});
+
+test("等待持久化时保持FIFO和排空屏障，其他thread与控制RPC仍可完成", async t => {
+  let release!: () => void;
+  let blocked = true;
+  const gate = new Promise<void>(resolve => { release = () => { blocked = false; resolve(); }; });
+  const manager = createManager(undefined, workspaceId => workspaceId === WORKSPACE_ID && blocked ? gate : undefined);
+  const handle = manager.forThread("thread-storage-pressure" as ThreadId);
+  const workspace = handle.getOrCreate(WORKSPACE_ID, WORKSPACE_PATH);
+  const siblingHandle = manager.forThread("thread-storage-sibling" as ThreadId);
+  const sibling = siblingHandle.getOrCreate("healthy-workspace" as WorkspaceId, WORKSPACE_PATH);
+  markWorkspaceRunning(workspace); markWorkspaceRunning(sibling);
+  (workspace as any).child.stdin = { write: () => true };
+  t.after(async () => { release(); await manager.killAllWorkspaces(); });
+  const received: number[] = [];
+  let siblingCalls = 0, pauses = 0, resumes = 0;
+  workspace.registerThread("provider-pressure", message => received.push((message.params as any).seq));
+  sibling.registerThread("provider-sibling", () => { siblingCalls++; });
+  const stdout = { pause() { pauses++; }, resume() { resumes++; } };
+  for (const seq of [1, 2]) {
+    (workspace as any).onStdoutLine(JSON.stringify({ method: "item/commandExecution/outputDelta", params: { threadId: "provider-pressure", seq } }), stdout);
+  }
+  (sibling as any).onStdoutLine(JSON.stringify({ method: "turn/started", params: { threadId: "provider-sibling" } }));
+  let drained = false;
+  const draining = handle.drainMessages()!.then(() => { drained = true; });
+  await siblingHandle.drainMessages();
+  assert.equal(siblingCalls, 1);
+  assert.deepEqual(received, []);
+  assert.equal(drained, false);
+  assert.equal(pauses, 1);
+  const request = workspace.request("thread/read", {}, { timeoutMs: 2_000 });
+  while ((workspace as any).pending.size === 0) await nextImmediate();
+  assert.equal(resumes, 1);
+  const requestId = Array.from((workspace as any).pending.keys())[0];
+  (workspace as any).onStdoutLine(JSON.stringify({ id: requestId, result: { ok: true } }));
+  assert.deepEqual(await request, { ok: true });
+  release();
+  await draining;
+  assert.deepEqual(received, [1, 2]);
+});
+
+test("持久化等待失败明确拒绝排空并保留根因，不派发后续通知", async () => {
+  const failure = Object.assign(new Error("LOCAL_EVENT_PIPELINE_CAPACITY_EXCEEDED"), { code: "storage-failed" });
+  const manager = createManager(undefined, () => Promise.reject(failure));
+  const threadId = "thread-storage-failed" as ThreadId;
+  const handle = manager.forThread(threadId);
+  const workspace = handle.getOrCreate(WORKSPACE_ID, WORKSPACE_PATH);
+  markWorkspaceRunning(workspace);
+  let calls = 0;
+  workspace.registerThread("provider-storage-failed", message => { if (message.method === "turn/started") calls++; });
+  (workspace as any).onStdoutLine(JSON.stringify({ method: "turn/started", params: { threadId: "provider-storage-failed" } }));
+  await assert.rejects(handle.drainMessages()!, error => error === failure);
+  assert.equal(calls, 0);
+  await assert.rejects(manager.releaseThread(threadId), error => error === failure);
 });
 
 test("Codex stdout 高水位只反压目标 thread 的独占子进程", async () => {

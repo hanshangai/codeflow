@@ -7,6 +7,7 @@ import { formatDesktopVersion } from "@codeflowai/shared";
 import { assertTrustedReleaseKeys, readReleaseBundleFiles, verifyReleaseBundlePayload } from "@codeflowai/shared/desktop-release-signing";
 import releaseVersioning from "../../../tools/release/release-versioning.cjs";
 import { buildReleaseBundle } from "./build-release-bundle.mjs";
+import { readDesktopReleasePlan } from "../../../tools/release/desktop-release-plan.mjs";
 
 const defaultDesktopDir = fileURLToPath(new URL("..", import.meta.url));
 const reservedMetadata = ["releaseId", "version", "createdAt", "schemaVersion", "files", "signature", "webSha256", "clientSha256", "packageSha256", "archiveSha256", "archiveSize"];
@@ -112,9 +113,10 @@ async function readAllocations(outputRoot) {
 }
 
 /** 默认真实调用原本地 NSIS 构建入口，明确关闭发布并核对结构化结果。 */
-async function buildInstaller({ resourcesDir, outputDir, desktopDir }) {
+async function buildInstaller({ resourcesDir, outputDir, desktopDir, planFile, allowDirty }) {
   const result = spawnSync(process.execPath, [path.join(desktopDir, "scripts/package-local-win.mjs"), resourcesDir, outputDir,
-    "--require-baseline-proof", "--target", "nsis"], { cwd: desktopDir, encoding: "utf8", env: process.env });
+    "--require-baseline-proof", "--target", "nsis", ...(planFile ? ["--plan", planFile] : []), ...(allowDirty ? ["--allow-dirty"] : [])],
+    { cwd: desktopDir, encoding: "utf8", env: process.env });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`DESKTOP_CANDIDATE_INSTALLER_FAILED: ${result.stderr || result.stdout}`);
   const ready = result.stdout.split(/\r?\n/).filter(line => line.startsWith("{")).map(line => JSON.parse(line))
@@ -160,7 +162,8 @@ export async function verifyPreparedRelease({ directory }) {
 
 /** 创建或继续本地候选：一次分配编号，内容变化须 --new，失败重试保留原事实与现场。 */
 export async function prepareRelease({ resourcesDir, outputRoot, metadata, privateKeyFile, notesFile, newCandidate = false,
-  now = new Date(), baselineVersion, desktopDir = defaultDesktopDir, packageInstaller = buildInstaller, validateRuntime = verifyRuntime }) {
+  now = new Date(), baselineVersion, desktopDir = defaultDesktopDir, packageInstaller = buildInstaller, validateRuntime = verifyRuntime,
+  planFile, planRoot, allowDirty = false }) {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata) || reservedMetadata.some(key => Object.hasOwn(metadata, key))) {
     throw new Error("DESKTOP_CANDIDATE_METADATA_RESERVED");
   }
@@ -171,8 +174,10 @@ export async function prepareRelease({ resourcesDir, outputRoot, metadata, priva
   if (contains(resourcesDir, privateKeyFile)) throw new Error("DESKTOP_RELEASE_PRIVATE_KEY_INSIDE_RESOURCES");
   if ([desktopDir, outputRoot].some(directory => contains(directory, privateKeyFile))) throw new Error("DESKTOP_CANDIDATE_PRIVATE_KEY_INSIDE_INPUT_OR_OUTPUT");
   if ([resourcesDir, desktopDir].some(input => contains(input, outputRoot) || contains(outputRoot, input))) throw new Error("DESKTOP_CANDIDATE_OUTPUT_OVERLAP");
-  const { version: shellVersion } = await readJson(path.join(desktopDir, "package.json"));
-  if (typeof shellVersion !== "string" || !/^\d+\.\d+$/.test(shellVersion)) throw new Error("DESKTOP_SHELL_VERSION_INVALID");
+  const plan = planFile ? await readDesktopReleasePlan({ root: planRoot ?? path.resolve(desktopDir, "../.."), file: planFile, allowDirty }) : undefined;
+  if (plan && (plan.keyId !== metadata.keyId || !plan.platformSet.includes(`${metadata.platform}/${metadata.arch}`))) throw new Error("DESKTOP_CANDIDATE_PLAN_METADATA_MISMATCH");
+  const shellVersion = plan?.shellVersion ?? (await readJson(path.join(desktopDir, "package.json"))).version;
+  if (typeof shellVersion !== "string" || !/^\d+\.\d+(?:\.\d+)?$/.test(shellVersion)) throw new Error("DESKTOP_SHELL_VERSION_INVALID");
   const resources = await resourceInputs(resourcesDir), shell = await shellInputs(desktopDir), notes = await fileDigest(notesFile);
   const keyBytes = await fs.readFile(privateKeyFile), keySha256 = crypto.createHash("sha256").update(keyBytes).digest("hex");
   if ([...resources, ...shell].some(file => file.sha256 === keySha256)) throw new Error("DESKTOP_CANDIDATE_PRIVATE_KEY_INSIDE_INPUT_OR_OUTPUT");
@@ -183,7 +188,7 @@ export async function prepareRelease({ resourcesDir, outputRoot, metadata, priva
   if (key.asymmetricKeyType !== "ed25519" || !trustedKeys[metadata.keyId]
     || !publicKey.equals(trustedKeys[metadata.keyId])) throw new Error("DESKTOP_CANDIDATE_SIGNING_KEY_MISMATCH");
   await validateRuntime({ resourcesDir });
-  const inputFingerprint = crypto.createHash("sha256").update(JSON.stringify(canonical({ resources, shell, notes, metadata,
+  const inputFingerprint = crypto.createHash("sha256").update(JSON.stringify(canonical({ resources, shell, notes, metadata, plan,
     publicKey: publicKey.export({ type: "spki", format: "pem" }) }))).digest("hex");
   baselineVersion ??= (await readJson(new URL("../../../package.json", import.meta.url))).version;
   releaseVersioning.resolveReleaseVersionBaseline(baselineVersion, null);
@@ -206,9 +211,11 @@ export async function prepareRelease({ resourcesDir, outputRoot, metadata, priva
       for (const version of versions) baseline = releaseVersioning.resolveReleaseVersionBaseline(baseline, version);
       const today = releaseVersioning.formatDateVersionPrefix(now);
       if (today < baseline.slice(0, 10)) throw new Error("DESKTOP_CANDIDATE_CLOCK_BEHIND");
-      const version = releaseVersioning.computeNextReleaseVersion(baseline, now);
+      const version = plan?.version ?? releaseVersioning.computeNextReleaseVersion(baseline, now);
       record = { schemaVersion: 1, inputFingerprint, shellVersion,
-        metadata: { ...metadata, releaseId: `desktop-${version}`, version, createdAt: now.toISOString() }, resources, notes, installer: null };
+        ...(plan ? { sourceCommit: plan.sourceCommit, shellInputFingerprint: plan.shellInputFingerprint } : {}),
+        metadata: { ...metadata, ...(plan ? { webVersion: plan.webVersion, clientVersion: plan.clientVersion, dbSchemaVersion: plan.dbSchemaVersion } : {}),
+          releaseId: `desktop-${version}`, version, createdAt: plan?.createdAt ?? now.toISOString() }, resources, notes, installer: null };
       directory = path.join(outputRoot, version);
       await fs.mkdir(directory);
       await writeJson(path.join(directory, "candidate.json"), record);
@@ -236,7 +243,7 @@ export async function prepareRelease({ resourcesDir, outputRoot, metadata, priva
     await verifyCandidatePayload(directory, record);
     const attempts = (await fs.readdir(directory)).filter(name => /^installer-attempt-\d+$/.test(name)).map(name => Number(name.slice(18)));
     const outputDir = path.join(directory, `installer-attempt-${Math.max(0, ...attempts) + 1}`);
-    const result = await packageInstaller({ resourcesDir: installationResources, outputDir, desktopDir });
+    const result = await packageInstaller({ resourcesDir: installationResources, outputDir, desktopDir, planFile, allowDirty });
     const displayVersion = formatDesktopVersion(shellVersion, record.metadata.version);
     if (result.shellVersion !== shellVersion || result.displayVersion !== displayVersion
       || !result.installer || !contains(outputDir, path.resolve(result.installer))) throw new Error("DESKTOP_CANDIDATE_INSTALLER_RESULT_INVALID");
@@ -265,9 +272,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     let result;
     if (args[0] === "--verify" && args.length === 2) result = await verifyPreparedRelease({ directory: path.resolve(args[1]) });
     else {
-      const [resourcesDir, outputRoot, metadataFile, privateKeyFile, notesFile, option, ...extra] = args;
-      if (!notesFile || (option !== undefined && option !== "--new") || extra.length) throw new Error("用法：prepare-release.mjs <resources> <candidate-root> <metadata.json> <private-key.pem> <notes.md> [--new]；复验：--verify <candidate-dir>");
-      result = await prepareRelease({ resourcesDir, outputRoot, metadata: await readJson(metadataFile), privateKeyFile, notesFile, newCandidate: option === "--new" });
+      const [resourcesDir, outputRoot, metadataFile, privateKeyFile, notesFile, ...options] = args;
+      let newCandidate = false, planFile, allowDirty = false;
+      for (let index = 0; index < options.length; index++) {
+        if (options[index] === "--new" && !newCandidate) newCandidate = true;
+        else if (options[index] === "--allow-dirty" && !allowDirty) allowDirty = true;
+        else if (options[index] === "--plan" && !planFile && options[index + 1] && !options[index + 1].startsWith("--")) planFile = path.resolve(options[++index]);
+        else throw new Error("DESKTOP_CANDIDATE_ARGUMENT_INVALID");
+      }
+      if (!notesFile) throw new Error("用法：prepare-release.mjs <resources> <candidate-root> <metadata.json> <private-key.pem> <notes.md> [--new] [--plan <file>] [--allow-dirty]；复验：--verify <candidate-dir>");
+      result = await prepareRelease({ resourcesDir, outputRoot, metadata: await readJson(metadataFile), privateKeyFile, notesFile, newCandidate, planFile, allowDirty });
     }
     console.log(JSON.stringify({ code: "DESKTOP_CANDIDATE_READY", directory: result.directory, version: result.metadata.version,
       displayVersion: result.displayVersion, shellVersion: result.shellVersion, published: false }));

@@ -4,7 +4,10 @@ import type { ShellReleaseFile } from "@codeflowai/shared";
 export function validateShellReleaseSigningInputs(input: {
   candidateDirectory: string;
   shellId: string;
-  version: string;
+  version?: string;
+  planFile: string;
+  root?: string;
+  allowDirty?: boolean;
   createdAt: string;
   expiresAt: string;
   keyId: string;
@@ -18,7 +21,10 @@ export function validateShellReleaseSigningInputs(input: {
 export function prepareShellRelease(input: {
   candidateDirectory: string;
   shellId: string;
-  version: string;
+  version?: string;
+  planFile: string;
+  root?: string;
+  allowDirty?: boolean;
   createdAt: string;
   expiresAt: string;
   keyId: string;

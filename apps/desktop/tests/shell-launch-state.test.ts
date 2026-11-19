@@ -135,8 +135,8 @@ test("original restoration rejects a third physical state or corrupt INI without
   }
 });
 
-test("original restoration still requires every S0 executable and baseline resource", async () => {
-  for (const relative of ["shells/shell-old/CodeFlowAI.exe", "shells/shell-older/CodeFlowAI.exe", "shells/installation/CodeFlowAI.exe", "shells/installation/resources/client/dist/index.cjs"]) {
+test("original restoration still requires the executable it will actually run", async () => {
+  for (const relative of ["shells/shell-old/CodeFlowAI.exe"]) {
     const directory = await missingCandidateFixture(); await fs.unlink(path.join(directory, relative));
     await assert.rejects(readRestore(directory), hasCode("DESKTOP_SHELL_LAUNCH_LAYOUT_INVALID"));
     await assert.rejects(replace({ installationDir: directory, expectedState: VALID_STATE, nextState: RESTORE_ORIGINAL.originalState, restoreOriginal: RESTORE_ORIGINAL }));
@@ -645,11 +645,8 @@ test("active may equal baseline and an empty previous field needs no old-shell d
   assert.equal(result.executablePath, path.join(directory, "shells", "installation", "CodeFlowAI.exe"));
 });
 
-test("every required state, shell and baseline resource fails explicitly when absent", async () => {
-  for (const relative of ["shell-launch.ini", "shells", "shells/shell-new", "shells/shell-new/CodeFlowAI.exe",
-    "shells/shell-old", "shells/shell-old/CodeFlowAI.exe", "shells/installation", "shells/installation/CodeFlowAI.exe", "shells/installation/resources",
-    "shells/installation/resources/web", "shells/installation/resources/web/index.html", "shells/installation/resources/client",
-    "shells/installation/resources/client/dist", "shells/installation/resources/client/dist/index.cjs", "shells/installation/resources/release-trust.json"]) {
+test("the state and selected shell fail explicitly when absent", async () => {
+  for (const relative of ["shell-launch.ini", "shells", "shells/shell-new", "shells/shell-new/CodeFlowAI.exe"]) {
     const directory = await fixture();
     await fs.rename(path.join(directory, relative), path.join(directory, "removed"));
     await assert.rejects(readShellLaunchState(directory), hasCode("DESKTOP_SHELL_LAUNCH_LAYOUT_INVALID"));
@@ -657,9 +654,7 @@ test("every required state, shell and baseline resource fails explicitly when ab
 });
 
 test("file and directory type mismatches never count as installed entries", async () => {
-  for (const relative of ["shell-launch.ini", "shells", "shells/shell-new", "shells/shell-new/CodeFlowAI.exe", "shells/shell-old/CodeFlowAI.exe",
-    "shells/installation/CodeFlowAI.exe", "shells/installation/resources", "shells/installation/resources/web/index.html", "shells/installation/resources/client/dist/index.cjs",
-    "shells/installation/resources/release-trust.json"]) {
+  for (const relative of ["shell-launch.ini", "shells", "shells/shell-new", "shells/shell-new/CodeFlowAI.exe"]) {
     const directory = await fixture();
     const target = path.join(directory, relative);
     const directoryEntry = (await fs.lstat(target)).isDirectory();
@@ -671,8 +666,7 @@ test("file and directory type mismatches never count as installed entries", asyn
 });
 
 test("rejects junctions at every internal directory component", async () => {
-  for (const relative of ["shells", "shells/shell-new", "shells/shell-old", "shells/installation", "shells/installation/resources",
-    "shells/installation/resources/web", "shells/installation/resources/client", "shells/installation/resources/client/dist"]) {
+  for (const relative of ["shells", "shells/shell-new"]) {
     const directory = await fixture();
     const target = path.join(directory, relative);
     const retained = path.join(directory, "retained");
@@ -690,12 +684,19 @@ test("rejects file symlink metadata for every required ordinary file", async (t)
     if (file === linkedTarget) stat.isSymbolicLink = () => true;
     return stat;
   });
-  for (const relative of ["shell-launch.ini", "shells/shell-new/CodeFlowAI.exe", "shells/shell-old/CodeFlowAI.exe", "shells/installation/CodeFlowAI.exe",
-    "shells/installation/resources/web/index.html", "shells/installation/resources/client/dist/index.cjs", "shells/installation/resources/release-trust.json"]) {
+  for (const relative of ["shell-launch.ini", "shells/shell-new/CodeFlowAI.exe"]) {
     const directory = await fixture();
     linkedTarget = path.join(directory, relative);
     await assert.rejects(readShellLaunchState(directory), hasCode("DESKTOP_SHELL_LAUNCH_LAYOUT_INVALID"));
   }
+});
+
+test("missing historical shells and business baseline cannot block the selected shell recovery UI", async () => {
+  const directory = await fixture();
+  await fs.rename(path.join(directory, "shells", "installation"), path.join(directory, "retained-baseline"));
+  await fs.rename(path.join(directory, "shells", "shell-old"), path.join(directory, "retained-previous"));
+  const result = await readShellLaunchState(directory);
+  assert.equal(result.executablePath, path.join(directory, "shells", "shell-new", "CodeFlowAI.exe"));
 });
 
 test("read errors retain the system cause and never print malformed INI content", async () => {

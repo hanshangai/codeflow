@@ -215,6 +215,16 @@ export function createLocalEventPipeline(input: {
     failWorkspace(workspaceId: string, cause: unknown): void { if (!failures.has(workspaceId)) failures.set(workspaceId, cause); },
     /** 失败属于原W owner，后续请求不能把未就绪数据当可用快照。 */
     assertNoFailure(workspaceId: string): void { if (failures.has(workspaceId)) throw failures.get(workspaceId); },
+    /** 高水位等待已接收批次释放容量；其他W的失败仍由其onFailure/flush负责，不转嫁给调用W。 */
+    waitForCapacity(workspaceId: string): Promise<void> | undefined {
+      if (closing) throw new Error("LOCAL_EVENT_PIPELINE_CLOSING");
+      if (failures.has(workspaceId)) throw failures.get(workspaceId);
+      if (totalEvents < 2048 && totalBytes < 32 * 1024 * 1024) return undefined;
+      flushQueued();
+      return Promise.allSettled([...pending].map(item => item.done)).then(() => {
+        if (failures.has(workspaceId)) throw failures.get(workspaceId);
+      });
+    },
     /** 启动恢复必须使用耐久原batchId和原载荷，不能为已提交事件重新分号。 */
     async recover(batch: LocalEventBatch): Promise<void> {
       if (closing || queued.size || pending.size) throw new Error("LOCAL_EVENT_RECOVERY_NOT_IDLE");

@@ -44,6 +44,7 @@ async function fixture(kind: Kind, initialized = false) {
   const root = await fs.mkdtemp(path.join(parent, `nsis-uninstall-${kind}-`));
   const temporary = path.join(root, "temporary");
   await fs.mkdir(temporary);
+  await fs.writeFile(path.join(root, "profile.json"), '{"account":"账号","deviceId":"unchanged","tasks":[1]}', "utf8");
   const env = { ...process.env, TEMP: temporary, TMP: temporary };
   /** 每次编译保留输入和完整诊断，任何编译失败均立即中止测试。 */
   async function compile(name: string, body: string) {
@@ -94,7 +95,6 @@ SectionEnd
   await fs.writeFile(includedHook, source, { encoding: "utf8", flag: "wx" });
   let initialization = `Function un.onInit
   StrCpy $INSTDIR "$EXEDIR"
-  StrCpy $d16Mode keep
   SetSilent silent
 FunctionEnd`;
   let definitions = '!define isUpdated \'"ordinary" == "updated"\'';
@@ -120,13 +120,13 @@ ${generator.build()}
 Function un.checkAppRunning
 FunctionEnd`;
     // 保留原初始化和参数解析，只设定夹具根；原初始化完成后再隐藏无页面窗口。
-    initialization = original![0].replace(/(Function un\.onInit\r?\n)/u, '$1  StrCpy $INSTDIR "$EXEDIR"\n  StrCpy $d16Mode keep\n')
+    initialization = original![0].replace(/(Function un\.onInit\r?\n)/u, '$1  StrCpy $INSTDIR "$EXEDIR"\n')
       .replace(/^FunctionEnd/mu, "  SetSilent silent\nFunctionEnd");
     await fs.writeFile(path.join(root, "template-init.nsh"), original![0], { encoding: "utf8", flag: "wx" });
   }
   const generator = await compile("generator", `SilentInstall silent
 !define BUILD_UNINSTALLER
-!define CODEFLOW_STOP_INSTALLED_HELPER "${nsisPath(fileURLToPath(new URL("../build/stop-installed-processes.ps1", import.meta.url)))}"
+!define CODEFLOW_STOP_INSTALLED_INCLUDE "${nsisPath(fileURLToPath(new URL("../build/stop-installed-processes.nsh", import.meta.url)))}"
 !include "${nsisPath(includedHook)}"
 ${definitions}
 ${initialization}
@@ -141,7 +141,10 @@ Section "Uninstall"
     SetErrorLevel 99
     Quit` : ""}
   ${kind === "prior-errors" ? "SetErrors" : "ClearErrors"}
-  !insertmacro customUnInstall
+  ${["log-unavailable", "flush-failure", "close-failure"].includes(kind) ? `Call un.D16NewRequestId
+  StrCpy $d16FailureCode DESKTOP_INSTALL_PROCESS_STOP_FAILED
+  StrCpy $d16FailureDetails '\"stage\":\"installation-process-stop\",\"rootCause\":\"PROCESS_STOP_FAILED\"'
+  Call un.D16FailUninstall` : "!insertmacro customUnInstall"}
   FileOpen $1 "$EXEDIR\\order.txt" a
   FileSeek $1 0 END
   FileWrite $1 "continued$\\r$\\n"
@@ -169,33 +172,14 @@ async function diagnostics(temporary: string) {
   return records;
 }
 
-for (const kind of ["missing", "invalid", "nonzero"] as const) {
-  test(`real uninstall maintenance stops and records ${kind} child failure`, { skip }, async () => {
+for (const kind of ["missing", "invalid", "nonzero", "success", "prior-errors"] as const) {
+  test(`real keep uninstall continues without running ${kind} business executable`, { skip }, async () => {
     const f = await fixture(kind), result = await execute(f.executable, [`_?=${f.root}`], f.env);
     await fs.writeFile(path.join(f.root, "result.json"), JSON.stringify(result, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
-    assert.equal(result.code, 1, `maintenance failure must remain nonzero: ${f.root}`);
-    if (kind === "nonzero") assert.equal(await fs.readFile(path.join(f.root, "order.txt"), "ascii"), "started\r\nfinished\r\n");
-    else await assert.rejects(fs.access(path.join(f.root, "order.txt")), { code: "ENOENT" });
-    const records = await diagnostics(f.temporary);
-    assert.equal(records.length, 1, "one maintenance diagnostic is required");
-    assert.equal(records[0].errorCode, "DESKTOP_UNINSTALL_MAINTENANCE_FAILED");
-    assert.equal(records[0].appId, "ai.codeflow.codeflowai");
-    assert.equal(records[0].stage, "uninstall-maintenance");
-    assert.equal(records[0].mode, "keep");
-    assert.match(records[0].requestId, /^nsis-[A-Za-z0-9._-]+$/u);
-    assert.equal(records[0].rootCause, kind === "nonzero" ? "PROCESS_EXIT_NONZERO" : "PROCESS_START_FAILED");
-    assert.equal(records[0].exitCode, kind === "nonzero" ? 7 : null);
-    assert.deepEqual(Object.keys(records[0]).sort(), ["appId", "errorCode", "exitCode", "mode", "requestId", "rootCause", "stage"]);
-    if (kind === "nonzero") assert.ok((await fs.readFile(path.join(f.root, "maintenance.txt"), "ascii")).includes(`"${records[0].requestId}"`));
-  });
-}
-
-for (const kind of ["success", "prior-errors"] as const) {
-  test(`real uninstall maintenance waits for ${kind} child before continuing`, { skip }, async () => {
-    const f = await fixture(kind), result = await execute(f.executable, [`_?=${f.root}`], f.env);
-    assert.equal(result.code, 0, `${f.root}\n${result.stderr}`);
-    assert.equal(await fs.readFile(path.join(f.root, "order.txt"), "ascii"), "started\r\nfinished\r\ncontinued\r\n");
-    assert.match(await fs.readFile(path.join(f.root, "maintenance.txt"), "ascii"), /^--codeflow-uninstall-maintenance "nsis-[A-Za-z0-9._-]+" "keep" --resume-pending$/u);
+    assert.equal(result.code, 0, `program removal must be independent: ${f.root}`);
+    assert.equal(await fs.readFile(path.join(f.root, "order.txt"), "ascii"), "continued\r\n");
+    for (const file of ["maintenance.txt", "preflight.txt"]) await assert.rejects(fs.access(path.join(f.root, file)), { code: "ENOENT" });
+    assert.equal(await fs.readFile(path.join(f.root, "profile.json"), "utf8"), '{"account":"账号","deviceId":"unchanged","tasks":[1]}');
     assert.deepEqual(await diagnostics(f.temporary), []);
   });
 }
@@ -212,17 +196,17 @@ for (const [name, args, expected] of [
   ["ordinary", [], "maintenance"],
   ["upgrade", ["--updated", "/S"], "upgrade"],
   ["interactive upgrade", ["--updated"], "upgrade"],
-  ["silent", ["/S"], "SILENT_UNINSTALL_UNSUPPORTED"],
+  ["silent", ["/S"], "ordinary"],
   ["template upgrade alias", ["/updated", "/S"], "upgrade"],
-  ["similar upgrade spelling", ["--updated-other", "/S"], "SILENT_UNINSTALL_UNSUPPORTED"],
+  ["similar upgrade spelling", ["--updated-other", "/S"], "ordinary"],
   ["explicit deletion", ["--delete-app-data", "/S"], "DELETE_APP_DATA_UNSUPPORTED"],
   ["upgrade with explicit deletion", ["--updated", "--delete-app-data", "/S"], "DELETE_APP_DATA_UNSUPPORTED"],
 ] as const) {
   test(`real template initialization handles ${name} parameters before maintenance`, { skip: initSkip }, async () => {
     const f = await fixture("success", true), result = await execute(f.executable, [...args, `_?=${f.root}`], f.env);
-    if (expected === "maintenance" || expected === "upgrade") {
+    if (expected === "maintenance" || expected === "upgrade" || expected === "ordinary") {
       assert.equal(result.code, 0, `valid initialization must continue: ${f.root}`);
-      assert.equal(await fs.readFile(path.join(f.root, "order.txt"), "ascii"), expected === "upgrade" ? "continued\r\n" : "started\r\nfinished\r\ncontinued\r\n");
+      assert.equal(await fs.readFile(path.join(f.root, "order.txt"), "ascii"), "continued\r\n");
       assert.deepEqual(await diagnostics(f.temporary), []);
       if (expected === "upgrade") await assert.rejects(fs.access(path.join(f.root, "maintenance.txt")), { code: "ENOENT" });
     } else {
@@ -240,12 +224,19 @@ for (const [name, args, expected] of [
   });
 }
 
-test('real template upgrade refuses a busy application before removing program files', { skip: initSkip }, async () => {
+test('real template upgrade never asks the old business executable for admission', { skip: initSkip }, async () => {
   const f = await fixture('nonzero', true), result = await execute(f.executable, ['--updated', '/S', `_?=${f.root}`], f.env);
-  assert.equal(result.code, 1);
-  assert.equal(await fs.readFile(path.join(f.root, 'preflight.txt'), 'ascii'), 'checked');
-  for (const file of ['maintenance.txt', 'order.txt']) await assert.rejects(fs.access(path.join(f.root, file)), { code: 'ENOENT' });
-  const records = await diagnostics(f.temporary);
-  assert.equal(records.length, 1); assert.equal(records[0].errorCode, 'DESKTOP_INSTALL_PREFLIGHT_FAILED');
-  assert.equal(records[0].exitCode, 7);
+  assert.equal(result.code, 0);
+  assert.equal(await fs.readFile(path.join(f.root, 'order.txt'), 'ascii'), 'continued\r\n');
+  for (const file of ['maintenance.txt', 'preflight.txt']) await assert.rejects(fs.access(path.join(f.root, file)), { code: 'ENOENT' });
+  assert.deepEqual(await diagnostics(f.temporary), []);
+});
+
+test("standard silent keep uninstall succeeds without any business executable and preserves profile bytes", { skip: initSkip }, async () => {
+  const f = await fixture("missing", true), before = await fs.readFile(path.join(f.root, "profile.json"));
+  const result = await execute(f.executable, ["/S", "/currentuser", `_?=${f.root}`], f.env);
+  assert.equal(result.code, 0, f.root);
+  assert.equal(await fs.readFile(path.join(f.root, "order.txt"), "ascii"), "continued\r\n");
+  assert.deepEqual(await fs.readFile(path.join(f.root, "profile.json")), before);
+  assert.deepEqual(await diagnostics(f.temporary), []);
 });

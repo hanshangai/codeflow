@@ -11,6 +11,7 @@ import { CodexAppServerManager } from "../src/engines/codex-app-server/codexAppS
 import { CodexAppServerThreadSession } from "../src/engines/codex-app-server/codexAppServerThreadSession.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
 import { logger } from "../src/logger.js";
+import { isEngineWorkspaceLogFailure } from "../src/engines/threadSession.js";
 
 /** 两个注册根和真实固定writer；无provider、安装或网络动作。 */
 function fixture(t: test.TestContext) {
@@ -112,6 +113,22 @@ test("Codex活动回合日志失败不拒绝活动owner或关闭超时控制", a
   assert.equal(stopped, 0);
 });
 
+test("Codex异步事件失败保留原始错误并停止owner，不能误标为日志失败", async () => {
+  const failure = Object.assign(new Error("LOCAL_EVENT_PIPELINE_CAPACITY_EXCEEDED"), { code: "event-storage-failed" });
+  let rejected: unknown, stopped = 0;
+  const session = new CodexAppServerThreadSession({ writeWorkspaceLog() {}, manager: {} as any,
+    workspacePath: "D:/isolated", workspaceId: "engine:b" as WorkspaceId, threadId: "event-failure-thread", initialSessionId: null,
+    initialSessionCapabilities: null, onEngineProcessSnapshot: () => false, onSessionBinding() {}, onSessionBindingDropped() {}, onStartAttempt() {} });
+  (session as any).active = { timeoutController: { stop() { stopped++; } }, reject(cause: unknown) { rejected = cause; } };
+  (session as any).observeDiagnosticTask(async () => { throw failure; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(rejected, failure);
+  assert.equal(stopped, 1);
+  assert.throws(() => session.canIdleDispose(), error => error === failure);
+  await assert.rejects(session.sendMessage({ turnId: "new-turn", userItemId: "user", text: "", images: [], assistantItemId: "assistant", reasoningItemId: "reasoning" },
+    { conversation() {}, raw() {} }), error => error === failure);
+});
+
 test("Codex真实ownership到期timer日志失败不锁死会话且其他W日志可用", async t => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 100 });
   const failure = new Error("expiry-log-failed"), logs: string[] = [];
@@ -175,6 +192,22 @@ test("Codex工作区日志和应用告警双失败后资源清理仍可重试", 
   assert.equal(unregisters, 2);
   records.clear();
   await manager.stopAndDrain();
+});
+
+test("Codex故障回收成功仍保留真实日志双失败，不能伪造release成功", async t => {
+  const manager = new CodexAppServerManager({ writeWorkspaceLog() { throw new Error("workspace-log-failed"); },
+    clientInfo: { name: "test", title: "test", version: "0" } });
+  const threadId = "fault-log-failure-thread" as ThreadId;
+  const workspace = manager.forThread(threadId).getOrCreate("engine:b" as WorkspaceId, "D:/isolated");
+  const child = { pid: 42, exitCode: null, signalCode: null };
+  (workspace as any).child = child;
+  (workspace as any).processGeneration = 1;
+  (workspace as any).opts.terminateProcessTree = async () => {};
+  t.mock.method(logger, "warn", () => { throw new Error("application-log-failed"); });
+  (workspace as any).failWorkspace(Object.assign(new Error("process-failed"), { code: "codex_app_server_process_error" }), {
+    child, processGeneration: 1, notifyThreads: false, killChild: true,
+  });
+  await assert.rejects(manager.releaseThread(threadId), error => isEngineWorkspaceLogFailure(error));
 });
 
 test("Codex配置退订日志失败只告警且保留原业务值，不读取异常getter", async () => {

@@ -432,6 +432,59 @@ test("异步提交失败由原工作区owner显式保留，禁止后续发布", 
   await assert.rejects(pipeline.close(), error => error === failure);
 });
 
+test("事件管线接近容量时等待慢写入，确认完成后恢复同步准入", async t => {
+  const { db } = setup(t);
+  const core = createLocalEventPersistence({ db, applyRaw() {}, applyConversation() {} });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let published = 0;
+  const pipeline = createLocalEventPipeline({
+    writer: {
+      async submit(batch) { await gate; return core.commitBatch(batch); },
+      async completeIndexes(workspace, batchId, count) { return core.completeBatchIndexes(workspace, batchId, count); },
+      async withLegacyDatabase(_requestId, operation) { return operation(); },
+      failIndexes() { assert.fail("unexpected index failure"); },
+    },
+    apply() {}, async applyBatch() {}, publish() { published++; }, onFailure(error) { assert.fail(String(error)); },
+  });
+  t.after(async () => { release(); await pipeline.close(); });
+  assert.equal(pipeline.waitForCapacity(workspaceId), undefined);
+  for (let index = 0; index < 2048; index++) pipeline.enqueue({ t: "raw.event", event: raw }, null, 1);
+  const waiting = pipeline.waitForCapacity(workspaceId);
+  assert.ok(waiting instanceof Promise);
+  let settled = false;
+  void waiting.then(() => { settled = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(published, 0);
+  release();
+  await waiting;
+  assert.equal(published, 2048);
+  assert.equal(pipeline.waitForCapacity(workspaceId), undefined);
+});
+
+test("容量等待保留所属工作区失败，其他工作区仍可继续", async () => {
+  const failure = new Error("capacity-writer-failed");
+  const observed: unknown[] = [];
+  const pipeline = createLocalEventPipeline({
+    writer: {
+      async submit() { throw failure; }, async completeIndexes() { assert.fail("must not index"); },
+      async withLegacyDatabase(_requestId, operation) { return operation(); }, failIndexes() {},
+    },
+    apply() { assert.fail("must not apply"); }, publish() { assert.fail("must not publish"); },
+    onFailure(error) { observed.push(error); },
+  });
+  for (let index = 0; index < 2048; index++) pipeline.enqueue({ t: "raw.event", event: raw }, null, 1);
+  const ownWait = pipeline.waitForCapacity(workspaceId);
+  const healthyWait = pipeline.waitForCapacity("healthy-workspace");
+  await assert.rejects(ownWait!, error => error === failure);
+  await healthyWait;
+  assert.deepEqual(observed, [failure]);
+  assert.throws(() => pipeline.waitForCapacity(workspaceId), error => error === failure);
+  assert.equal(pipeline.waitForCapacity("healthy-workspace"), undefined);
+  await assert.rejects(pipeline.close(), error => error === failure);
+});
+
 test("工作区恢复读取失败只冻结所属W且保留首次根因，其他W仍可持久化发布", async () => {
   const failure = new Error("WORKSPACE_RECEIPT_CORRUPT"), published: string[] = [];
   const pipeline = createLocalEventPipeline({

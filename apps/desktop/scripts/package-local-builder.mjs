@@ -92,13 +92,13 @@ export async function removeBuilderProject(stage) {
   await fs.rm(stage, { recursive: true, force: true });
 }
 
-/** electron-builder 在读取配置前直接校验 projectDir/package.json；用临时壳目录补零，不改源码清单。 */
+/** 临时清单保存精确计划壳号；builder 的 semver 独立补零，不改工作区清单。 */
 export async function createBuilderProject(desktopDir, shellVersion) {
   const stage = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-desktop-build-"));
   try {
     const packageJson = JSON.parse(await fs.readFile(path.join(desktopDir, "package.json"), "utf8"));
     await fs.writeFile(path.join(stage, "package.json"),
-      `${JSON.stringify({ ...packageJson, version: toBuilderVersion(shellVersion) }, null, 2)}\n`, "utf8");
+      `${JSON.stringify({ ...packageJson, version: toBuilderVersion(shellVersion), shellVersion }, null, 2)}\n`, "utf8");
     /** electron-builder 不跟随 dist 目录链接，壳产物必须复制；资源目录由 extraResources 单独携带。 */
     const resourcesDir = path.resolve(desktopDir, "dist", "resources");
     await copyDirectory(path.join(desktopDir, "dist"), path.join(stage, "dist"), resourcesDir);

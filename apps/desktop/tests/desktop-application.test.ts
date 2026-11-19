@@ -18,6 +18,7 @@ import { loadOrCreateDeviceIdentity } from "../src/deviceIdentity.js";
 import { createLegacyClientMigration, type LegacyClientMigration } from "../src/legacyClientMigration.js";
 import { loadWeb } from "../src/webLoader.js";
 import { signReleaseBundleManifest, readReleaseBundleFiles, computeReleaseDirectorySha256, computeReleasePackageSha256 } from "@codeflowai/shared/desktop-release-signing";
+import { signShellReleaseManifest } from "@codeflowai/shared/desktop-shell-release-signing";
 import { desktopDevicePublicKeySha256, readDesktopDeviceHeaders } from "@codeflowai/shared/desktop-device-auth";
 import { createDesktopUpdateReceipt } from "@codeflowai/shared/desktop-update-receipt";
 import { createUpdateFailureJournal } from "../src/updateFailureJournal.js";
@@ -216,7 +217,7 @@ test("壳交接启动同样先检查数据库迁移围栏，不启动不兼容�
   assert.equal(f.actions.includes("start"), false);
 });
 
-for (const mode of ["continuation", "preparing"] as const) test(`数据库修复与壳更新${mode}同时存在时拒绝启动Client并保留恢复记录`, async t => {
+for (const mode of ["continuation", "preparing"] as const) test(`数据库修复只服从真实交接授权，历史壳${mode}不新增启动围栏`, async t => {
   const f = await heldApplicationFixture(t, { dbSchemaVersion: 89 });
   await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1", dbSchemaVersion: 88 });
   await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }));
@@ -242,6 +243,15 @@ for (const mode of ["continuation", "preparing"] as const) test(`数据库修复
       main: { pid: 101, parentPid: 90, created: 1101, executable: path.join(f.baseline, "CodeFlowAI.exe"), commandLine: "main" } } };
   }
   const app = createDesktopApplication(options);
+  if (mode === 'preparing') {
+    await app.start();
+    assert.equal(app.getRuntimeState().status, 'ready');
+    assert.equal(await readActivePointer(f.dataDir), null);
+    assert.equal(await readPendingRelease(f.dataDir), null);
+    assert.deepEqual(await createShellUpdateAttemptStore(f.dataDir).read(), attempt);
+    await app.exit();
+    return;
+  }
   await assert.rejects(app.start(), /DESKTOP_DB_SCHEMA_FORWARD_ONLY/u);
   assert.equal(f.actions.includes("start"), false);
   assert.equal(f.actions.includes("continue"), false);
@@ -547,14 +557,14 @@ for (const failure of ["none", "frame", "authorize", "ack", "ready"] as const) t
 });
 
 /** 每份工件都独立签实际库存，marker失败不会被不匹配的签名提前掩盖。 */
-async function createHeldRelease(directory: string, options: { releaseId?: string; baseline?: boolean; marker?: Record<string, unknown> | false; clientVersion?: string; dbSchemaVersion?: number } = {}) {
+async function createHeldRelease(directory: string, options: { releaseId?: string; version?: string; webVersion?: string; baseline?: boolean; marker?: Record<string, unknown> | false; clientVersion?: string; dbSchemaVersion?: number } = {}) {
   await fs.mkdir(path.join(directory, "web"), { recursive: true }); await fs.mkdir(path.join(directory, "client", "dist"), { recursive: true });
   const source = "held-client";
   await fs.writeFile(path.join(directory, "web", "index.html"), "held-web", "utf8"); await fs.writeFile(path.join(directory, "client", "dist", "index.cjs"), source, "utf8");
   if (options.marker !== false) await fs.writeFile(path.join(directory, DESKTOP_STARTUP_CAPABILITY_PATH), JSON.stringify({ schemaVersion: 1, heldStartupProtocol: 1,
     clientEntrySha256: crypto.createHash("sha256").update(source).digest("hex"), ...options.marker }), "utf8");
   const files = await readReleaseBundleFiles(directory), webSha256 = computeReleaseDirectorySha256(files, "web"), clientSha256 = computeReleaseDirectorySha256(files, "client");
-  const manifest = signReleaseBundleManifest({ schemaVersion: 2, releaseId: options.releaseId ?? "baseline", version: "1.0.0", webVersion: "1.0.0", clientVersion: options.clientVersion ?? "1.0.0",
+  const manifest = signReleaseBundleManifest({ schemaVersion: 2, releaseId: options.releaseId ?? "baseline", version: options.version ?? "1.0.0", webVersion: options.webVersion ?? options.version ?? "1.0.0", clientVersion: options.clientVersion ?? "1.0.0",
     protocolVersion: 1, capabilityVersion: 1, dbSchemaVersion: options.dbSchemaVersion ?? 88, platform: process.platform, arch: process.arch, keyId: "fixture",
     archiveSha256: "e".repeat(64), archiveSize: 100, files, webSha256, clientSha256, packageSha256: computeReleasePackageSha256(webSha256, clientSha256),
     createdAt: "2026-10-24T00:00:00.000Z", expiresAt: "2099-10-24T00:00:00.000Z" }, privateKey);
@@ -707,7 +717,7 @@ test('exit drain returns a structured shutdown response and keeps the exit fence
 });
 
 /** 真实资源准备与shell store/INI/binding；外部进程受控，显式重启仍走原退出边界。 */
-async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
+async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, resourceVersion = '2.0.0', resourceWebVersion?: string) {
   const f = await fixture(t), installationDir = path.join(f.dataDir, "installation"), userDataDir = path.join(f.dataDir, "user"), sessionDataDir = path.join(f.dataDir, "session");
   for (const directory of [userDataDir, sessionDataDir]) await fs.mkdir(directory);
   for (const shell of ["old", "new", "baseline"]) { const directory = path.join(installationDir, "shells", shell); await fs.mkdir(directory, { recursive: true }); await fs.writeFile(path.join(directory, "CodeFlowAI.exe"), "fixture"); }
@@ -727,12 +737,14 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
     holdHealth: undefined as (() => Promise<void>) | undefined, holdDrain: undefined as (() => Promise<void>) | undefined };
   let hotManifest = manifest, archive: Buffer = Buffer.alloc(0);
   if (hotUpdate) {
-    const packageDir = path.join(f.dataDir, "hot-incoming"), original = await createHeldRelease(packageDir, { releaseId: "hot-release" }), archiveFile = path.join(f.dataDir, "hot.tar.gz");
+    const packageDir = path.join(f.dataDir, "hot-incoming"), original = await createHeldRelease(packageDir, { releaseId: "hot-release", version: resourceVersion, webVersion: resourceWebVersion }), archiveFile = path.join(f.dataDir, "hot.tar.gz");
     await tar.c({ cwd: packageDir, file: archiveFile, gzip: true, portable: true }, ["web", "client"]);
     archive = await fs.readFile(archiveFile); const { signature: _signature, ...payload } = original;
     hotManifest = signReleaseBundleManifest({ ...payload, archiveSha256: crypto.createHash("sha256").update(archive).digest("hex"), archiveSize: archive.length }, privateKey);
   }
+  const requestPaths: string[] = [];
   const server = http.createServer((request, response) => { void (async () => {
+    requestPaths.push(request.url ?? '');
     const meta = readDesktopDeviceHeaders(request.rawHeaders); response.setHeader("content-type", "application/json");
     if (request.url?.endsWith("/devices/register")) { for await (const _chunk of request) { /* 完整消费登记体。 */ } response.end(JSON.stringify({ ok: true, deviceId: identity.deviceId, publicKeySha256: desktopDevicePublicKeySha256(identity.publicKeyBase64) })); return; }
     if (request.url?.endsWith("/archive")) { response.writeHead(200, { etag: `"${hotManifest.archiveSha256}"`, "content-length": archive.length }); response.end(archive); return; }
@@ -741,11 +753,18 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
     if (request.url?.endsWith("/switch-authorization")) { response.end(JSON.stringify({ ok: true, authorized: true, deviceId: identity.deviceId, requestId: meta.requestId, releaseId: hotManifest.releaseId, archiveSha256: hotManifest.archiveSha256 })); return; }
     f.actions.push("hot-discover");
     if (control.failHot) { response.writeHead(403); response.end("{}"); return; }
-    response.end(JSON.stringify({ ok: true, available: control.hotAvailable, ...(control.hotAvailable ? { manifest: hotManifest } : {}), deviceId: identity.deviceId, requestId: meta.requestId }));
+    response.end(JSON.stringify(request.url?.endsWith('/update-availability')
+      ? { ok: true, deviceId: identity.deviceId, requestId: meta.requestId,
+        resource: control.hotAvailable ? { available: true, manifest: hotManifest } : { available: false },
+        shell: control.available ? { available: true, manifest: shellManifest } : { available: false } }
+      : { ok: true, available: control.hotAvailable, ...(control.hotAvailable ? { manifest: hotManifest } : {}), deviceId: identity.deviceId, requestId: meta.requestId }));
   })().catch(error => { serverErrors.push(error); response.writeHead(500); response.end("{}"); }); });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
   t.after(async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); assert.deepEqual(serverErrors, []); });
-  const shellManifest = { shellId: "new", installerSha256: "b".repeat(64), installerSize: 1 } as any;
+  const shellManifest = signShellReleaseManifest({ schemaVersion: 1, protocol: 'codeflow-desktop-shell-v1', shellId: 'new', version: '1.1',
+    platform: 'win32', arch: 'x64', installerSha256: 'b'.repeat(64), installerSize: 1, keyId: 'fixture',
+    files: ['CodeFlowAI.exe', 'resources/app.asar', 'resources/release-trust.json'].map(path => ({ path, size: 1, sha256: 'a'.repeat(64) })),
+    createdAt: '2026-01-01T00:00:00.000Z', expiresAt: '2099-01-01T00:00:00.000Z' }, privateKey);
   const channel = Object.assign(new EventEmitter(), { pid: helper.pid, connected: true,
     /** 响应沿同一真实store接线；禁止在旧main退出前伪造候选进程。 */
     send(message: any, callback: (error: Error | null) => void) { f.actions.push(message.kind); callback(null); queueMicrotask(() => { void (async () => {
@@ -761,9 +780,15 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
       channel.emit("message", { ...message, revision, kind, body: kind === "armed" ? { helper } : {} });
     })().catch(error => channel.emit("error", error)); }); return true; },
     disconnect() { control.closed = true; channel.connected = false; queueMicrotask(() => channel.emit("close", 1, null)); }, unref() { f.actions.push("helper-unref"); } });
-  const boundary: Partial<ShellUpdateOperationBoundary> = { createNetwork: () => ({
+  const boundary: Partial<ShellUpdateOperationBoundary> = { createNetwork: networkInput => ({
     async prepare() { f.actions.push("shell-discover"); if (control.fail === "discover") throw new Error("shell discover failed");
       let current = await store.read() as ShellUpdateAttemptV2;
+      if (networkInput.discovery) {
+        const cached = await networkInput.discovery(current.requestId);
+        assert.equal(cached.requestId, current.requestId);
+        assert.equal(cached.available, control.available);
+        if (cached.available) assert.deepEqual(cached.manifest, shellManifest);
+      }
       if (current.target) return { status: "target", attempt: current, manifest: shellManifest };
       const sent = await store.replace(current, { ...current, revision: current.revision + 1, network: { actionKey: "shell-discover", requestSha256: "d".repeat(64), status: "dispatching" } }) as ShellUpdateAttemptV2;
       current = await store.replace(sent, { ...sent, revision: sent.revision + 1, network: { ...sent.network!, status: "succeeded", evidence: { kind: "shell-manifest", sha256: "e".repeat(64) } } }) as ShellUpdateAttemptV2;
@@ -785,15 +810,74 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false) {
   f.host.onUpdateError = error => { errors.push(error); }; f.host.onUpdateRetry = () => {};
   f.host.quit = () => { f.actions.push("quit"); if (control.quitFail) throw new Error("quit failed"); };
   f.host.relaunch = () => { f.actions.push("relaunch"); };
-  const options: Parameters<typeof createDesktopApplication>[0] = { dataDir: f.dataDir, initialReleaseDir, trustedReleaseKeys, host: f.host, createRuntime: (_entry, expectation, startup) => { runtimeReleaseId = expectation?.releaseId ?? null; heldId = startup?.mode === "held" ? startup.continuationId : undefined; return f.runtime; },
+  const options: Parameters<typeof createDesktopApplication>[0] = { requireBaseline: true, shellVersion: "1.0", dataDir: f.dataDir, initialReleaseDir, trustedReleaseKeys, host: f.host, createRuntime: (_entry, expectation, startup) => { runtimeReleaseId = expectation?.releaseId ?? null; heldId = startup?.mode === "held" ? startup.continuationId : undefined; return f.runtime; },
     configuredServerOrigin: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
     shellUpdate: { facts: { installationDir, userDataDir, sessionDataDir, main }, boundary, timeoutMs: 10_000 } };
   let app = createDesktopApplication(options);
   await app.start(); f.actions.length = 0;
-  return { ...f, get app() { return app; }, control, errors, store, manifest, boundary,
+  return { ...f, get app() { return app; }, control, errors, store, manifest, boundary, requestPaths,
     /** 使用同一磁盘尝试重建 owner，模拟下一次正常启动。 */
     async restart() { await app.exit(); control.drained = false; app = createDesktopApplication(options); await app.start(); } };
 }
+
+test('one update check consumes a combined response for both channels without duplicate discovery', async t => {
+  const f = await shellApplicationFixture(t); f.control.available = false;
+  await f.app.checkForUpdates();
+  assert.equal(f.requestPaths.filter(value => value.endsWith('/update-availability')).length, 1);
+  assert.equal(f.requestPaths.some(value => value.endsWith('/release-availability') || value.endsWith('/shell-release-availability')), false);
+  assert.equal((await f.app.getUpdateDetails()).shell.result, 'none');
+  await f.app.exit();
+});
+
+for (const version of ['0.9.0', '1.0.0', '2.0.0']) test(`resource discovery compares only its numeric version: ${version}`, async t => {
+  const f = await shellApplicationFixture(t, true, version); f.control.available = false;
+  await f.app.checkForUpdates();
+  assert.equal(f.requestPaths.filter(value => value.endsWith('/archive')).length, version === '2.0.0' ? 1 : 0);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, version === '2.0.0' ? 'prepared' : 'same');
+  assert.equal(await readActivePointer(f.dataDir), null);
+  await f.app.exit();
+});
+
+test('resource activation uses the bundle version even when its compatible Web version is lower', async t => {
+  const f = await shellApplicationFixture(t, true, '2.0.0', '0.9.0'); f.control.available = false;
+  await f.app.checkForUpdates(); await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), 'hot-release');
+  assert.equal((await f.app.getUpdateDetails()).current.bundle?.version, '2.0.0');
+  await f.app.exit();
+});
+
+for (const malformed of ['request', 'shell-extra', 'resource-type']) test(`combined discovery rejects an invalid ${malformed} envelope before downloading`, async t => {
+  const f = await shellApplicationFixture(t, true), fetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    const response = await fetch(url, options);
+    if (!String(url).endsWith('/update-availability')) return response;
+    const body = await response.json();
+    if (malformed === 'request') body.requestId = 'another-attempt';
+    else if (malformed === 'shell-extra') body.shell.extra = true;
+    else body.resource.available = 'true';
+    return Response.json(body);
+  });
+  await assert.rejects(f.app.checkForUpdates(), { code: 'DESKTOP_UPDATE_RESPONSE_INVALID' });
+  assert.equal(f.requestPaths.some(value => value.endsWith('/archive')), false);
+  assert.equal(f.control.spawned, false);
+  await f.app.exit();
+});
+
+test('pending remote receipt delivery cannot block a new update check', async t => {
+  const f = await shellApplicationFixture(t), identity = await loadOrCreateDeviceIdentity(f.dataDir);
+  const receipt = createDesktopUpdateReceipt({ schemaVersion: 1, deviceId: identity.deviceId, requestId: crypto.randomUUID(),
+    releaseId: 'old-pending', archiveSha256: 'a'.repeat(64), stage: 'received', at: '2026-11-18T00:00:00.000Z', errorCode: null, errorId: null });
+  await createUpdateReceiptJournal(f.dataDir).record(receipt);
+  const fetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    if (String(url).endsWith('/update-receipts')) throw new Error('REMOTE_RECEIPT_OFFLINE');
+    return await fetch(url, options);
+  });
+  assert.equal(await f.app.checkForUpdates(), null);
+  assert.equal((await f.app.getUpdateDetails()).shell.result, 'prepared');
+  assert.deepEqual(await createUpdateReceiptJournal(f.dataDir).pending(identity.deviceId), [receipt]);
+  await f.app.exit();
+});
 
 test("用户重启更新前确认运行中会话，取消后保留应用", async t => {
   const f = await shellApplicationFixture(t);
@@ -829,26 +913,25 @@ test("prepared resource defers shell discovery until its next activation", async
   assert.equal(f.actions.includes("drain"), false); assert.equal(f.errors.length, 0); await f.app.exit();
 });
 
-test("resource activation keeps tasks held and continues the shell in the same user update", async t => {
+test("resource activation releases business startup without a shell discovery or automatic restart", async t => {
   const f = await shellApplicationFixture(t, true);
   await f.app.checkForUpdates();
   await f.restart();
   assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
-  assert.equal(f.actions.includes("runtime.startup.continue"), false, "business must remain held until the shell decision");
-  assert.ok(await readPendingRelease(f.dataDir), "resource pending must survive the transfer to the shell owner");
-  assert.equal(await f.app.resumeStartupUpdate(), true);
-  const attempt = await f.store.read();
-  assert.equal(attempt?.binding.kind, "active");
-  assert.equal(attempt?.binding.kind === "active" && attempt.binding.releaseId, "hot-release");
-  assert.equal(f.actions.filter(action => action === "quit").length, 2, "one resource restart and one shell handoff");
-  assert.equal(f.actions.includes("runtime.startup.continue"), false);
+  assert.equal(f.actions.filter(action => action === "runtime.startup.continue").length, 1);
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  assert.equal(await f.store.read(), null);
+  assert.equal(f.actions.filter(action => action === "quit").length, 1);
+  assert.equal(f.control.spawned, false);
+  await f.app.exit();
 });
 
-test("resource update without a shell update releases tasks after a durable shell decision", async t => {
+test("resource update releases tasks without waiting for an absent shell update", async t => {
   const f = await shellApplicationFixture(t, true); f.control.available = false;
   await f.app.checkForUpdates();
   await f.restart();
-  assert.equal(f.actions.includes("runtime.startup.continue"), false);
+  assert.equal(f.actions.includes("runtime.startup.continue"), true);
   assert.equal(await f.app.resumeStartupUpdate(), false);
   assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
   assert.equal(f.actions.filter(action => action === "runtime.startup.continue").length, 1);
@@ -857,14 +940,14 @@ test("resource update without a shell update releases tasks after a durable shel
   await f.app.exit();
 });
 
-test("a restart between resource activation and shell discovery resumes the same durable update", async t => {
+test("another cold restart preserves activated resources without reopening their pending transaction", async t => {
   const f = await shellApplicationFixture(t, true); f.control.available = false;
   await f.app.checkForUpdates(); await f.restart();
-  assert.ok(await readPendingRelease(f.dataDir));
+  assert.equal(await readPendingRelease(f.dataDir), null);
   await f.restart();
-  assert.equal(f.actions.includes("runtime.startup.continue"), false);
+  assert.equal(f.actions.filter(action => action === 'runtime.startup.continue').length, 1);
   assert.equal(await f.app.resumeStartupUpdate(), false);
-  assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
+  assert.equal((await f.app.getUpdateDetails()).current.bundle?.releaseId, 'hot-release');
   assert.equal(await readPendingRelease(f.dataDir), null);
   await f.app.exit();
 });
@@ -879,6 +962,7 @@ test("a historical shell no-update binding is archived before activating new res
   assert.equal(await f.store.read(), null);
   assert.ok((await fs.readdir(f.dataDir)).some(name => name.startsWith("shell-update-retired-")));
   await f.app.resumeStartupUpdate();
+  await f.app.checkForUpdates();
   const attempt = await f.store.read();
   assert.equal(attempt?.binding.kind === "active" && attempt.binding.releaseId, "hot-release");
   await f.app.exit();
@@ -887,44 +971,48 @@ test("a historical shell no-update binding is archived before activating new res
 test("shell discovery failure after resource activation remains a partial update failure", async t => {
   const f = await shellApplicationFixture(t, true);
   await f.app.checkForUpdates(); await f.restart(); f.control.fail = "discover";
-  await f.app.resumeStartupUpdate();
+  await assert.rejects(f.app.checkForUpdates());
   const details = await f.app.getUpdateDetails();
-  assert.equal(details.bundle.result, "healthy");
+  assert.equal(details.current.bundle?.releaseId, 'hot-release');
+  assert.equal(details.bundle.result, "same");
   assert.equal(details.shell.result, "failure");
   assert.ok(f.app.shellUpdateFailure);
-  assert.ok(await readPendingRelease(f.dataDir));
+  assert.equal(await readPendingRelease(f.dataDir), null);
   assert.equal(f.control.spawned, false);
   await f.app.exit();
 });
 
-test("resource pending cleanup must finish before a shell helper receives lifecycle ownership", async t => {
+test("resource pending cleanup failure is explicit and cannot transfer lifecycle ownership to a shell helper", async t => {
   const f = await shellApplicationFixture(t, true);
-  await f.app.checkForUpdates(); await f.restart();
+  await f.app.checkForUpdates();
   const remove = fs.rm;
   const mocked = t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
     if (String(args[0]) === path.join(f.dataDir, "pending-release.json")) throw new Error("pending cleanup failed");
     return await remove(...args);
   });
-  const outcome = await Promise.allSettled([f.app.resumeStartupUpdate()]);
+  const outcome = await Promise.allSettled([f.restart()]);
   assert.equal(outcome.length, 1);
   assert.equal(f.control.spawned, false, "fallible resource cleanup cannot strand an accepted shell helper");
-  assert.ok(f.app.shellUpdateFailure);
+  assert.ok(f.app.updateCheckFailure);
   assert.ok(await readPendingRelease(f.dataDir));
   mocked.mock.restore();
   await f.app.exit();
 });
 
-test("a prepared shell restart retains the resource health result from its durable pending", async t => {
+test("a prepared shell failure leaves activated resources usable across a cold restart", async t => {
   const f = await shellApplicationFixture(t, true);
   await f.app.checkForUpdates(); await f.restart();
   f.control.holdHealth = async () => { throw new Error("candidate health interrupted"); };
-  await f.app.resumeStartupUpdate();
+  await assert.rejects(f.app.checkForUpdates());
   assert.ok((await f.store.read())?.target);
-  assert.ok(await readPendingRelease(f.dataDir));
+  assert.equal(await readPendingRelease(f.dataDir), null);
   f.control.holdHealth = undefined;
   await f.restart();
-  assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
-  assert.equal(await f.app.resumeStartupUpdate(), true);
+  assert.equal((await f.app.getUpdateDetails()).current.bundle?.releaseId, 'hot-release');
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  assert.equal(f.control.spawned, false);
+  await f.app.checkForUpdates(); await f.app.restartForUpdate();
+  assert.equal(f.control.spawned, true);
 });
 
 test("resources discovered after a prepared shell activate before that shell is rebound", async t => {
@@ -934,8 +1022,9 @@ test("resources discovered after a prepared shell activate before that shell is 
   f.control.hotAvailable = true; await f.app.checkForUpdates(); await f.restart();
   assert.equal(await readActivePointer(f.dataDir), "hot-release");
   assert.equal(await f.store.read(), null, "old binding must be archived before resource activation");
-  assert.equal(f.actions.includes("runtime.startup.continue"), false);
-  assert.equal(await f.app.resumeStartupUpdate(), true);
+  assert.equal(f.actions.includes("runtime.startup.continue"), true);
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  await f.app.checkForUpdates(); await f.app.restartForUpdate();
   const current = await f.store.read();
   assert.notEqual(current?.requestId, previous?.requestId);
   assert.equal(current?.binding.kind === "active" && current.binding.releaseId, "hot-release");
@@ -1003,7 +1092,7 @@ test("a historical shell network failure cannot prevent valid resources from sta
   assert.equal(await readActivePointer(f.dataDir), "hot-release");
   assert.equal(await f.app.resumeStartupUpdate(), false);
   assert.equal(f.app.getRuntimeState().status, "ready");
-  assert.equal((await f.app.getUpdateDetails()).shell.result, "none");
+  assert.equal((await f.app.getUpdateDetails()).shell.result, "unknown");
   await f.app.exit();
 });
 
@@ -1027,18 +1116,18 @@ test("retirement I/O failure restores the stopped original Client and retains th
   mocked.mock.restore(); await f.app.exit();
 });
 
-test("normal restart resumes a prepared shell before held tasks are released", async t => {
+test("normal restart starts business immediately and leaves the prepared shell for explicit update restart", async t => {
   const f = await shellApplicationFixture(t);
   let bridge!: DesktopBridgeApi;
   f.host.registerBridge = value => { bridge = value; return () => {}; };
   await f.app.checkForUpdates();
   await f.restart();
-  assert.equal((await bridge.getState()).status, "starting");
+  assert.equal((await bridge.getState()).status, "ready");
   assert.equal(f.app.getRuntimeState().status, "ready");
   assert.equal(f.actions.includes("runtime.startup.continue"), false);
-  assert.equal(await f.app.resumeStartupUpdate(), true);
+  assert.equal(await f.app.resumeStartupUpdate(), false);
   assert.equal(f.actions.includes("runtime.update.interrupt"), false);
-  assert.equal(f.actions.at(-1), "helper-unref");
+  assert.equal(f.control.spawned, false);
   assert.equal(f.errors.length, 0);
 });
 
@@ -1064,8 +1153,11 @@ test("D13 application persists one final shell failure in the existing journal w
   assert.equal(Object.hasOwn(record, "releaseId"), false); await f.app.exit();
 });
 
-test("D13 tray retry acknowledges old shell failure before opening a new manual request", async t => {
+test("D13 tray retry opens a new manual request independently of pending error delivery", async t => {
   const f = await shellApplicationFixture(t), network = f.boundary.createNetwork!;
+  const originalFetch = globalThis.fetch;
+  t.mock.method(globalThis, "fetch", async (url: Parameters<typeof fetch>[0], options?: RequestInit) => String(url).endsWith("/update-failures")
+    ? Response.json({ ok: false, code: "DESKTOP_UPDATE_UNAVAILABLE" }, { status: 503 }) : await originalFetch(url, options));
   f.boundary.createNetwork = () => ({
     async prepare() {
       const adapter = createShellUpdateAttemptNetworkAdapter(f.store), before = await adapter.read();
@@ -1080,7 +1172,7 @@ test("D13 tray retry acknowledges old shell failure before opening a new manual 
   assert.equal(failure.requestId, failed.requestId); f.boundary.createNetwork = network; f.control.available = false;
   assert.equal(await f.app.checkForUpdates(), null); const next = await f.store.read();
   assert.notEqual(next!.requestId, failed.requestId); assert.equal(next!.phase, "no-update"); assert.equal(next!.retriesUsed, 0);
-  assert.deepEqual(journal.pending(identity.deviceId), []); assert.deepEqual(journal.shellFailures(identity.deviceId, failed.requestId), [failure]);
+  assert.deepEqual(journal.pending(identity.deviceId), [failure]); assert.deepEqual(journal.shellFailures(identity.deviceId, failed.requestId), [failure]);
   assert.equal(f.app.shellUpdateFailure, null); assert.equal(f.control.spawned, false); await f.app.exit();
 });
 
@@ -1227,6 +1319,18 @@ test("closing the window keeps Client alive, explicit exit drains before destruc
   assert.deepEqual(f.actions.slice(-5), ["drain", "unregister", "tray-destroy", "window-destroy", "quit"]);
 });
 
+test("a trusted active resource starts without a permanently required installation baseline", async t => {
+  const f = await fixture(t), activeDirectory = path.join(f.dataDir, "releases", "active-independent");
+  await loadOrCreateDeviceIdentity(f.dataDir);
+  await createHeldRelease(activeDirectory, { releaseId: "active-independent" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-independent" }));
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: path.join(f.dataDir, "missing-old-baseline"),
+    requireBaseline: true, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
+  await app.start();
+  assert.equal(f.actions.includes("start"), true); assert.equal(f.actions.includes("load-web"), true);
+  await app.exit();
+});
+
 test("start wires the local identity receipt journal and delivery for pending receipts", async t => {
   const f = await fixture(t);
   const identity = await loadOrCreateDeviceIdentity(f.dataDir);
@@ -1262,6 +1366,32 @@ test("start wires the local identity receipt journal and delivery for pending re
   await app.exit();
 });
 
+test("a stalled remote error delivery does not hold local startup or normal exit", { timeout: 3000 }, async t => {
+  const f = await fixture(t), identity = await loadOrCreateDeviceIdentity(f.dataDir);
+  const journal = createUpdateFailureJournal(f.dataDir);
+  journal.record({ deviceId: identity.deviceId, shellVersion: "1", currentReleaseId: "installation", webVersion: "1",
+    clientVersion: "1", requestId: "held-report", releaseId: "release-2", phase: "health", recovery: "restored", error: new Error("EIO") });
+  let release!: () => void, entered!: () => void, reported!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const sending = new Promise<void>(resolve => { entered = resolve; }), reporting = new Promise<void>(resolve => { reported = resolve; });
+  t.mock.method(globalThis, "fetch", async () => { entered(); await gate; throw new Error("TEST_REPORT_OFFLINE"); });
+  f.host.onUpdateError = (_error, context) => { assert.equal(context.logOnly, true); reported(); };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host,
+    configuredServerOrigin: "https://report.invalid", createRuntime: () => f.runtime });
+  let completed = false;
+  const starting = app.start().then(() => { completed = true; });
+  try {
+    await starting;
+    assert.equal(completed, true, "local startup cannot wait for remote telemetry");
+    t.mock.timers.tick(1000); await sending;
+    await app.exit(); assert.equal(f.actions.includes("quit"), true);
+  } finally { release(); await starting; }
+  await reporting;
+  assert.equal(journal.pending(identity.deviceId).length, 1);
+  assert.equal(app.updateFailureFailure?.requestId, 'held-report');
+});
+
 test("start flushes existing update failures once after local Web health", async t => {
   const f = await fixture(t);
   const identity = await loadOrCreateDeviceIdentity(f.dataDir);
@@ -1287,6 +1417,8 @@ test("start flushes existing update failures once after local Web health", async
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host,
     configuredServerOrigin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, createRuntime: () => f.runtime });
   await app.start();
+  assert.deepEqual(requests, []);
+  await app.flushFailures();
   assert.deepEqual(requests, ["/api/software/desktop/devices/register", "/api/software/desktop/update-failures"]);
   assert.deepEqual(journal.pending(identity.deviceId), []);
   await app.flushFailures();
@@ -1316,6 +1448,7 @@ test("startup failure delivery keeps pending evidence and exposes fixed error co
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host,
     configuredServerOrigin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, createRuntime: () => f.runtime });
   await app.start();
+  await assert.rejects(app.flushFailures());
   assert.deepEqual(await journal.pending(identity.deviceId), [record]);
   assert.deepEqual(app.updateFailureFailure, { errorCode: "DESKTOP_UPDATE_UNAVAILABLE", requestId: record.requestId, deviceId: identity.deviceId });
   await app.exit();
@@ -1329,6 +1462,7 @@ test("missing Server origin leaves local startup available but failure flush exp
     clientVersion: "1", requestId: "failure-request", releaseId: "release-2", phase: "prepare", recovery: "not_needed", error: new Error("EIO") });
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host, createRuntime: () => f.runtime });
   await app.start();
+  await assert.rejects(() => app.flushFailures(), /DESKTOP_UPDATE_UNAVAILABLE/);
   assert.deepEqual(app.updateFailureFailure, { errorCode: "DESKTOP_UPDATE_UNAVAILABLE", requestId: record.requestId, deviceId: identity.deviceId });
   await assert.rejects(() => app.flushFailures(), /DESKTOP_UPDATE_UNAVAILABLE/);
   assert.deepEqual(journal.pending(identity.deviceId), [record]);
@@ -1930,7 +2064,8 @@ test("download retries replay the original received fact and apply keeps the sam
   await app.start();
   const requestId = crypto.randomUUID();
   const options = { requestId };
-  await assert.rejects(() => app.downloadAvailableReleaseBundle(options));
+  await app.downloadAvailableReleaseBundle(options);
+  await assert.rejects(() => app.flushReceipts());
   const pending = await createUpdateReceiptJournal(f.dataDir).pending(identity.deviceId);
   assert.equal(pending.length, 1);
   assert.equal(pending[0]!.stage, "received");
@@ -1939,6 +2074,7 @@ test("download retries replay the original received fact and apply keeps the sam
   assert.equal(f.actions.includes("drain"), false);
   fail = false;
   const result = await app.downloadAvailableReleaseBundle(options);
+  await app.flushReceipts();
   assert.equal(downloads, 1);
   assert.deepEqual(receipts, [pending[0], pending[0]]);
   await app.downloadAvailableReleaseBundle(options);
@@ -1946,6 +2082,7 @@ test("download retries replay the original received fact and apply keeps the sam
   assert.equal(receipts.length, 2);
   assert.equal(app.updateReceiptFailure, null);
   await app.applyRelease(result.directory, { requestId: result.requestId });
+  await app.flushReceipts();
   assert.deepEqual(receipts.slice(1).map((value: any) => value.stage), ["received", "verified", "prepared", "switched", "healthy"]);
   assert.equal(receipts.every((value: any) => value.requestId === requestId), true);
   assert.deepEqual(await createUpdateReceiptJournal(f.dataDir).pending(identity.deviceId), []);
@@ -2148,7 +2285,7 @@ test("healthy receipt failure updates failure context to the activated release",
     reportReceipt: async receipt => { if (receipt.stage === "healthy") throw new Error("receipt offline"); }, createRuntime: () => f.runtime });
   await app.start();
   const firstPackage = await createUpdatePackage(f.dataDir);
-  await assert.rejects(() => app.applyRelease(firstPackage), /DESKTOP_RELEASE_RECEIPT_FAILED/);
+  await app.applyRelease(firstPackage);
   const secondPackage = await createUpdatePackage(f.dataDir, 89, "next-release");
   await assert.rejects(() => app.applyRelease(secondPackage), /DESKTOP_DB_SCHEMA_UPDATE_UNSUPPORTED/);
   const records = (await fs.readFile(path.join(f.dataDir, "errors.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
