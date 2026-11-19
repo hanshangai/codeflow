@@ -32,6 +32,7 @@ async function fixture(t: TestContext) {
     "resources/client/package.json": "{}", "resources/client/dist/index.cjs": "client",
     "resources/client/dist/desktopUninstallWorker.cjs": "uninstall worker",
     "resources/client/node_modules/dependency/index.js": "dependency", "resources/web/index.html": "web",
+    "resources/client/node_modules/undici/lib/llhttp/.gitkeep": "",
     "resources/client/npm/package.json": JSON.stringify({ name: "npm", version: "12.2.2" }),
     "resources/client/npm/bin/npm-cli.js": "npm cli",
     "resources/client/cli-runtime.json": JSON.stringify({ schemaVersion: 1, npm: { version: "12.2.2" }, engines: {} }),
@@ -88,12 +89,18 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     const appOutDir = path.join(config.directories.output, "win-unpacked");
     await fs.mkdir(appOutDir, { recursive: true });
     if ((options.targets as string[])[0] === "nsis") await fs.writeFile(path.join(appOutDir, "CodeFlowAI.exe"), "electron", "ascii");
-    await fs.cp(f.resources, path.join(appOutDir, "resources"), { recursive: true });
+    const { FileMatcher, copyFiles } = createRequire(createRequire(builderEntry).resolve("app-builder-lib"))("./fileMatcher.js");
+    await copyFiles([new FileMatcher(f.resources, path.join(appOutDir, "resources"), (value: string) => value, ["**/*"])]);
     const nativeTool = config.extraResources.find((entry: { to: string }) => entry.to === "shell-switch.exe");
     if (nativeTool) await fs.copyFile(nativeTool.from, path.join(appOutDir, "resources/shell-switch.exe"));
     const icon = config.extraResources.find((entry: { to: string }) => entry.to === "shell-icon.png");
     if (icon) await fs.copyFile(icon.from, path.join(appOutDir, "resources/shell-icon.png"));
     await fs.writeFile(path.join(appOutDir, "resources/app.asar"), "application", "ascii");
+    if (config.afterPack) {
+      assert.equal(config.afterPack, path.join(f.shell, "scripts/packaged-resource-copy.mjs"));
+      const { default: afterPack } = await import("../scripts/packaged-resource-copy.mjs");
+      await afterPack({ appOutDir, electronPlatformName: "win32", packager: { config, getResourcesDir: (directory: string) => path.join(directory, "resources") } });
+    }
     if (config.afterSign) {
       assert.equal(config.afterSign, path.join(f.shell, "scripts/windows-install-layout.mjs"));
       const { prepareWindowsInstallLayout } = await import("../scripts/windows-install-layout.mjs");
@@ -119,6 +126,13 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     () => readDesktopShellInputs(fileURLToPath(new URL("../../..", import.meta.url))), buildShellSwitch);
   return { state, messages, calls, manifests, nativeTools };
 }
+
+test("Windows dir packaging retains signed-tree dotfiles before reporting a ready artifact", async t => {
+  const f = await fixture(t), output = path.join(f.root, "dotfile-output");
+  const result = await runScript(f, output);
+  assert.equal(result.state.exitCode, undefined);
+  assert.equal(await fs.readFile(path.join(output, "win-unpacked/resources/client/node_modules/undici/lib/llhttp/.gitkeep"), "utf8"), "");
+});
 
 test("planned packaging injects the exact allocated shell version and refuses a different installed Electron", async t => {
   const f = await fixture(t), output = path.join(f.root, "planned-output");

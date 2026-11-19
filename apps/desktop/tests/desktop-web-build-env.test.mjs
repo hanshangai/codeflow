@@ -10,6 +10,6 @@ test("测试桌面 Web 使用 HTTPS 环境对应的 WSS，清除外部旧环境�
 });
 
 test("生产桌面与测试环境显式隔离，未知目标拒绝打包", () => {
-  assert.equal(resolveDesktopWebBuildEnv({ environment: "production" }, {}).VITE_CODEFLOWAI_SERVER_WS_ORIGIN, "wss://codeflow.hanshangai.com");
+  assert.equal(resolveDesktopWebBuildEnv({ environment: "production" }, {}).VITE_CODEFLOWAI_SERVER_WS_ORIGIN, "wss://codeflowai.cn");
   assert.throws(() => resolveDesktopWebBuildEnv({ environment: "invalid" }, {}), /DESKTOP_WEB_BUILD_ENVIRONMENT_INVALID/u);
 });

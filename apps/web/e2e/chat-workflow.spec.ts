@@ -267,7 +267,7 @@ test("a full review opinion in the conversation composer resumes the only waitin
   await expect(panel.getByText("请在下方会话框")).toBeVisible();
   await expect(panel.getByRole("button", { name: "提出修改" })).toBeVisible();
 
-  const opinion = "生产回调域使用 codeflow.hanshangai.com；本地测试环境暂不启用扫码登录。";
+  const opinion = "生产回调域使用 codeflowai.cn；本地测试环境暂不启用扫码登录。";
   await page.locator(".composer__textarea").fill(opinion);
   await page.locator(".composer__send-btn").click();
 

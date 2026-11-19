@@ -121,7 +121,7 @@ test("macOS 未签名 dir 包禁用签名并携带本地标记", async t => {
   const icon = config.extraResources.find((entry: { to: string }) => entry.to === "shell-icon.png");
   assert.equal(await fs.readFile(icon.from, "ascii"), "fixed shell icon");
   assert.equal(config.mac.hardenedRuntime, false);
-  assert.match(String(config.afterPack).replaceAll("\\", "/"), /\/scripts\/adhoc-sign-mac\.cjs$/u);
+  assert.match(String(config.afterPack).replaceAll("\\", "/"), /\/scripts\/packaged-resource-copy\.mjs$/u);
   assert.deepEqual(config.dmg.contents, [
     { x: 130, y: 220 },
     { x: 410, y: 220, type: "link", path: "/Applications" },

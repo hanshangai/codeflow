@@ -14,11 +14,11 @@ import {
 test("buildWindowsUpgradeScript stops daemon before replacing the global client", () => {
   const script = buildWindowsUpgradeScript({
     parentPid: 43210,
-    installUrl: "https://codeflow.hanshangai.com/downloads/codeflowai-2026.04.05.01.tgz",
+    installUrl: "https://codeflowai.cn/downloads/codeflowai-2026.04.05.01.tgz",
     npmPrefix: "C:\\Users\\u\\AppData\\Roaming\\npm",
     daemonWasRunning: true,
     resultReport: {
-      url: "https://codeflow.hanshangai.com/api/client/upgrade-result",
+      url: "https://codeflowai.cn/api/client/upgrade-result",
       upgradeId: "upgrade-1",
       token: "a".repeat(43),
       fromVersion: "2026.04.05.00",
@@ -150,11 +150,11 @@ test("buildWindowsUpgradeLauncherEnv clears inherited daemon runtime markers", (
 test("buildWindowsUpgradeScript generates valid Windows PowerShell syntax", { skip: process.platform !== "win32" }, () => {
   const script = buildWindowsUpgradeScript({
     parentPid: 43210,
-    installUrl: "https://codeflow.hanshangai.com/downloads/codeflowai-2026.04.05.01.tgz",
+    installUrl: "https://codeflowai.cn/downloads/codeflowai-2026.04.05.01.tgz",
     npmPrefix: "C:\\Users\\测试 用户\\AppData\\Roaming\\npm",
     daemonWasRunning: true,
     resultReport: {
-      url: "https://codeflow.hanshangai.com/api/client/upgrade-result",
+      url: "https://codeflowai.cn/api/client/upgrade-result",
       upgradeId: "upgrade-ast",
       token: "b".repeat(43),
       fromVersion: "2026.04.05.00",

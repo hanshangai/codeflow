@@ -167,25 +167,35 @@ test("handleClientExit responds before requesting shutdown", async () => {
 test("resolveClientUpgradeInstallUrl prefers the connected server address plus downloadPath", () => {
   assert.equal(
     resolveClientUpgradeInstallUrl({
-      serverWsUrl: "wss://codeflow.hanshangai.com/ws/client",
+      serverWsUrl: "wss://codeflowai.cn/ws/client",
       downloadPath: "/downloads/codeflowai-2026.04.17.09.tgz",
       installUrl: "https://evil.example/codeflowai-2026.04.17.09.tgz",
     }),
-    "https://codeflow.hanshangai.com/downloads/codeflowai-2026.04.17.09.tgz",
+    "https://codeflowai.cn/downloads/codeflowai-2026.04.17.09.tgz",
   );
   assert.equal(
     resolveClientUpgradeInstallUrl({
-      serverWsUrl: "wss://codeflow.hanshangai.com/ws/client",
+      serverWsUrl: "wss://codeflowai.cn/ws/client",
       downloadPath: "/downloads/codeflowai-2026.04.17.09-win32-x64.tgz",
     }),
-    "https://codeflow.hanshangai.com/downloads/codeflowai-2026.04.17.09-win32-x64.tgz",
+    "https://codeflowai.cn/downloads/codeflowai-2026.04.17.09-win32-x64.tgz",
   );
   assert.equal(
     resolveClientUpgradeInstallUrl({
-      serverWsUrl: "wss://codeflow.hanshangai.com/ws/client",
+      serverWsUrl: "wss://codeflowai.cn/ws/client",
       downloadPath: "/downloads/codeflowai-latest-win32-x64.tgz",
     }),
-    "https://codeflow.hanshangai.com/downloads/codeflowai-latest-win32-x64.tgz",
+    "https://codeflowai.cn/downloads/codeflowai-latest-win32-x64.tgz",
+  );
+});
+
+test("resolveClientUpgradeInstallUrl keeps the legacy server domain upgrade path", () => {
+  assert.equal(
+    resolveClientUpgradeInstallUrl({
+      serverWsUrl: "wss://codeflow.hanshangai.com/ws/client",
+      downloadPath: "/downloads/codeflowai-2026.04.17.09.tgz",
+    }),
+    "https://codeflow.hanshangai.com/downloads/codeflowai-2026.04.17.09.tgz",
   );
 });
 
@@ -220,7 +230,7 @@ test("resolveClientUpgradeInstallUrl falls back to a trusted absolute installUrl
 test("resolveClientUpgradeInstallUrl validates paths, protocols, and same-server public HTTP", () => {
   assert.equal(
     resolveClientUpgradeInstallUrl({
-      serverWsUrl: "wss://codeflow.hanshangai.com/ws/client",
+      serverWsUrl: "wss://codeflowai.cn/ws/client",
       downloadPath: "/downloads/skills-bin/manifest.json",
       installUrl: "file:///tmp/payload.tgz",
     }),
@@ -228,10 +238,10 @@ test("resolveClientUpgradeInstallUrl validates paths, protocols, and same-server
   );
   assert.equal(
     resolveClientUpgradeInstallUrl({
-      serverWsUrl: "ws://codeflow.hanshangai.com/ws/client",
+      serverWsUrl: "ws://codeflowai.cn/ws/client",
       downloadPath: "/downloads/codeflowai-2026.04.17.09.tgz",
     }),
-    "http://codeflow.hanshangai.com/downloads/codeflowai-2026.04.17.09.tgz",
+    "http://codeflowai.cn/downloads/codeflowai-2026.04.17.09.tgz",
   );
   assert.equal(
     resolveClientUpgradeInstallUrl({

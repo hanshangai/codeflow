@@ -23,7 +23,7 @@ const bundledVersion = resolveClientBuildVersion(
 
 /** 按打包目标生成 client 包内默认 Server 地址。 */
 function resolveBuiltDefaultServerWs(target) {
-  if (target === "prod") return "wss://codeflow.hanshangai.com/ws/client";
+  if (target === "prod") return "wss://codeflowai.cn/ws/client";
   if (target === "test") return "wss://codeflow-test.hanshangai.com/ws/client";
   return "ws://127.0.0.1:39280/ws/client";
 }

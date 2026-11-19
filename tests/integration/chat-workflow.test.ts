@@ -518,7 +518,7 @@ test("a unique waiting-input todo accepts the full conversation text while ambig
   view.status = "waiting-feedback";
   view.todos = [{ nodeId: "solution", label: "方案设计", version: "node-v1", status: "waiting-feedback", summary: "方案待确认", question: "请补充决策", actions: [{ action: "resume_with_input", label: "补充并继续", effect: "继续" }], branches: [] }];
   let snapshot: ChatWorkflowSnapshot = { recommendationEnabled: true, tasks: [view] };
-  const text = "生产回调域使用 codeflow.hanshangai.com；本地测试环境暂不启用扫码登录。";
+  const text = "生产回调域使用 codeflowai.cn；本地测试环境暂不启用扫码登录。";
   assert.deepEqual(resolveChatWorkflowNaturalAction(text, snapshot), {
     taskId: view.task.id, expectedVersion: view.task.version, action: "feedback", nodeId: "solution",
     nodeVersion: "node-v1", feedbackAction: "resume_with_input", feedback: text,

@@ -157,7 +157,7 @@ async function packageLocalMac() {
       npmRebuild: false,
       // 本地包不进入官方签名，但仍做 ad-hoc 签名并保留图标、分类与包标识。
       mac: { ...original.mac, identity: null, hardenedRuntime: false, gatekeeperAssess: false },
-      afterPack: path.join(desktopDir, "scripts/adhoc-sign-mac.cjs"),
+      afterPack: path.join(desktopDir, "scripts/packaged-resource-copy.mjs"),
       dmg: { ...(original.dmg ?? {}), title: `CodeFlow ${displayVersion}`, contents: [
         { x: 130, y: 220 },
         { x: 410, y: 220, type: "link", path: "/Applications" },
