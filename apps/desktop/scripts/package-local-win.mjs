@@ -164,7 +164,13 @@ async function packageLocalWindows() {
         ...(hasBaselineProof ? [{ from: path.join(resources, "baseline-release-manifest.json"), to: "baseline-release-manifest.json" }] : []),
       ],
     }, null, 2)}\n`, "utf8");
-    artifacts = await build({ projectDir: builderProjectDir, targets: Platform.WINDOWS.createTarget(target, Arch.x64), publish: "never", config: configPath });
+    artifacts = await build({ projectDir: builderProjectDir, targets: Platform.WINDOWS.createTarget(target, Arch.x64), publish: "never", config: configPath,
+      /** NSIS 显示精确壳号；builder/PE 内部仍使用合法的三段版本。 */
+      effectiveOptionComputed: async ([defines]) => {
+        defines.CODEFLOW_SHELL_VERSION = shellVersion;
+        return false;
+      },
+    });
   } catch (error) {
     buildError = error;
     throw error;

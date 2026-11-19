@@ -5,6 +5,11 @@ import test from "node:test";
 const source = await fs.readFile(new URL("../build/installer.nsh", import.meta.url), "utf8");
 const builderConfig = await fs.readFile(new URL("../electron-builder.yml", import.meta.url), "utf8");
 
+test("Windows installed name excludes version and display version uses the exact shell plan", () => {
+  assert.match(builderConfig, /uninstallDisplayName:\s*CodeFlow\s*$/mu);
+  assert.match(source, /WriteRegStr SHELL_CONTEXT "\$\{UNINSTALL_REGISTRY_KEY\}" "DisplayVersion" "\$\{CODEFLOW_SHELL_VERSION\}"/u);
+});
+
 test("NSIS program lifecycle never starts Electron registration or business maintenance", () => {
   assert.match(source, /!include "nsDialogs\.nsh"/u);
   assert.doesNotMatch(source, /StrFunc\.nsh|FUNCTION_STRING_StrStr/u);

@@ -23,6 +23,7 @@ extraResources:
   - from: dist/macosUninstallHelper.cjs
     to: macosUninstallHelper.cjs
 nsis:
+  uninstallDisplayName: CodeFlow
   oneClick: false
   allowToChangeInstallationDirectory: true
   runAfterFinish: true

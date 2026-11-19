@@ -57,7 +57,8 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     argv: [process.execPath, path.join(f.shell, "scripts/package-local-win.mjs"), ...argv], platform: "win32", env: {},
   };
   const messages: Array<Record<string, unknown>> = [];
-  const calls: Array<{ projectDir: string; targets: unknown; publish: string; config: string }> = [];
+  const calls: Array<{ projectDir: string; targets: unknown; publish: string; config: string;
+    effectiveOptionComputed?: (options: [Record<string, string>, unknown]) => Promise<boolean> }> = [];
   const manifests: Array<{ version: string; shellVersion: string }> = [];
   const nativeTools: Array<{ outputDir: string; version: string }> = [];
   /** 仅隔离 NSIS 编译；实际资源装配和临时项目清理继续执行原逻辑。 */
@@ -127,6 +128,10 @@ test("planned packaging injects the exact allocated shell version and refuses a 
   const result = await runScript(f, output, f.resources, extra);
   assert.equal(result.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY");
   assert.equal(result.messages[0]?.shellVersion, plan.shellVersion);
+  const installerDefines: Record<string, string> = {};
+  assert.ok(result.calls[0]?.effectiveOptionComputed);
+  assert.equal(await result.calls[0].effectiveOptionComputed!([installerDefines, {}]), false);
+  assert.equal(installerDefines.CODEFLOW_SHELL_VERSION, plan.shellVersion);
   assert.deepEqual({ version: result.manifests[0]?.version, shellVersion: result.manifests[0]?.shellVersion }, { version: `${plan.shellVersion}.0`, shellVersion: plan.shellVersion });
   assert.equal(JSON.parse(await fs.readFile(path.join(f.shell, "package.json"), "utf8")).version, "1.0");
   const wrong = path.join(f.root, "wrong-electron");
