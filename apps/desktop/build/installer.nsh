@@ -165,6 +165,9 @@ FunctionEnd
 
 ; Persist only bounded NSIS diagnostics; a logging failure is a distinct failed install.
 Function D16FailInstallation
+  StrCpy $d16UpgradeSavedCause $d16InstallCause
+  Call D16RestoreUpgrade
+  StrCpy $d16InstallCause $d16UpgradeSavedCause
   ${If} $d16InstallNativeError == ""
     StrCpy $d16InstallNativeError 0
   ${EndIf}
@@ -178,7 +181,7 @@ Function D16FailInstallation
   IfErrors diagnostic_failed
   FileOpen $1 "$d16InstallLog" w
   IfErrors diagnostic_failed
-  FileWrite $1 '{"errorCode":"$d16InstallErrorCode","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","exitCode":$d16InstallExitCode,"win32Error":$d16InstallNativeError}$\r$\n'
+  FileWrite $1 '{"errorCode":"$d16InstallErrorCode","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","recoveryRootCause":"$d16UpgradeFailure","exitCode":$d16InstallExitCode,"win32Error":$d16InstallNativeError}$\r$\n'
   IfErrors diagnostic_close_failed
   System::Call 'kernel32::FlushFileBuffers(p r1) i.r2'
   ${If} $2 == 0
@@ -281,6 +284,18 @@ FunctionEnd
 ; Record completed program files without starting Electron or touching any profile.
 !macro customInstall
   Call D16RecordInstallation
+  ; The template registers builder semver first; retain the exact planned shell display version.
+  !ifdef CODEFLOW_SHELL_VERSION
+    ClearErrors
+    WriteRegStr SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" "DisplayVersion" "${CODEFLOW_SHELL_VERSION}"
+    ${If} ${Errors}
+      StrCpy $d16InstallStage installation-display-version
+      StrCpy $d16InstallErrorCode DESKTOP_INSTALL_COMPLETION_FAILED
+      StrCpy $d16InstallCause DISPLAY_VERSION_WRITE_FAILED
+      Call D16FailInstallation
+    ${EndIf}
+  !endif
+  Call D16FinishProgramReplacement
 !macroend
 !endif
 

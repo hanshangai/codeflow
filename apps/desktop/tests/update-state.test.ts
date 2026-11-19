@@ -35,7 +35,9 @@ async function fixture(t: test.TestContext, options: { network?: boolean; start?
       else {
         await control.hold?.();
         if (control.reject) { response.writeHead(403); response.end("{}"); }
-        else response.end(JSON.stringify({ ok: true, available: false, deviceId: identity.deviceId, requestId: meta.requestId }));
+        else response.end(JSON.stringify(request.url === "/api/software/desktop/update-availability"
+          ? { ok: true, deviceId: identity.deviceId, requestId: meta.requestId, resource: { available: false }, shell: { available: false } }
+          : { ok: true, available: false, deviceId: identity.deviceId, requestId: meta.requestId }));
       }
     })().catch(error => { serverErrors.push(error); response.destroy(error as Error); });
   });
@@ -111,7 +113,7 @@ test("bridge manual checks join the original automatic flight and return only vo
   try { assert.equal(typeof check, "function", "fixed checkForUpdates capability is required"); }
   finally { release(); }
   assert.deepEqual(await Promise.all([check!(), check!()]), [undefined, undefined]);
-  assert.equal(f.requests.filter(url => url.includes("release-availability")).length, 1);
+  assert.equal(f.requests.filter(url => url.includes("update-availability")).length, 1);
   assert.equal((await get()).checking, false); assert.deepEqual(f.actions, []);
 });
 
@@ -142,7 +144,7 @@ test("update state keeps existing faults safe and detached without evaluating er
   assert.equal((await get()).updateCheckFailure!.rootCause.code, "DESKTOP_RELEASE_DOWNLOAD_FAILED");
 });
 
-test("receipt delivery failure blocks bridge discovery and is projected through the existing public diagnostic map", async t => {
+test("receipt delivery failure stays explicit without blocking bridge discovery", async t => {
   const f = await fixture(t, { network: true }), get = getState(f.bridge);
   const check = (f.bridge as { checkForUpdates?: () => Promise<void> }).checkForUpdates;
   assert.equal(typeof check, "function"); f.control.failReceipt = true;
@@ -150,8 +152,9 @@ test("receipt delivery failure blocks bridge discovery and is projected through 
   const receipt = createDesktopUpdateReceipt({ schemaVersion: 1, deviceId: f.identity.deviceId, requestId, releaseId: "candidate",
     archiveSha256: "a".repeat(64), stage: "received", at: new Date().toISOString(), errorCode: null, errorId: null });
   await createUpdateReceiptJournal(f.dataDir).record(receipt);
-  await assert.rejects(check!());
-  assert.equal(f.requests.some(url => url.includes("release-availability")), false);
+  await assert.rejects(f.app.flushReceipts());
+  await check!();
+  assert.equal(f.requests.some(url => url.includes("update-availability")), true);
   const state = await get(); assert.ok(state.updateReceiptFailure); assert.equal(state.updateReceiptFailure.requestId, requestId);
   assert.equal(state.updateReceiptFailure.rootCause.code, "DESKTOP_UPDATE_HTTP_FAILED");
   assert.equal(state.operation, "idle"); assert.equal(state.checking, false);
@@ -190,13 +193,15 @@ test("bridge correlates the actual update failure but never labels a lifecycle r
   } finally { release(); await flight; f.runtime.drain = async () => {}; }
 });
 
-test("error delivery blocks a new check and state never exposes an unknown retained diagnostic code", async t => {
+test("error delivery stays explicit without blocking a new check or leaking unknown codes", async t => {
   const f = await fixture(t, { network: true }), get = getState(f.bridge), requestId = crypto.randomUUID();
   createUpdateFailureJournal(f.dataDir).record({ deviceId: f.identity.deviceId, shellVersion: "1.0.0", currentReleaseId: "installation",
     webVersion: "1.0.0", clientVersion: "1.0.0", requestId, releaseId: "candidate", phase: "download", recovery: "not_needed", error: new Error("EIO") });
   f.control.reject = true;
-  await assert.rejects(f.bridge.checkForUpdates!());
-  assert.equal(f.requests.some(url => url.includes("release-availability")), false);
+  await assert.rejects(f.app.flushFailures());
+  f.control.reject = false;
+  await f.bridge.checkForUpdates!();
+  assert.equal(f.requests.some(url => url.includes("update-availability")), true);
   assert.equal((await get()).updateFailureFailure!.requestId, requestId);
   f.app.updateFailureFailure!.errorCode = "PRIVATE_SECRET_CODE";
   assert.equal((await get()).updateFailureFailure!.rootCause.code, "UNCLASSIFIED_ERROR");

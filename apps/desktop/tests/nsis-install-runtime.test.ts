@@ -10,6 +10,40 @@ const compiler = process.env.CF_NSIS_COMPILER;
 const skip = process.platform !== "win32" ? "Windows NSIS runtime required" : !compiler ? "Set CF_NSIS_COMPILER to run native contracts" : false;
 const hook = fileURLToPath(new URL("../build/installer.nsh", import.meta.url));
 
+/** 真实安装钩子覆盖默认 semver，只操作夹具私有注册表键并在退出前删除。 */
+test("installed display version preserves the two-part shell number", { skip }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "nsis-display-version-"));
+  const executable = path.join(root, "display.exe"), source = path.join(root, "display.nsi");
+  const registryKey = `Software\\CodeFlowInstallerTests\\${path.basename(root)}`;
+  await fs.mkdir(path.join(root, "app"));
+  await fs.writeFile(source, `Unicode true
+RequestExecutionLevel user
+SilentInstall silent
+AutoCloseWindow true
+Name "CodeFlow display fixture"
+OutFile "${nsisPath(executable)}"
+!define SHELL_CONTEXT HKCU
+!define UNINSTALL_REGISTRY_KEY "${registryKey}"
+!define CODEFLOW_SHELL_VERSION "1.4"
+!include "${nsisPath(hook)}"
+Section
+  StrCpy $INSTDIR "$EXEDIR\\app"
+  WriteRegStr HKCU "${registryKey}" "DisplayVersion" "1.4.0"
+  !insertmacro customInstall
+  ReadRegStr $0 HKCU "${registryKey}" "DisplayVersion"
+  FileOpen $1 "$EXEDIR\\display.txt" w
+  FileWrite $1 "$0"
+  FileClose $1
+  DeleteRegKey HKCU "${registryKey}"
+SectionEnd
+`, { encoding: "utf8", flag: "wx" });
+  const compiled = await execute(compiler!, ["/V2", "/INPUTCHARSET", "UTF8", source]);
+  assert.equal(compiled.code, 0, compiled.stdout + compiled.stderr);
+  const installed = await execute(executable, []);
+  assert.equal(installed.code, 0, installed.stdout + installed.stderr);
+  assert.equal(await fs.readFile(path.join(root, "display.txt"), "utf8"), "1.4");
+});
+
 /** 只转义 NSIS 源码路径，不把路径拼接到 shell 命令。 */
 function nsisPath(value: string): string {
   assert.doesNotMatch(value, /[\r\n\0]/u);
@@ -201,14 +235,129 @@ FunctionEnd
     await assert.rejects(fs.access(path.join(root, "legacy-ran.txt")), { code: "ENOENT" });
     assert.equal(await fs.readFile(path.join(app, "unknown-user.txt"), "utf8"), "账号、身份、任务原样保留");
     if (variant === "same-root") {
-      await assert.rejects(fs.access(path.join(app, "CodeFlowAI.exe")), { code: "ENOENT" });
-      await assert.rejects(fs.access(path.join(app, "shells")), { code: "ENOENT" });
+      assert.equal(await fs.readFile(path.join(app, "CodeFlowAI.exe"), "ascii"), "old executable", "preflight must preserve the complete old program until the new payload is ready");
+      assert.equal(await fs.readFile(path.join(app, "shells/old/obsolete.txt"), "ascii"), "old shell");
     } else {
       assert.equal(await fs.readFile(path.join(app, "shells/old/obsolete.txt"), "ascii"), "old shell", "read-only preflight must reject before deleting any program file");
       assert.equal(await fs.readFile(path.join(root, "failure.txt"), "ascii"), variant === "junction" ? "PROGRAM_PATH_REPARSE"
         : variant === "wrong-type" ? "PROGRAM_PATH_TYPE_INVALID" : variant === "different-root" ? "LEGACY_INSTALL_ROOT_CONFLICT" : "LEGACY_INSTALL_SCOPE_CONFLICT");
       if (variant === "junction") assert.equal(await fs.readFile(path.join(root, "external/user.txt"), "ascii"), "external");
     }
+  });
+}
+
+for (const interruption of ["copy-failure", "commit-interrupted", "snapshot-interrupted"] as const) {
+  test(`real NSIS replacement preserves a runnable and uninstallable old program after ${interruption}`, { skip }, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "nsis-transaction-"));
+    const app = path.join(root, "app"), payload = path.join(root, "payload");
+    await fs.mkdir(path.join(app, "resources"), { recursive: true });
+    await fs.mkdir(path.join(app, "shells/old"), { recursive: true });
+    await fs.mkdir(path.join(payload, "resources"), { recursive: true });
+    await fs.writeFile(path.join(app, "resources/old.txt"), "old resource", "ascii");
+    await fs.writeFile(path.join(app, "shells/old/runtime.txt"), "old shell", "ascii");
+    await fs.writeFile(path.join(app, "unknown-user.txt"), "账号、设备、任务保留", "utf8");
+    await fs.writeFile(path.join(payload, "resources/new.txt"), "new resource", "ascii");
+    /** 每个独立程序都在隔离目录内编译，失败保留实际编译诊断。 */
+    async function compile(name: string, body: string) {
+      const source = path.join(root, `${name}.nsi`), output = path.join(root, `${name}.exe`);
+      await fs.writeFile(source, `Unicode true\nRequestExecutionLevel user\nSilentInstall silent\nAutoCloseWindow true\nName "Transaction fixture"\nOutFile "${nsisPath(output)}"\n${body}`, "utf8");
+      const result = await execute(compiler!, ["/V2", "/INPUTCHARSET", "UTF8", source]);
+      assert.equal(result.code, 0, result.stdout + result.stderr);
+      return output;
+    }
+    const old = await compile("old", `Section
+  IfFileExists "$EXEDIR\\resources\\old.txt" +3
+    SetErrorLevel 9
+    Quit
+  IfFileExists "$EXEDIR\\shells\\old\\runtime.txt" +3
+    SetErrorLevel 10
+    Quit
+SectionEnd`);
+    const oldUninstaller = await compile("old-uninstaller", `Section
+  Delete "$EXEDIR\\CodeFlowAI.exe"
+  RMDir /r "$EXEDIR\\resources"
+  RMDir /r "$EXEDIR\\shells"
+  FileOpen $0 "$EXEDIR\\old-uninstalled.txt" w
+  FileWrite $0 "old uninstaller completed"
+  FileClose $0
+SectionEnd`);
+    const next = await compile("next", `Section
+  IfFileExists "$EXEDIR\\resources\\new.txt" +3
+    SetErrorLevel 11
+    Quit
+  FileOpen $0 "$EXEDIR\\new-launched.txt" w
+  FileWrite $0 "new program started"
+  FileClose $0
+SectionEnd`);
+    await fs.copyFile(old, path.join(app, "CodeFlowAI.exe"));
+    await fs.copyFile(oldUninstaller, path.join(app, "Uninstall CodeFlowAI.exe"));
+    await fs.copyFile(next, path.join(payload, "CodeFlowAI.exe"));
+    const include = fileURLToPath(new URL("../build/upgrade-installed-files.nsh", import.meta.url));
+    const original = await fs.readFile(include, "utf8");
+    const anchor = interruption === "copy-failure"
+      ? "    System::Call 'kernel32::CopyFileW(w \"$d16UpgradePath\""
+      : `  StrCpy $d16UpgradeMode ${interruption === "commit-interrupted" ? "install" : "snapshot"}`;
+    assert.equal(original.split(anchor).length, 2, "fault must target exactly one production transaction boundary");
+    const injection = interruption === "copy-failure"
+      ? '    ${If} $d16UpgradeMode == install\n      StrCpy $d16UpgradePath "$PLUGINSDIR\\missing-copy-source"\n    ${EndIf}\n'
+      : '  FileOpen $0 "$EXEDIR\\commit-waiting.txt" w\n  FileClose $0\n  Sleep 20000\n';
+    const fault = path.join(root, "fault-upgrade.nsh");
+    await fs.writeFile(fault, original.replace(anchor, injection + anchor), "utf8");
+    /** 使用与 builder 相同的两次 include 和文件宏顺序，不访问系统安装登记。 */
+    async function installer(name: string, upgrade: string) {
+      return await compile(name, `!define CODEFLOW_UPGRADE_INSTALLED_INCLUDE "${nsisPath(upgrade)}"
+!define APP_BUILD_DIR "${nsisPath(payload)}"
+!define UNINSTALL_FILENAME "Uninstall CodeFlowAI.exe"
+!define UNINSTALLER_OUT_FILE "${nsisPath(oldUninstaller)}"
+!include "${nsisPath(hook)}"
+!macro installApplicationFiles
+  SetOutPath $INSTDIR
+  File /r "${nsisPath(payload)}\\*.*"
+!macroend
+Section
+  InitPluginsDir
+  StrCpy $INSTDIR "$EXEDIR\\app"
+  !insertmacro customCheckAppRunning
+  Call D16UpgradeSameRoot
+  !insertmacro installApplicationFiles
+  !insertmacro customInstall
+SectionEnd
+Function .onInstFailed
+  FileOpen $0 "$EXEDIR\\failed.txt" w
+  FileWrite $0 "$d16InstallCause"
+  FileClose $0
+FunctionEnd`);
+    }
+    const executable = await installer("fault-install", fault);
+    if (interruption === "copy-failure") {
+      const result = await execute(executable, []);
+      assert.equal(result.code, 1, root);
+    } else {
+      const running = spawn(executable, [], { windowsHide: true, stdio: "ignore" });
+      const closed = new Promise<void>((resolve, reject) => { running.once("error", reject); running.once("close", () => resolve()); });
+      t.after(async () => { if (running.exitCode === null) running.kill(); await closed; });
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        try { await fs.access(path.join(root, "commit-waiting.txt")); break; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        assert.ok(Date.now() < deadline, `replacement did not reach interruption boundary: ${root}`);
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      running.kill();
+      await closed;
+    }
+    const oldRoot = interruption === "commit-interrupted"
+      ? path.join(app, ".codeflow-install-previous") : app;
+    assert.equal(await fs.readFile(path.join(oldRoot, "resources/old.txt"), "ascii"), "old resource", root);
+    assert.equal((await execute(path.join(oldRoot, "CodeFlowAI.exe"), [])).code, 0, "complete old layout must remain runnable");
+    assert.equal((await execute(path.join(app, "Uninstall CodeFlowAI.exe"), [])).code, 0, "the original installation must retain its working uninstaller");
+    assert.equal(await fs.readFile(path.join(app, "old-uninstalled.txt"), "ascii"), "old uninstaller completed");
+    const retry = await installer("retry-install", include);
+    assert.equal((await execute(retry, [])).code, 0, `same installer retry must recover then complete: ${root}`);
+    assert.equal((await execute(path.join(app, "CodeFlowAI.exe"), [])).code, 0);
+    assert.equal(await fs.readFile(path.join(app, "new-launched.txt"), "ascii"), "new program started");
+    assert.equal(await fs.readFile(path.join(app, "unknown-user.txt"), "utf8"), "账号、设备、任务保留");
+    await assert.rejects(fs.access(path.join(app, "shells/old")), { code: "ENOENT" });
   });
 }
 

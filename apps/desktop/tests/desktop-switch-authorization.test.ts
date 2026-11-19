@@ -114,6 +114,7 @@ async function fixture(t: test.TestContext, options: { busy?: boolean; expiresAt
 
 /** 准入检查失败不能进入中断、停止、重载或提交活动指针。 */
 async function assertPreserved(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.app.flushReceipts();
   assert.equal(f.actions.includes('runtime.update.interrupt'), false);
   assert.equal(f.actions.includes('drain'), false);
   assert.equal(f.actions.includes('reload-web'), false);
@@ -126,6 +127,7 @@ async function assertPreserved(f: Awaited<ReturnType<typeof fixture>>) {
 for (const busy of [false, true]) test(`switch authorization runs after ${busy ? 'confirmation' : 'idle preparation'} before interruption`, async t => {
   const f = await fixture(t, { busy });
   assert.equal((await f.app.applyRelease(f.packageDir, { requestId: f.requestId }))?.releaseId, f.manifest.releaseId);
+  await f.app.flushReceipts();
   assert.deepEqual(f.actions.slice(0, busy ? 5 : 4), busy
     ? ['runtime.update.prepare', 'confirm', 'switch-authorization', 'runtime.update.interrupt', 'drain']
     : ['runtime.update.prepare', 'switch-authorization', 'runtime.update.interrupt', 'drain']);

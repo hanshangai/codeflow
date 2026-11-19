@@ -185,6 +185,7 @@ test("archive body interruption persists one safe failure and explicit resume pr
   await assert.rejects(() => fs.access(path.join(f.directory, "bundle.tar.gz")), { code: "ENOENT" });
   f.complete();
   const downloaded = await f.app.downloadAvailableReleaseBundle({ requestId });
+  await f.app.flushReceipts();
   assert.equal(downloaded.requestId, requestId);
   assert.equal(downloaded.manifest.archiveSha256, f.archiveSha256);
   assert.deepEqual(await fs.readFile(downloaded.archivePath), f.archive);

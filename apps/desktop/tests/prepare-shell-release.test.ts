@@ -53,7 +53,7 @@ test("signs the installer digest and complete builder inventory into an immutabl
   const f = await fixture(), bytes = Buffer.from("installer bytes"), outputDir = path.join(f.root, "output");
   const result = await prepareShellRelease({ candidateDirectory: f.candidateDirectory, shellId: "shell-test", version: f.version, planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir }, { buildShellInstaller: builder(bytes, f.inventory) });
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir, historyDir: outputDir }, { buildShellInstaller: builder(bytes, f.inventory) });
   const digest = crypto.createHash("sha256").update(bytes).digest("hex");
   assert.equal(result.installerSha256, digest);
   assert.equal(path.basename(result.packageDir), digest);
@@ -69,7 +69,7 @@ test("shell signing uses its own trusted key independently of the resource plan 
   const f = await fixture("resource-only");
   const input = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "separate-key") };
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "separate-key"), historyDir: path.join(f.root, "separate-key") };
   assert.equal((await validateShellReleaseSigningInputs(input)).keyId, "test");
   const result = await prepareShellRelease(input, { buildShellInstaller: builder(Buffer.from("independent shell signature"), f.inventory) });
   const manifest = JSON.parse(await fs.readFile(path.join(result.packageDir, "manifest.json"), "utf8"));
@@ -82,7 +82,7 @@ test("rejects key trust mismatch, invalid metadata, protected key paths and occu
   const f = await fixture(), bytes = Buffer.from("installer bytes"), buildShellInstaller = builder(bytes, f.inventory);
   const base = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", version: f.version, planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "output") };
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "output"), historyDir: path.join(f.root, "output") };
   await assert.rejects(prepareShellRelease({ ...base, keyId: "unknown" }, { buildShellInstaller }), /UNTRUSTED_KEY/);
   const otherKeys = crypto.generateKeyPairSync("ed25519"), mismatchTrust = path.join(f.root, "mismatch-trust.json");
   await fs.writeFile(mismatchTrust, JSON.stringify({ test: otherKeys.publicKey.export({ type: "spki", format: "pem" }) }));
@@ -95,7 +95,7 @@ test("rejects key trust mismatch, invalid metadata, protected key paths and occu
   await fs.copyFile(f.privateKeyFile, nestedKey);
   await assert.rejects(prepareShellRelease({ ...base, outputDir: outputWithKey, privateKeyFile: nestedKey }, { buildShellInstaller }), /PRIVATE_KEY_PATH_INVALID/);
   await fs.mkdir(path.join(base.outputDir, crypto.createHash("sha256").update(bytes).digest("hex")), { recursive: true });
-  await assert.rejects(prepareShellRelease(base, { buildShellInstaller }), /OUTPUT_EXISTS/);
+  await assert.rejects(prepareShellRelease(base, { buildShellInstaller }), { code: "ENOENT" });
   assert.deepEqual((await fs.readdir(base.outputDir)).sort(), [crypto.createHash("sha256").update(bytes).digest("hex")]);
 });
 
@@ -103,7 +103,7 @@ test("read-only preflight checks the complete candidate inventory without creati
   const f = await fixture();
   const input = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", version: f.version, planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "checked-output") };
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "checked-output"), historyDir: path.join(f.root, "checked-history") };
   await validateShellReleaseSigningInputs(input);
   await assert.rejects(fs.access(input.outputDir), { code: "ENOENT" });
   const keys = JSON.parse(await fs.readFile(f.trustedKeysFile, "utf8"));
@@ -119,7 +119,7 @@ test("real builder prepares a signed complete small Windows shell package", { sk
   const f = await fixture();
   const result = await prepareShellRelease({ candidateDirectory: f.candidateDirectory, shellId: "shell-test", version: f.version, planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "actual-output") });
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "actual-output"), historyDir: path.join(f.root, "actual-history") });
   const manifest = JSON.parse(await fs.readFile(path.join(result.packageDir, "manifest.json"), "utf8"));
   const installer = await fs.readFile(path.join(result.packageDir, "installer.exe"));
   assert.equal(installer.subarray(0, 2).toString("ascii"), "MZ");
@@ -133,7 +133,7 @@ test("shell signing requires a release plan before building or accepting a manua
   // @ts-expect-error 运行时也必须拒绝无计划调用。
   await assert.rejects(prepareShellRelease({ candidateDirectory: f.candidateDirectory, shellId: "shell-test", version: "1.0",
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "unplanned") }, {
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "unplanned"), historyDir: path.join(f.root, "unplanned-history") }, {
     buildShellInstaller: async () => { called = true; throw new Error("must not build"); },
   }), /PLAN_REQUIRED/);
   assert.equal(called, false);
@@ -144,7 +144,7 @@ test("shell signing rejects an override and a packaged shell version that differ
   const f = await fixture();
   const base = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "wrong-version") };
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "wrong-version"), historyDir: path.join(f.root, "wrong-history") };
   await assert.rejects(validateShellReleaseSigningInputs({ ...base, version: "1.0" }), /PLAN_VERSION_MISMATCH/);
   const require = createRequire(import.meta.url);
   const asar = createRequire(createRequire(require.resolve("electron-builder")).resolve("app-builder-lib"))("@electron/asar");
@@ -158,12 +158,42 @@ test("an existing signed shell version cannot be rebound to different payload fi
   const f = await fixture(), outputDir = path.join(f.root, "immutable-output");
   const input = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir };
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir, historyDir: outputDir };
   await prepareShellRelease(input, { buildShellInstaller: builder(Buffer.from("first installer"), f.inventory) });
   await fs.appendFile(path.join(f.candidateDirectory, "CodeFlowAI.exe"), "different shell bytes");
   const changed = await readShellCandidateInventory(f.candidateDirectory, "shell-test");
   await assert.rejects(prepareShellRelease(input, { buildShellInstaller: builder(Buffer.from("other installer"), changed) }), /VERSION_CONTENT_CONFLICT/);
   assert.equal((await fs.readdir(outputDir)).length, 1);
+});
+
+test("a new request directory and shellId cannot rebind signed shell version bytes", async () => {
+  const f = await fixture();
+  const input = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", planFile: f.planFile, allowDirty: true,
+    createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "request-one"), historyDir: path.join(f.root, "history") };
+  await prepareShellRelease(input, { buildShellInstaller: builder(Buffer.from("first installer"), f.inventory) });
+  await fs.appendFile(path.join(f.candidateDirectory, "CodeFlowAI.exe"), "different runtime");
+  const changed = await readShellCandidateInventory(f.candidateDirectory, "another-shell");
+  await assert.rejects(prepareShellRelease({ ...input, shellId: "another-shell", outputDir: path.join(f.root, "request-two") }, {
+    buildShellInstaller: async () => { throw new Error("CONFLICT_MUST_PRECEDE_BUILD"); },
+  }), /VERSION_CONTENT_CONFLICT/);
+  assert.notDeepEqual(changed, f.inventory);
+});
+
+test("a retry reuses the signed artifact bytes across request directories and shellIds", async () => {
+  const f = await fixture(), input = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", planFile: f.planFile, allowDirty: true,
+    createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "first-request"), historyDir: path.join(f.root, "history") };
+  const first = await prepareShellRelease(input, { buildShellInstaller: builder(Buffer.from("signed once"), f.inventory) });
+  const manifest = await fs.readFile(path.join(first.packageDir, "manifest.json"));
+  const retried = await prepareShellRelease({ ...input, shellId: "retry-shell", createdAt: new Date().toISOString(), outputDir: path.join(f.root, "retry-request") }, {
+    buildShellInstaller: async () => { throw new Error("RETRY_MUST_NOT_REBUILD"); },
+  });
+  assert.deepEqual(retried, first);
+  assert.deepEqual(await fs.readFile(path.join(retried.packageDir, "manifest.json")), manifest);
+  assert.deepEqual(await readShellCandidateInventory(f.candidateDirectory, "shell-test"), f.inventory);
+  await fs.appendFile(path.join(first.packageDir, "installer.exe"), "tampered");
+  await assert.rejects(prepareShellRelease(input), /HISTORY_INSTALLER_MISMATCH/);
 });
 
 test("shell projection signs identical files after only bundled business resources change", async () => {
@@ -175,7 +205,7 @@ test("shell projection signs identical files after only bundled business resourc
   }
   const input = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir };
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir, historyDir: outputDir };
   let attempt = 0;
   const buildShellInstaller = async ({ candidateDirectory, outputDir }: { candidateDirectory: string; outputDir: string }) => {
     assert.notEqual(candidateDirectory, f.candidateDirectory);
@@ -196,7 +226,7 @@ test("shell projection signs identical files after only bundled business resourc
 test("shell projection rejects linked inputs and source changes while the installer builds", async () => {
   const f = await fixture(), input = { candidateDirectory: f.candidateDirectory, shellId: "shell-test", planFile: f.planFile, allowDirty: true,
     createdAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(), keyId: "test",
-    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "guarded-projection") };
+    privateKeyFile: f.privateKeyFile, trustedKeysFile: f.trustedKeysFile, outputDir: path.join(f.root, "guarded-projection"), historyDir: path.join(f.root, "guarded-history") };
   const linked = path.join(f.candidateDirectory, "linked");
   await fs.symlink(path.join(f.candidateDirectory, "resources"), linked, process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(prepareShellRelease(input, { buildShellInstaller: builder(Buffer.from("must not build"), f.inventory) }), /FILE_INVALID|DIRECTORY_INVALID/);

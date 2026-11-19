@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -53,13 +54,14 @@ async function digestFile(file) {
 
 /** 只接受精确参数字段，避免拼写错误被静默忽略。 */
 function readInput(value) {
-  const fields = ["candidateDirectory", "shellId", "version", "createdAt", "expiresAt", "keyId", "privateKeyFile", "trustedKeysFile", "outputDir", "cacheDir", "planFile", "root", "allowDirty"];
+  const fields = ["candidateDirectory", "shellId", "version", "createdAt", "expiresAt", "keyId", "privateKeyFile", "trustedKeysFile", "outputDir", "cacheDir", "planFile", "root", "allowDirty", "historyDir"];
   if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype
     || Reflect.ownKeys(value).some(key => typeof key !== "string" || !fields.includes(key))) throw new Error("DESKTOP_SHELL_RELEASE_INPUT_INVALID");
   for (const field of fields.slice(0, 9).filter(field => field !== "version")) if (typeof value[field] !== "string" || !value[field]) throw new Error("DESKTOP_SHELL_RELEASE_INPUT_INVALID");
   if (typeof value.planFile !== "string" || !value.planFile) throw new Error("DESKTOP_SHELL_RELEASE_PLAN_REQUIRED");
   if (value.version !== undefined && typeof value.version !== "string" || value.root !== undefined && typeof value.root !== "string"
-    || value.allowDirty !== undefined && typeof value.allowDirty !== "boolean") throw new Error("DESKTOP_SHELL_RELEASE_INPUT_INVALID");
+    || value.allowDirty !== undefined && typeof value.allowDirty !== "boolean"
+    || value.historyDir !== undefined && (typeof value.historyDir !== "string" || !value.historyDir)) throw new Error("DESKTOP_SHELL_RELEASE_INPUT_INVALID");
   return value;
 }
 
@@ -72,7 +74,8 @@ async function readPlannedInput(value) {
   asar.uncache(archive);
   const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(asar.extractFile(archive, "package.json")));
   if ((manifest.shellVersion ?? manifest.version) !== plan.shellVersion) throw new Error("DESKTOP_SHELL_RELEASE_CANDIDATE_VERSION_MISMATCH");
-  return { ...input, version: plan.shellVersion };
+  return { ...input, version: plan.shellVersion,
+    historyDir: input.historyDir ?? path.join(os.homedir(), ".codeflow", "shell-releases", plan.environment) };
 }
 
 /** 在构建前验证签名清单字段与当前有效期，预检和正式发布共用。 */
@@ -88,9 +91,9 @@ function validateMetadata(input) {
 }
 
 /** 显式验证已有私钥和信任根，不生成密钥或接受不同 keyId 的信任。 */
-async function readSigningMaterial(input, candidateDirectory, outputDir) {
+async function readSigningMaterial(input, candidateDirectory, outputDir, historyDir) {
   const privateKeyFile = await fs.realpath(input.privateKeyFile);
-  if ([repository, candidateDirectory, outputDir].some(root => within(root, privateKeyFile))) throw new Error("DESKTOP_SHELL_RELEASE_PRIVATE_KEY_PATH_INVALID");
+  if ([repository, candidateDirectory, outputDir, historyDir].some(root => within(root, privateKeyFile))) throw new Error("DESKTOP_SHELL_RELEASE_PRIVATE_KEY_PATH_INVALID");
   const stat = await fs.lstat(privateKeyFile);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("DESKTOP_SHELL_RELEASE_PRIVATE_KEY_FILE_INVALID");
   const privateKey = crypto.createPrivateKey(await fs.readFile(privateKeyFile));
@@ -104,16 +107,32 @@ async function readSigningMaterial(input, candidateDirectory, outputDir) {
   return { privateKey, trustedKeys, privateKeyFile };
 }
 
-/** 复用既有签名包历史，拒绝同一壳号在本输出根绑定不同运行文件。 */
-async function assertImmutableShellVersion(outputDir, payload, trustedKeys) {
-  for (const entry of await fs.readdir(outputDir, { withFileTypes: true })) {
+/** 验证稳定工件历史；同号不同字节失败，同内容只复用仍可信且未过期的完整包。 */
+async function findSignedShellVersion(historyDir, payload, trustedKeys) {
+  let entries;
+  try { entries = await fs.readdir(historyDir, { withFileTypes: true }); }
+  catch (error) { if (error.code === "ENOENT") return; throw error; }
+  let reusable;
+  for (const entry of entries) {
     if (!/^[a-f0-9]{64}$/u.test(entry.name)) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error("DESKTOP_SHELL_RELEASE_HISTORY_INVALID");
-    const previous = verifyShellReleaseSignature(JSON.parse(await fs.readFile(path.join(outputDir, entry.name, "manifest.json"), "utf8")), trustedKeys);
+    const packageDir = path.join(historyDir, entry.name), manifestFile = path.join(packageDir, "manifest.json");
+    const manifestStat = await fs.lstat(manifestFile);
+    if (!manifestStat.isFile() || manifestStat.isSymbolicLink() || manifestStat.nlink !== 1) throw new Error("DESKTOP_SHELL_RELEASE_HISTORY_INVALID");
+    const manifestBytes = await fs.readFile(manifestFile);
+    const previous = verifyShellReleaseSignature(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes)), trustedKeys);
+    if (previous.installerSha256 !== entry.name) throw new Error("DESKTOP_SHELL_RELEASE_HISTORY_INVALID");
     if (previous.version === payload.version && JSON.stringify(previous.files) !== JSON.stringify(payload.files)) {
       throw new Error("DESKTOP_SHELL_RELEASE_VERSION_CONTENT_CONFLICT");
     }
+    if (previous.version !== payload.version) continue;
+    const installer = await digestFile(path.join(packageDir, "installer.exe"));
+    if (installer.sha256 !== previous.installerSha256 || installer.size !== previous.installerSize) throw new Error("DESKTOP_SHELL_RELEASE_HISTORY_INSTALLER_MISMATCH");
+    if (Date.parse(previous.expiresAt) <= Date.now()) throw new Error("DESKTOP_SHELL_RELEASE_HISTORY_EXPIRED");
+    reusable = { shellId: previous.shellId, installerSha256: previous.installerSha256,
+      manifestSha256: crypto.createHash("sha256").update(manifestBytes).digest("hex"), packageDir };
   }
+  return reusable;
 }
 
 /** 独立壳包排除离线业务基线；完整安装包及原输入保持原样。 */
@@ -141,10 +160,12 @@ export async function validateShellReleaseSigningInputs(value) {
   validateMetadata(input);
   const candidateDirectory = await fs.realpath(input.candidateDirectory);
   const outputDir = await resolveNew(input.outputDir);
-  const { privateKeyFile } = await readSigningMaterial(input, candidateDirectory, outputDir);
-  await readShellCandidateInventory(candidateDirectory, input.shellId);
+  const historyDir = await resolveNew(input.historyDir);
+  const { privateKeyFile, trustedKeys } = await readSigningMaterial(input, candidateDirectory, outputDir, historyDir);
+  const files = (await readShellCandidateInventory(candidateDirectory, input.shellId)).filter(file => includedShellFile(file.path));
   if (within(repository, candidateDirectory) || within(candidateDirectory, repository)
-    || [repository, candidateDirectory].some(root => within(root, outputDir) || within(outputDir, root))) throw new Error("DESKTOP_SHELL_RELEASE_PATH_OVERLAP");
+    || [outputDir, historyDir].some(directory => [repository, candidateDirectory].some(root => within(root, directory) || within(directory, root)))) throw new Error("DESKTOP_SHELL_RELEASE_PATH_OVERLAP");
+  await findSignedShellVersion(historyDir, { version: input.version, files }, trustedKeys);
   return { shellId: input.shellId, keyId: input.keyId, privateKeyFile };
 }
 
@@ -154,18 +175,23 @@ export async function prepareShellRelease(value, dependencies = {}) {
   validateMetadata(input);
   const candidateDirectory = await fs.realpath(input.candidateDirectory);
   const outputDir = await resolveNew(input.outputDir);
+  const historyDir = await resolveNew(input.historyDir);
   const cacheDir = input.cacheDir;
   if (within(repository, candidateDirectory) || within(candidateDirectory, repository)
-    || [repository, candidateDirectory].some(root => within(root, outputDir) || within(outputDir, root))) throw new Error("DESKTOP_SHELL_RELEASE_PATH_OVERLAP");
-  const { privateKey, trustedKeys } = await readSigningMaterial(input, candidateDirectory, outputDir);
+    || [outputDir, historyDir].some(directory => [repository, candidateDirectory].some(root => within(root, directory) || within(directory, root)))) throw new Error("DESKTOP_SHELL_RELEASE_PATH_OVERLAP");
+  const { privateKey, trustedKeys } = await readSigningMaterial(input, candidateDirectory, outputDir, historyDir);
   const payloadMetadata = { schemaVersion: 1, protocol: "codeflow-desktop-shell-v1", shellId: input.shellId, version: input.version,
     platform: "win32", arch: "x64", createdAt: input.createdAt, expiresAt: input.expiresAt, keyId: input.keyId };
   const builder = dependencies.buildShellInstaller ?? buildShellInstaller;
   await fs.mkdir(outputDir, { recursive: true });
-  const lockPath = path.join(outputDir, ".signing.lock"), lock = await fs.open(lockPath, "wx");
-  const staging = path.join(outputDir, `.staging-${crypto.randomUUID()}`);
+  await fs.mkdir(historyDir, { recursive: true });
+  const lockPath = path.join(historyDir, ".signing.lock"), lock = await fs.open(lockPath, "wx");
+  const staging = path.join(historyDir, `.staging-${crypto.randomUUID()}`);
   let failure;
   try {
+    const files = (await readShellCandidateInventory(candidateDirectory, input.shellId)).filter(file => includedShellFile(file.path));
+    const reusable = await findSignedShellVersion(historyDir, { version: input.version, files }, trustedKeys);
+    if (reusable) return reusable;
     await fs.mkdir(staging);
     const buildDirectory = path.join(staging, "build");
     const projectedDirectory = path.join(staging, "candidate");
@@ -179,6 +205,7 @@ export async function prepareShellRelease(value, dependencies = {}) {
     if (JSON.stringify(built.files) !== JSON.stringify(projected)) throw new Error("DESKTOP_SHELL_RELEASE_BUILD_INVENTORY_MISMATCH");
     const installer = await digestFile(built.executablePath), installerSha256 = installer.sha256;
     const payload = assertShellReleasePayload({ ...payloadMetadata, installerSha256, installerSize: installer.size, files: built.files });
+    await findSignedShellVersion(historyDir, payload, trustedKeys);
     const manifest = signShellReleaseManifest(payload, privateKey);
     verifyShellReleaseSignature(manifest, trustedKeys);
     await fs.writeFile(path.join(staging, "manifest.json"), JSON.stringify(manifest), { flag: "wx" });
@@ -187,10 +214,9 @@ export async function prepareShellRelease(value, dependencies = {}) {
     if (copiedInstaller.size !== installer.size || copiedInstaller.sha256 !== installerSha256) throw new Error("DESKTOP_SHELL_RELEASE_INSTALLER_COPY_MISMATCH");
     await fs.rm(buildDirectory, { recursive: true });
     await fs.rm(projectedDirectory, { recursive: true });
-    const packageDir = path.join(outputDir, installerSha256);
+    const packageDir = path.join(historyDir, installerSha256);
     try { await fs.lstat(packageDir); throw new Error("DESKTOP_SHELL_RELEASE_OUTPUT_EXISTS"); }
     catch (error) { if (error.code !== "ENOENT") throw error; }
-    await assertImmutableShellVersion(outputDir, payload, trustedKeys);
     const manifestSha256 = crypto.createHash("sha256").update(await fs.readFile(path.join(staging, "manifest.json"))).digest("hex");
     await fs.rename(staging, packageDir);
     return { shellId: input.shellId, installerSha256, manifestSha256, packageDir };

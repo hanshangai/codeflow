@@ -28,9 +28,91 @@ import { createShellUpdateAttemptStore, createShellUpdateAttemptNetworkAdapter, 
 import type { ShellUpdateOperationBoundary } from "../src/shellUpdateOperation.js";
 import type { ChildProcess } from "node:child_process";
 import * as tar from "tar";
+import vm from "node:vm";
+import ts from "typescript";
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
 const trustedReleaseKeys = { fixture: publicKey };
+
+for (const cancelled of [false, true]) test(`one explicit restart preserves the combined update decision: cancelled=${cancelled}`, async () => {
+  const file = new URL("../src/desktopApplication.ts", import.meta.url);
+  const source = ts.createSourceFile(file.pathname, await fs.readFile(file, "utf8"), ts.ScriptTarget.Latest, true);
+  let method: ts.MethodDeclaration | undefined;
+  /** 执行产品重启入口，确认待更新资源不会绕过已准备的原生壳。 */
+  const visit = (node: ts.Node): void => {
+    if (ts.isMethodDeclaration(node) && node.name.getText(source) === "restartForUpdate") method = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  assert.ok(method);
+  const calls: string[] = [];
+  const context = {
+    operation: "idle", window: {} as unknown, preparedUpdate: { manifest: { releaseId: "resource-2" } },
+    shellDetails: { result: "prepared" }, shellOwner: undefined as unknown, runtime: {}, restartRequested: false,
+    updateCheckFailure: null, shellUpdateFailure: null, updatesSuppressed: false,
+    input: { shellUpdate: { boundary: {} }, host: { relaunch() {}, confirmUpdate: async () => true } },
+    async beginUpdateCheck(manual: boolean, allowRestart: boolean) {
+      assert.equal(manual, true); assert.equal(allowRestart, true);
+      calls.push("native transfer with pending resource");
+      if (cancelled) context.updatesSuppressed = true;
+      else { context.shellOwner = {}; context.window = null; }
+    },
+    async controlUpdate() { return { hasRunningSessions: false }; },
+    application: { async exit() { calls.push("wrong resource-only restart"); } },
+  };
+  const compiled = ts.transpileModule(`({${method.getText(source)}}).restartForUpdate;`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  await vm.runInNewContext(compiled, context)();
+  assert.deepEqual(calls, ["native transfer with pending resource"]);
+});
+
+for (const failureStage of ["executor", "interrupt"] as const) test(`native shell ${failureStage} failure resumes only its own Client changes`, async () => {
+  const file = new URL("../src/desktopApplication.ts", import.meta.url);
+  const source = ts.createSourceFile(file.pathname, await fs.readFile(file, "utf8"), ts.ScriptTarget.Latest, true);
+  let initializer: ts.Expression | undefined;
+  /** 抽取实际应用接线，外部执行器失败仍经过产品自身的恢复 hook。 */
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "checkShellInternal") initializer = node.initializer;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  assert.ok(initializer);
+  const calls: string[] = [];
+  let status = "ready";
+  const runtime = {
+    snapshot: () => ({ status, pid: status === "ready" ? 123 : null }),
+    async drain() { status = "stopped"; calls.push("drain active resource/schema90"); },
+    async start() { status = "ready"; calls.push("start active resource/schema90"); },
+    async waitReady() { calls.push("ready active resource/schema90"); },
+  };
+  const context = {
+    input: { shellUpdate: { facts: {}, boundary: {} }, dataDir: "data", initialReleaseDir: "installation/schema88", host: {} },
+    runtime, identity: { deviceId: "device" }, initialExpectation: { dbSchemaVersion: 88 }, startupHeldId: undefined,
+    shellDrainedRuntime: undefined, shellDetails: {}, shellOwner: undefined, switchCommitted: false,
+    async resolveActiveRelease() { throw new Error("shell preparation must not require business resources"); },
+    async discoverUpdatesInternal() { return {}; },
+    async readPendingRelease() { return null; }, async clearPendingRelease() {},
+    async controlUpdate(_runtime: unknown, method: string) {
+      if (failureStage === "interrupt" && method === "runtime.update.interrupt") throw new Error("INTERRUPT_FAILED");
+      if (method === "runtime.update.cancel") calls.push("cancel admission");
+      return { hasRunningSessions: false };
+    },
+    async restartClient(directory: string) { calls.push(`wrong new runtime:${directory}`); },
+    async runShellUpdateOperation(input: any) {
+      assert.equal(await input.hooks.prepare(), true);
+      try { await input.hooks.drain(); }
+      catch (cause) { await input.hooks.resume(); throw cause; }
+      await input.hooks.resume();
+      throw new Error("EXECUTOR_START_FAILED");
+    },
+  };
+  const compiled = ts.transpileModule(`const operation = ${initializer.getText(source)}; operation;`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  const operation = vm.runInNewContext(compiled, context);
+  await assert.rejects(operation(crypto.randomUUID(), new AbortController().signal, true, true), failureStage === "executor" ? /EXECUTOR_START_FAILED/u : /INTERRUPT_FAILED/u);
+  assert.deepEqual(calls, failureStage === "executor" ? ["drain active resource/schema90", "start active resource/schema90", "ready active resource/schema90"] : ["cancel admission"]);
+  assert.equal(context.shellDrainedRuntime, undefined, "resumed Client must be drained normally on the next exit");
+});
 
 /** 云关联测试复用真实壳身份与业务桥，不依赖配置更新源或运行中的桌面实例。 */
 async function cloudRegistrationFixture(t: test.TestContext) {
@@ -733,7 +815,8 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
   f.runtime.snapshot = () => ({ status: "ready", requestId: "client-ready-1", releaseId: runtimeReleaseId, errorCode: null, pid: client.pid, health,
     ...(heldId ? { startup: { continuationId: heldId, admission: "paused" as const } } : {}) });
   const store = createShellUpdateAttemptStore(f.dataDir), identity = await loadOrCreateDeviceIdentity(f.dataDir), errors: unknown[] = [], serverErrors: unknown[] = [];
-  const control = { available: true, hotAvailable: hotUpdate, busy: false, confirm: true, fail: "", spawned: false, closed: false, drained: false, failHot: false, quitFail: false,
+  const control = { available: true, hotAvailable: hotUpdate, resourceAuthorized: true, busy: false, confirm: true, fail: "", spawned: false, closed: false, drained: false, failHot: false, quitFail: false,
+    shellChannelFailed: false, resourceChannelFailed: false,
     holdHealth: undefined as (() => Promise<void>) | undefined, holdDrain: undefined as (() => Promise<void>) | undefined };
   let hotManifest = manifest, archive: Buffer = Buffer.alloc(0);
   if (hotUpdate) {
@@ -750,13 +833,16 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
     if (request.url?.endsWith("/archive")) { response.writeHead(200, { etag: `"${hotManifest.archiveSha256}"`, "content-length": archive.length }); response.end(archive); return; }
     if (request.url?.endsWith("/update-receipts")) { const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const receipt = JSON.parse(Buffer.concat(chunks).toString("utf8")); response.end(JSON.stringify({ ok: true, deviceId: receipt.deviceId, requestId: receipt.requestId, releaseId: receipt.releaseId, archiveSha256: receipt.archiveSha256, stage: receipt.stage, at: receipt.at, payloadSha256: receipt.payloadSha256 })); return; }
     if (request.url?.endsWith("/update-failures")) { const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const record = JSON.parse(Buffer.concat(chunks).toString("utf8")); response.end(JSON.stringify({ ok: true, deviceId: record.deviceId, errorId: record.errorId, payloadSha256: record.payloadSha256 })); return; }
-    if (request.url?.endsWith("/switch-authorization")) { response.end(JSON.stringify({ ok: true, authorized: true, deviceId: identity.deviceId, requestId: meta.requestId, releaseId: hotManifest.releaseId, archiveSha256: hotManifest.archiveSha256 })); return; }
+    if (request.url?.endsWith("/switch-authorization")) { response.end(JSON.stringify({ ok: true, authorized: control.resourceAuthorized, deviceId: identity.deviceId, requestId: meta.requestId, releaseId: hotManifest.releaseId,
+      ...(control.resourceAuthorized ? { archiveSha256: hotManifest.archiveSha256 } : {}) })); return; }
     f.actions.push("hot-discover");
     if (control.failHot) { response.writeHead(403); response.end("{}"); return; }
     response.end(JSON.stringify(request.url?.endsWith('/update-availability')
       ? { ok: true, deviceId: identity.deviceId, requestId: meta.requestId,
-        resource: control.hotAvailable ? { available: true, manifest: hotManifest } : { available: false },
-        shell: control.available ? { available: true, manifest: shellManifest } : { available: false } }
+        resource: control.resourceChannelFailed ? { available: false, error: { code: 'DESKTOP_UPDATE_UNAVAILABLE', requestId: meta.requestId } }
+          : control.hotAvailable ? { available: true, manifest: hotManifest } : { available: false },
+        shell: control.shellChannelFailed ? { available: false, error: { code: 'DESKTOP_SHELL_ARTIFACT_EXPIRED', requestId: meta.requestId } }
+          : control.available ? { available: true, manifest: shellManifest } : { available: false } }
       : { ok: true, available: control.hotAvailable, ...(control.hotAvailable ? { manifest: hotManifest } : {}), deviceId: identity.deviceId, requestId: meta.requestId }));
   })().catch(error => { serverErrors.push(error); response.writeHead(500); response.end("{}"); }); });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -819,6 +905,42 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
     /** 使用同一磁盘尝试重建 owner，模拟下一次正常启动。 */
     async restart() { await app.exit(); control.drained = false; app = createDesktopApplication(options); await app.start(); } };
 }
+
+test('revoking prepared resources does not skip an independently available shell', async t => {
+  const f = await shellApplicationFixture(t, true); f.control.available = false;
+  await f.app.checkForUpdates();
+  f.control.resourceAuthorized = false; f.control.hotAvailable = false; f.control.available = true;
+  await f.app.checkForUpdates();
+  assert.equal((await f.app.getUpdateDetails()).shell.result, 'prepared');
+  assert.equal(f.control.drained, false);
+  await f.app.exit();
+});
+
+test('a failed shell channel remains explicit while verified resources are prepared', async t => {
+  const f = await shellApplicationFixture(t, true);
+  f.control.shellChannelFailed = true;
+  await assert.rejects(f.app.checkForUpdates(), /DESKTOP_SHELL_OPERATION_FAILED/u);
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.bundle.result, 'prepared');
+  assert.equal(details.bundle.target?.releaseId, 'hot-release');
+  assert.equal(details.shell.result, 'failure');
+  assert.ok(f.app.shellUpdateFailure);
+  assert.ok(await readPendingRelease(f.dataDir));
+  assert.equal(f.control.drained, false);
+  await f.app.exit();
+});
+
+test('a failed resource channel remains explicit while a healthy shell is prepared', async t => {
+  const f = await shellApplicationFixture(t, true);
+  f.control.resourceChannelFailed = true;
+  await assert.rejects(f.app.checkForUpdates(), /DESKTOP_UPDATE_UNAVAILABLE/u);
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.bundle.result, 'failure');
+  assert.equal(details.shell.result, 'prepared');
+  assert.ok(f.app.updateCheckFailure);
+  assert.equal(f.control.drained, false);
+  await f.app.exit();
+});
 
 test('one update check consumes a combined response for both channels without duplicate discovery', async t => {
   const f = await shellApplicationFixture(t); f.control.available = false;
@@ -1210,9 +1332,10 @@ test("shell later cancels original admission before helper creation and leaves t
   await f.app.exit();
 });
 
-test("shell interrupt failure resumes the original Client only after helper closure", async t => {
+test("shell interrupt failure closes its helper and cancels admission without restarting the untouched Client", async t => {
   const f = await shellApplicationFixture(t); await f.app.checkForUpdates(); f.control.fail = "interrupt";
-  await assert.rejects(f.app.restartForUpdate()); assert.equal(f.control.closed, true); assert.equal(f.actions.includes("start"), true);
+  await assert.rejects(f.app.restartForUpdate()); assert.equal(f.control.closed, true); assert.equal(f.actions.includes("start"), false);
+  assert.equal(f.actions.includes("runtime.update.cancel"), true); assert.equal(f.actions.includes("drain"), false);
   assert.equal(f.actions.includes("quit"), false); assert.equal(f.app.updateCheckFailure, null); assert.ok(f.app.shellUpdateFailure);
   await f.app.exit();
 });

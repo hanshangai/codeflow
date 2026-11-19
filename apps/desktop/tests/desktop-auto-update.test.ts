@@ -47,7 +47,7 @@ async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'd
   const baselineDir = path.join(dataDir, 'baseline');
   await fs.cp(packageDir, baselineDir, { recursive: true });
   const { signature: _signature, ...payload } = manifest;
-  const baselineManifest = signReleaseBundleManifest({ ...payload, dbSchemaVersion: baselineSchema, releaseId: installed && installed !== 'different' ? manifest.releaseId : 'baseline-release',
+  const baselineManifest = signReleaseBundleManifest({ ...payload, version: installed && baselineSchema === 88 ? manifest.version : '0.9.0', dbSchemaVersion: baselineSchema, releaseId: installed && installed !== 'different' ? manifest.releaseId : 'baseline-release',
     ...(installed === 'conflict' ? { archiveSha256: 'b'.repeat(64) } : {}) }, privateKey);
   await fs.writeFile(path.join(baselineDir, 'baseline-release-manifest.json'), JSON.stringify(baselineManifest));
   const receipts: { stage: string; requestId: string; at: string }[] = [];
@@ -69,15 +69,17 @@ async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'd
       if (request.url!.endsWith('/devices/register')) {
         response.end(JSON.stringify({ ok: true, deviceId: identity.deviceId,
           publicKeySha256: desktopDevicePublicKeySha256(identity.publicKeyBase64) }));
-      } else if (request.url!.startsWith('/api/software/desktop/release-availability')) {
+      } else if (request.url!.startsWith('/api/software/desktop/release-availability') || request.url === '/api/software/desktop/update-availability') {
         if (control.holdErrorBody) { response.writeHead(403, { 'content-length': '128' }); response.flushHeaders(); return; }
         if (control.failuresRemaining > 0) {
           control.failuresRemaining--; response.writeHead(503, { 'retry-after': '0' }); response.end(JSON.stringify({ ok: false, code: 'DESKTOP_UPDATE_UNAVAILABLE' })); return;
         }
         await control.holdDiscovery?.();
         const available = control.available && new URL(request.url!, 'http://localhost').searchParams.get('excludeReleaseId') !== manifest.releaseId;
-        response.end(JSON.stringify({ ok: true, available, deviceId: identity.deviceId, requestId: meta.requestId,
-          ...(available ? { manifest: control.badSignature ? { ...manifest, signature: 'A'.repeat(88) } : manifest } : {}) }));
+        const resource = { available, ...(available ? { manifest: control.badSignature ? { ...manifest, signature: 'A'.repeat(88) } : manifest } : {}) };
+        response.end(JSON.stringify(request.url === '/api/software/desktop/update-availability'
+          ? { ok: true, deviceId: identity.deviceId, requestId: meta.requestId, resource, shell: { available: false } }
+          : { ok: true, deviceId: identity.deviceId, requestId: meta.requestId, ...resource }));
       } else if (request.url!.endsWith('/archive')) {
         if (control.holdArchive) {
           response.writeHead(200, { etag: `"${manifest.archiveSha256}"`, 'content-length': archive.length });
@@ -184,14 +186,14 @@ test('内置发布同 ID 不同摘要必须显式拒绝，不能按相同版本�
   assert.ok(f.app.updateCheckFailure);
 });
 
-test('展示版本相同但发布身份不同，仍按真实目标准备更新', async t => {
+test('资源版本相同但发布身份不同，不重复下载更新', async t => {
   const f = await fixture(t, 'different');
   await f.app.checkForUpdates();
   const details = await f.app.getUpdateDetails();
   assert.equal(details.current.bundle?.version, details.bundle.target?.version);
   assert.notEqual(details.current.bundle?.releaseId, details.bundle.target?.releaseId);
-  assert.equal(details.bundle.result, 'prepared');
-  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
+  assert.equal(details.bundle.result, 'same');
+  assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 0);
 });
 
 for (const expired of [false, true]) test(`完整安装已包含待更新同包时清理待更新标记：已过下载有效期=${expired}`, async t => {
@@ -215,7 +217,7 @@ for (const expired of [false, true]) test(`完整安装已包含待更新同包�
 });
 
 test('未安装的过期候选不能借用内置包身份绕过有效期', async t => {
-  const f = await fixture(t, 'different');
+  const f = await fixture(t);
   await f.app.checkForUpdates();
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse(f.manifest.expiresAt) + 1 });
   await f.restart();
@@ -284,12 +286,13 @@ test('background and manual checks share preparation without interrupting runnin
   const f = await fixture(t);
   f.app.startAutomaticUpdates();
   const active = await f.app.checkForUpdates();
+  await f.app.flushReceipts();
   assert.equal(active, null);
   assert.equal(await readActivePointer(f.dataDir), null);
   assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
   assert.equal(f.actions.includes('runtime.update.prepare'), false);
   assert.equal(f.actions.includes('drain'), false);
-  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/update-availability')).length, 1);
   assert.deepEqual(f.receipts.map(receipt => receipt.stage), ['received', 'verified', 'prepared']);
   assert.equal(new Set(f.receipts.map(receipt => receipt.requestId)).size, 1);
   assert.deepEqual(f.failures, []);
@@ -299,7 +302,8 @@ test('periodic checks keep the active package and do not download or switch twic
   const f = await fixture(t); t.mock.timers.enable({ apis: ['setTimeout'] });
   f.app.startAutomaticUpdates(); await f.app.checkForUpdates();
   t.mock.timers.tick(30 * 60 * 1000); await f.app.checkForUpdates();
-  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  await f.app.flushReceipts();
+  assert.equal(f.requests.filter(request => request.path.endsWith('/update-availability')).length, 1);
   assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
   assert.equal(f.receipts.length, 3);
 });
@@ -308,17 +312,19 @@ test('prepared update waits for normal restart and resumes the original attempt'
   const f = await fixture(t); f.control.busy = true; f.control.confirm = false;
   t.mock.timers.enable({ apis: ['setTimeout'] });
   f.app.startAutomaticUpdates(); assert.equal(await f.app.checkForUpdates(), null);
+  await f.app.flushReceipts();
   const requestId = f.receipts[0]!.requestId;
   t.mock.timers.tick(60 * 60 * 1000);
   assert.equal(f.actions.filter(action => action === 'confirm').length, 0);
   f.control.confirm = true;
   assert.equal(await f.app.checkForUpdates(), null);
   await f.restart();
+  await f.app.flushReceipts();
   assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
   assert.equal(f.actions.filter(action => action === 'runtime.startup.continue').length, 1);
   assert.equal(f.actions.filter(action => action === 'confirm').length, 0);
   assert.ok(f.receipts.every(receipt => receipt.requestId === requestId));
-  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/update-availability')).length, 1);
   assert.ok(f.requests.filter(request => request.path.endsWith('/switch-authorization')).every(request => request.requestId === requestId));
   assert.deepEqual(f.journal(), []);
 });
@@ -327,12 +333,14 @@ test('server pause does not suppress the next automatic cycle and retains the sa
   const f = await fixture(t); f.control.authorized = false;
   t.mock.timers.enable({ apis: ['setTimeout'] });
   f.app.startAutomaticUpdates(); assert.equal(await f.app.checkForUpdates(), null);
+  await f.app.flushReceipts();
   const requestId = f.receipts[0]!.requestId;
   f.control.authorized = true; t.mock.timers.tick(30 * 60 * 1000);
   await f.app.checkForUpdates(); await f.restart();
+  await f.app.flushReceipts();
   assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
   assert.ok(f.receipts.every(receipt => receipt.requestId === requestId));
-  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/update-availability')).length, 1);
   assert.deepEqual(f.journal(), []);
 });
 
@@ -356,7 +364,7 @@ test('busy tasks are not interrupted or asked to confirm during background prepa
 test('transient discovery succeeds before creating an incident and retains one attempt ID', async t => {
   const f = await fixture(t); f.control.failuresRemaining = 2;
   await f.app.checkForUpdates(); assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
-  const discovery = f.requests.filter(request => request.path.endsWith('/release-availability'));
+  const discovery = f.requests.filter(request => request.path.endsWith('/update-availability'));
   assert.equal(discovery.length, 3); assert.equal(new Set(discovery.map(request => request.requestId)).size, 1);
   assert.deepEqual(f.retries.map(retry => retry.retry), [1, 2]);
   assert.deepEqual(f.journal(), []); assert.deepEqual(f.failures, []);
@@ -366,22 +374,25 @@ test('retry exhaustion creates one failure and requires manual recovery', async 
   const f = await fixture(t); f.control.failuresRemaining = 4;
   t.mock.timers.enable({ apis: ['setTimeout'] });
   f.app.startAutomaticUpdates(); await assert.rejects(() => f.app.checkForUpdates());
-  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 4);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/update-availability')).length, 4);
   assert.deepEqual(f.retries.map(retry => retry.retry), [1, 2, 3]);
   assert.equal(f.journal().length, 1); assert.equal(f.failures.length, 1);
   t.mock.timers.tick(30 * 60 * 1000);
-  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 4);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/update-availability')).length, 4);
 });
 
 test('healthy ACK recovery replays exact original evidence without switching the active release twice', async t => {
   const f = await fixture(t); f.control.failReceipt = 'healthy';
   await f.app.checkForUpdates(); await f.restart();
-  assert.ok(f.app.updateCheckFailure);
+  assert.equal(f.app.updateCheckFailure, null);
+  await assert.rejects(f.app.flushReceipts());
+  assert.ok(f.app.updateReceiptFailure);
   assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
   const healthy = f.receipts.find(receipt => receipt.stage === 'healthy'); assert.ok(healthy);
   const interruptions = f.actions.filter(action => action === 'runtime.update.interrupt').length;
   f.control.failReceipt = undefined;
   assert.equal(await f.app.checkForUpdates(), null);
+  await f.app.flushReceipts();
   assert.equal(f.actions.filter(action => action === 'runtime.update.interrupt').length, interruptions);
   assert.deepEqual(f.receipts.filter(receipt => receipt.stage === 'healthy'), [healthy, healthy]);
   assert.deepEqual(await createUpdateReceiptJournal(f.dataDir).pending(f.identity.deviceId), []);
@@ -408,19 +419,23 @@ test('restart finishes committed pending cleanup and replays the original receip
   const pendingFile = path.join(f.dataDir, 'pending-release.json');
   const pending = await fs.readFile(pendingFile);
   f.control.failReceipt = 'healthy'; await f.restart();
+  await assert.rejects(f.app.flushReceipts());
   const original = f.receipts.find(receipt => receipt.stage === 'healthy'); assert.ok(original);
   // 恢复提交后、清理前的磁盘状态，模拟此窗口进程中断。
   await fs.writeFile(pendingFile, pending);
   const starts = f.actions.filter(action => action === 'start').length;
   const authorizations = f.requests.filter(request => request.path.endsWith('/switch-authorization')).length;
-  await f.restart(); assert.ok(f.app.updateCheckFailure);
-  assert.deepEqual(await fs.readFile(pendingFile), pending);
+  await f.restart(); assert.equal(f.app.updateCheckFailure, null);
+  await assert.rejects(f.app.flushReceipts());
+  await assert.rejects(fs.access(pendingFile), { code: 'ENOENT' });
   assert.equal(f.actions.filter(action => action === 'start').length, starts + 1);
   f.control.failReceipt = undefined; await f.restart();
+  await f.app.flushReceipts();
   assert.equal(f.app.updateCheckFailure, null);
   assert.equal(f.actions.filter(action => action === 'start').length, starts + 2);
   assert.equal(f.requests.filter(request => request.path.endsWith('/switch-authorization')).length, authorizations);
-  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'healthy');
+  assert.equal((await f.app.getUpdateDetails()).current.bundle?.releaseId, f.manifest.releaseId);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'unknown', '普通冷启动不把历史交付补报伪装成本次资源激活');
   await assert.rejects(() => fs.access(pendingFile), { code: 'ENOENT' });
   assert.equal(await f.app.checkForUpdates(), null);
   assert.equal(await f.app.checkForUpdates(), null);
@@ -450,7 +465,7 @@ for (const failedStage of ['switched', 'healthy']) {
     await f.restart(); assert.equal(failed, true); assert.ok(f.app.updateCheckFailure);
     assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
     const journal = createUpdateReceiptJournal(f.dataDir);
-    const requestId = f.receipts[0]!.requestId;
+    const requestId = JSON.parse(pending.toString('utf8')).requestId;
     const switched = await journal.find(f.identity.deviceId, requestId, 'switched');
     assert.deepEqual(await fs.readFile(pendingFile), pending, '回执未落盘时必须保留真实待更新记录');
     const starts = f.actions.filter(action => action === 'start').length;
@@ -459,6 +474,7 @@ for (const failedStage of ['switched', 'healthy']) {
     assert.equal(f.actions.filter(action => action === 'start').length, starts + 1);
     if (switched) assert.deepEqual(await journal.find(f.identity.deviceId, requestId, 'switched'), switched);
     assert.equal(await f.app.checkForUpdates(), null);
+    await f.app.flushReceipts();
     assert.equal(f.receipts.filter(receipt => receipt.stage === 'healthy').length, 1);
     assert.deepEqual(await journal.pending(f.identity.deviceId), []);
     await assert.rejects(() => fs.access(pendingFile), { code: 'ENOENT' });
@@ -468,9 +484,11 @@ for (const failedStage of ['switched', 'healthy']) {
 test('rollback terminal attempt is never reused for a manual installation', async t => {
   const f = await fixture(t); f.control.rejectLoadWeb = true;
   await f.app.checkForUpdates(); await f.restart();
+  await f.app.flushReceipts();
   const rolledBack = f.receipts.find(receipt => receipt.stage === 'rolled_back'); assert.ok(rolledBack);
   assert.equal(await readActivePointer(f.dataDir), null);
   await f.app.checkForUpdates(); await f.restart();
+  await f.app.flushReceipts();
   const healthy = f.receipts.find(receipt => receipt.stage === 'healthy'); assert.ok(healthy);
   assert.notEqual(healthy.requestId, rolledBack.requestId);
 });
@@ -486,25 +504,29 @@ test('exit cancels an in-flight archive and clears the timer without reporting a
 
 test('received ACK recovery retains the verified manifest and original attempt without rediscovery', async t => {
   const f = await fixture(t); f.control.failReceipt = 'received';
-  await assert.rejects(() => f.app.checkForUpdates());
+  await f.app.checkForUpdates();
+  await assert.rejects(f.app.flushReceipts());
   const original = f.receipts[0]!; assert.equal(original.stage, 'received');
   f.control.failReceipt = undefined;
   await f.app.checkForUpdates(); assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  await f.app.flushReceipts();
   assert.ok(f.receipts.every(receipt => receipt.requestId === original.requestId));
   assert.deepEqual(f.receipts.filter(receipt => receipt.stage === 'received'), [original, original]);
-  assert.equal(f.requests.filter(request => request.path.endsWith('/release-availability')).length, 1);
+  assert.equal(f.requests.filter(request => request.path.endsWith('/update-availability')).length, 1);
   assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
 });
 
 test('switched ACK recovery sends the persisted healthy fact without repeating the switch', async t => {
   const f = await fixture(t); f.control.failReceipt = 'switched';
   await f.app.checkForUpdates(); await f.restart();
-  assert.ok(f.app.updateCheckFailure);
+  assert.equal(f.app.updateCheckFailure, null);
+  await assert.rejects(f.app.flushReceipts());
   assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
   const requestId = f.receipts[0]!.requestId;
   assert.deepEqual((await createUpdateReceiptJournal(f.dataDir).pending(f.identity.deviceId)).map(receipt => receipt.stage), ['switched', 'healthy']);
   f.control.failReceipt = undefined;
   assert.equal(await f.app.checkForUpdates(), null);
+  await f.app.flushReceipts();
   const healthy = f.receipts.filter(receipt => receipt.stage === 'healthy');
   assert.equal(healthy.length, 1); assert.equal(healthy[0]!.requestId, requestId);
   assert.equal(f.actions.filter(action => action === 'runtime.update.interrupt').length, 0);
@@ -513,10 +535,12 @@ test('switched ACK recovery sends the persisted healthy fact without repeating t
 test('resume between permission denial and discovery retains the original same-package attempt', async t => {
   const f = await fixture(t); f.control.authorized = false;
   assert.equal(await f.app.checkForUpdates(), null);
+  await f.app.flushReceipts();
   const requestId = f.receipts[0]!.requestId;
   f.control.holdDiscovery = async () => { f.control.authorized = true; };
   assert.equal(await f.app.checkForUpdates(), null);
   await f.app.checkForUpdates(); assert.equal((await f.app.getUpdateDetails()).bundle.result, 'prepared');
+  await f.app.flushReceipts();
   assert.ok(f.receipts.every(receipt => receipt.requestId === requestId));
   assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 1);
 });
@@ -524,7 +548,7 @@ test('resume between permission denial and discovery retains the original same-p
 test('exit cancels an unfinished HTTP error body without creating an update incident', async t => {
   const f = await fixture(t); f.control.holdErrorBody = true;
   f.app.startAutomaticUpdates();
-  while (!f.requests.some(request => request.path.endsWith('/release-availability'))) await new Promise<void>(resolve => setImmediate(resolve));
+  while (!f.requests.some(request => request.path.endsWith('/update-availability'))) await new Promise<void>(resolve => setImmediate(resolve));
   await new Promise<void>(resolve => setImmediate(resolve));
   await f.exit();
   assert.equal(f.actions.at(-1), 'quit'); assert.deepEqual(f.journal(), []); assert.deepEqual(f.failures, []);
@@ -547,6 +571,7 @@ test('healthy persistence failure stays explicit until its observed receipt is s
   await f.app.checkForUpdates(); await f.restart(); assert.equal(failed, true);
   assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
   assert.equal(await f.app.checkForUpdates(), null);
+  await f.app.flushReceipts();
   assert.equal(f.receipts.filter(receipt => receipt.stage === 'healthy').length, 1);
   assert.equal(f.actions.filter(action => action === 'runtime.update.interrupt').length, 0);
 });
@@ -627,6 +652,7 @@ test('活动指针重命名后刷盘失败保留候选数据库，完整重启�
     try { assert.equal(db.prepare('SELECT v FROM version').get()?.v, 2); } finally { db.close(); }
   }
   await assert.rejects(fs.access(pendingFile), { code: 'ENOENT' });
+  await f.app.flushReceipts();
   assert.equal(f.receipts.filter(receipt => receipt.stage === 'healthy').length, 1);
 });
 

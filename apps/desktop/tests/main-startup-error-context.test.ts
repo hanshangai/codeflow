@@ -13,6 +13,60 @@ import { DesktopMaintenanceStartupError } from "../src/desktopMaintenanceRecord.
 
 const startupId = "startup:current", attemptId = "attempt:original", continuationId = "continuation-original";
 
+test("normal relaunch drops the completed shell handshake while preserving both profile arguments", async () => {
+  const source = await fs.readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const ast = ts.createSourceFile("main.ts", source, ts.ScriptTarget.Latest, true);
+  const declaration = ast.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === "relaunchDesktop");
+  assert.ok(declaration, "normal relaunch must not reuse a completed updater pipe");
+  const calls: unknown[] = [];
+  const argv = ["CodeFlowAI.exe", "--user-data-dir=C:\\用户 空间", "--codeflow-session-data-dir=C:\\session", "--codeflow-shell-ready=a2b17190-9093-4f0b-b028-27c4fd87234d"];
+  const context = vm.createContext({ process: { argv }, app: { relaunch: (input: unknown) => calls.push(JSON.parse(JSON.stringify(input))) } });
+  vm.runInContext(ts.transpileModule(declaration.getFullText(ast), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  vm.runInContext("relaunchDesktop()", context);
+  assert.deepEqual(calls, [{ args: ["--user-data-dir=C:\\用户 空间", "--codeflow-session-data-dir=C:\\session"] }]);
+});
+
+test("shell switch ready confirms a sandbox renderer before any business bootstrap and retains real request/PID", async () => {
+  const source = await fs.readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const ast = ts.createSourceFile("main.ts", source, ts.ScriptTarget.Latest, true);
+  const declaration = ast.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === "confirmShellSwitchReady");
+  assert.ok(declaration, "shell-only readiness entry is required");
+  const events: string[] = [], id = "a2b17190-9093-4f0b-b028-27c4fd87234d";
+  let failRenderer = false, commitByte = 1;
+  const context = vm.createContext({ process: { platform: "win32", pid: 12345 }, Buffer,
+    app: { whenReady: async () => { events.push("app-ready"); } },
+    BrowserWindow: class {
+      webContents = { isDestroyed: () => false };
+      constructor(input: { webPreferences: { sandbox: boolean; partition: string } }) {
+        assert.equal(input.webPreferences.sandbox, true);
+        assert.equal(input.webPreferences.partition, `codeflow-shell-ready-${id}`, "readiness must not initialize or lock the business session profile");
+      }
+      async loadURL(url: string) { assert.match(url, /^data:text\/html/u); if (failRenderer) throw new Error("RENDERER_FAILED"); events.push("renderer-ready"); }
+      destroy() { events.push("destroyed"); }
+    },
+    fs: { openSync(file: string, flags: string) { assert.equal(file, `\\\\.\\pipe\\codeflow-shell-ready-${id}`); assert.equal(flags, "r+"); events.push("open"); return 42; },
+      writeSync(fd: number, value: Buffer) { assert.equal(fd, 42); assert.equal(value.toString("ascii"), `${id}:12345\r\n`); events.push("ready"); return value.length; },
+      readSync(fd: number, value: Buffer) { assert.equal(fd, 42); value[0] = commitByte; events.push("committed"); return 1; },
+      closeSync(fd: number) { assert.equal(fd, 42); events.push("closed"); } } });
+  vm.runInContext(ts.transpileModule(declaration.getFullText(ast), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  await vm.runInContext("confirmShellSwitchReady([])", context);
+  assert.deepEqual(events, [], "ordinary startup must have no update gate");
+  await vm.runInContext(`confirmShellSwitchReady(['--codeflow-shell-ready=${id}'])`, context);
+  assert.deepEqual(events, ["app-ready", "renderer-ready", "open", "ready", "committed", "closed", "destroyed"]);
+  for (const failure of ["renderer", "commit"]) {
+    events.length = 0; failRenderer = failure === "renderer"; commitByte = 0;
+    await assert.rejects(vm.runInContext(`confirmShellSwitchReady(['--codeflow-shell-ready=${id}'])`, context),
+      { code: "DESKTOP_SHELL_READY_FAILED", requestId: id });
+    assert.equal(events.at(-1), "destroyed");
+    if (failRenderer) assert.deepEqual(events, ["app-ready", "destroyed"]);
+  }
+  for (const argv of [["--codeflow-shell-ready=expired"], [`--codeflow-shell-ready=${id}`, `--codeflow-shell-ready=${id}`]]) {
+    await assert.rejects(vm.runInContext(`confirmShellSwitchReady(${JSON.stringify(argv)})`, context), /DESKTOP_SHELL_READY_ARGUMENT_INVALID/u);
+  }
+  const bootstrap = source.slice(source.indexOf("void app.whenReady().then(async () =>"));
+  assert.ok(bootstrap.indexOf("await confirmShellSwitchReady(process.argv)") < bootstrap.indexOf("resolveDesktopStorageLocation("));
+});
+
 /** 保留真实日志去重声明；测试不另造生产状态或去重实现。 */
 function mainLogDeclarations(ast: ts.SourceFile): ts.VariableStatement[] {
   return ast.statements.filter(ts.isVariableStatement).filter(statement => statement.declarationList.declarations.some(declaration =>

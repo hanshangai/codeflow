@@ -31,7 +31,8 @@ import { createUpdateNoticeController, type PreparedUpdateNotice } from "./updat
 type ApplicationDownloadOptions = Omit<DownloadOptions, "transport" | "rootDir" | "trustedReleaseKeys" | "receivedReporter">;
 type ApplicationDiscoveryOptions = { requestId?: string; signal?: AbortSignal };
 type DownloadedRelease = Awaited<ReturnType<typeof downloadReleaseBundle>>;
-type CombinedUpdateDiscovery = { resource: { manifest: DownloadedRelease['manifest']; manifestBytes: Uint8Array } | null; shell: ShellDiscovery };
+type CombinedUpdateDiscovery = { resource: { manifest: DownloadedRelease['manifest']; manifestBytes: Uint8Array } | null;
+  shell: ShellDiscovery; resourceError?: Error; shellError?: Error };
 type DesktopWindow = {
   show(): void;
   focus(): void;
@@ -468,7 +469,11 @@ export function createDesktopApplication(input: {
     const currentRuntime = runtime;
     const nativeUpdate = !config.boundary?.spawnHelper;
     let active: ActiveRelease | null;
-    try { active = nativeUpdate ? null : await resolveActiveRelease(input.dataDir, { trustedReleaseKeys: input.trustedReleaseKeys }); }
+    try {
+      const discovered = await discoverUpdatesInternal({ requestId, signal });
+      if (discovered.shellError) throw discovered.shellError;
+      active = nativeUpdate ? null : await resolveActiveRelease(input.dataDir, { trustedReleaseKeys: input.trustedReleaseKeys });
+    }
     catch (cause) { throw Object.assign(new Error("DESKTOP_SHELL_OPERATION_FAILED", { cause }), { code: "DESKTOP_SHELL_OPERATION_FAILED",
       requestId, deviceId: identity!.deviceId, shellId: null, failurePhase: "prepare", recovery: "not_needed" }); }
     const releaseDir = active?.releaseDir ?? input.initialReleaseDir, expectation = active?.manifest ?? initialExpectation;
@@ -523,14 +528,23 @@ export function createDesktopApplication(input: {
         },
         /** accepted后不可再由外部abort取消持久交接；真实drain成功才记录本轮事实。 */
         async drain() {
-          interrupted = true;
           if (!startupHeldId && (!nativeUpdate || currentRuntime.snapshot().status === "ready")) await controlUpdate(currentRuntime, "runtime.update.interrupt");
+          interrupted = true;
           await currentRuntime.drain(); shellDrainedRuntime = currentRuntime;
         },
-        /** helper确认释放且S0完整复核后才走恢复入口，绝不另造准入位。 */
+        /** 原生失败重启同一运行时，保留实际资源、schema 和启动参数，不退回首装基线。 */
         async resume() {
           if (!allowRestart) return;
-          if (interrupted) { await restartClient(releaseDir, expectation); interrupted = false; }
+          if (interrupted) {
+            if (nativeUpdate) {
+              if (runtime !== currentRuntime) throw new Error("DESKTOP_SHELL_RUNTIME_CHANGED");
+              if (shellDrainedRuntime !== currentRuntime) await currentRuntime.drain();
+              shellDrainedRuntime = undefined;
+              await currentRuntime.start();
+              await currentRuntime.waitReady();
+            } else await restartClient(releaseDir, expectation);
+            interrupted = false;
+          }
           else if (!startupHeldId && (!nativeUpdate || currentRuntime.snapshot().status === "ready")) await controlUpdate(currentRuntime, "runtime.update.cancel");
         },
         /** 与hot相同的退出等待边界，accepted后退出只等待交接结果。 */
@@ -701,17 +715,24 @@ export function createDesktopApplication(input: {
       if (response.ok !== true || response.deviceId !== identity!.deviceId || response.requestId !== options.requestId
         || Object.keys(response).length !== fields.length || Object.keys(response).some(field => !fields.includes(field))) invalid();
       /** 每个通道明确表达是否可用；不可用不得携带不可信或陈旧清单。 */
-      const availability = (value: unknown): { available: boolean; manifest?: unknown } => {
+      const availability = (value: unknown, channel: "resource" | "shell"): { available: boolean; manifest?: unknown; error?: Error } => {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return invalid();
-        const item = value as Record<string, unknown>, fields = ['available', ...(item.available === true ? ['manifest'] : [])];
+        const item = value as Record<string, unknown>, fields = ['available', ...(item.available === true ? ['manifest'] : Object.hasOwn(item, 'error') ? ['error'] : [])];
         if (typeof item.available !== 'boolean' || Object.keys(item).length !== fields.length || Object.keys(item).some(field => !fields.includes(field))) return invalid();
+        if (Object.hasOwn(item, 'error')) {
+          const error = item.error as { code?: unknown; requestId?: unknown } | null;
+          if (!error || typeof error !== 'object' || Array.isArray(error) || Object.keys(error).length !== 2
+            || typeof error.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,95}$/u.test(error.code) || error.requestId !== options.requestId) return invalid();
+          return { available: false, error: Object.assign(new Error(error.code), { code: error.code, requestId: options.requestId, updateChannel: channel }) };
+        }
         return item as { available: boolean; manifest?: unknown };
       };
-      const resource = availability(response.resource), shell = availability(response.shell);
+      const resource = availability(response.resource, 'resource'), shell = availability(response.shell, 'shell');
       const manifest = resource.available ? assertReleaseBundleManifest(resource.manifest) : null;
       return { resource: manifest ? { manifest, manifestBytes: Buffer.from(JSON.stringify(manifest), 'utf8') } : null,
         shell: shell.available ? { ok: true, available: true, deviceId: identity!.deviceId, requestId: options.requestId,
-          manifest: assertShellReleaseManifest(shell.manifest) } : { ok: true, available: false, deviceId: identity!.deviceId, requestId: options.requestId } };
+          manifest: assertShellReleaseManifest(shell.manifest) } : { ok: true, available: false, deviceId: identity!.deviceId, requestId: options.requestId },
+        ...(resource.error ? { resourceError: resource.error } : {}), ...(shell.error ? { shellError: shell.error } : {}) };
     })();
     checkDiscoveries?.set(options.requestId, flight);
     return flight;
@@ -722,7 +743,9 @@ export function createDesktopApplication(input: {
     bundleDetails.requestId = options.requestId;
     bundleDetails.phase = "discovery";
     if (conditional && operation === 'checking') {
-      const discovered = (await discoverUpdatesInternal(options)).resource;
+      const response = await discoverUpdatesInternal(options);
+      if (response.resourceError) throw response.resourceError;
+      const discovered = response.resource;
       if (!discovered || discovered.manifest.releaseId === excludeReleaseId) { bundleDetails.result = 'none'; bundleDetails.target = null; return null; }
       return discovered;
     }
@@ -1093,6 +1116,7 @@ export function createDesktopApplication(input: {
     shellDetails = { requestId: null, target: null, phase: null,
       result: input.shellUpdate || process.platform !== "darwin" ? "unknown" : "manual_required", failure: null };
     let checkingShell = false;
+    let resourceFailure: unknown;
     networkContext = { signal, retry: createUpdateNetworkRetry({ signal,
       onExhausted() {
         if (!["healthy", "restored", "unavailable"].includes(bundleDetails.result)) bundleDetails.result = "manual_required";
@@ -1114,7 +1138,6 @@ export function createDesktopApplication(input: {
             // 授权拒绝只作废当前候选；后续发现结果按服务器真实情况保留，不能一律标成撤回。
             preparedUpdate = undefined;
             downloaded = await downloadDiscoveredReleaseInternal({ requestId, signal }, true);
-            if (!downloaded) return null;
           }
         } else downloaded = await downloadDiscoveredReleaseInternal({ requestId, signal }, true);
         if (downloaded) {
@@ -1123,7 +1146,15 @@ export function createDesktopApplication(input: {
           preparedUpdate = prepared;
           bundleDetails.result = "prepared";
         }
-      } catch (error) { failure = error; throw error; }
+      } catch (error) {
+        failure = error;
+        // 用户已批准逐通道失败；资源错误保留给调用者，仍准备独立可用的壳。
+        if ((error as { updateChannel?: unknown } | null)?.updateChannel !== "resource") throw error;
+        resourceFailure = error;
+        bundleDetails.result = "failure";
+        updateCheckFailure = { requestId, error };
+        input.host.onUpdateError?.(error, { requestId, deviceId, ...(manual ? {} : { logOnly: true }) });
+      }
       finally {
         if (pendingUpdate) {
           try {
@@ -1137,7 +1168,14 @@ export function createDesktopApplication(input: {
       }
       if (updatesSuppressed) return active;
       // 优先完成已准备的资源；同轮创建壳绑定会在下次资源激活后失效。
-      if (preparedUpdate) return active;
+      if (preparedUpdate) {
+        const discovered = checkDiscoveries?.get(requestId);
+        if (discovered && (await discovered).shellError) {
+          checkingShell = true;
+          await checkShellInternal(requestId, signal, manual, allowRestart);
+        }
+        if (!input.shellUpdate || input.shellUpdate.boundary?.spawnHelper) return active;
+      }
       switchCommitted = false;
       signal.throwIfAborted();
       checkingShell = Boolean(input.shellUpdate);
@@ -1176,6 +1214,7 @@ export function createDesktopApplication(input: {
       updateFlightManualRequested = false;
       void notifyPreparedUpdate(seenInManualCheck);
       if (shellOwner && !stoppingUpdates) await application.exit();
+      if (resourceFailure !== undefined) throw resourceFailure;
       return active;
     });
     updateFlightManualRequested = false;
@@ -1246,11 +1285,23 @@ export function createDesktopApplication(input: {
     async resumeStartupUpdate(): Promise<boolean> {
       return false;
     },
-    /** 显式重启检查中新发现资源时，仍沿同一确认和退出入口完成重启。 */
+    /** 同次显式重启先交出已准备原生壳，待更新资源由新壳冷启动消费。 */
     async restartForUpdate(): Promise<void> {
       if (operation !== "idle" || !window || !input.host.relaunch) throw new Error("DESKTOP_RESTART_UNAVAILABLE");
       if (!preparedUpdate && shellDetails.result !== "prepared") throw new Error("DESKTOP_UPDATE_NOT_PREPARED");
+      const nativeUpdate = input.shellUpdate && !input.shellUpdate.boundary?.spawnHelper;
+      let shellRestartFailure: unknown;
+      if (nativeUpdate) {
+        try { await beginUpdateCheck(true, true); }
+        catch (error) {
+          // 已批准通道隔离：壳失败显式保留，只允许仍可信的待更新资源独立重启。
+          if (!preparedUpdate || updateCheckFailure || !shellUpdateFailure || shellOwner || !window) throw error;
+          shellRestartFailure = error;
+        }
+        if (!window || shellOwner || updatesSuppressed) return;
+      }
       if (!preparedUpdate) {
+        if (nativeUpdate) return;
         await beginUpdateCheck(true, true);
         if (preparedUpdate && window && !shellOwner) await application.restartForUpdate();
         return;
@@ -1265,6 +1316,7 @@ export function createDesktopApplication(input: {
       restartRequested = !shellOwner;
       try { await application.exit(); }
       finally { restartRequested = false; }
+      if (shellRestartFailure !== undefined) throw shellRestartFailure;
     },
     /** 页面侧更新操作失败写入同一失败日志；原因码走宿主既有白名单，正文只保留为因果链。 */
     reportUpdateError(input: DesktopUpdateClientErrorReport): void {

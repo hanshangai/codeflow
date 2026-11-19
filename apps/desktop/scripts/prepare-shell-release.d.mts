@@ -14,6 +14,8 @@ export function validateShellReleaseSigningInputs(input: {
   privateKeyFile: string;
   trustedKeysFile: string;
   outputDir: string;
+  /** 稳定签名工件根；默认用户目录 .codeflow/shell-releases/<计划环境>。 */
+  historyDir?: string;
   cacheDir?: string;
 }): Promise<{ shellId: string; keyId: string; privateKeyFile: string }>;
 
@@ -31,6 +33,8 @@ export function prepareShellRelease(input: {
   privateKeyFile: string;
   trustedKeysFile: string;
   outputDir: string;
+  /** 跨请求保留工件；重试返回该目录中原有的已签名包。 */
+  historyDir?: string;
   cacheDir?: string;
 }, dependencies?: {
   buildShellInstaller?: (input: { candidateDirectory: string; shellId: string; outputDir: string; cacheDir?: string }) => Promise<{

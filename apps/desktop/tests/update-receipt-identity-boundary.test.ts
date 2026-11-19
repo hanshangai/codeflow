@@ -127,15 +127,13 @@ for (const boundary of ["before-register", "before-receipt"] as const) {
   for (const fault of ["missing", "invalid-json", "same-device-new-key", "different-device"] as const) {
     test(`received remains pending when identity is ${fault} ${boundary} and resumes only with the original identity`, { timeout: 12_000 }, async t => {
       const f = await fixture(t, fault, boundary), requestId = crypto.randomUUID();
-      await assert.rejects(() => f.app.downloadAvailableReleaseBundle({ requestId }), error => {
+      await f.app.downloadAvailableReleaseBundle({ requestId });
+      await assert.rejects(() => f.app.flushReceipts(), error => {
         assert.ok(error instanceof Error);
-        assert.equal((error as Error & { code: string }).code, "DESKTOP_RELEASE_DOWNLOAD_FAILED");
+        assert.equal((error as Error & { code: string }).code, "DESKTOP_UPDATE_RECEIPT_SEND_FAILED");
         assert.equal((error as Error & { requestId: string }).requestId, requestId);
         assert.ok(error.cause instanceof Error);
-        assert.equal((error.cause as Error & { code: string }).code, "DESKTOP_UPDATE_RECEIPT_SEND_FAILED");
-        assert.equal((error.cause as Error & { requestId: string }).requestId, requestId);
-        assert.ok(error.cause.cause instanceof Error);
-        const identityFailure = error.cause.cause;
+        const identityFailure = error.cause;
         if (fault === "invalid-json") {
           assert.ok(identityFailure.cause instanceof Error);
           assert.equal(identityFailure.cause.message, "DESKTOP_DEVICE_IDENTITY_JSON_INVALID");

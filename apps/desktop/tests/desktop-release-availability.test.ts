@@ -161,6 +161,7 @@ test('availability false returns null without download or failure effects and re
 test('installation version equality does not replace a trusted archive identity', async t => {
   const f = await fixture(t); const requestId = crypto.randomUUID();
   const result = await f.app.downloadReleaseUpdateIfAvailable({ requestId });
+  await f.app.flushReceipts();
   assert.ok(result); assert.equal(result.requestId, requestId); assert.equal(result.manifest.archiveSha256, f.manifest.archiveSha256);
   assert.deepEqual(f.receipts.map(receipt => receipt.stage), ['received']);
   assert.equal(f.receipts[0]!.requestId, requestId); assert.deepEqual(f.failures(), []);
@@ -170,6 +171,7 @@ test('installation version equality does not replace a trusted archive identity'
 for (const cold of [false, true]) test(`an exact active release returns null after ${cold ? 'cold startup' : 'the original switch'}`, async t => {
   const f = await fixture(t); const result = await f.app.downloadReleaseUpdateIfAvailable(); assert.ok(result);
   await f.app.applyRelease(result.directory, { requestId: result.requestId });
+  await f.app.flushReceipts();
   assert.deepEqual(f.receipts.map(receipt => receipt.stage), ['received', 'verified', 'prepared', 'switched', 'healthy']);
   if (cold) await f.restart();
   f.requests.length = 0; f.actions.length = 0;
@@ -183,7 +185,8 @@ for (const cold of [false, true]) test(`an exact active release returns null aft
 test('a committed active pointer still skips the package when healthy receipt delivery failed', async t => {
   const f = await fixture(t); const result = await f.app.downloadReleaseUpdateIfAvailable(); assert.ok(result);
   f.control.failStage = 'healthy';
-  await assert.rejects(() => f.app.applyRelease(result.directory, { requestId: result.requestId }));
+  await f.app.applyRelease(result.directory, { requestId: result.requestId });
+  await assert.rejects(f.app.flushReceipts());
   assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
   const receipts = structuredClone(f.receipts); const failures = f.failures(); f.requests.length = 0;
   assert.equal(await f.app.downloadReleaseUpdateIfAvailable(), null);
@@ -325,13 +328,16 @@ test('download errors retain the original request context and existing download 
 
 test('the same download attempt replays received and keeps the existing stage journal', async t => {
   const f = await fixture(t); const requestId = crypto.randomUUID(); f.control.failStage = 'received';
-  await assert.rejects(() => f.app.downloadReleaseUpdateIfAvailable({ requestId }));
+  await f.app.downloadReleaseUpdateIfAvailable({ requestId });
+  await assert.rejects(f.app.flushReceipts());
   const original = await createUpdateReceiptJournal(f.dataDir).find(f.identity.deviceId, requestId, 'received'); assert.ok(original);
   f.control.failStage = undefined;
   const result = await f.app.downloadReleaseUpdateIfAvailable({ requestId }); assert.ok(result);
+  await f.app.flushReceipts();
   assert.equal(f.requests.filter(url => url.endsWith('/archive')).length, 1);
   assert.deepEqual(f.receipts, [original, original]);
   await f.app.applyRelease(result.directory, { requestId });
+  await f.app.flushReceipts();
   assert.equal(f.receipts.every(receipt => receipt.requestId === requestId), true);
   assert.deepEqual(f.receipts.slice(1).map(receipt => receipt.stage), ['received', 'verified', 'prepared', 'switched', 'healthy']);
 });
@@ -340,6 +346,7 @@ test('the strict discovery entry still downloads the exact active release', asyn
   const f = await fixture(t); const result = await f.app.downloadReleaseUpdateIfAvailable(); assert.ok(result);
   await f.app.applyRelease(result.directory, { requestId: result.requestId }); f.requests.length = 0;
   const strict = await f.app.downloadAvailableReleaseBundle();
+  await f.app.flushReceipts();
   assert.equal(strict.manifest.releaseId, f.manifest.releaseId);
   assert.equal(f.requests.includes('/api/software/desktop/release'), true);
   assert.equal(f.requests.includes('/api/software/desktop/release-availability'), false);

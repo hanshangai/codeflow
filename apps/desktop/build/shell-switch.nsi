@@ -11,6 +11,9 @@ OutFile "${OUTPUT_FILE}"
 !if ${NSIS_PTR_SIZE} != 4
   !error "Shell switch requires the existing x86 NSIS stub"
 !endif
+!ifndef SHELL_READY_WAIT_MS
+  !define SHELL_READY_WAIT_MS 30000
+!endif
 !ifndef SWITCH_WAIT_MS
   !define SWITCH_WAIT_MS 30000
 !endif
@@ -43,6 +46,12 @@ Var expectedType
 Var id
 Var candidateHandle
 Var candidateThread
+Var candidatePid
+Var readyPipe
+Var readyBuffer
+Var readyElapsed
+Var readyStarted
+Var readyConnected
 Var selectionPath
 Var userData
 Var sessionData
@@ -207,7 +216,7 @@ Function WriteJournal
     StrCpy $failure JOURNAL_TRUNCATE_FAILED
     Return
   ${EndIf}
-  FileWrite $journal '[switch]$\r$\nschema=1$\r$\nrequestId=$requestId$\r$\nfrom=$previous$\r$\nto=$target$\r$\nphase=$phase$\r$\nerrorCode=$failure$\r$\nwin32Error=$win32Error$\r$\ncleanupError=$cleanupError$\r$\nprocessExitCode=$processExitCode$\r$\n'
+  FileWrite $journal '[switch]$\r$\nschema=1$\r$\nrequestId=$requestId$\r$\nfrom=$previous$\r$\nto=$target$\r$\nphase=$phase$\r$\nerrorCode=$failure$\r$\nwin32Error=$win32Error$\r$\ncleanupError=$cleanupError$\r$\nprocessExitCode=$processExitCode$\r$\ncandidatePid=$candidatePid$\r$\n'
   IfErrors journal_write_failed
   System::Call 'kernel32::FlushFileBuffers(p $journal) i.r0 ?e'
   Pop $R1
@@ -340,6 +349,11 @@ Section
   StrCpy $sessionDataHandle 0
   StrCpy $committed false
   StrCpy $launched false
+  StrCpy $readyPipe 0
+  StrCpy $readyBuffer 0
+  StrCpy $candidateHandle 0
+  StrCpy $candidateThread 0
+  StrCpy $candidatePid 0
   System::Alloc 16
   Pop $0
   System::Call 'ole32::CoCreateGuid(p r0) i.r1'
@@ -538,6 +552,15 @@ Section
     StrCpy $phase prepared
     Call WriteJournal
     StrCmp $failure "" 0 failed
+    ; First-instance local pipe prevents stale ownership; client identity is checked against CreateProcess PID.
+    System::Call 'kernel32::CreateNamedPipeW(w "\\.\pipe\codeflow-shell-ready-$requestId", i 0x80003, i 9, i 1, i 128, i 128, i 0, p 0) p.s ?e'
+    Pop $win32Error
+    Pop $readyPipe
+    ${If} $readyPipe == -1
+      StrCpy $readyPipe 0
+      StrCpy $failure READY_PIPE_CREATE_FAILED
+      Goto failed
+    ${EndIf}
     !insertmacro CheckObject "shell-launch.ini" 0
     !insertmacro CheckObject "shells" 16
     !insertmacro CheckObject "shells\$target" 16
@@ -553,17 +576,28 @@ Section
     StrCmp $0 0 allocation_failed
     System::Call '*$0(i 68)'
     IntOp $1 $0 + 68
-    StrCpy $2 '$\"$root\shells\$target\CodeFlowAI.exe$\" $\"--user-data-dir=$quotedUserData$\" $\"--codeflow-session-data-dir=$quotedSessionData$\"'
+    StrCpy $2 '$\"$root\shells\$target\CodeFlowAI.exe$\" $\"--user-data-dir=$quotedUserData$\" $\"--codeflow-session-data-dir=$quotedSessionData$\" --codeflow-shell-ready=$requestId'
     System::Call 'kernel32::CreateProcessW(w "$root\shells\$target\CodeFlowAI.exe", w r2, p 0, p 0, i 0, i 0, p 0, w "$root\shells\$target", p r0, p r1) i.r3 ?e'
     Pop $win32Error
     ${If} $3 != 0
-      System::Call '*$1(p .r4, p .r5)'
+      System::Call '*$1(p .r4, p .r5, i .r6)'
       StrCpy $candidateHandle $4
       StrCpy $candidateThread $5
+      StrCpy $candidatePid $6
     ${EndIf}
     System::Free $0
     IntCmp $3 0 launch_failed
-    System::Call 'kernel32::WaitForSingleObject(p $candidateHandle, i 3000) i.r0 ?e'
+    Call WriteJournal
+    StrCmp $failure "" 0 stop_candidate
+    System::Call 'kernel32::GlobalAlloc(i 0x40, p 128) p.s'
+    Pop $readyBuffer
+    StrCmp $readyBuffer 0 ready_allocation_failed
+    StrCpy $readyElapsed 0
+    System::Call 'kernel32::GetTickCount() i.s'
+    Pop $readyStarted
+    StrCpy $readyConnected false
+  wait_ready:
+    System::Call 'kernel32::WaitForSingleObject(p $candidateHandle, i 0) i.r0 ?e'
     Pop $win32Error
     ${If} $0 == 0
       System::Call 'kernel32::GetExitCodeProcess(p $candidateHandle, *i .r1) i.r0 ?e'
@@ -573,27 +607,86 @@ Section
       ${If} $0 == 0
         StrCpy $failure TARGET_RESULT_FAILED
       ${EndIf}
-      !insertmacro CloseHandle $candidateThread
-      !insertmacro CloseHandle $candidateHandle
-      Goto failed
+      Goto stop_candidate
     ${ElseIf} $0 != 258
       StrCpy $failure TARGET_WAIT_FAILED
-      ; A failed wait cannot authorize restoring selection while a new candidate still runs.
-      System::Call 'kernel32::TerminateProcess(p $candidateHandle, i 1) i.r0'
-      System::Call 'kernel32::WaitForSingleObject(p $candidateHandle, i 5000) i.r0'
-      ${If} $0 != 0
-        StrCpy $launched true
-      ${EndIf}
-      !insertmacro CloseHandle $candidateThread
-      !insertmacro CloseHandle $candidateHandle
-      Goto failed
+      Goto stop_candidate
     ${EndIf}
-    StrCpy $launched true
-    !insertmacro CloseHandle $candidateThread
-    !insertmacro CloseHandle $candidateHandle
+    ${If} $readyConnected != true
+      System::Call 'kernel32::ConnectNamedPipe(p $readyPipe, p 0) i.r0 ?e'
+      Pop $win32Error
+      ${If} $0 != 0
+      ${OrIf} $win32Error == 535
+        StrCpy $readyConnected true
+        System::Call 'kernel32::GetNamedPipeClientProcessId(p $readyPipe, *i .r1) i.r0 ?e'
+        Pop $win32Error
+        ${If} $0 == 0
+        ${OrIf} $1 != $candidatePid
+          StrCpy $failure TARGET_READY_IDENTITY_INVALID
+          Goto stop_candidate
+        ${EndIf}
+      ${ElseIf} $win32Error != 536
+        StrCpy $failure TARGET_READY_CONNECT_FAILED
+        Goto stop_candidate
+      ${EndIf}
+    ${EndIf}
+    ${If} $readyConnected == true
+      System::Call 'kernel32::ReadFile(p $readyPipe, p $readyBuffer, i 128, *i .r2, p 0) i.r0 ?e'
+      Pop $win32Error
+      ${If} $0 != 0
+      ${AndIf} $2 > 0
+        System::Call 'kernel32::MultiByteToWideChar(i 20127, i 0, p $readyBuffer, i r2, w .r1, i 128) i.r0'
+        StrCpy $3 "$requestId:$candidatePid$\r$\n"
+        StrLen $4 $3
+        ${If} $0 != $4
+        ${OrIf} $2 != $4
+        ${OrIf} $1 != $3
+          StrCpy $failure TARGET_READY_RESPONSE_INVALID
+          Goto stop_candidate
+        ${EndIf}
+        Goto target_ready
+      ${ElseIf} $0 == 0
+      ${AndIf} $win32Error != 232
+        StrCpy $failure TARGET_READY_READ_FAILED
+        Goto stop_candidate
+      ${EndIf}
+    ${EndIf}
+    System::Call 'kernel32::GetTickCount() i.r0'
+    IntOp $readyElapsed $0 - $readyStarted
+    IntCmp $readyElapsed ${SHELL_READY_WAIT_MS} ready_timeout +1 ready_timeout
+    Sleep 20
+    Goto wait_ready
+  ready_allocation_failed:
+    StrCpy $failure READY_ALLOCATION_FAILED
+    Goto stop_candidate
+  ready_timeout:
+    StrCpy $failure TARGET_READY_TIMEOUT
+  stop_candidate:
+    ; Restore only after the exact candidate handle is signalled, including timeout and invalid ready.
+    System::Call 'kernel32::TerminateProcess(p $candidateHandle, i 1) i.r0 ?e'
+    Pop $cleanupError
+    System::Call 'kernel32::WaitForSingleObject(p $candidateHandle, i 5000) i.r0 ?e'
+    Pop $R1
+    ${If} $0 != 0
+      StrCpy $launched true
+      StrCpy $cleanupError $R1
+    ${Else}
+      StrCpy $cleanupError 0
+    ${EndIf}
+    Goto failed
+  target_ready:
     StrCpy $phase started
     Call WriteJournal
-    StrCmp $failure "" 0 failed
+    StrCmp $failure "" 0 stop_candidate
+    System::Call '*$readyBuffer(i 1)'
+    System::Call 'kernel32::WriteFile(p $readyPipe, p $readyBuffer, i 1, *i .r1, p 0) i.r0 ?e'
+    Pop $win32Error
+    ${If} $0 == 0
+    ${OrIf} $1 != 1
+      StrCpy $failure TARGET_READY_COMMIT_FAILED
+      Goto stop_candidate
+    ${EndIf}
+    StrCpy $launched true
     ${If} $cleanupError == 0
       SetErrorLevel 0
     ${Else}
@@ -691,6 +784,15 @@ Section
         SetErrorLevel 2
     ${EndIf}
   close_owned:
+    !insertmacro CloseHandle $candidateThread
+    !insertmacro CloseHandle $candidateHandle
+    !insertmacro CloseHandle $readyPipe
+    ${If} $readyBuffer != 0
+      System::Call 'kernel32::GlobalFree(p $readyBuffer) p.r0'
+      ${If} $0 != 0
+        SetErrorLevel 2
+      ${EndIf}
+    ${EndIf}
     !insertmacro CloseHandle $oldHandle
     !insertmacro CloseHandle $journal
     !insertmacro CloseHandle $rootHandle

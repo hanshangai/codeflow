@@ -50,7 +50,7 @@ async function waitFor(file: string) {
 }
 
 /** 独占隔离目录编译旧/新壳及真实切换器，不包含Client、数据库、安装和注册表操作。 */
-async function fixture(kind: "normal" | "wait" | "invalid-target" | "early-exit" | "timeout" | "replace-failure" | "partial-replace" = "normal") {
+async function fixture(kind: "normal" | "wait" | "invalid-target" | "early-exit" | "timeout" | "replace-failure" | "partial-replace" | "late-exit" | "hang" | "slow-ready" | "wrong-ready-pid" | "stale-ready" | "forged-client" = "normal") {
   assert.equal(await fs.access(source).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; }), true, "independent native shell switch is missing");
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "nsis-switch-"));
   const userData = path.join(root, "用户 空间 $"), sessionData = path.join(root, "会话 空间 $");
@@ -60,7 +60,7 @@ async function fixture(kind: "normal" | "wait" | "invalid-target" | "early-exit"
     const result = await execute(compiler!, ["/V2", "/INPUTCHARSET", "UTF8", ...args, input]);
     assert.equal(result.code, 0, `${root}\n${result.output}`);
   }
-  for (const id of ["old", "new"]) {
+  for (const id of kind === "forged-client" ? ["old", "new", "forger"] : ["old", "new"]) {
     const directory = path.join(root, "shells", id);
     await fs.mkdir(directory, { recursive: true });
     const input = path.join(root, `${id}.nsi`);
@@ -74,7 +74,7 @@ OutFile "${literal(path.join(directory, "CodeFlowAI.exe"))}"
 Section
   System::Call 'kernel32::GetCommandLineW() p.r0'
   System::Call 'shell32::CommandLineToArgvW(p r0, *i .r1) p.r2'
-  \${If} $1 == 3
+  \${If} $1 == 4
     FileOpen $6 "$EXEDIR\\argv.txt" w
     IntOp $3 $2 + 4
     System::Call '*$3(p .r4)'
@@ -85,12 +85,26 @@ Section
     System::Call 'kernel32::lstrcpynW(w .r5, p r4, i 8192) p'
     FileWriteUTF16LE $6 "$5$\\r$\\n"
     FileClose $6
+    IntOp $3 $2 + 12
+    System::Call '*$3(p .r4)'
+    System::Call 'kernel32::lstrcpynW(w .r5, p r4, i 8192) p'
+    StrCpy $7 $5 36 23
+    StrCpy $8 "\\\\.\\pipe\\codeflow-shell-ready-$7"
   \${EndIf}
   System::Call 'kernel32::LocalFree(p r2) p.r0'
   FileOpen $0 "$EXEDIR\\started.txt" w
   FileWrite $0 "started"
   FileClose $0
-  Sleep ${id === "old" ? kind === "timeout" || kind === "wait" ? 2500 : 500 : kind === "early-exit" ? 50 : 4000}
+  ${id === "new" && kind === "forged-client" ? `Exec '$\\"$EXEDIR\\\\..\\\\forger\\\\CodeFlowAI.exe$\\" --user-data-dir=x --codeflow-session-data-dir=y --codeflow-shell-ready=${requestId}'` : ""}
+  ${id !== "old" && !(id === "new" && kind === "forged-client") && !["early-exit", "late-exit", "hang"].includes(kind) ? `Sleep ${kind === "slow-ready" ? 3500 : 0}
+  System::Call 'kernel32::GetCurrentProcessId() i.r9'
+  ${kind === "wrong-ready-pid" ? 'StrCpy $9 1' : ""}
+  ${kind === "stale-ready" ? 'StrCpy $7 "00000000-0000-4000-8000-000000000000"' : ""}
+  System::Call 'kernel32::CreateFileW(w "$8", i 0xC0000000, i 0, p 0, i 3, i 0, p 0) p.r0'
+  FileWrite $0 "$7:$9$\\r$\\n"
+  System::Call 'kernel32::ReadFile(p r0, *i .r1, i 1, *i .r2, p 0) i.r3'
+  System::Call 'kernel32::CloseHandle(p r0) i.r1'` : ""}
+  Sleep ${id === "old" ? kind === "timeout" || kind === "wait" ? 2500 : 500 : kind === "early-exit" ? 50 : kind === "late-exit" ? 3500 : kind === "hang" ? 8000 : 4000}
   FileOpen $0 "$EXEDIR\\done.txt" w
   FileWrite $0 "done"
   FileClose $0
@@ -111,11 +125,34 @@ SectionEnd
     await fs.writeFile(input, changed, "utf8");
   }
   const executable = path.join(root, "switch.exe");
-  await compile(input, [`/DOUTPUT_FILE=${executable}`, `/DSWITCH_WAIT_MS=${kind === "timeout" ? 100 : 5000}`]);
+  await compile(input, [`/DOUTPUT_FILE=${executable}`, `/DSWITCH_WAIT_MS=${kind === "timeout" ? 100 : 5000}`, "/DSHELL_READY_WAIT_MS=4500"]);
   const args = ["--root", root, "--previous", "old", "--target", "new", "--pid", "2147483646", "--request-id", requestId,
     "--user-data-dir", userData, "--session-data-dir", sessionData];
   return { root, executable, args, userData, sessionData };
 }
+
+for (const kind of ["late-exit", "hang", "wrong-ready-pid", "stale-ready", "forged-client"] as const) {
+  test(`native switch rejects ${kind} and stops its real candidate before rollback`, { skip }, async () => {
+    const f = await fixture(kind), result = await execute(f.executable, f.args);
+    assert.notEqual(result.code, 0, f.root);
+    assert.equal(await fs.readFile(path.join(f.root, "shell-launch.ini"), "ascii"), original);
+    const journal = await fs.readFile(path.join(f.root, "shell-switch.ini"), "ascii");
+    assert.match(journal, /phase=rolled-back\r\n/u);
+    assert.match(journal, new RegExp(`requestId=${requestId}\\r\\n`));
+    assert.match(journal, /candidatePid=[1-9][0-9]*\r\n/u);
+    assert.match(journal, new RegExp(`errorCode=${kind === "late-exit" ? "TARGET_EXITED_EARLY" : kind === "hang" ? "TARGET_READY_TIMEOUT" : kind === "forged-client" ? "TARGET_READY_IDENTITY_INVALID" : "TARGET_READY_RESPONSE_INVALID"}\\r\\n`));
+    if (kind !== "late-exit") await assert.rejects(fs.access(path.join(f.root, "shells/new/done.txt")), { code: "ENOENT" });
+    if (kind === "forged-client") await waitFor(path.join(f.root, "shells/forger/done.txt"));
+  });
+}
+
+test("native switch waits beyond three seconds for an explicit shell ready confirmation", { skip }, async () => {
+  const f = await fixture("slow-ready"), began = Date.now(), result = await execute(f.executable, f.args);
+  assert.equal(result.code, 0, f.root);
+  assert.ok(Date.now() - began >= 3500);
+  assert.match(await fs.readFile(path.join(f.root, "shell-switch.ini"), "ascii"), /phase=started\r\n/u);
+  await waitFor(path.join(f.root, "shells/new/done.txt"));
+});
 
 test("native switch waits for the exact old process, commits selection and starts without business resources", { skip }, async () => {
   const f = await fixture("wait");

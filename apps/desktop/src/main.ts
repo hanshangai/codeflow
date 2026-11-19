@@ -311,6 +311,40 @@ async function exitCandidateFailure(request: CandidateShellHealthRequest | null,
   } finally { app.exit(1); }
 }
 
+/** 普通重启保留真实 profile，移除已经结束的单次壳握手，避免重连失效执行器。 */
+function relaunchDesktop(): void {
+  app.relaunch({ args: process.argv.slice(1).filter(value => !value.startsWith("--codeflow-shell-ready=")) });
+}
+
+/** 更新候选仅以壳内置沙箱渲染成功确认就绪；普通启动不读取更新事务或业务数据。 */
+async function confirmShellSwitchReady(argv: readonly string[]): Promise<void> {
+  const requests = argv.filter(value => value.startsWith("--codeflow-shell-ready"));
+  if (!requests.length) return;
+  const requestId = requests[0]?.slice("--codeflow-shell-ready=".length);
+  if (process.platform !== "win32" || requests.length !== 1 || requests[0] !== `--codeflow-shell-ready=${requestId}`
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(requestId ?? "")) {
+    throw new Error("DESKTOP_SHELL_READY_ARGUMENT_INVALID");
+  }
+  try {
+    await app.whenReady();
+    const window = new BrowserWindow({ show: false, webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false,
+      partition: `codeflow-shell-ready-${requestId}` } });
+    try {
+      await window.loadURL("data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Ctitle%3ECodeFlow%20shell%3C%2Ftitle%3E");
+      if (window.webContents.isDestroyed()) throw new Error("DESKTOP_SHELL_READY_WINDOW_INVALID");
+      const fd = fs.openSync(`\\\\.\\pipe\\codeflow-shell-ready-${requestId}`, "r+");
+      try {
+        const ready = Buffer.from(`${requestId}:${process.pid}\r\n`, "ascii");
+        if (fs.writeSync(fd, ready) !== ready.length) throw new Error("DESKTOP_SHELL_READY_WRITE_FAILED");
+        const committed = Buffer.alloc(1);
+        if (fs.readSync(fd, committed, 0, 1, null) !== 1 || committed[0] !== 1) throw new Error("DESKTOP_SHELL_READY_COMMIT_FAILED");
+      } finally { fs.closeSync(fd); }
+    } finally { window.destroy(); }
+  } catch (cause) {
+    throw Object.assign(new Error("DESKTOP_SHELL_READY_FAILED", { cause }), { code: "DESKTOP_SHELL_READY_FAILED", requestId });
+  }
+}
+
 if (process.versions.electron) {
   // 候选壳只测自身窗口能力；独立临时profile，不读取账号、Client或业务库。
   if (process.argv.some(value => value.startsWith("--codeflow-shell-self-test"))) {
@@ -534,6 +568,7 @@ if (process.versions.electron) {
     // Windows 通知按 AUMID 关联开始菜单快捷方式；必须在 ready 前固定。
     if (process.platform === "win32") app.setAppUserModelId("ai.codeflow.codeflowai");
     void app.whenReady().then(async () => {
+      await confirmShellSwitchReady(process.argv);
       // 无边框窗口不需要原生菜单栏；macOS 保留最小系统菜单以维持 Cmd+Q/复制粘贴。
       if (process.platform === "darwin") {
         // 不挂载默认菜单：默认菜单会向用户暴露 Reload 与 DevTools。
@@ -936,7 +971,7 @@ if (process.versions.electron) {
             window.webContents.send("desktop:update-progress", progress);
           },
           /** 用户确认重启后先登记重启意图，退出仍由原 owner 完成清理。 */
-          relaunch: () => { app.relaunch(); },
+          relaunch: relaunchDesktop,
           quit: () => { quitAllowed = true; app.quit(); },
         },
       });
@@ -998,7 +1033,7 @@ if (process.versions.electron) {
         recovery.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
         recovery.webContents.on("will-navigate", (event, url) => {
           event.preventDefault();
-          if (url === "codeflow-recovery://retry") { quitAllowed = true; app.relaunch(); app.exit(0); }
+          if (url === "codeflow-recovery://retry") { quitAllowed = true; relaunchDesktop(); app.exit(0); }
           else if (url === "codeflow-recovery://close") { quitAllowed = true; app.exit(1); }
         });
         recovery.on("closed", () => { quitAllowed = true; app.exit(1); });

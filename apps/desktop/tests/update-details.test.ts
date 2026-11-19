@@ -59,12 +59,14 @@ async function fixture(t: test.TestContext, network = true, start = true) {
       requests.push(request.url!); response.setHeader("content-type", "application/json");
       if (request.url!.endsWith("/devices/register")) response.end(JSON.stringify({ ok: true, deviceId: identity.deviceId,
         publicKeySha256: desktopDevicePublicKeySha256(identity.publicKeyBase64) }));
-      else if (request.url!.includes("release-availability")) {
+      else if (request.url!.includes("release-availability") || request.url === "/api/software/desktop/update-availability") {
         if (control.transientFailures > 0) { control.transientFailures--; response.writeHead(503, { "retry-after": "0" }); response.end("{}"); return; }
         if (control.failDiscovery) { response.writeHead(403); response.end("{}"); return; }
-        response.end(JSON.stringify({ ok: true, available: control.available, deviceId: identity.deviceId, requestId: meta.requestId,
-          ...(control.available ? { manifest: control.badSignature ? { ...manifest, signature: `${"A".repeat(86)}==` }
-            : control.useAlternative ? alternative : manifest } : {}) }));
+        const resource = { available: control.available, ...(control.available ? { manifest: control.badSignature ? { ...manifest, signature: `${"A".repeat(86)}==` }
+          : control.useAlternative ? alternative : manifest } : {}) };
+        response.end(JSON.stringify(request.url === "/api/software/desktop/update-availability"
+          ? { ok: true, deviceId: identity.deviceId, requestId: meta.requestId, resource, shell: { available: false } }
+          : { ok: true, deviceId: identity.deviceId, requestId: meta.requestId, ...resource }));
       } else if (request.url!.endsWith("/archive")) {
         if (control.failArchive) { response.writeHead(403); response.end("{}"); return; }
         await control.holdArchive?.();
@@ -210,9 +212,9 @@ for (const failWeb of [1, 2]) test(`${failWeb === 1 ? "restored" : "unavailable"
 test("receipt delivery failure preserves already observed local healthy result", async t => {
   const f = await fixture(t); f.control.failReceipt = "healthy";
   await f.app.checkForUpdates(); assert.equal((await details(f.bridge)()).bundle.result, "prepared");
-  await f.restart(); const value = await details(f.bridge)();
+  await f.restart(); await assert.rejects(f.app.flushReceipts()); const value = await details(f.bridge)();
   assert.equal(value.bundle.result, "healthy"); assert.equal(value.current.bundle?.releaseId, "details-release");
-  assert.ok(value.bundle.failure);
+  assert.equal(value.bundle.failure, null);
   assert.ok((await f.bridge.getUpdateState!()).updateReceiptFailure);
 });
 
@@ -258,11 +260,11 @@ test("local healthy version is visible while its startup ACK is pending and its 
   await f.app.checkForUpdates(); assert.equal((await details(f.bridge)()).bundle.result, "prepared");
   const waiting = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
   f.control.holdHealthy = async () => { entered(); await gate; }; f.control.transientReceipts = 1;
-  const restarting = f.restart(); await waiting;
+  await f.restart(); const flushing = f.app.flushReceipts(); await waiting;
   try { const value = await details(f.bridge)(); assert.equal(value.bundle.result, "healthy"); assert.equal(value.current.bundle?.releaseId, "details-release"); }
   finally { release(); }
-  await restarting; const value = await details(f.bridge)();
-  assert.equal(value.bundle.result, "healthy"); assert.ok(value.bundle.failure);
+  await assert.rejects(flushing); const value = await details(f.bridge)();
+  assert.equal(value.bundle.result, "healthy"); assert.equal(value.bundle.failure, null);
   assert.ok((await f.bridge.getUpdateState!()).updateReceiptFailure);
 });
 
