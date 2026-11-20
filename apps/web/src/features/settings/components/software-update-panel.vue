@@ -675,7 +675,7 @@ watch(() => [configStore.serverWsOrigin, configStore.sessionToken, configStore.u
         <div
           v-for="item in displayItems"
           :key="item.engineType"
-          style="border: 1px solid var(--app-border); border-radius: 12px; padding: 12px; background: var(--app-panel-bg); display: grid; gap: 8px"
+          style="border: 1px solid var(--app-border); border-radius: 12px; padding: 12px; background: var(--app-panel-bg); display: grid; gap: 8px; min-width: 0"
         >
           <div style="display: flex; align-items: flex-start; gap: 8px">
             <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0">
@@ -862,6 +862,8 @@ watch(() => [configStore.serverWsOrigin, configStore.sessionToken, configStore.u
 }
 
 .swupd__path {
+  min-width: 0;
+  max-width: 100%;
   overflow-wrap: anywhere;
   word-break: break-word;
   white-space: normal;

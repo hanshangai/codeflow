@@ -4,7 +4,7 @@ import { useRouter } from "vue-router";
 import { ExportOutlined } from "@ant-design/icons-vue";
 import { describeUserFacingError, formatDesktopVersion, type DesktopUpdateDetails, type DesktopUpdateDiagnostics, type DesktopUpdateState } from "@codeflowai/shared";
 import { checkDesktopForUpdates, reportDesktopUpdateError, restartDesktopForUpdate, DesktopUpdateServiceError, getDesktopUpdateCapabilities, getDesktopUpdateDetails, getDesktopUpdateDiagnostics, getDesktopUpdateState } from "../../../services/desktop";
-import { desktopBundlePhaseLabels, desktopShellPhaseLabels, desktopUpdateOperationLabels, desktopUpdateResultLabels, formatDesktopCurrentVersion } from "../desktopUpdateLabels";
+import { desktopBundlePhaseLabels, desktopShellPhaseLabels, desktopUpdateOperationLabels, desktopUpdateResultLabels, formatDesktopCurrentVersion, resolveDesktopUpdateOutcome } from "../desktopUpdateLabels";
 import { openUpgradeNotes } from "../../../utils/upgradeNotes";
 
 const props = defineProps<{ active: boolean }>();
@@ -60,40 +60,20 @@ const preparedTargetText = computed(() => {
   return bundle || shell ? `版本 ${formatDesktopVersion(shell?.version ?? value.current.shellVersion, bundle?.version ?? value.current.bundle?.version ?? null)}` : "";
 });
 const restartDisabled = computed(() => !props.active || !capabilities.value.restart || !preparedTargetText.value || restarting.value || checkingBusy.value
+  || state.value?.checking || state.value?.operation === "checking" || state.value?.operation === "downloading" || state.value?.operation === "updating"
   || stateLoading.value || detailsLoading.value || !!stateError.value || !!detailsError.value || !state.value
   || state.value.stoppingUpdates || state.value.shellOwned || state.value.operation === "exiting");
-/** 首屏按资源与壳各自事实展示，任一健康结果不能代替整体完成。 */
+/** 状态摘要复用检查弹框口径；局部读取错误保留可见，稍后不改变宿主准备结果。 */
 const statusSummary = computed(() => {
   if (actionError.value) return "更新操作失败，请查看诊断。";
   if (stateError.value) return "更新状态读取失败，请稍后重试。";
-  if (checkingBusy.value) return "正在检查更新…";
+  if (detailsError.value) return "更新详情读取失败，请稍后重试。";
   if (!state.value) return stateLoading.value ? "正在读取更新状态…" : "尚未读取更新状态。";
   if (state.value.transportConfigured === false) return "更新源尚未配置，当前无法检查更新。";
   if (state.value.stoppingUpdates || state.value.shellOwned || state.value.operation === "exiting") return "桌面应用正在停止或交接更新。";
-  const current = details.value;
-  const bundleHealthy = current?.bundle.result === "healthy";
-  if (state.value.updateCheckFailure || state.value.shellUpdateFailure || current?.bundle.failure || current?.shell.failure
-    || current && (["failure", "manual_required", "unavailable", "revoked"].includes(current.bundle.result)
-      || ["failure", "unavailable", ...(isMacDesktop ? [] : ["manual_required"])].includes(current.shell.result))) {
-    return bundleHealthy ? "应用内容已更新，桌面壳更新未完成，请查看诊断。" : "更新未完成，请查看诊断。";
-  }
-  if (preparedTargetText.value) {
-    if (!isMacDesktop && current?.bundle.result === "prepared") {
-      return deferred.value ? "已保留待更新版本，下次正常启动时激活应用内容，并继续检查桌面壳更新。" : "应用内容已准备，重启后激活并继续检查桌面壳更新。";
-    }
-    return deferred.value ? "已保留待更新版本，下次正常启动时更新。" : "新版本已准备，重启应用后生效。";
-  }
-  if (current) {
-    const bundleLatest = current.bundle.result === "none" || current.bundle.result === "same";
-    const shellLatest = current.shell.result === "none" || current.shell.result === "same";
-    if (isMacDesktop && (bundleLatest || bundleHealthy)) return `${bundleHealthy ? "应用内容已更新" : "应用资源已是最新"}；macOS 桌面壳请手动下载安装。`;
-    if (bundleLatest && shellLatest && !current.shell.target) return "当前已是最新版本。";
-    if ((bundleLatest || bundleHealthy) && current.shell.result === "unknown") {
-      return `${bundleHealthy ? "应用内容已更新" : "应用内容已是最新"}，桌面壳尚未检查，请重新检查。旧版安装可能需要通过完整安装包更新桌面壳。`;
-    }
-    if (bundleHealthy && shellLatest || (bundleLatest || bundleHealthy) && current.shell.result === "healthy") return "更新已生效，当前运行版本已通过健康检查。";
-  }
-  return "查看当前版本，按需检查并准备更新。";
+  const summary = resolveDesktopUpdateOutcome({ details: details.value, state: state.value, isMacDesktop, checking: checkingBusy.value });
+  if (summary.title === "当前已是最新版本") return `${summary.title}。`;
+  return `${summary.title}。${deferred.value && preparedTargetText.value && summary.tone === "success" ? "已保留更新，下次启动时继续。" : summary.detail}`;
 });
 const failureSummary = computed(() => {
   const first = currentFailures.value[0];
@@ -159,13 +139,18 @@ async function loadState(): Promise<void> {
   }
 }
 
-/** 检查结算强制读取新快照；重复点击、失活和旧响应不能覆盖当前详情。 */
+/** 后台更新的详情刷新同时收敛宿主在途状态；读取失败不继续，旧响应不覆盖当前详情。 */
 async function loadDetails(afterCheck = false): Promise<void> {
   if (!props.active || disposed || !capabilities.value.details || detailsLoading.value && !afterCheck) return;
   const owner = activation, read = ++detailsRead;
   detailsLoading.value = true;
   detailsError.value = null;
   try {
+    if (!afterCheck && (state.value?.checking || state.value?.operation === "checking"
+      || state.value?.operation === "downloading" || state.value?.operation === "updating")) {
+      await loadState();
+      if (!isCurrent(owner) || read !== detailsRead || stateError.value) return;
+    }
     const result = await getDesktopUpdateDetails();
     if (isCurrent(owner) && read === detailsRead) details.value = result;
   } catch (error) {

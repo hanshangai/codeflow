@@ -9,7 +9,7 @@ import {
   getDesktopUpdateState, reportDesktopUpdateError, restartDesktopForUpdate, subscribeDesktopUpdateCheckRequested, subscribeDesktopUpdateProgress,
   takeDesktopUpdateCheckRequest,
 } from "../../../services/desktop";
-import { formatDesktopCurrentVersion } from "../desktopUpdateLabels";
+import { formatDesktopCurrentVersion, resolveDesktopUpdateOutcome, type DesktopUpdateOutcome } from "../desktopUpdateLabels";
 import { desktopUpdateCheckRequestTick } from "../desktopUpdateCheckRequest";
 import { activeDesktopUpdateNotice, dismissDesktopUpdateNoticeLater, hideDesktopUpdateNotice } from "../desktopUpdateNoticeState";
 import { openUpgradeNotes } from "../../../utils/upgradeNotes";
@@ -19,8 +19,6 @@ defineOptions({ name: "DesktopUpdateCheckModal" });
 const router = useRouter();
 /** 关闭更新弹窗后打开更新日志；桌面端交给系统浏览器。 */
 function openNotes(): void { close(); openUpgradeNotes(router); }
-
-type Outcome = { tone: "success" | "error" | "warning" | "info"; title: string; detail: string };
 
 const capabilities = getDesktopUpdateCapabilities();
 const open = ref(false);
@@ -36,6 +34,7 @@ let unsubscribeProgress: (() => void) | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let pollBusy = false;
 let run = 0;
+let snapshotRead = 0;
 let disposed = false;
 
 const currentRows = computed(() => [
@@ -46,7 +45,7 @@ const targetRows = computed(() => {
   const value = details.value;
   if (!value) return [];
   // same/failure/restored 时宿主仍保留目标快照，不能当成待安装的新版本展示。
-  const active = (result: string | null | undefined) => result === "prepared" || result === "unknown";
+  const active = (result: string | null | undefined) => result === "prepared" || result === "unknown" && updateInProgress.value;
   const bundle = active(value.bundle.result) ? value.bundle.target : null;
   const shell = active(value.shell.result) ? value.shell.target : null;
   if (!bundle && !shell) return [];
@@ -57,24 +56,15 @@ const targetRows = computed(() => {
 const versionRows = computed(() => [...currentRows.value, ...targetRows.value]);
 const prepared = computed(() => details.value?.bundle.result === "prepared" && !!details.value.bundle.target
   || details.value?.shell.result === "prepared" && !!details.value.shell.target);
-const restartDisabled = computed(() => !prepared.value || !capabilities.restart || checking.value || restarting.value || !!snapshotError.value
+const updateInProgress = computed(() => checking.value || state.value?.checking || state.value?.operation === "checking"
+  || state.value?.operation === "downloading" || state.value?.operation === "updating");
+const restartDisabled = computed(() => !prepared.value || !capabilities.restart || updateInProgress.value || restarting.value || !!snapshotError.value
   || !state.value || state.value.stoppingUpdates || state.value.shellOwned || state.value.operation === "exiting");
-
-/** 已准备的资源阶段不遮住随后进行的壳更新；只把活跃阶段翻译成用户动作。 */
-const phaseLabel = computed(() => {
-  const value = details.value;
-  const phase = value?.bundle.result === "unknown" ? value.bundle.phase
-    : value?.shell.result === "unknown" ? value.shell.phase : null;
-  if (phase === "download") return "正在下载更新";
-  if (phase === "verify" || phase === "compatibility" || phase === "health") return "正在校验更新";
-  if (phase && phase !== "discovery" && phase !== "read-active") return "正在准备更新";
-  return "正在检查更新";
-});
 
 /** 下载阶段字节百分比；宿主未推送或已离开下载阶段时隐藏。 */
 const downloadPercent = computed<number | null>(() => {
   const progress = updateProgress.value;
-  if (!checking.value || !progress) return null;
+  if (!updateInProgress.value || !progress || outcome.value.title !== "正在下载更新") return null;
   return Math.min(100, Math.max(0, Math.floor(progress.received * 100 / progress.total)));
 });
 const downloadSize = computed(() => downloadPercent.value !== null && updateProgress.value
@@ -83,72 +73,35 @@ const downloadSize = computed(() => downloadPercent.value !== null && updateProg
 /** macOS 桌面壳不参与自动更新，manual_required 是人工安装提示，不是失败。 */
 const isMacDesktop = typeof window !== "undefined" && window.codeflowDesktop?.platform === "darwin";
 
-/** 资源与壳均取得完成事实才报告整体成功，未检查不能推断为不适用。 */
-const outcome = computed<Outcome | null>(() => {
+/** 读取及操作错误优先，其余展示结论与设置页共用。 */
+const outcome = computed<DesktopUpdateOutcome>(() => {
   if (error.value) return { tone: "error", title: "更新未完成", detail: error.value };
   if (snapshotError.value) return { tone: "error", title: "更新状态读取失败", detail: snapshotError.value };
   if (!details.value) {
-    // 旧壳只有基础状态：检查已结束但没有详情可展示，明确告知而不是停在“准备检查”。
-    if (!checking.value && !capabilities.details) {
-      return { tone: "info", title: "检查已完成", detail: "当前桌面壳不提供更新详情，请到更新设置查看。" };
+    if (!updateInProgress.value && !capabilities.details) {
+      return { tone: "error", title: "更新结果无法读取", detail: "当前桌面程序不支持读取更新详情，请使用完整安装包更新。" };
     }
-    return null;
   }
-  if (checking.value) return null;
-  const value = details.value;
-  const bundleHealthy = value.bundle.result === "healthy";
-  const shellFailure = state.value?.shellUpdateFailure ?? value.shell.failure;
-  const failure = state.value?.updateCheckFailure ?? state.value?.shellUpdateFailure ?? value.bundle.failure ?? value.shell.failure;
-  if (failure) return { tone: "error", title: "更新未完成", detail: (bundleHealthy && shellFailure ? "应用内容已更新，桌面壳更新未完成。" : "")
-    + describeUserFacingError(failure.rootCause, "更新未完成，请到更新设置查看诊断。") };
-  const bundleLatest = value.bundle.result === "none" || value.bundle.result === "same";
-  const shellLatest = value.shell.result === "none" || value.shell.result === "same";
-  if (isMacDesktop && (bundleLatest || bundleHealthy) && value.shell.result === "manual_required") {
-    return { tone: "info", title: "需要手动安装更新", detail: `${bundleHealthy ? "应用内容已更新" : "应用内容已是最新"}，macOS 桌面应用请通过完整安装包更新。` };
-  }
-  if (bundleLatest && shellLatest && !value.shell.target) {
-    return { tone: "success", title: "当前已是最新版本", detail: "无需下载或安装更新" };
-  }
-  if (["failure", "manual_required", "unavailable", "revoked"].includes(value.bundle.result)
-    || ["failure", "unavailable", ...(isMacDesktop ? [] : ["manual_required"])].includes(value.shell.result)) {
-    return { tone: "error", title: "更新未完成", detail: (bundleHealthy ? "应用内容已更新，桌面壳更新未完成。" : "") + "请到更新设置查看诊断。" };
-  }
-  if (value.bundle.result === "restored" || value.shell.result === "restored") {
-    return { tone: "warning", title: "更新已回退", detail: "新版本未通过健康检查，已恢复原版本。" };
-  }
-  if (prepared.value) {
-    if (!isMacDesktop && value.bundle.result === "prepared") {
-      return { tone: "success", title: "重启并继续更新", detail: "应用内容已下载并校验完成。重启后将激活应用内容，并继续检查桌面壳更新。" };
-    }
-    return { tone: "success", title: "重启即可完成更新", detail: "更新已下载并校验完成。现在重启即可使用，也可以下次启动时更新。" };
-  }
-  if ((bundleLatest || bundleHealthy) && value.shell.result === "unknown") {
-    return { tone: "info", title: "桌面壳尚未检查", detail: `${bundleHealthy ? "应用内容已更新" : "应用内容已是最新"}，桌面壳尚未检查，请重新检查。旧版安装可能需要通过完整安装包更新桌面壳。` };
-  }
-  if (bundleHealthy && shellLatest || (bundleLatest || bundleHealthy) && value.shell.result === "healthy") {
-    return { tone: "success", title: "更新已生效", detail: "你正在使用更新后的版本。" };
-  }
-  if (value.bundle.target || value.shell.target) {
-    return { tone: "info", title: "更新尚未准备完成", detail: "请重新检查，完成下载和校验后即可重启更新。" };
-  }
-  return { tone: "info", title: "暂未确认可用更新", detail: "尚未取得完整的更新结果，请稍后重新检查。" };
+  return resolveDesktopUpdateOutcome({ details: details.value, state: state.value, isMacDesktop, checking: checking.value });
 });
 
 /** 展示直接派生自原检查、重启与错误事实，不维护另一套升级状态。 */
-const presentation = computed<Outcome>(() => {
+const presentation = computed<DesktopUpdateOutcome>(() => {
   if (error.value || snapshotError.value) return outcome.value!;
   if (restarting.value) return { tone: "info", title: "正在重启更新", detail: "应用将关闭并重新启动，请稍候。" };
-  if (checking.value) return { tone: "info", title: downloadPercent.value !== null ? "正在下载更新" : phaseLabel.value,
-    detail: "你可以继续使用 CodeFlow，更新会在后台准备。" };
-  return outcome.value ?? { tone: "info", title: "正在读取更新状态", detail: "正在获取当前版本与可用更新。" };
+  return outcome.value;
 });
 
 /** 每种结果只突出一个下一步；准备完成前不提供重启操作。 */
 const primaryAction = computed(() => {
   if (restarting.value) return { kind: "restart" as const, label: "正在重启…", disabled: true };
-  if (checking.value) return { kind: "close" as const, label: "后台继续", disabled: false };
-  if (presentation.value.tone === "error") return { kind: "check" as const, label: "重试", disabled: !capabilities.check };
+  if (error.value || snapshotError.value) {
+    if (!snapshotError.value && prepared.value && capabilities.restart) return { kind: "restart" as const, label: "重启并更新", disabled: restartDisabled.value };
+    return { kind: "check" as const, label: "重试", disabled: !capabilities.check || checking.value };
+  }
+  if (updateInProgress.value) return { kind: "close" as const, label: "后台继续", disabled: false };
   if (prepared.value && capabilities.restart) return { kind: "restart" as const, label: "重启并更新", disabled: restartDisabled.value };
+  if (presentation.value.tone === "error") return { kind: "check" as const, label: "重试", disabled: !capabilities.check };
   if (presentation.value.tone === "success" || prepared.value) return { kind: "close" as const, label: "完成", disabled: false };
   return { kind: "check" as const, label: "重新检查", disabled: !capabilities.check };
 });
@@ -171,10 +124,14 @@ function stopPolling(): void {
   pollTimer = null;
 }
 
+/** 同轮旧读取不停止新轮询；失败或已观察到结束才收口。 */
 async function poll(owner: number): Promise<void> {
   if (pollBusy) return;
   pollBusy = true;
-  try { await refreshSnapshots(owner); }
+  try {
+    const loaded = await refreshSnapshots(owner);
+    if (owner === run && (snapshotError.value || loaded && !updateInProgress.value)) stopPolling();
+  }
   finally { pollBusy = false; }
 }
 
@@ -183,21 +140,22 @@ function startPolling(owner: number): void {
   pollTimer = setInterval(() => { void poll(owner); }, 800);
 }
 
-/** 快照失败明确阻止本轮后续检查，旧快照不能覆盖失败结论。 */
+/** 按轮次与读取序号接收快照；慢轮询不覆盖最终读取，失败只作用于仍有效的读取。 */
 async function refreshSnapshots(owner: number): Promise<boolean> {
   if (disposed || owner !== run) return false;
+  const read = ++snapshotRead;
   try {
     const [nextState, nextDetails] = await Promise.all([
       capabilities.state ? getDesktopUpdateState() : Promise.resolve(null),
       capabilities.details ? getDesktopUpdateDetails() : Promise.resolve(null),
     ]);
-    if (disposed || owner !== run) return false;
+    if (disposed || owner !== run || read !== snapshotRead) return false;
     if (nextState) state.value = nextState;
     if (nextDetails) details.value = nextDetails;
     snapshotError.value = "";
     return true;
   } catch (cause) {
-    if (disposed || owner !== run) return false;
+    if (disposed || owner !== run || read !== snapshotRead) return false;
     snapshotError.value = failureText(cause);
     console.error("[desktop_update_check_snapshot_failed]", {
       code: cause instanceof DesktopUpdateServiceError ? cause.code : "DESKTOP_UPDATE_CHECK_SNAPSHOT_FAILED",
@@ -246,6 +204,7 @@ async function startCheck(): Promise<void> {
       checking.value = false;
       stopPolling();
       if (requested) await refreshSnapshots(owner);
+      if (owner === run && open.value && updateInProgress.value && !snapshotError.value) startPolling(owner);
     }
   }
 }
@@ -346,7 +305,7 @@ onBeforeUnmount(() => {
     <div class="update-check">
       <section class="update-check__summary" :class="`update-check__summary--${presentation.tone}`" role="status" aria-live="polite">
         <div class="update-check__symbol" aria-hidden="true">
-          <a-spin v-if="checking || restarting" />
+          <a-spin v-if="updateInProgress || restarting" />
           <CheckCircleFilled v-else-if="presentation.tone === 'success'" />
           <CloseCircleFilled v-else-if="presentation.tone === 'error'" />
           <InfoCircleOutlined v-else-if="presentation.tone === 'warning'" />
@@ -382,8 +341,8 @@ onBeforeUnmount(() => {
         </a-button>
         <div class="update-check__action-buttons">
           <a-button v-if="primaryAction.kind !== 'close'" :disabled="restarting" @click="close">{{ prepared ? '稍后' : '关闭' }}</a-button>
-          <a-button v-else-if="!checking && capabilities.check" type="text" @click="startCheck">重新检查</a-button>
-          <a-button :type="checking ? 'default' : 'primary'" :loading="restarting" :disabled="primaryAction.disabled" @click="performPrimaryAction">
+          <a-button v-else-if="!updateInProgress && capabilities.check" type="text" @click="startCheck">重新检查</a-button>
+          <a-button :type="updateInProgress ? 'default' : 'primary'" :loading="restarting" :disabled="primaryAction.disabled" @click="performPrimaryAction">
             {{ primaryAction.label }}
           </a-button>
         </div>

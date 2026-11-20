@@ -15,7 +15,7 @@ const { parse, compileScript } = createRequire(import.meta.url)("vue/compiler-sf
 const deviceId = "12345678-1234-4234-8234-123456789abc";
 
 /** 执行真实 SFC setup，替换宿主、生命周期和计时器以验证可见状态与操作。 */
-function setupComponent(t: test.TestContext, file: string, imports: Record<string, unknown>) {
+function setupComponent(t: test.TestContext, file: string, imports: Record<string, unknown>, props: object = {}) {
   const script = compileScript(parse(readFileSync(new URL(file, import.meta.url), "utf8")).descriptor, { id: "update-ui" }).content;
   const compiled = ts.transpileModule(script, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const unmount: Array<() => void> = [];
@@ -28,7 +28,7 @@ function setupComponent(t: test.TestContext, file: string, imports: Record<strin
     throw new Error(`unexpected component import: ${id}`);
   }, module, module.exports, () => 1, () => {});
   const scope = vue.effectScope();
-  const bindings = scope.run(() => module.exports.default.setup({}, { expose() {} }))!;
+  const bindings = scope.run(() => module.exports.default.setup(props, { expose() {} }))!;
   t.after(() => { unmount.forEach(callback => callback()); scope.stop(); });
   return bindings;
 }
@@ -65,21 +65,217 @@ function modalFixture(t: test.TestContext, canRestart = true, platform: "win32" 
 /** 设置页复用同一宿主快照，停用自动读取以单独验证首屏结论。 */
 function settingsFixture(t: test.TestContext, platform: "win32" | "darwin" = "win32") {
   const f = modalFixture(t, true, platform);
+  const props = vue.reactive({ active: false });
   const panel = setupComponent(t, "../src/features/settings/components/desktop-update-panel.vue", {
     "../../../services/desktop": desktop, "../desktopUpdateLabels": labels,
     "@ant-design/icons-vue": { ExportOutlined: {} },
     "../../../utils/upgradeNotes": { openUpgradeNotes() {} },
-  });
+  }, props);
   panel.state.value = structuredClone(f.state);
   panel.details.value = structuredClone(f.details);
-  return panel;
+  return { ...panel, props, hostState: f.state, hostDetails: f.details, bridge: f.bridge };
 }
+
+for (const bundle of ["none", "same"] as const) for (const shell of ["none", "same"] as const)
+test(`检查完成无更新时忽略历史目标，弹框和设置页一致：${bundle}/${shell}`, async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = bundle;
+  f.details.shell.result = shell;
+  f.details.shell.target = { shellId: "historical-shell", version: "1.0.0" };
+  await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.title, "当前已是最新版本");
+  assert.deepEqual(f.panel.targetRows.value, []);
+  assert.equal(f.panel.primaryAction.value.kind, "close");
+  assert.equal(f.panel.restartDisabled.value, true);
+  const settings = settingsFixture(t);
+  settings.details.value = structuredClone(f.details);
+  assert.equal(settings.statusSummary.value, "当前已是最新版本。");
+});
+
+test("检查已返回但目标未取得准备结果时明确失败，不暗示仍在下载", async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = "unknown";
+  await f.panel.startCheck();
+  assert.equal(f.panel.outcome.value.tone, "error");
+  assert.equal(f.panel.outcome.value.title, "检查更新失败");
+  assert.match(f.panel.outcome.value.detail, /结果不完整/u);
+  assert.deepEqual(f.panel.targetRows.value, []);
+  assert.equal(f.panel.primaryAction.value.label, "重试");
+});
+
+for (const result of ["cancelled", "postponed", "revoked", "restored"] as const)
+test(`更新结束原因明确展示且不把旧目标当作可安装更新：${result}`, async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = result;
+  await f.panel.startCheck();
+  const reason = { cancelled: /取消/u, postponed: /暂缓/u, revoked: /撤回/u, restored: /恢复原版本/u }[result];
+  assert.match(f.panel.outcome.value.detail, reason);
+  assert.notEqual(f.panel.outcome.value.title, "当前已是最新版本");
+  assert.deepEqual(f.panel.targetRows.value, []);
+  assert.equal(f.panel.restartDisabled.value, true);
+});
+
+test("宿主检查仍在进行时显示真实阶段，不能因当前调用已返回而显示结果不完整", async t => {
+  const f = modalFixture(t);
+  f.state.checking = true;
+  f.state.operation = "downloading";
+  f.details.bundle.result = "unknown";
+  f.details.bundle.phase = "download";
+  await f.panel.startCheck();
+  assert.equal(f.panel.presentation.value.title, "正在下载更新");
+  assert.equal(f.panel.primaryAction.value.kind, "close");
+  assert.equal(f.panel.restartDisabled.value, true);
+  const settings = settingsFixture(t);
+  settings.state.value = structuredClone(f.state);
+  settings.details.value = structuredClone(f.details);
+  assert.match(settings.statusSummary.value, /正在下载更新/u);
+  assert.equal(settings.restartDisabled.value, true);
+  f.state.checking = false;
+  f.state.operation = "idle";
+  f.details.bundle.result = "prepared";
+  await f.panel.poll(1);
+  assert.equal(f.panel.presentation.value.title, "新版本已下载，重启后生效");
+  assert.equal(f.panel.restartDisabled.value, false);
+});
+
+for (const phase of ["discovery", "download", "verify"] as const)
+test(`失败按实际阶段显示原因且设置页不报告成功：${phase}`, async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = "failure";
+  f.details.bundle.phase = phase;
+  await f.panel.startCheck();
+  const titles = { discovery: "检查更新失败", download: "下载更新失败", verify: "更新校验失败" };
+  assert.equal(f.panel.outcome.value.title, titles[phase]);
+  assert.equal(f.panel.primaryAction.value.label, "重试");
+  const settings = settingsFixture(t);
+  settings.details.value = structuredClone(f.details);
+  assert.ok(settings.statusSummary.value.startsWith(titles[phase]));
+});
+
+test("同轮慢轮询迟到不能覆盖检查结束后读到的已下载结果", async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = "unknown";
+  f.details.bundle.phase = "download";
+  f.state.checking = true;
+  let entered!: () => void, finish!: () => void, finishPoll!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const check = new Promise<void>(resolve => { finish = resolve; });
+  const gate = new Promise<void>(resolve => { finishPoll = resolve; });
+  f.bridge.checkForUpdates = async () => { entered(); await check; };
+  const work = f.panel.startCheck();
+  await started;
+  const oldState = structuredClone(f.state), oldDetails = structuredClone(f.details);
+  let stateReads = 0, detailReads = 0;
+  f.bridge.getUpdateState = async () => { if (++stateReads === 1) { await gate; return oldState; } return structuredClone(f.state); };
+  f.bridge.getUpdateDetails = async () => { if (++detailReads === 1) { await gate; return oldDetails; } return structuredClone(f.details); };
+  const poll = f.panel.poll(1);
+  try {
+    f.state.checking = false;
+    f.details.bundle.result = "prepared";
+    finish(); await work;
+    assert.equal(f.panel.restartDisabled.value, false);
+    finishPoll(); await poll;
+    assert.equal(f.panel.presentation.value.title, "新版本已下载，重启后生效");
+    assert.equal(f.panel.restartDisabled.value, false);
+  } finally { finish(); finishPoll(); await Promise.all([work, poll]); }
+});
+
+test("后台更新快照读取失败时显示重试，旧在途快照不能掩盖失败操作", async t => {
+  const f = modalFixture(t);
+  f.state.checking = true;
+  await f.panel.startCheck();
+  f.bridge.getUpdateState = async () => { throw new Error("SNAPSHOT_FAILED"); };
+  await f.panel.poll(1);
+  assert.equal(f.panel.presentation.value.tone, "error");
+  assert.equal(f.panel.primaryAction.value.kind, "check");
+  assert.equal(f.panel.primaryAction.value.label, "重试");
+});
+
+test("下载进度在进入校验阶段后隐藏，不能让旧字节进度覆盖真实阶段", async t => {
+  const f = modalFixture(t);
+  f.details.bundle.result = "unknown";
+  f.details.bundle.phase = "verify";
+  let entered!: () => void, finish!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  f.bridge.checkForUpdates = async () => { entered(); await gate; };
+  const work = f.panel.startCheck(); await started;
+  try {
+    f.panel.updateProgress.value = { received: 100, total: 100 };
+    assert.equal(f.panel.downloadPercent.value, null);
+    assert.equal(f.panel.presentation.value.title, "正在校验更新");
+  } finally { finish(); await work; }
+});
+
+test("资源尚未取得阶段时展示壳实际下载阶段", async t => {
+  const f = modalFixture(t);
+  f.state.checking = true;
+  f.details.bundle.result = "unknown";
+  f.details.bundle.phase = null;
+  f.details.shell.result = "unknown";
+  f.details.shell.phase = "download";
+  await f.panel.startCheck();
+  assert.equal(f.panel.presentation.value.title, "正在下载更新");
+});
+
+test("设置页稍后后发生另一通道失败，保留失败原因而非用下次启动提示覆盖", t => {
+  const panel = settingsFixture(t);
+  panel.deferUpdate();
+  panel.state.value.shellUpdateFailure = { requestId: "shell-failed", rootCause: toUpdateDiagnosticCause(new Error("DESKTOP_UPDATE_TRANSPORT_FAILED")) };
+  assert.match(panel.statusSummary.value, /网络|连接/u);
+});
+
+test("一通道下载时保留另一通道的失败说明，不被普通进度提示覆盖", async t => {
+  const f = modalFixture(t);
+  f.state.checking = true;
+  f.details.bundle.result = "failure";
+  f.state.updateCheckFailure = { requestId: "resource-failed", rootCause: toUpdateDiagnosticCause(new Error("DESKTOP_UPDATE_TRANSPORT_FAILED")) };
+  f.details.shell.result = "unknown";
+  f.details.shell.phase = "download";
+  await f.panel.startCheck();
+  assert.equal(f.panel.presentation.value.title, "正在下载更新");
+  assert.equal(f.panel.presentation.value.tone, "warning");
+  assert.match(f.panel.presentation.value.detail, /网络|连接/u);
+  assert.match(f.panel.presentation.value.detail, /仍在继续/u);
+});
+
+for (const failed of ["bundle", "shell"] as const)
+test(`一通道失败另一通道已下载时保留错误和可用重启入口：${failed}`, async t => {
+  const f = modalFixture(t);
+  const prepared = failed === "bundle" ? "shell" : "bundle";
+  f.details[failed].result = "failure";
+  f.details[prepared].result = "prepared";
+  if (prepared === "shell") f.details.shell.target = { shellId: "prepared-shell", version: "2.0.0" };
+  await f.panel.startCheck();
+  assert.equal(f.panel.presentation.value.tone, "error");
+  assert.equal(f.panel.primaryAction.value.kind, "restart");
+  assert.equal(f.panel.restartDisabled.value, false);
+  let restarts = 0;
+  f.bridge.restartForUpdate = async () => { restarts++; };
+  await f.panel.performPrimaryAction();
+  assert.equal(restarts, 1);
+});
+
+test("设置页后台更新结束后刷新版本同步收敛在途状态并开放重启", async t => {
+  const panel = settingsFixture(t);
+  panel.hostState.checking = true;
+  panel.hostDetails.bundle.result = "unknown";
+  panel.props.active = true;
+  await vue.nextTick(); await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(panel.restartDisabled.value, true);
+  panel.hostState.checking = false;
+  panel.hostDetails.bundle.result = "prepared";
+  await panel.loadDetails();
+  assert.equal(panel.state.value.checking, false);
+  assert.equal(panel.restartDisabled.value, false);
+  assert.match(panel.statusSummary.value, /重启后生效/u);
+});
 
 test("托盘弹框展示实际单一版本，prepared可重启，healthy已生效", async t => {
   const f = modalFixture(t);
   await f.panel.startCheck();
   assert.deepEqual(f.panel.currentRows.value, [{ label: "当前版本", value: "1.0.1108" }]);
-  assert.equal(f.panel.outcome.value.title, "重启并继续更新");
+  assert.equal(f.panel.outcome.value.title, "新版本已下载，重启后生效");
   assert.match(f.panel.outcome.value.detail, /重启后.*检查桌面壳/u);
   assert.equal(f.panel.targetRows.value[0].value, "1.0.1109.2");
   assert.equal(f.panel.restartDisabled.value, false);
@@ -91,6 +287,7 @@ test("托盘弹框展示实际单一版本，prepared可重启，healthy已生�
 
 for (const target of ["bundle", "shell", "both"] as const) test(`更新弹框${target}目标显示统一对外新版本`, async t => {
   const f = modalFixture(t);
+  f.state.checking = target !== "shell";
   f.details.current.bundle!.version = "2026.11.17.01";
   if (target !== "shell") {
     f.details.bundle.target!.version = "2026.11.17.02";
@@ -271,9 +468,9 @@ test("应用资源和桌面壳均已检查才显示最新结论", async t => {
   assert.equal(f.panel.outcome.value.detail, "无需下载或安装更新");
   f.details.shell = { requestId: null, target: null, phase: null, result: "unknown", failure: null };
   await f.panel.startCheck();
-  assert.equal(f.panel.outcome.value.tone, "info");
+  assert.equal(f.panel.outcome.value.tone, "error");
   assert.match(f.panel.outcome.value.detail, /桌面壳尚未检查/u);
-  assert.match(f.panel.outcome.value.detail, /旧版安装可能需要.*完整安装包/u);
+  assert.match(f.panel.outcome.value.detail, /结果不完整/u);
   assert.equal(f.panel.primaryAction.value.kind, "check");
   assert.doesNotMatch(f.panel.outcome.value.title, /最新版本/u);
 });
@@ -283,9 +480,9 @@ test("资源已生效但桌面壳未检查时不能显示整个更新已完成",
   f.details.bundle.result = "healthy";
   f.details.shell.result = "unknown";
   await f.panel.startCheck();
-  assert.equal(f.panel.outcome.value.tone, "info");
+  assert.equal(f.panel.outcome.value.tone, "error");
   assert.match(f.panel.outcome.value.detail, /应用内容已更新.*桌面壳尚未检查/u);
-  assert.match(f.panel.outcome.value.detail, /旧版安装可能需要.*完整安装包/u);
+  assert.match(f.panel.outcome.value.detail, /结果不完整/u);
   assert.equal(f.panel.primaryAction.value.kind, "check");
 });
 
@@ -311,7 +508,7 @@ test("资源与桌面壳都已完成才显示更新已生效", async t => {
   assert.equal(f.panel.outcome.value.title, "更新已生效");
   f.details.bundle.result = "unknown";
   await f.panel.startCheck();
-  assert.equal(f.panel.outcome.value.tone, "info");
+  assert.equal(f.panel.outcome.value.tone, "error");
   assert.doesNotMatch(f.panel.outcome.value.title, /已生效/u);
 });
 
@@ -382,7 +579,7 @@ test("托盘只准备壳更新时可重启，并展示将运行的组合版本",
   f.details.bundle = { requestId: null, target: null, phase: null, result: "same", failure: null };
   f.details.shell = { requestId: "shell:prepared", target: { shellId: "shell-next", version: "2.0.0" }, phase: "download", result: "prepared", failure: null };
   await f.panel.startCheck();
-  assert.equal(f.panel.outcome.value.title, "重启即可完成更新");
+  assert.equal(f.panel.outcome.value.title, "新版本已下载，重启后生效");
   assert.equal(f.panel.targetRows.value[0].value, "2.0.1108");
   assert.equal(f.panel.restartDisabled.value, false);
   assert.deepEqual(f.panel.currentRows.value, [{ label: "当前版本", value: "1.0.1108" }]);

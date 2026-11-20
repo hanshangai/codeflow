@@ -4,6 +4,8 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* 内容超宽时由内部区域滚动，避免整页横向偏移顶栏和侧边栏。 */
+  overflow: hidden;
 }
 
 .app-topbar {
