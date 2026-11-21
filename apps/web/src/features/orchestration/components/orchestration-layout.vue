@@ -43,6 +43,7 @@ import { useUiStore } from "../../../store/ui";
 import { useWorkspacesStore } from "../../../store/workspaces";
 import AssetAssistantPanel from "./AssetAssistantPanel.vue";
 import ClientStartupBanner from "../../../components/app-shell/ClientStartupBanner.vue";
+import { useClientStartupBanner } from "../../../components/app-shell/useClientStartupBanner";
 import DesktopPanelResizeHandle from "../../../components/layout/desktop-panel-resize-handle.vue";
 import { resolveLeftSidebarTrackWidth } from "../../../layouts/desktop/desktop-panel-sizing";
 import { deriveIntakeRunSummary } from "../task-intake-run-summary";
@@ -497,6 +498,7 @@ const scopedExecutionProposals = computed(() => {
 });
 const scopedArtifactCount = computed(() => scopedInstances.value.reduce((count, instance) => count + instance.runSummary.artifactCount, 0));
 const activeWorkspaceRuntimeState = computed(() => presence.activeWorkspaceRuntimeState);
+const clientStartupBanner = useClientStartupBanner(activeWorkspaceRuntimeState);
 const awaitingWorkspaceRuntime = computed(() =>
   !presence.isCurrentWorkspaceClientOnline
   && !orch.intakeComposerOpen
@@ -510,6 +512,7 @@ const awaitingWorkspaceRuntime = computed(() =>
 );
 const showClientStartupGuide = computed(() =>
   config.connected
+  && clientStartupBanner.visible.value
   && activeWorkspaceRuntimeState.value.kind !== "none"
   && activeWorkspaceRuntimeState.value.status !== "online"
   && activeWorkspaceRuntimeState.value.status !== "unknown",

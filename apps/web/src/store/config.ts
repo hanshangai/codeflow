@@ -71,6 +71,8 @@ export type ConfigState = {
   officeH5Resume: Partial<Record<OfficePlatform, { corpId: string; credential: string; expiresAt: number }>>;
   desktopRuntime: DesktopRuntimeState | null;
   desktopClient: OnlineClientInfo | null;
+  /** 本机 Client 身份；运行态失败时仍保留，用于区分远端 presence。 */
+  desktopClientId: string | null;
   desktopError: string | null;
   desktopCloudAccount: DesktopCloudAccountState | null;
   desktopCloudAccountError: string | null;
@@ -107,6 +109,7 @@ export const useConfigStore = defineStore("config", {
     officeH5Resume: {},
     desktopRuntime: null,
     desktopClient: null,
+    desktopClientId: null,
     desktopError: null,
     desktopCloudAccount: null,
     desktopCloudAccountError: null,
@@ -274,6 +277,7 @@ export const useConfigStore = defineStore("config", {
           throw new Error("DESKTOP_RUNTIME_INFO_INVALID");
         }
         this.desktopClient = { ...client, workspaceIds: [...client.workspaceIds] };
+        this.desktopClientId = client.clientId;
       } catch (error) {
         this.desktopClient = null;
         // 退出中的结构化拒绝是正常收尾，不刷新为错误态或弹窗。

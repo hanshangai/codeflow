@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import type { WorkspaceId } from "@codeflowai/shared";
-import { computed, ref } from "vue";
+import { computed } from "vue";
 import { useRouter } from "vue-router";
 
 import { useAdminStore } from "../../store/admin";
 import { useConfigStore } from "../../store/config";
 import type { ActiveWorkspaceRuntimeState } from "../../store/presence";
-import { useWorkspacesStore } from "../../store/workspaces";
 import { resolveDesktopRuntimeStatusHint } from "./desktopLocalClientStatus";
+import { useClientStartupBanner } from "./useClientStartupBanner";
 
 defineOptions({ name: "ClientStartupBanner" });
 
@@ -17,19 +16,9 @@ const props = defineProps<{
 
 const config = useConfigStore();
 const admin = useAdminStore();
-const workspaces = useWorkspacesStore();
 const router = useRouter();
+const { canManageSharedWorkspace, visible, dismiss } = useClientStartupBanner(computed(() => props.runtimeState));
 
-const currentSharedRole = computed(() => {
-  if (props.runtimeState.kind !== "shared") return null;
-  const workspaceId = String(config.workspaceId ?? "").trim();
-  if (!workspaceId) return null;
-  const workspace = workspaces.byId.get(workspaceId as WorkspaceId) ?? null;
-  return workspace?.shared?.currentUserRole ?? workspace?.shared?.effectiveAssetRole ?? null;
-});
-const canManageSharedWorkspace = computed(() =>
-  currentSharedRole.value === "enterprise_admin" || currentSharedRole.value === "workspace_admin",
-);
 const alertType = computed<"warning" | "error">(() =>
   props.runtimeState.kind === "shared" && props.runtimeState.status === "forbidden" ? "error" : "warning",
 );
@@ -55,23 +44,6 @@ const messageText = computed(() => {
 const showAction = computed(() => canManageSharedWorkspace.value || (!config.isDesktop && props.runtimeState.kind === "local"));
 const actionLabel = computed(() => props.runtimeState.kind === "shared" ? "共享空间设置" : "下载桌面版");
 
-const dismissedStateKey = ref<string | null>(null);
-/** 状态、工作区或错误变化后重新提示，避免一次关闭永久隐藏后续故障。 */
-const runtimeStateKey = computed(() => JSON.stringify([
-  String(config.workspaceId ?? ""),
-  props.runtimeState.kind,
-  props.runtimeState.status,
-  config.desktopRuntime?.status ?? null,
-  config.desktopRuntime?.requestId ?? null,
-  config.desktopError ?? null,
-]));
-const visible = computed(() => dismissedStateKey.value !== runtimeStateKey.value);
-
-/** 关闭仅隐藏当前状态；状态变化后恢复展示。 */
-function dismiss(): void {
-  dismissedStateKey.value = runtimeStateKey.value;
-}
-
 /** 共享空间保留管理入口，浏览器本地离线引导下载桌面版。 */
 function openPrimaryAction(): void {
   if (props.runtimeState.kind !== "shared") {
@@ -84,19 +56,14 @@ function openPrimaryAction(): void {
 </script>
 
 <template>
-  <a-alert v-if="visible" class="client-startup-banner" :type="alertType" show-icon>
+  <a-alert v-if="visible" class="client-startup-banner" :type="alertType" show-icon closable @close="dismiss">
     <template #message>
       <span class="client-startup-banner__message">
         <span class="client-startup-banner__detail">{{ messageText }}</span>
       </span>
     </template>
-    <template #action>
-      <span class="client-startup-banner__actions">
-        <a-button v-if="showAction" class="client-startup-banner__action" size="small" type="primary" @click="openPrimaryAction">{{ actionLabel }}</a-button>
-        <button class="client-startup-banner__close" type="button" aria-label="关闭提示" title="关闭提示" @click="dismiss">
-          <span aria-hidden="true">×</span>
-        </button>
-      </span>
+    <template v-if="showAction" #action>
+      <a-button class="client-startup-banner__action" size="small" type="primary" @click="openPrimaryAction">{{ actionLabel }}</a-button>
     </template>
   </a-alert>
 </template>
@@ -143,38 +110,6 @@ function openPrimaryAction(): void {
   background: linear-gradient(180deg, color-mix(in srgb, var(--app-accent, #c96442) 92%, white), var(--app-accent, #c96442));
   box-shadow: 0 8px 18px color-mix(in srgb, var(--app-accent, #c96442) 24%, transparent);
   font-weight: 700;
-}
-
-.client-startup-banner__actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.client-startup-banner__close {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: color-mix(in srgb, var(--app-text, #141413) 55%, transparent);
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.client-startup-banner__close:hover {
-  background: color-mix(in srgb, var(--app-text, #141413) 8%, transparent);
-  color: var(--app-text, #141413);
-}
-
-.client-startup-banner__close:focus-visible {
-  outline: 2px solid var(--app-accent, #c96442);
-  outline-offset: 2px;
 }
 
 .client-startup-banner :deep(.ant-alert-content) {

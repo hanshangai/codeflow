@@ -23,6 +23,8 @@ function fixture() {
   });
   const admin = vue.reactive({ setPanel() {} });
   const workspaces = vue.reactive({ byId: new Map([["remote-client:repo", { ownerClientId: "remote-client" }]]) });
+  const visible = vue.ref(true);
+  const banner = { visible, dismiss: () => { visible.value = false; }, canManageSharedWorkspace: vue.computed(() => false) };
   const descriptor = parse(readFileSync(filename, "utf8")).descriptor;
   const compiled = ts.transpileModule(compileScript(descriptor, { id: "client-startup-banner" }).content,
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -33,6 +35,7 @@ function fixture() {
     "../../store/config": { useConfigStore: () => config },
     "../../store/workspaces": { useWorkspacesStore: () => workspaces },
     "./desktopLocalClientStatus": { resolveDesktopRuntimeStatusHint },
+    "./useClientStartupBanner": { useClientStartupBanner: () => banner },
   };
   new Function("require", "module", "exports", compiled)((id: string) => {
     if (id === "vue") return vue;
@@ -64,17 +67,15 @@ function text(node: vue.VNode): string {
     ? (node.children as { default: () => vue.VNode[] }).default().filter(vue.isVNode).map(text).join("") : "";
 }
 
-test("本机运行时失败提示可关闭，状态变化后重新显示", () => {
+test("本机运行时失败提示可关闭", () => {
   const f = fixture();
   assert.equal(f.bindings.visible.value, true);
   const rendered = nodes(f.tree());
   assert.ok(rendered.map(text).join(" ").includes("本机运行环境启动失败或连接已中断"));
 
-  const close = rendered.find(node => node.type === "button" && node.props?.["aria-label"] === "关闭提示");
-  assert.ok(close);
-  (close.props!.onClick as () => void)();
+  const alert = rendered.find(node => (node.type as { name?: string } | null)?.name === "a-alert");
+  assert.ok(alert);
+  assert.ok("closable" in alert.props!);
+  (alert.props!.onClose as () => void)();
   assert.equal(f.bindings.visible.value, false);
-
-  f.props.runtimeState = { kind: "local", status: "online" };
-  assert.equal(f.bindings.visible.value, true);
 });

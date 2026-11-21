@@ -48,6 +48,7 @@ test("远端工作区所属 Client 在线时，本机运行时未就绪不覆盖
   config.workspaceId = "remote-client:repo";
   config.desktopRuntime = { status: "failed", requestId: "local", releaseId: null, errorCode: "CLIENT_BOOT_FAILED" };
   config.desktopClient = null;
+  config.desktopClientId = "local-client";
   workspaces.workspaces = [{
     id: "remote-client:repo", title: "Remote Repo", path: "/remote/repo",
     ownerClientId: "remote-client", createdAt: 1, updatedAt: 1,
@@ -70,6 +71,39 @@ test("远端工作区所属 Client 在线时，本机运行时未就绪不覆盖
 
   assert.deepEqual(presence.activeWorkspaceRuntimeState, { kind: "local", status: "online" });
   assert.equal(presence.isCurrentWorkspaceClientOnline, true);
+});
+
+test("陈旧的本机 Client presence 不能冒充远端在线", t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { codeflowDesktop: { getState() {}, request() {} } } });
+  t.after(() => original ? Object.defineProperty(globalThis, "window", original) : Reflect.deleteProperty(globalThis, "window"));
+  setActivePinia(createPinia());
+  const config = useConfigStore(), presence = usePresenceStore(), workspaces = useWorkspacesStore();
+  config.workspaceId = "local-client:repo";
+  config.desktopRuntime = { status: "failed", requestId: "local", releaseId: null, errorCode: "CLIENT_BOOT_FAILED" };
+  config.desktopClient = null;
+  config.desktopClientId = "local-client";
+  workspaces.workspaces = [{
+    id: "local-client:repo", title: "Local Repo", path: "/local/repo",
+    ownerClientId: "local-client", createdAt: 1, updatedAt: 1,
+  }] as any;
+  presence.applyPresenceEvent({
+    type: "presence.updated",
+    ts: 1,
+    payload: {
+      onlineWebCount: 1,
+      clientOnline: true,
+      onlineClients: [{
+        clientId: "local-client",
+        name: "Local Client",
+        version: "1.0.0",
+        connectedAt: 1,
+        workspaceIds: ["local-client:repo"],
+      }],
+    },
+  });
+
+  assert.deepEqual(presence.activeWorkspaceRuntimeState, { kind: "local", status: "offline" });
 });
 
 test("workspace Client offline errors are recognized and active notices are throttled", () => {

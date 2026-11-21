@@ -8,6 +8,7 @@ import ExplorerRightPanel from "../../features/explorer/components/explorer-righ
 import TerminalModal from "../../features/terminal/components/terminal-modal.vue";
 import AdminLayout from "../../features/admin/components/admin-layout.vue";
 import ClientStartupBanner from "../../components/app-shell/ClientStartupBanner.vue";
+import { useClientStartupBanner } from "../../components/app-shell/useClientStartupBanner";
 import DesktopPanelResizeHandle from "../../components/layout/desktop-panel-resize-handle.vue";
 import {
   DESKTOP_TABLET_KEPT_ALIVE_INCLUDE,
@@ -78,9 +79,11 @@ const primaryPaneProps = computed(() => {
     : { workspaceId, threadId: chat.primaryThreadId };
 });
 const activeWorkspaceRuntimeState = computed(() => presence.activeWorkspaceRuntimeState);
+const clientStartupBanner = useClientStartupBanner(activeWorkspaceRuntimeState);
 const showClientStartupGuide = computed(() =>
   primaryPane.value !== "orchestration"
   && config.connected
+  && clientStartupBanner.visible.value
   && activeWorkspaceRuntimeState.value.kind !== "none"
   && activeWorkspaceRuntimeState.value.status !== "online"
   && activeWorkspaceRuntimeState.value.status !== "unknown",

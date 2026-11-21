@@ -8,6 +8,7 @@ import InspectorPanel from "../../features/inspector/components/inspector-panel.
 import ExplorerRightPanel from "../../features/explorer/components/explorer-right-panel.vue";
 import TerminalModal from "../../features/terminal/components/terminal-modal.vue";
 import ClientStartupBanner from "../../components/app-shell/ClientStartupBanner.vue";
+import { useClientStartupBanner } from "../../components/app-shell/useClientStartupBanner";
 import {
   DESKTOP_TABLET_KEPT_ALIVE_INCLUDE,
   resolveDesktopTabletPrimaryPane,
@@ -48,9 +49,11 @@ const primaryPaneProps = computed(() => {
     : { workspaceId, threadId: chat.primaryThreadId };
 });
 const activeWorkspaceRuntimeState = computed(() => presence.activeWorkspaceRuntimeState);
+const clientStartupBanner = useClientStartupBanner(activeWorkspaceRuntimeState);
 const showClientStartupGuide = computed(() =>
   primaryPane.value !== "orchestration"
   && config.connected
+  && clientStartupBanner.visible.value
   && activeWorkspaceRuntimeState.value.kind !== "none"
   && activeWorkspaceRuntimeState.value.status !== "online"
   && activeWorkspaceRuntimeState.value.status !== "unknown",

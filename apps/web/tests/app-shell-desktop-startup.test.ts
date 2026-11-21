@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
 import { createPinia, setActivePinia } from "pinia";
-import { computed, ref, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import type { DesktopBridgeApi, DesktopRuntimeState } from "@codeflowai/shared";
 import { useConfigStore } from "../src/store/config.ts";
 import { useWorkspacesStore } from "../src/store/workspaces.ts";
@@ -39,11 +39,12 @@ function fixture(t: test.TestContext, options: { workspaces?: number; failure?: 
   setActivePinia(createPinia());
   const config = useConfigStore();
   const startupComplete = ref(false);
+  const presence = reactive({ activeWorkspaceRuntimeState: { kind: "none", status: "ready" } });
   const readinessCode = shell.body!.statements.filter(statement => ts.isVariableStatement(statement)
     && statement.declarationList.declarations.some(declaration => ["localWorkspaceReady", "currentWorkspaceReady"].includes(declaration.name.getText(ast))))
     .map(statement => statement.getText(ast)).join("\n");
-  const workspaceReady = new Function("config", "computed", "isDesktopWorkspace", "desktopStartupComplete",
-    ts.transpile(`${readinessCode}\nreturn currentWorkspaceReady;`, { target: ts.ScriptTarget.ES2022 }))(config, computed, isDesktopWorkspace, startupComplete);
+  const workspaceReady = new Function("config", "computed", "isDesktopWorkspace", "desktopStartupComplete", "presence",
+    ts.transpile(`${readinessCode}\nreturn currentWorkspaceReady;`, { target: ts.ScriptTarget.ES2022 }))(config, computed, isDesktopWorkspace, startupComplete, presence);
   const refreshAfterConnect = shell.body!.statements.find(statement => ts.isFunctionDeclaration(statement)
     && statement.name?.text === "refreshWorkspaceListAfterConnect");
   assert.ok(refreshAfterConnect);
@@ -56,9 +57,9 @@ function fixture(t: test.TestContext, options: { workspaces?: number; failure?: 
     } };
   const feedback = { error: () => events.push("error") };
   const diagnostics = { error: (...args: unknown[]) => { logs.push(args); }, warn: (...args: unknown[]) => { logs.push(args); } };
-  const refreshWorkspaceList = new Function("config", "workspaces", "ctx", "ensureWorkspaceSelectionStable", "fetchClientVersionInfo", "isCancelledRequestError", "console", "message", "desktopStartupComplete",
+  const refreshWorkspaceList = new Function("config", "workspaces", "ctx", "ensureWorkspaceSelectionStable", "fetchClientVersionInfo", "isCancelledRequestError", "console", "message", "desktopStartupComplete", "presence",
     ts.transpile(`${refreshAfterConnect.getText(ast)}\nreturn refreshWorkspaceListAfterConnect;`, { target: ts.ScriptTarget.ES2022 }))(
-    config, workspaces, { value: {} }, () => {}, async () => {}, isCancelledRequestError, diagnostics, feedback, startupComplete);
+    config, workspaces, { value: {} }, () => {}, async () => {}, isCancelledRequestError, diagnostics, feedback, startupComplete, presence);
   let poll!: () => void;
   let dispose!: () => void;
   const intervals: number[] = [];
@@ -75,7 +76,7 @@ function fixture(t: test.TestContext, options: { workspaces?: number; failure?: 
   );
   /** 排空真实状态查询、目录读取和轮询续体。 */
   const settle = async () => { for (let index = 0; index < 4; index++) await new Promise<void>(resolve => setImmediate(resolve)); };
-  return { config, events, logs, settle, intervals, dispose: () => dispose(), workspaceReady, refreshWorkspaceList, startupComplete, refreshes: () => refreshes, release: () => { held = false; }, clearFailure: () => { fail = undefined; },
+  return { config, presence, events, logs, settle, intervals, dispose: () => dispose(), workspaceReady, refreshWorkspaceList, startupComplete, refreshes: () => refreshes, release: () => { held = false; }, clearFailure: () => { fail = undefined; },
     poll: async () => { poll(); await settle(); } };
 }
 
@@ -126,6 +127,19 @@ test("云端先连上不能提前激活桌面工作区或绕过本机首次加�
   assert.equal(f.workspaceReady.value, false);
   f.config.connected = true;
   assert.equal(f.workspaceReady.value, true, "远端工作区仍依赖云端连接");
+});
+
+test("本机运行时失败时，远端在线工作区仍可激活", async t => {
+  const f = fixture(t);
+  f.startupComplete.value = true;
+  f.config.connected = true;
+  f.config.workspaceId = "remote-client:repo";
+  f.config.desktopRuntime = { status: "failed", requestId: "local", releaseId: null, errorCode: "CLIENT_BOOT_FAILED" };
+  f.config.desktopClient = null;
+  f.config.desktopClientId = "local-client";
+  f.presence.activeWorkspaceRuntimeState = { kind: "local", status: "online" };
+
+  assert.equal(f.workspaceReady.value, true);
 });
 
 test("延后首次加载得到空目录时才沿原入口打开设置", async t => {

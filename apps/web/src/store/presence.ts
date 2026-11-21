@@ -117,9 +117,10 @@ export const usePresenceStore = defineStore("presence", {
         if (!normalizedWorkspaceId) return { kind: "none", status: "ready" };
         const config = useConfigStore();
         if (config.isDesktop && !config.localRuntimeReady) {
-          // 本机运行时未就绪时，远端工作区仍以所属 Client 的在线 presence 为准，
-          // 避免另一台电脑已恢复后仍被判为本机离线。
-          if (this.clientForWorkspace(normalizedWorkspaceId)) return { kind: "local", status: "online" };
+          // 本机运行时未就绪时，仅采信其他 Client 的在线 presence；陈旧的本机 Client 不能冒充远端在线。
+          const localClientId = String(config.desktopClientId ?? "").trim();
+          const workspaceClient = this.ready && localClientId ? this.clientForWorkspace(normalizedWorkspaceId) : null;
+          if (workspaceClient && workspaceClient.clientId !== localClientId) return { kind: "local", status: "online" };
           const status = config.desktopRuntime?.status;
           return { kind: "local", status: status === "failed" || status === "stopped" ? "offline" : "unknown" };
         }

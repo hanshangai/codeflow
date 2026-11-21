@@ -112,11 +112,13 @@ async function fixture(t: test.TestContext, options?: {
   const route = reactive({ currentRoute: { value: { name: "chat", fullPath: "/chat", query: {} } } });
   const requestedThreadId = ref<ThreadId>(threadId);
   const desktopStartupComplete = ref(options?.startupComplete ?? true);
+  const presence = reactive({ captureActiveWorkspaceSnapshot: () => ({ state: "online" }), online: { onlineClients: [client] },
+    activeWorkspaceRuntimeState: { kind: "none", status: "ready" } });
   const readinessCode = shell.body.statements.filter(statement => ts.isVariableStatement(statement)
     && statement.declarationList.declarations.some(declaration => ["localWorkspaceReady", "currentWorkspaceReady"].includes(declaration.name.getText(ast))))
     .map(statement => statement.getText(ast)).join("\n");
-  const currentWorkspaceReady = new Function("config", "computed", "isDesktopWorkspace", "desktopStartupComplete",
-    ts.transpile(`${readinessCode}\nreturn currentWorkspaceReady;`, { target: ts.ScriptTarget.ES2022 }))(config, computed, isDesktopWorkspace, desktopStartupComplete);
+  const currentWorkspaceReady = new Function("config", "computed", "isDesktopWorkspace", "desktopStartupComplete", "presence",
+    ts.transpile(`${readinessCode}\nreturn currentWorkspaceReady;`, { target: ts.ScriptTarget.ES2022 }))(config, computed, isDesktopWorkspace, desktopStartupComplete, presence);
   const localWorkspaceReady = computed(() => isDesktopWorkspace(config, config.workspaceId ?? ""));
   const workspaceSwitching = ref(false);
   const sandbox: Record<string, any> = {
@@ -136,7 +138,7 @@ async function fixture(t: test.TestContext, options?: {
     resolveRequestedThreadId: () => requestedThreadId.value, resolveRouteThreadId: () => requestedThreadId.value,
     resolveSharedThreadOnlyRelatedToMe: () => null, workspaces, isSharedWorkspaceSelectionId, resolveStickyWorkspaceSelection,
     ws: { replaceLocalWorkspaceSubscription: () => {} },
-    presence: { captureActiveWorkspaceSnapshot: () => ({ state: "online" }), online: { onlineClients: [client] } },
+    presence,
     explorer: { resetForWorkspace: () => {} }, ui: { closeAllPreviewWindows: () => {} },
     markWorkspacePresenceFromCurrentSnapshot: () => ({ degraded: false }),
     settleRequestedThreadSelection: async (_key: string, _workspace: WorkspaceId, _route: ThreadId, requested: ThreadId) => {

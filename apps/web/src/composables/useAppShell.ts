@@ -240,8 +240,12 @@ export function useAppShell() {
   });
   const localWorkspaceReady = computed(() => isDesktopWorkspace(config, String(config.workspaceId ?? "")));
   /** 桌面身份和首次目录均完成后才激活会话，避免并发目录读取互相取消并遗漏列表。 */
-  const currentWorkspaceReady = computed(() => (!config.isDesktop || desktopStartupComplete.value)
-    && (localWorkspaceReady.value || (config.connected && (!config.isDesktop || config.localRuntimeReady))));
+  const currentWorkspaceReady = computed(() => {
+    // 本机运行时不可用时，其他机器已在线的工作区仍可沿云端连接激活。
+    const remoteOnline = presence.activeWorkspaceRuntimeState.status === "online";
+    return (!config.isDesktop || desktopStartupComplete.value || remoteOnline)
+      && (localWorkspaceReady.value || (config.connected && (!config.isDesktop || config.localRuntimeReady || remoteOnline)));
+  });
 
   /** 设置入口只接收已登记页签；桌面弹窗只保留模型配置。 */
   function normalizeSettingsTab(tab?: string): string {
@@ -1329,7 +1333,8 @@ export function useAppShell() {
 
   /** 云端目录刷新独立结算失败，不改变本机启动状态；启动前仍遵守本机就绪围栏。 */
   function refreshWorkspaceListAfterConnect(): void {
-    if (config.isDesktop && (!config.localRuntimeReady || !desktopStartupComplete.value)) return;
+    if (config.isDesktop && (!desktopStartupComplete.value
+      || (!config.localRuntimeReady && presence.activeWorkspaceRuntimeState.status !== "online"))) return;
     void workspaces.refresh(ctx.value)
       .then(() => {
         ensureWorkspaceSelectionStable();
