@@ -54,11 +54,10 @@ async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'd
   const actions: string[] = [];
   const failures: unknown[] = [];
   const serverErrors: unknown[] = [];
-  const control = { available: true, authorized: true, busy: false, confirm: true, badSignature: false, holdArchive: false,
+  const control = { available: true, authorized: true, busy: false, badSignature: false, holdArchive: false,
     failuresRemaining: 0, failReceipt: undefined as string | undefined, rejectLoadWeb: false, holdErrorBody: false,
     holdDiscovery: undefined as (() => Promise<void>) | undefined,
-    onCandidateStart: undefined as (() => Promise<void>) | undefined,
-    confirmUpdate: undefined as ((signal?: AbortSignal) => Promise<boolean>) | undefined };
+    onCandidateStart: undefined as (() => Promise<void>) | undefined };
   const server = http.createServer((request, response) => {
     void (async () => {
       const chunks: Buffer[] = [];
@@ -108,7 +107,6 @@ async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'd
   const retries: { requestId: string; retry: number }[] = [];
   const host: DesktopHost = { createWindow: () => window, async loadWeb(_window, releaseDir) { if (control.rejectLoadWeb && releaseDir.endsWith(manifest.releaseId)) { control.rejectLoadWeb = false; throw new Error('WEB_LOAD_FAILED'); } },
     createTray: () => ({ destroy() {} }), registerBridge: () => () => {}, quit() { actions.push('quit'); },
-    async confirmUpdate(_window, signal) { actions.push('confirm'); return control.confirmUpdate ? await control.confirmUpdate(signal) : control.confirm; },
     onUpdateError(error) { failures.push(error); }, onUpdateRetry(context) { retries.push(context); } };
   host.relaunch = () => { actions.push('relaunch'); };
   /** 原健康与更新控制协议保留，观察停止前的真实调用顺序。 */
@@ -309,14 +307,13 @@ test('periodic checks keep the active package and do not download or switch twic
 });
 
 test('prepared update waits for normal restart and resumes the original attempt', async t => {
-  const f = await fixture(t); f.control.busy = true; f.control.confirm = false;
+  const f = await fixture(t); f.control.busy = true;
   t.mock.timers.enable({ apis: ['setTimeout'] });
   f.app.startAutomaticUpdates(); assert.equal(await f.app.checkForUpdates(), null);
   await f.app.flushReceipts();
   const requestId = f.receipts[0]!.requestId;
   t.mock.timers.tick(60 * 60 * 1000);
   assert.equal(f.actions.filter(action => action === 'confirm').length, 0);
-  f.control.confirm = true;
   assert.equal(await f.app.checkForUpdates(), null);
   await f.restart();
   await f.app.flushReceipts();

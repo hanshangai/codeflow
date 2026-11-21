@@ -385,6 +385,191 @@ test("drain timeout marks the runtime failed", async (t) => {
   assert.equal(runtime.snapshot().errorCode, "CLIENT_DRAIN_TIMEOUT");
 });
 
+test("explicit shutdown forces a timed out Client and waits for its close", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-force-stop-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  let forced = 0;
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async target => { assert.equal(target, child); forced++; child.emit("exit", null, "SIGKILL"); } });
+  await runtime.start();
+  await runtime.drain(1, { force: true });
+  assert.equal(forced, 1);
+  assert.equal(runtime.snapshot().status, "stopped");
+  assert.equal(runtime.snapshot().pid, null);
+});
+
+test("explicit shutdown accepts an already closed failed Client without pretending it saved successfully", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-failed-stop-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child });
+  await runtime.start();
+  const stopping = runtime.drain(100, { force: true });
+  child.emit("exit", 1, null);
+  await stopping;
+  assert.equal(runtime.snapshot().status, "stopped");
+  assert.equal(runtime.snapshot().errorCode, "CLIENT_EXIT_1");
+});
+
+test("failed force termination still blocks release of the live Client", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-force-failed-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async () => { throw new Error("FORCE_TERMINATION_DENIED"); } });
+  await runtime.start();
+  await assert.rejects(runtime.drain(1, { force: true }), /CLIENT_FORCE_STOP_FAILED/);
+  assert.equal(runtime.snapshot().status, "failed");
+  child.emit("exit", 0, null);
+});
+
+test("a Client that already exited waits for close without targeting its old PID", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-late-close-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  let forced = false;
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async () => { forced = true; throw new Error("OLD_PID_MUST_NOT_BE_TARGETED"); } });
+  await runtime.start();
+  const stopping = runtime.drain(1, { force: true });
+  EventEmitter.prototype.emit.call(child, "exit", 0, null);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(forced, false);
+  child.emit("close", 0, null);
+  await stopping;
+  assert.equal(runtime.snapshot().status, "stopped");
+});
+
+test("natural close during force termination wins over a process-not-found helper error", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-force-race-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async () => { child.emit("exit", 0, null); throw Object.assign(new Error("PROCESS_NOT_FOUND"), { code: "ESRCH" }); } });
+  await runtime.start();
+  await runtime.drain(1, { force: true });
+  assert.equal(runtime.snapshot().status, "stopped");
+  assert.equal(runtime.snapshot().pid, null);
+});
+
+test("root close cannot hide a failure to verify the remaining process tree", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-tree-failure-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async () => { child.emit("exit", 0, null); throw new Error("CLIENT_PROCESS_TREE_STOP_TIMEOUT"); } });
+  await runtime.start();
+  await assert.rejects(runtime.drain(1, { force: true }), /CLIENT_FORCE_STOP_FAILED/);
+  assert.equal(runtime.snapshot().status, "failed");
+  await assert.rejects(runtime.drain(1, { force: true }), /CLIENT_FORCE_STOP_FAILED/);
+  await assert.rejects(runtime.start(), /CLIENT_FORCE_STOP_FAILED/);
+});
+
+test("exit before close cannot clear an earlier unconfirmed process tree failure", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-tree-exit-race-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  let attempts = 0;
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async () => { attempts++; throw new Error("CLIENT_PROCESS_TREE_STOP_TIMEOUT"); } });
+  await runtime.start();
+  await assert.rejects(runtime.drain(1, { force: true }), /CLIENT_FORCE_STOP_FAILED/);
+  EventEmitter.prototype.emit.call(child, "exit", 0, null);
+  await assert.rejects(runtime.drain(1, { force: true }), /CLIENT_FORCE_STOP_FAILED/);
+  child.emit("close", 0, null);
+  await assert.rejects(runtime.drain(1, { force: true }), /CLIENT_FORCE_STOP_FAILED/);
+  assert.equal(attempts, 1);
+});
+
+test("a real hung Client and its engine child are terminated together", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-real-force-stop-"));
+  const entry = path.join(dataDir, "fixture.cjs"), pidFile = path.join(dataDir, "engine.pid");
+  let rootPid: number | null = null, enginePid = 0;
+  /** 仅检查本测试创建的 PID；权限及其它进程查询错误不能冒充已经退出。 */
+  const alive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+  };
+  t.after(async () => {
+    for (const pid of [enginePid, rootPid]) {
+      if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+    await fs.rm(dataDir, { recursive: true, force: true });
+  });
+  await fs.writeFile(entry, `
+const {spawn}=require('node:child_process'),fs=require('node:fs');
+const engine=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',windowsHide:true,detached:process.platform!=='win32'});
+engine.once('spawn',()=>{
+  fs.writeFileSync(${JSON.stringify(pidFile)},String(engine.pid));
+  process.send({t:'desktop.ready',requestId:process.env.CODEFLOWAI_DESKTOP_REQUEST_ID,
+    health:{protocolVersion:1,clientVersion:'fixture',dbSchemaVersion:88,database:'ready'}});
+});
+process.on('message',()=>{});setInterval(()=>{},1000);
+`, "utf8");
+  const runtime = createClientRuntime({ entry, dataDir });
+  await runtime.start(); rootPid = runtime.snapshot().pid;
+  await runtime.waitReady(3000);
+  enginePid = Number(await fs.readFile(pidFile, "utf8"));
+  assert.equal(alive(enginePid), true);
+  await runtime.drain(20, { force: true });
+  for (let attempt = 0; attempt < 40 && alive(enginePid); attempt++) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(runtime.snapshot().status, "stopped");
+  assert.equal(alive(rootPid!), false);
+  assert.equal(alive(enginePid), false);
+});
+
+test("force termination retains startup ownership after the root closes", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-force-owner-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  let entered!: () => void, release!: () => void, spawns = 0;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => { spawns++; return spawns === 1 ? child : new FakeChild(); },
+    forceKill: async () => { child.emit("exit", 0, null); entered(); await held; } });
+  await runtime.start();
+  const stopping = runtime.drain(1, { force: true });
+  await started;
+  try { await assert.rejects(runtime.start(), /CLIENT_RUNTIME_(STOPPING|ALREADY_RUNNING)/); }
+  finally { release(); await stopping; }
+  assert.equal(spawns, 1);
+});
+
+test("concurrent forced drains wait for the same process tree verification", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-force-shared-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  let entered!: () => void, release!: () => void, attempts = 0, secondFinished = false;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async () => { attempts++; child.emit("exit", 0, null); entered(); await held; } });
+  await runtime.start();
+  const first = runtime.drain(1, { force: true });
+  await started;
+  const second = runtime.drain(1, { force: true }).then(() => { secondFinished = true; });
+  try { await new Promise(setImmediate); assert.equal(secondFinished, false); }
+  finally { release(); await Promise.all([first, second]); }
+  assert.equal(attempts, 1);
+});
+
+test("late close after successful tree termination does not permanently block retries", async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-force-late-success-"));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const child = new FakeChild(false);
+  const runtime = createClientRuntime({ entry: "fixture.cjs", dataDir, spawn: () => child,
+    forceKill: async () => { EventEmitter.prototype.emit.call(child, "exit", 0, null); } });
+  await runtime.start();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const stopping = assert.rejects(runtime.drain(1, { force: true }), /CLIENT_FORCE_STOP_FAILED/);
+  t.mock.timers.tick(2); await new Promise(setImmediate);
+  t.mock.timers.tick(5_001); await stopping;
+  child.emit("close", 0, null);
+  await runtime.drain(1, { force: true });
+  assert.equal(runtime.snapshot().pid, null);
+});
+
 test("a real child confirms readiness and exits through the IPC cleanup boundary", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-desktop-runtime-"));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));

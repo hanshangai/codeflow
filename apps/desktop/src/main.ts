@@ -149,18 +149,9 @@ function createTray(open: () => void, exit: () => Promise<void>, onExitError: (e
 function registerIpcHandlers(bridge: DesktopBridgeApi, window: BrowserWindow, webEntry: string,
   logError: (error: unknown, context?: DesktopErrorContext) => void,
   takeUpdateCheckRequest?: () => boolean,
-  takeFeedbackRequest?: () => boolean,
-  quitConfirmation?: { markReady: (ready: boolean) => void; respond: (confirmed: boolean) => void }): () => void {
+  takeFeedbackRequest?: () => boolean): () => void {
   if (!bridge.onEvent) throw new Error("DESKTOP_EVENT_BRIDGE_REQUIRED");
   const operations: Record<string, (payload: unknown) => unknown> = {
-    ...(quitConfirmation ? {
-      "desktop:quitConfirmReady": () => { quitConfirmation.markReady(true); },
-      "desktop:quitConfirmUnready": () => { quitConfirmation.markReady(false); },
-      "desktop:respondQuitConfirm": (confirmed: unknown) => {
-        if (typeof confirmed !== "boolean") throw Object.assign(new Error("DESKTOP_QUIT_CONFIRM_INVALID"), { code: "DESKTOP_QUIT_CONFIRM_INVALID" });
-        quitConfirmation.respond(confirmed);
-      },
-    } : {}),
     ...(takeUpdateCheckRequest ? { "desktop:takeUpdateCheckRequest": () => takeUpdateCheckRequest() } : {}),
     ...(takeFeedbackRequest ? { "desktop:takeFeedbackRequest": () => takeFeedbackRequest() } : {}),
     "desktop:getState": bridge.getState, "desktop:openWindow": bridge.openWindow, "desktop:exit": bridge.exit,
@@ -449,69 +440,14 @@ if (process.versions.electron) {
   let shellStartupContext: Pick<DesktopErrorContext, "shellAttemptRequestId" | "continuationId" | "shellId" | "revision" | "phase"> | undefined;
   const logError = (error: unknown, context?: DesktopErrorContext): void => recordDesktopError(dataDir, error, context);
   const showError = (error: unknown): void => showDesktopError(dataDir, "CodeFlow 操作失败", error);
-  let quitDialogInFlight = false;
-  let quitConfirmReady = false;
-  let quitConfirmWindow: BrowserWindow | undefined;
-  let pendingQuitConfirmation: ((confirmed: boolean) => void) | null = null;
-  /** 页面未回传时按取消退出处理，避免退出确认永久挂起。 */
-  const QUIT_CONFIRM_TIMEOUT_MS = 15_000;
-  /** 有会话时优先由页面显示应用内确认；页面未就绪或窗口缺失时回退系统框。 */
-  async function confirmQuitWithRunningTurns(): Promise<boolean> {
-    const target = quitConfirmWindow;
-    if (target && !target.isDestroyed() && !target.webContents.isDestroyed() && quitConfirmReady) {
-      if (target.isMinimized()) target.restore();
-      target.show();
-      target.focus();
-      const confirmed = await new Promise<boolean>(resolve => {
-        const settle = (value: boolean): void => {
-          clearTimeout(timer);
-          if (pendingQuitConfirmation === settle) pendingQuitConfirmation = null;
-          resolve(value);
-        };
-        const timer = setTimeout(() => {
-          logError(Object.assign(new Error("DESKTOP_QUIT_CONFIRM_TIMEOUT"), { code: "DESKTOP_QUIT_CONFIRM_TIMEOUT" }),
-            { errorCode: "DESKTOP_QUIT_CONFIRM_TIMEOUT", requestId: `quit:${process.pid}` });
-          settle(false);
-        }, QUIT_CONFIRM_TIMEOUT_MS);
-        pendingQuitConfirmation = settle;
-      });
-      target.webContents.send("desktop:quit-confirm-requested");
-      return confirmed;
-    }
-    const result = await dialog.showMessageBox({
-      type: "warning", title: "退出 CodeFlow", message: "当前有会话在执行，退出将终止会话。",
-      buttons: ["取消", "退出"], defaultId: 0, cancelId: 0, noLink: true,
-    });
-    return result.response === 1;
-  }
-  /** 退出前确认运行中会话；无会话或无法确认时直接退出，失败保留应用并给出可定位原因。 */
+  /** 显式退出直接进入唯一关闭入口；重复点击共享应用层清理结果，不再查询活动或询问。 */
   async function requestQuit(): Promise<void> {
     if (quitAllowed) { app.quit(); return; }
-    if (quitDialogInFlight) return;
-    quitDialogInFlight = true;
     try {
       if (!application) { quitAllowed = true; app.quit(); return; }
-      const activity = await application.getActivity();
-      if (!activity.available) {
-        if (application.getRuntimeState().status === "ready") {
-          // 已就绪但活动读取失败时无法排除会话，回退系统确认而不是静默终止。
-          const result = await dialog.showMessageBox({
-            type: "warning", title: "退出 CodeFlow", message: "无法确认是否有会话在执行，退出将终止本机运行环境。",
-            buttons: ["取消", "退出"], defaultId: 0, cancelId: 0, noLink: true,
-          });
-          if (result.response !== 1) return;
-        } else {
-          // 环境未就绪时本机没有可终止的会话；直接退出并保留可检索原因。
-          console.warn(JSON.stringify({ code: "DESKTOP_QUIT_ACTIVITY_UNAVAILABLE", requestId: `quit:${process.pid}` }));
-        }
-      } else if (activity.runningTurns.length > 0 && !await confirmQuitWithRunningTurns()) {
-        return;
-      }
       await application.exit();
     } catch (error) {
       showQuitError(error);
-    } finally {
-      quitDialogInFlight = false;
     }
   }
   /** 退出失败给出具体原因与日志位置，而不是通用运行环境错误。 */
@@ -522,7 +458,7 @@ if (process.versions.electron) {
     const message = code === "DESKTOP_OPERATION_IN_PROGRESS"
       ? "CodeFlow 正在启动或更新，暂时无法退出。请等待完成后再从托盘退出。"
       : code.startsWith("CLIENT_") || code === "CLIENT_DRAIN_TIMEOUT"
-        ? "停止本机会话超时，CodeFlow 未退出。请重试；若仍失败，可从任务管理器结束 CodeFlow。"
+        ? "无法确认本机运行环境已停止，CodeFlow 未退出。请重试，或查看日志中的具体原因。"
         : describeUserFacingError(error, "退出失败，请稍后重试。");
     dialog.showErrorBox("退出 CodeFlow 失败", `${message}\n错误码：${code}\n日志：${path.join(dataDir, "logs", "desktop-errors.jsonl")}`);
   }
@@ -880,20 +816,6 @@ if (process.versions.electron) {
           /** 保留原状态读取，只有运行时ready后才固化安装身份与定位。 */
           registerBridge: (bridge, window) => {
             const target = window as BrowserWindow;
-            quitConfirmWindow = target;
-            /** 主 frame 导航、渲染进程退出或销毁时撤销旧确认能力，避免等待已不存在的页面。 */
-            const resetQuitConfirmation = (): void => {
-              quitConfirmReady = false;
-              const resolve = pendingQuitConfirmation;
-              pendingQuitConfirmation = null;
-              resolve?.(false);
-            };
-            target.webContents.on("did-start-navigation", (_event, _url, _isInPlace, isMainFrame) => {
-              if (isMainFrame) resetQuitConfirmation();
-            });
-            target.webContents.on("render-process-gone", resetQuitConfirmation);
-            target.webContents.on("unresponsive", resetQuitConfirmation);
-            target.webContents.on("destroyed", resetQuitConfirmation);
             return registerIpcHandlers(bridge, target, webEntry, logError, () => {
               const pending = pendingUpdateCheck;
               pendingUpdateCheck = false;
@@ -902,27 +824,7 @@ if (process.versions.electron) {
               const pending = pendingFeedbackRequest;
               pendingFeedbackRequest = false;
               return pending;
-            }, {
-              markReady: ready => {
-                if (ready) quitConfirmReady = true;
-                else resetQuitConfirmation();
-              },
-              respond: confirmed => {
-                const resolve = pendingQuitConfirmation;
-                pendingQuitConfirmation = null;
-                resolve?.(confirmed);
-              },
             });
-          },
-          /** 确认即中断当前会话及其终端、托管服务；稍后继续当前工作。 */
-          confirmUpdate: async (window, signal) => {
-            signal?.throwIfAborted();
-            const result = await dialog.showMessageBox(window as BrowserWindow, {
-              type: "question", title: "CodeFlow 更新", message: "有正在运行的会话，是否立即更新？",
-              detail: "立即更新将中断当前会话并停止终端和托管服务。",
-              buttons: ["立即更新", "稍后"], defaultId: 1, cancelId: 1, noLink: true, signal,
-            });
-            return result.response === 0;
           },
           /** 恢复前只记录首错；最终失败仍弹框，写入失败继续交回调用方。 */
           onUpdateError: (error, context) => {

@@ -690,6 +690,15 @@ export class OrchestrationEngine {
     await this.waitForInFlightWork();
   }
 
+  /** 生产者停止后释放根及已创建工作区的托管服务，不为清理创建新工作区。 */
+  async disposeManagedServices(reason = "client-shutdown"): Promise<void> {
+    const results = await Promise.allSettled([this.managedServiceRuntime.disposeAllServices(reason),
+      ...[...this.workspaceEngines.values()].map(engine => engine.disposeManagedServices(reason))]);
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "ORCHESTRATION_SERVICES_DISPOSAL_FAILED", { cause: failures[0] });
+  }
+
   /** 只读查询原异步 owner；已结算失败仍可等待，但不再算作在途活动。 */
   hasInFlightWork(): boolean {
     return this.collectDrainPromises(true).length > 0 || [...this.workspaceEngines.values()].some(engine => engine.hasInFlightWork());

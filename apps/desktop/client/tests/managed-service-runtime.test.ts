@@ -37,6 +37,19 @@ function runtimeContext(runtime: ManagedServiceRuntime, threadId: ThreadId, inst
 /** 只返回本例已经持久化的实例身份。 */
 function runtimeInstance(runtime: ManagedServiceRuntime): OrchestrationId { return scopes.get(runtime)!.instanceId; }
 
+test("Client关闭释放全部已持有线程的托管服务，无需重新查询线程列表", async t => {
+  const runtime = createRuntime(t), tool = getBuiltinTool(runtime), children = captureStartedProcesses(t, runtime);
+  const threads = ["shutdown-first", "shutdown-second"] as ThreadId[];
+  for (const threadId of threads) await runtime.executeBuiltinTool(tool, {
+    action: "ensure", serviceId: "background", command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"], ready: { delayMs: 100 },
+  }, runtimeContext(runtime, threadId));
+  assert.equal(children.length, 2);
+  await runtime.disposeAllServices("client-shutdown");
+  for (const child of children) assert.notEqual(child.exitCode ?? child.signalCode, null);
+  for (const threadId of threads) assert.deepEqual(runtime.listThreadServices(threadId), []);
+});
+
 test("N1 线程释放复用已含停止诊断的最终启动对象且重复消费稳定", async t => {
   const startup = new Error("N1-startup"), notification = new Error("N1-terminal-notify"), logging = new Error("N1-terminal-log");
   const runtime = createRuntime(t, { onChanged: event => { if (event.status === "stopped") throw notification; } }), tool = getBuiltinTool(runtime), ctx = runtimeContext(runtime, "n1-disposal" as ThreadId), children = captureStartedProcesses(t, runtime);

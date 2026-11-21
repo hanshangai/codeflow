@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { spawn as spawnProcess } from "node:child_process";
+import { execFile, spawn as spawnProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -30,6 +30,7 @@ type SpawnOptions = {
   env: NodeJS.ProcessEnv;
   stdio: ["ignore", "inherit", "pipe", "ipc"];
   windowsHide: boolean;
+  detached?: boolean;
 };
 
 /** 单次启动的 Client 原生 stderr 上限；超限后停止写入，下次启动重新截断。 */
@@ -59,6 +60,8 @@ type ClientRuntimeDeps = {
   /** 未提供时保持系统安装 CLI 的既有行为。 */
   cliRuntime?: ClientCliRuntime;
   spawn?: (file: string, args: string[], options: SpawnOptions) => ClientChild;
+  /** 仅终止本实例持有的 Client 进程树；真实关闭仍由 close 事件确认。 */
+  forceKill?: (child: ClientChild) => Promise<void>;
   /** 子进程退出观察；主动停止以 expected 标记，不进入崩溃证据。 */
   onExit?: (facts: { exitCode: number | null; signal: NodeJS.Signals | null; expected: boolean }) => void;
 };
@@ -67,13 +70,15 @@ export type ClientRuntime = {
   start(): Promise<void>;
   waitReady(timeoutMs?: number): Promise<void>;
   stop(reason?: "exit" | "update"): Promise<void>;
-  drain(timeoutMs?: number): Promise<void>;
+  drain(timeoutMs?: number, options?: { force: boolean }): Promise<void>;
   snapshot(): ClientRuntimeSnapshot;
   request(request: DesktopRuntimeRequest, timeoutMs?: number): Promise<DesktopApiResponse>;
   onEvent(listener: (event: DesktopEvent) => void): () => void;
 };
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
+const EXIT_DRAIN_TIMEOUT_MS = 10_000;
+const FORCE_STOP_TIMEOUT_MS = 5_000;
 
 /** 管理现有 Client 入口的进程生命周期，并将数据目录映射到既有环境契约。 */
 export function createClientRuntime(deps: ClientRuntimeDeps): ClientRuntime {
@@ -87,6 +92,10 @@ export function createClientRuntime(deps: ClientRuntimeDeps): ClientRuntime {
   let stopping = false;
   let childClosed: Promise<void> = Promise.resolve();
   let lastFailure: Error | null = null;
+  // 树清理尚未确认不能像已交付业务错误一样消费；根丢失后也保留门禁，避免重试绕过。
+  let forceStopFailure: Error | null = null;
+  let drainFlight: Promise<void> | null = null;
+  let forceTermination: Promise<void> | null = null;
   const startupStopReason = Object.assign(new Error("CLIENT_STARTUP_STOPPED"), { code: "CLIENT_STARTUP_STOPPED" });
   let detachMessages: (() => void) | null = null;
   const eventListeners = new Set<(event: DesktopEvent) => void>();
@@ -151,7 +160,8 @@ export function createClientRuntime(deps: ClientRuntimeDeps): ClientRuntime {
         requestId: state.requestId,
         releaseId: state.releaseId,
         pid,
-        rootCause: cause.message,
+        rootCause: cause instanceof AggregateError ? { message: cause.message,
+          errors: cause.errors.slice(0, 8).map(error => error instanceof Error ? error.message : String(error)) } : cause.message,
         ...eventDiagnosticContext(event),
       });
       lastFailure = cause;
@@ -187,7 +197,9 @@ export function createClientRuntime(deps: ClientRuntimeDeps): ClientRuntime {
   return {
     /** 创建进程并等待 spawn；主动关闭沿停止结果返回，真实启动错误继续失败。 */
     async start(): Promise<void> {
+      if (forceStopFailure) throw forceStopFailure;
       if (child) throw new Error("CLIENT_RUNTIME_ALREADY_RUNNING");
+      if (drainFlight || forceTermination) throw new Error("CLIENT_RUNTIME_STOPPING");
       const requestId = crypto.randomUUID();
       lastFailure = null; stopping = false;
       state = { ...state, status: "starting", requestId, errorCode: null, health: null, startup: undefined };
@@ -240,6 +252,7 @@ export function createClientRuntime(deps: ClientRuntimeDeps): ClientRuntime {
           },
           stdio: ["ignore", "inherit", "pipe", "ipc"],
           windowsHide: true,
+          detached: process.platform !== "win32",
         });
         const currentChild = child;
         captureClientStderr(currentChild);
@@ -350,25 +363,74 @@ export function createClientRuntime(deps: ClientRuntimeDeps): ClientRuntime {
       await this.drain();
     },
 
-    /** 有界等待原 Client 关闭；退出与清理失败均显式交还调用方。 */
-    async drain(timeoutMs = DEFAULT_DRAIN_TIMEOUT_MS): Promise<void> {
-      stopping = true;
-      const currentChild = child;
-      const closed = childClosed;
-      const pendingFailure = lastFailure;
-      if (currentChild && state.status !== "failed") state = { ...state, status: "draining" };
-      try {
-        if (!currentChild) { if (pendingFailure) raise(pendingFailure); return; }
-        await requestClientStop(currentChild, state.requestId!, timeoutMs, closed, () => child !== currentChild || childExited);
-        if (lastFailure || pendingFailure) raise(lastFailure ?? pendingFailure!);
-      } catch (error) {
-        // drain 失败后 runtime 仍可能继续运行，后续真实退出不能继续按预期停止处理。
-        stopping = false;
-        const original = lastFailure ?? pendingFailure;
-        const failure = original && !containsRuntimeFailure(error, original) ? new AggregateError([original, error], "CLIENT_DRAIN_FAILED") : error;
-        if (!currentChild) return raise(failure);
-        raise(fail(error instanceof Error ? error.message : "CLIENT_DRAIN_FAILED", failure, currentChild.pid ?? null));
-      }
+    /** 有界等待原 Client；显式退出可强杀，必须确认物理关闭，保存错误保留原诊断。 */
+    async drain(timeoutMs?: number, options?: { force: boolean }): Promise<void> {
+      if (drainFlight) return await drainFlight;
+      const flight = (async (): Promise<void> => {
+        if (forceTermination) await forceTermination;
+        if (forceStopFailure && (!child || childExited)) throw forceStopFailure;
+        stopping = true;
+        const currentChild = child;
+        const closed = childClosed;
+        const pendingFailure = lastFailure;
+        if (currentChild && state.status !== "failed") state = { ...state, status: "draining" };
+        try {
+          if (forceStopFailure) throw forceStopFailure;
+          if (!currentChild) { if (pendingFailure) raise(pendingFailure); return; }
+          await requestClientStop(currentChild, state.requestId!, timeoutMs ?? (options?.force ? EXIT_DRAIN_TIMEOUT_MS : DEFAULT_DRAIN_TIMEOUT_MS), closed, () => child !== currentChild || childExited);
+          if (lastFailure || pendingFailure) raise(lastFailure ?? pendingFailure!);
+        } catch (error) {
+          if (options?.force) {
+            const termination = (async () => {
+              if (!currentChild || child !== currentChild || childExited) return;
+              try { await (deps.forceKill ?? forceTerminateClient)(currentChild); }
+              catch (forceError) {
+                // 只接受已确认退出的根进程不存在；后代核验、权限或查询失败不能被根退出掩盖。
+                if ((forceError as NodeJS.ErrnoException | null)?.code !== "ESRCH" || child === currentChild && !childExited) throw forceError;
+              }
+            })().catch(forceError => {
+              forceStopFailure = fail("CLIENT_FORCE_STOP_FAILED", Object.assign(new AggregateError([error, forceError], "CLIENT_FORCE_STOP_FAILED"),
+                { code: "CLIENT_FORCE_STOP_FAILED" }), currentChild?.pid ?? null);
+              throw forceStopFailure;
+            });
+            forceTermination = termination;
+            // 树核验独立于 close 等待；close 晚到不能永久锁住已确认释放的资源，真树失败仍保留。
+            void termination.then(() => {
+              if (forceTermination === termination) { forceTermination = null; forceStopFailure = null; }
+            }, () => { if (forceTermination === termination) forceTermination = null; });
+            try {
+              await Promise.all([
+                termination,
+                waitForClientClose(closed, FORCE_STOP_TIMEOUT_MS),
+              ]);
+            } catch (forceError) {
+              stopping = false;
+              raise(forceStopFailure ?? fail("CLIENT_FORCE_STOP_FAILED", Object.assign(new AggregateError([error, forceError], "CLIENT_FORCE_STOP_FAILED"),
+                { code: "CLIENT_FORCE_STOP_FAILED" }), currentChild?.pid ?? null));
+            }
+            // 用户批准退出兜底：已确认关闭可继续退出/重启；保存失败事实留在原日志，启动沿既有恢复入口处理。
+            try {
+              recordRuntimeError(errorLogPath, { errorCode: "CLIENT_STOP_RECOVERED", requestId: state.requestId,
+                releaseId: state.releaseId, pid: currentChild?.pid ?? null, rootCause: error instanceof Error ? error.message : String(error) });
+            } catch (logError) {
+              console.warn("[CLIENT_STOP_DIAGNOSTIC_FAILED]", { requestId: state.requestId, rootCause: logError instanceof Error ? logError.message : String(logError) });
+            }
+            lastFailure = null;
+            forceStopFailure = null;
+            state = { ...state, status: "stopped", pid: null };
+            return;
+          }
+          // drain 失败后 runtime 仍可能继续运行，后续真实退出不能继续按预期停止处理。
+          stopping = false;
+          const original = lastFailure ?? pendingFailure;
+          const failure = original && !containsRuntimeFailure(error, original) ? new AggregateError([original, error], "CLIENT_DRAIN_FAILED") : error;
+          if (!currentChild) return raise(failure);
+          raise(fail(error instanceof Error ? error.message : "CLIENT_DRAIN_FAILED", failure, currentChild.pid ?? null));
+        }
+      })();
+      drainFlight = flight;
+      try { await flight; }
+      finally { if (drainFlight === flight) drainFlight = null; }
     },
 
     /** 返回状态和健康信息副本，避免界面改变进程事实。 */
@@ -441,6 +503,66 @@ export function createClientRuntime(deps: ClientRuntimeDeps): ClientRuntime {
       }
     },
   };
+}
+
+/** 正常停止超时仅终止所持 Client 树；独立任务进程组按父链枚举，不能扩大到宿主的其它进程。 */
+async function forceTerminateClient(child: ClientChild): Promise<void> {
+  const pid = child.pid;
+  if (!Number.isSafeInteger(pid) || pid! <= 0 || pid === process.pid) throw new Error("CLIENT_FORCE_STOP_PID_INVALID");
+  if (process.platform === "win32") {
+    const command = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
+    await new Promise<void>((resolve, reject) => {
+      execFile(command, ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: FORCE_STOP_TIMEOUT_MS }, (error) => {
+        // taskkill 的 128 明确表示目标进程不存在；不依赖本地化 stderr，避免中文系统误判失败。
+        if (error && error.code === 128) {
+          reject(Object.assign(new Error("CLIENT_FORCE_PROCESS_GONE", { cause: error }), { code: "ESRCH" }));
+        } else if (error) reject(error);
+        else resolve();
+      });
+    });
+  } else {
+    const deadline = Date.now() + FORCE_STOP_TIMEOUT_MS;
+    /** 只读取 PID/父 PID/组号/状态，不采集命令行或凭据；查询失败显式阻断交接。 */
+    const snapshot = async () => await new Promise<Array<{ pid: number; parent: number; group: number; state: string }>>((resolve, reject) => {
+      execFile("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="], { timeout: Math.max(1, deadline - Date.now()), maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
+        if (error) { reject(error); return; }
+        const rows = stdout.trim().split(/\r?\n/u).filter(Boolean).map(line => {
+          const [id, parent, group, state] = line.trim().split(/\s+/u);
+          return { pid: Number(id), parent: Number(parent), group: Number(group), state: state ?? "" };
+        });
+        if (rows.some(row => !Number.isSafeInteger(row.pid) || row.pid < 0 || !Number.isSafeInteger(row.parent) || row.parent < 0
+          || !Number.isSafeInteger(row.group) || row.group < 0 || !row.state)) { reject(new Error("CLIENT_PROCESS_TREE_INVALID")); return; }
+        resolve(rows);
+      });
+    });
+    const rows = await snapshot(), owned = new Set<number>([pid!]);
+    let added = true;
+    while (added) {
+      added = false;
+      for (const row of rows) if (owned.has(row.parent) && !owned.has(row.pid)) { owned.add(row.pid); added = true; }
+    }
+    const targets = new Set(rows.filter(row => owned.has(row.pid)).map(row => owned.has(row.group) ? -row.group : row.pid));
+    targets.delete(-pid!); targets.add(-pid!);
+    for (const target of targets) {
+      try { process.kill(target, "SIGKILL"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    }
+    // SIGKILL 后只接受进程消失或僵尸态；僵尸已释放文件句柄，不能继续写数据库。
+    while ((await snapshot()).some(row => owned.has(row.pid) && !row.state.startsWith("Z"))) {
+      if (Date.now() >= deadline) throw new Error("CLIENT_PROCESS_TREE_STOP_TIMEOUT");
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+}
+
+/** 杀进程只是请求；确认 stdio/IPC 已关闭后才能交出数据库和版本切换资格。 */
+async function waitForClientClose(closed: Promise<void>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([closed, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("CLIENT_FORCE_STOP_TIMEOUT")), timeoutMs);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
 /** 按异常身份检查既有聚合，合并清理主副因时不重复包入同一失败。 */

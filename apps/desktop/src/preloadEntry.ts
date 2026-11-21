@@ -2,15 +2,6 @@ import { contextBridge, ipcRenderer } from "electron";
 
 import { exposeDesktopBridge, subscribeDesktopEvents, subscribeFixedChannel } from "./preload.js";
 
-/** 声明或撤销页面的退出确认能力；失败只回退系统框，仍留下可检索原因。 */
-function reportQuitConfirmReady(ready: boolean): void {
-  void ipcRenderer.invoke(ready ? "desktop:quitConfirmReady" : "desktop:quitConfirmUnready").catch((error: unknown) => {
-    console.warn(ready ? "[desktop_quit_confirm_ready_failed]" : "[desktop_quit_confirm_unready_failed]", {
-      rootCause: error instanceof Error ? error.message : String(error),
-    });
-  });
-}
-
 exposeDesktopBridge(contextBridge, {
   platform: process.platform === "darwin" ? "darwin" : process.platform === "win32" ? "win32" : "linux",
   getState: () => ipcRenderer.invoke("desktop:getState"),
@@ -30,13 +21,6 @@ exposeDesktopBridge(contextBridge, {
   onUpdateNotice: (listener) => subscribeFixedChannel(ipcRenderer, "desktop:update-notice", listener),
   onUpdateProgress: (listener) => subscribeFixedChannel(ipcRenderer, "desktop:update-progress", listener),
   reportUpdateError: (input) => ipcRenderer.invoke("desktop:reportUpdateError", input),
-  /** 订阅即声明页面具备应用内确认能力；主进程据此决定是否回退系统框。 */
-  onQuitConfirmRequested: (listener) => {
-    reportQuitConfirmReady(true);
-    const unsubscribe = subscribeFixedChannel(ipcRenderer, "desktop:quit-confirm-requested", listener);
-    return () => { unsubscribe(); reportQuitConfirmReady(false); };
-  },
-  respondQuitConfirm: (confirmed) => ipcRenderer.invoke("desktop:respondQuitConfirm", confirmed),
   checkForUpdates: () => ipcRenderer.invoke("desktop:checkForUpdates"),
   restartForUpdate: () => ipcRenderer.invoke("desktop:restartForUpdate"),
   onUpdateCheckRequested: (listener) => subscribeFixedChannel(ipcRenderer, "desktop:update-check-requested", listener),

@@ -46,7 +46,7 @@ async function fixture(t: test.TestContext, network = true, start = true) {
   await fs.writeFile(path.join(baselineDir, "baseline-release-manifest.json"), JSON.stringify(baseline), "utf8");
   await fs.writeFile(path.join(incoming, "manifest.json"), JSON.stringify(manifest), "utf8");
   const alternative = signReleaseBundleManifest({ ...manifestPayload, releaseId: "other-release" }, keys.privateKey);
-  const control = { available: true, authorized: true, busy: false, confirm: true, badSignature: false,
+  const control = { available: true, authorized: true, busy: false, badSignature: false,
     failWeb: 0, failReceipt: "", failDiscovery: false, transientFailures: 0, useAlternative: false, failArchive: false,
     transientReceipts: 0, holdHealthy: undefined as (() => Promise<void>) | undefined,
     holdArchive: undefined as (() => Promise<void>) | undefined };
@@ -98,7 +98,7 @@ async function fixture(t: test.TestContext, network = true, start = true) {
       if (releaseDir.endsWith(manifest.releaseId)) candidateWebAttempted = true;
       if (candidateWebAttempted && control.failWeb > 0) { control.failWeb--; throw new Error("WEB_LOAD_FAILED"); }
     },
-    async confirmUpdate() { return control.confirm; }, onUpdateError() {}, onUpdateRetry() {} };
+    onUpdateError() {}, onUpdateRetry() {} };
   /** 保留更新协议和 held 启动事实，版本随真实选中的整组清单变化。 */
   const createRuntime = (_entry: string, expected?: ClientRuntimeExpectation, startup?: DesktopStartupMode): ClientRuntime => ({
     async start() {}, async waitReady() {}, async stop() {}, async drain() { actions.push("drain"); }, onEvent: () => () => {},
@@ -184,9 +184,9 @@ test("untrusted manifest never becomes a visible target", async t => {
   assert.ok(value.bundle.failure); assert.equal(JSON.stringify(value).includes("signature"), false);
 });
 
-for (const revoked of [false, true]) test(`${revoked ? "startup revocation" : "direct apply postponement"} is explicit after preparation`, async t => {
+for (const revoked of [false, true]) test(`${revoked ? "startup revocation" : "direct apply completion without confirmation"} is explicit after preparation`, async t => {
   const f = await fixture(t), get = details(f.bridge); f.control.busy = !revoked;
-  f.control.confirm = false; f.control.authorized = !revoked;
+  f.control.authorized = !revoked;
   assert.equal(await f.app.checkForUpdates(), null);
   assert.equal((await get()).bundle.result, "prepared"); assert.deepEqual(f.actions, []);
   assert.equal((await get()).current.bundle, null);
@@ -195,8 +195,8 @@ for (const revoked of [false, true]) test(`${revoked ? "startup revocation" : "d
     assert.equal(value.bundle.result, "revoked"); assert.equal(value.current.bundle?.releaseId, "baseline-release");
     assert.equal(value.current.clientVersion, "1.2.0");
   } else {
-    assert.equal(await f.app.applyRelease(f.incoming, { requestId: crypto.randomUUID() }), null);
-    assert.equal((await get()).bundle.result, "postponed"); assert.equal((await get()).current.bundle, null);
+    assert.equal((await f.app.applyRelease(f.incoming, { requestId: crypto.randomUUID() }))?.releaseId, "details-release");
+    assert.equal((await get()).bundle.result, "healthy"); assert.equal((await get()).current.bundle?.releaseId, "details-release");
   }
 });
 

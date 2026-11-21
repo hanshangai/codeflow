@@ -2,18 +2,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import ts from "typescript";
+import { EventEmitter } from "node:events";
 import { runClientAsyncCleanupStep, runClientCleanupStep } from "../src/runtime/clientCleanup.js";
 
-test("同步关闭的诊断失败不跳过必要释放，所有原值按顺序失败", () => {
+test("同步关闭忽略诊断故障，仍保留真实清理失败", () => {
   let released = false;
   const business = new Error("CLOSE_FAILED");
   assert.throws(() => runClientCleanupStep(() => { released = true; throw business; }, phase => {
     if (phase === "start") throw undefined;
     throw 0;
   }), error => {
-    assert.ok(error instanceof AggregateError);
-    assert.deepEqual(error.errors, [undefined, business, 0]);
-    assert.equal(error.cause, undefined); return true;
+    assert.equal(error, business); return true;
   });
   assert.equal(released, true);
 });
@@ -26,9 +25,7 @@ test("异步释放等待真实收口，诊断再错保持业务原对象", async
     if (phase === "fail") throw false;
   });
   const rejected = assert.rejects(result, error => {
-    assert.ok(error instanceof AggregateError);
-    assert.deepEqual(error.errors, [business, false]);
-    assert.equal(error.cause, business); return true;
+    assert.equal(error, business); return true;
   });
   await Promise.resolve(); assert.equal(done, false);
   release(); await rejected; assert.equal(done, true);
@@ -59,13 +56,16 @@ function shutdownFixture(failStep: string, configure?: (dependencies: Record<str
     async stopAndDrain() { released.push(name); }, async close() { released.push(name); } });
   const buffer = () => ({ getPendingCount: () => 0, dispose() {} });
   const dependencies = {
-    config: { clientId: "client" }, process: { pid: 1 }, logger: { info() {} },
+    config: { clientId: "client" }, process: Object.assign(new EventEmitter(), { pid: 1, connected: false }), logger: { info() {} },
+    workspaces: new Map(), eventPipeline: null, databaseWriter: null,
     runClientCleanupStep, runClientAsyncCleanupStep,
     describeWorkspaceApiFailure: (error: unknown) => ({ rootCause: { type: typeof error } }),
+    describeClientErrorTree: (error: unknown) => ({ type: typeof error }),
     logClientStep: (_level: string, step: string) => { if (step === failStep) throw 0; },
     workspaceMigrationService: resource("migration"), conversationEventAckBuffer: buffer(), rawEventAckBuffer: buffer(), threadTouchBuffer: buffer(),
     lastEventLoopLagSnapshot: null, desktopLifecycle: null, hostRpcHttpTransport: resource("http"), transport: resource("transport"),
-    localEventRelay: resource("relay"), scheduledTaskScheduler: resource("scheduler"), orchEngine: resource("engine"),
+    localEventRelay: resource("relay"), scheduledTaskScheduler: resource("scheduler"),
+    orchEngine: { ...resource("engine"), async disposeManagedServices() {} },
     eventFlowMonitor: resource("monitor"), dbCleanup: null, stopEventLoopLagMonitor() {}, rawEventRetention: resource("retention"),
     pendingReminderDirtyWorkspaces: new Set(), desktopCloudAccount: null,
     queueDispatcher: { async waitForIdle() {} }, sessions: resource("sessions"),
@@ -125,9 +125,44 @@ test("终端物理释放未确认时仍保留数据库和进程锁，避免旧PT
 });
 
 for (const step of ["shutdown.begin", "shutdown.complete"]) {
-  test(`真实关闭入口 ${step} 诊断失败仍释放资源并失败退出`, async () => {
+  test(`真实关闭入口 ${step} 诊断失败只告警，仍正常释放资源并退出`, async () => {
     const f = shutdownFixture(step);
-    assert.equal(await f.run("test", 0), 1);
+    assert.equal(await f.run("test", 0), 0);
     for (const name of ["sessions", "engine", "reader", "database", "lock"]) assert.ok(f.released.includes(name), name);
   });
 }
+
+test("普通关闭等待托管服务真实停止，再排空事件和关闭数据库", async () => {
+  let enter!: () => void, release!: () => void, serviceStopped = false;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const f = shutdownFixture("none", dependencies => {
+    dependencies.orchEngine.disposeManagedServices = async (reason: string) => {
+      assert.equal(reason, "client-shutdown"); enter(); await pending; serviceStopped = true;
+    };
+    dependencies.runtime.waitForIdle = async () => { assert.equal(serviceStopped, true); };
+  });
+  const stopping = f.run("desktop_exit", 0);
+  await Promise.race([entered, stopping.then(() => { throw new Error("MANAGED_SERVICES_NOT_DRAINED"); })]);
+  assert.equal(f.released.includes("database"), false);
+  release(); assert.equal(await stopping, 0);
+  assert.equal(f.released.includes("database"), true);
+});
+
+test("托管服务释放失败保留数据库，已连接桌面等待宿主强杀而不先丢失父链", async () => {
+  const f = shutdownFixture("none", dependencies => {
+    dependencies.process.connected = true;
+    dependencies.desktopLifecycle = { async drainRequests() {} };
+    dependencies.orchEngine.disposeManagedServices = async () => { throw new Error("SERVICE_STOP_FAILED"); };
+  });
+  let settled = false;
+  const stopping = f.run("desktop_exit", 0).then(code => { settled = true; return code; });
+  await new Promise(setImmediate);
+  assert.equal(f.released.includes("reader"), true);
+  assert.equal(f.released.includes("database"), false);
+  assert.equal(f.released.includes("lock"), false);
+  assert.equal(settled, false);
+  f.dependencies.process.connected = false;
+  f.dependencies.process.emit("disconnect");
+  assert.equal(await Promise.race([stopping, new Promise(resolve => setImmediate(() => resolve("STILL_WAITING_FOR_DEAD_PARENT")))]), 1);
+});

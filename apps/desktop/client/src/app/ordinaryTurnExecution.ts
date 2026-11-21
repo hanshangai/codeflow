@@ -87,11 +87,11 @@ export async function waitForOrdinaryTurnExecution(
   } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
-/** 关闭时撤销未派发回合并排空原尾链及已结算失败；保留原 record 供精确等待核验。 */
+/** 只排空关闭时仍在执行的尾链；历史失败留给精确等待，不重复阻断退出。 */
 export async function drainOrdinaryTurnExecutions(sessions: object): Promise<void> {
   const observed = new Set<ExecutionOwner>(), failures: unknown[] = [];
   while (true) {
-    const pending = [...(executions.get(sessions)?.values() ?? [])].filter(owner => !observed.has(owner));
+    const pending = [...(executions.get(sessions)?.values() ?? [])].filter(owner => !owner.result && !observed.has(owner));
     if (!pending.length) break;
     for (const owner of pending) {
       observed.add(owner);

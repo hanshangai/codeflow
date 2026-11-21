@@ -54,7 +54,6 @@ export type DesktopHost = {
   createTray(open: () => void, exit: () => Promise<void>, checkForUpdates?: () => void): { destroy(): void };
   registerBridge(bridge: DesktopBridgeApi, window: DesktopWindow): () => void;
   /** 仅在存在运行中会话时确认是否中断并更新。 */
-  confirmUpdate?(window: DesktopWindow, signal?: AbortSignal): Promise<boolean>;
   /** 后台失败由主进程展示或记录；logOnly仅预记首错，不提前展示UI。 */
   onUpdateError?(error: unknown, context: { requestId: string; deviceId: string; logOnly?: boolean }): void;
   /** 启动或迁移窗口退出失败保留进程 owner，由宿主显式展示错误。 */
@@ -447,7 +446,7 @@ export function createDesktopApplication(input: {
 
   /** 确认旧进程已清理后才交接运行时引用，防止遗留失控子进程。 */
   const restartClient = async (releaseDir: string, expectedRelease?: ClientRuntimeExpectation): Promise<void> => {
-    if (shellDrainedRuntime !== runtime) await runtime.drain();
+    if (shellDrainedRuntime !== runtime) await runtime.drain(undefined, { force: true });
     unsubscribeRuntime?.();
     unsubscribeRuntime = null;
     runtime = createRuntime(clientEntry(releaseDir), expectedRelease, startupHeldId ? { mode: "held", continuationId: startupHeldId } : undefined);
@@ -478,14 +477,7 @@ export function createDesktopApplication(input: {
     shellUpdateFailure = { requestId, error: failure }; return failure;
   };
 
-  /** hot与壳共用原D09响应门禁；故障不当作空闲或已恢复。 */
-  const controlUpdate = async (currentRuntime: ClientRuntime, method: "runtime.update.prepare" | "runtime.update.cancel" | "runtime.update.interrupt") => {
-    const response = await currentRuntime.request({ method }), body = response.body as { ok?: unknown; code?: unknown; hasRunningSessions?: unknown } | null;
-    if (response.status !== 200 || body?.ok !== true) throw new Error(typeof body?.code === "string" ? body.code : "DESKTOP_UPDATE_CONTROL_FAILED");
-    return body;
-  };
-
-  /** 同一checking轮次使用原D09控制；稍后cancel，interrupt后由原Client重启入口恢复。 */
+  /** 显式重启沿统一关闭入口交接；失败后由原 Client 重启入口恢复。 */
   const checkShellInternal = async (requestId: string, signal: AbortSignal, manual: boolean, allowRestart = false): Promise<void> => {
     const config = input.shellUpdate;
     if (!config) return;
@@ -532,28 +524,17 @@ export function createDesktopApplication(input: {
         if (observation.target) shellDetails.target = { shellId: observation.target.shellId, version: observation.target.version };
         if (observation.result) shellDetails.result = observation.result;
       }, hooks: {
-        /** 在helper创建前确认，稍后保持同一schema2可继续。 */
+        /** 后台只准备工件，只有显式重启允许创建 helper。 */
         async prepare() {
           if (!allowRestart) return false;
           if (nativeUpdate && currentRuntime.snapshot().status !== "ready") return true;
           if (startupHeldId) { await finishResourcePending(); return true; }
-          signal.throwIfAborted(); const activity = await controlUpdate(currentRuntime, "runtime.update.prepare");
-          if (typeof activity.hasRunningSessions !== "boolean") throw new Error("DESKTOP_UPDATE_ACTIVITY_INVALID");
-          if (activity.hasRunningSessions) {
-            if (!input.host.confirmUpdate) throw new Error("DESKTOP_UPDATE_CONFIRMATION_UNAVAILABLE");
-            const confirmed = await input.host.confirmUpdate(window!, signal); signal.throwIfAborted();
-            if (!confirmed) {
-              if (!config.boundary?.spawnHelper) await controlUpdate(currentRuntime, "runtime.update.cancel");
-              updatesSuppressed = true; return false;
-            }
-          }
           signal.throwIfAborted(); await finishResourcePending(); return true;
         },
         /** accepted后不可再由外部abort取消持久交接；真实drain成功才记录本轮事实。 */
         async drain() {
-          if (!startupHeldId && (!nativeUpdate || currentRuntime.snapshot().status === "ready")) await controlUpdate(currentRuntime, "runtime.update.interrupt");
           interrupted = true;
-          await currentRuntime.drain(); shellDrainedRuntime = currentRuntime;
+          await currentRuntime.drain(undefined, { force: true }); shellDrainedRuntime = currentRuntime;
         },
         /** 原生失败重启同一运行时，保留实际资源、schema 和启动参数，不退回首装基线。 */
         async resume() {
@@ -561,14 +542,13 @@ export function createDesktopApplication(input: {
           if (interrupted) {
             if (nativeUpdate) {
               if (runtime !== currentRuntime) throw new Error("DESKTOP_SHELL_RUNTIME_CHANGED");
-              if (shellDrainedRuntime !== currentRuntime) await currentRuntime.drain();
+              if (shellDrainedRuntime !== currentRuntime) await currentRuntime.drain(undefined, { force: true });
               shellDrainedRuntime = undefined;
               await currentRuntime.start();
               await currentRuntime.waitReady();
             } else await restartClient(releaseDir, expectation);
             interrupted = false;
           }
-          else if (!startupHeldId && (!nativeUpdate || currentRuntime.snapshot().status === "ready")) await controlUpdate(currentRuntime, "runtime.update.cancel");
         },
         /** 与hot相同的退出等待边界，accepted后退出只等待交接结果。 */
         committed() { switchCommitted = true; },
@@ -914,37 +894,17 @@ export function createDesktopApplication(input: {
         },
         drain: async () => {
           const currentRuntime = runtime;
-          try {
-            options.signal?.throwIfAborted();
-            const activity = await controlUpdate(currentRuntime, "runtime.update.prepare");
-            if (typeof activity.hasRunningSessions !== "boolean") throw new Error("DESKTOP_UPDATE_ACTIVITY_INVALID");
-            if (activity.hasRunningSessions) {
-              if (!input.host.confirmUpdate) throw new Error("DESKTOP_UPDATE_CONFIRMATION_UNAVAILABLE");
-              const confirmed = await input.host.confirmUpdate(window!, options.signal);
-              options.signal?.throwIfAborted();
-              if (!confirmed) {
-                if (operation === "checking") updatesSuppressed = true;
-                throw new DesktopUpdatePostponed();
-              }
+          options.signal?.throwIfAborted();
+          if (input.configuredServerOrigin) {
+            if (!await authorizeReleaseSwitch(prepared.manifest, prepared.requestId, options.signal)) throw new DesktopUpdatePostponed();
+            if (Date.parse(prepared.manifest.expiresAt) <= Date.now()) {
+              throw Object.assign(new Error("DESKTOP_RELEASE_EXPIRED"), { code: "DESKTOP_RELEASE_EXPIRED", requestId: prepared.requestId });
             }
-            options.signal?.throwIfAborted();
-            if (input.configuredServerOrigin) {
-              if (!await authorizeReleaseSwitch(prepared.manifest, prepared.requestId, options.signal)) throw new DesktopUpdatePostponed();
-              if (Date.parse(prepared.manifest.expiresAt) <= Date.now()) {
-                throw Object.assign(new Error("DESKTOP_RELEASE_EXPIRED"), { code: "DESKTOP_RELEASE_EXPIRED", requestId: prepared.requestId });
-              }
-            }
-            options.signal?.throwIfAborted();
-            // 中断发出后退出只等待切换/回退，不能再取消已开始的运行时交接。
-            if (operation === "checking") switchCommitted = true;
-            await controlUpdate(currentRuntime, "runtime.update.interrupt");
-            options.signal?.throwIfAborted();
-          } catch (error) {
-            try { await controlUpdate(currentRuntime, "runtime.update.cancel"); }
-            catch (resumeError) { throw new AggregateError([error, resumeError], "DESKTOP_UPDATE_ADMISSION_RESUME_FAILED"); }
-            throw error;
           }
-          await currentRuntime.drain();
+          options.signal?.throwIfAborted();
+          // 交接开始后复用唯一关闭入口，避免重复停止会话及更新确认状态。
+          if (operation === "checking") switchCommitted = true;
+          await currentRuntime.drain(undefined, { force: true });
         }, restartClient, reloadWeb,
         waitHealthy: async () => runtime.snapshot().status === "ready",
         restoreInitialRelease: async () => {
@@ -1039,7 +999,7 @@ export function createDesktopApplication(input: {
         async drain() {
           if (!await authorizeReleaseSwitch(candidate!.manifest, pending.requestId, AbortSignal.timeout(30_000))) throw new DesktopUpdatePostponed();
           if (databaseMigration) await markPendingDatabaseMigration(input.dataDir, pending, candidate!.manifest.dbSchemaVersion);
-          await runtime.drain();
+          await runtime.drain(undefined, { force: true });
           try {
             if (input.shellUpdate) {
               const facts = input.shellUpdate.facts;
@@ -1065,7 +1025,7 @@ export function createDesktopApplication(input: {
         },
         /** 停候选后保留当前数据库；跨结构失败显式阻止旧 Client 自动回退。 */
         async beforeRestore() {
-          await runtime.drain();
+          await runtime.drain(undefined, { force: true });
           if (databaseMigration && candidateStarted) throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY"),
             { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY", requestId: pending.requestId, releaseId: pending.releaseId });
         },
@@ -1252,27 +1212,6 @@ export function createDesktopApplication(input: {
   const application = {
     /** 仅供宿主存储/生命周期校验读取真实健康；页面getState继续遵守启动围栏。 */
     getRuntimeState(): ClientRuntimeSnapshot { return runtime.snapshot(); },
-    /** 退出前读取运行中回合；Client 未就绪或读取失败时标记不可用，由宿主决定是否提示。 */
-    async getActivity(): Promise<{
-      available: boolean;
-      runningTurns: Array<{ workspaceId: string; threadId: string; title: string; engine: string; turnId: string | null }>;
-    }> {
-      try {
-        // 退出确认不等待慢 Client：短超时后按“不可确认”交宿主提示。
-        const response = await runtime.request({ method: "runtime.activity" }, 2_000);
-        const body = response.body as { ok?: boolean; activity?: { runningTurns?: unknown } } | null;
-        if (response.status !== 200 || body?.ok !== true || !Array.isArray(body.activity?.runningTurns)) {
-          // 响应非法与网络失败同样属于退出确认不可用，保留状态码便于排障。
-          console.warn(JSON.stringify({ code: "DESKTOP_QUIT_ACTIVITY_INVALID", requestId: crypto.randomUUID(), status: response.status }));
-          return { available: false, runningTurns: [] };
-        }
-        return { available: true, runningTurns: body.activity.runningTurns as Array<{ workspaceId: string; threadId: string; title: string; engine: string; turnId: string | null }> };
-      } catch (error) {
-        console.warn(JSON.stringify({ code: "DESKTOP_QUIT_ACTIVITY_READ_FAILED", requestId: crypto.randomUUID(),
-          rootCause: error instanceof Error ? error.message : String(error) }));
-        return { available: false, runningTurns: [] };
-      }
-    },
     /** 固定 origin 装配完成后才暴露网络更新可用性。 */
     get updateAvailable(): boolean { return transport !== undefined; },
     /** 最近一次补报失败的固定诊断信息；不暴露远端正文或凭据。 */
@@ -1329,13 +1268,7 @@ export function createDesktopApplication(input: {
         if (preparedUpdate && window && !shellOwner) await application.restartForUpdate();
         return;
       }
-      /** 用户明确重启更新仍先确认运行中会话，不能静默终止回合。 */
-      const activity = await controlUpdate(runtime, "runtime.update.prepare");
-      if (typeof activity.hasRunningSessions !== "boolean") throw new Error("DESKTOP_UPDATE_ACTIVITY_INVALID");
-      if (activity.hasRunningSessions) {
-        if (!input.host.confirmUpdate) throw new Error("DESKTOP_UPDATE_CONFIRMATION_UNAVAILABLE");
-        if (!await input.host.confirmUpdate(window, undefined)) return;
-      }
+      // 用户已明确重启更新，直接沿统一关闭入口停止本机任务。
       restartRequested = !shellOwner;
       try { await application.exit(); }
       finally { restartRequested = false; }
@@ -1677,7 +1610,7 @@ export function createDesktopApplication(input: {
         }
         if (error instanceof DesktopStartupCleanupError) throw error;
         try {
-          await runtime.drain();
+          await runtime.drain(undefined, { force: true });
           destroyShell();
         } catch (cleanupError) {
           throw new DesktopStartupCleanupError(error, cleanupError);
@@ -1715,13 +1648,13 @@ export function createDesktopApplication(input: {
           if (updateFlight) {
             if (!switchCommitted) updateController?.abort(updateStopReason);
             await updateSettled;
-            if (updateCheckFailure) throw updateCheckFailure.error;
-            if (shellUpdateFailure) throw shellUpdateFailure.error;
+            // 更新错误已在所属边界上报；普通退出只等待交接收口，不重抛历史更新失败。
+            if (shellOwner && shellUpdateFailure) throw shellUpdateFailure.error;
           }
           operation = "exiting";
           await migration?.stop();
           shellOwner?.check();
-          if (shellDrainedRuntime !== runtime) await runtime.drain();
+          if (shellDrainedRuntime !== runtime) await runtime.drain(undefined, { force: true });
           destroyShell();
           if (restartRequested) input.host.relaunch!();
           input.host.quit();

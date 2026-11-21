@@ -286,6 +286,14 @@ export class ManagedServiceRuntime {
     }
   }
 
+  /** 关闭按已持有记录释放全部线程；各线程独立收口，失败保留原对象与记录。 */
+  async disposeAllServices(reason = "client-shutdown"): Promise<void> {
+    const results = await Promise.allSettled([...this.servicesByThread.keys()].map(threadId => this.disposeThreadServices(threadId, reason)));
+    const failures = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "MANAGED_SERVICES_DISPOSAL_FAILED", { cause: failures[0] });
+  }
+
   /** 查询先交付原失败，再映射终态快照；prune 不得掩盖诊断失败。 */
   listThreadServices(threadId: ThreadId): ManagedServiceSnapshot[] {
     this.pruneTerminalRecords(threadId);

@@ -35,12 +35,12 @@ test("普通关闭排空真实尾链，provider结束不代表资源已释放", 
   assert.equal(owners.hasOrdinaryTurnExecutions(sessions), false);
 });
 
-test("普通关闭观察已settled的falsy失败且不破坏精确等待恢复", async () => {
+test("普通关闭不重放已结束回合失败，精确等待仍可查询原失败", async () => {
   const sessions = {}, identity = scope();
   owners.trackOrdinaryTurnExecution(sessions, identity, async () => { throw undefined; });
   await assert.rejects(owners.waitForOrdinaryTurnExecution(sessions, identity), error => error === undefined);
   assert.equal(owners.listOrdinaryTurnExecutions(sessions).length, 0);
-  await assert.rejects(owners.drainOrdinaryTurnExecutions(sessions), error => error === undefined);
+  await owners.drainOrdinaryTurnExecutions(sessions);
   await assert.rejects(owners.waitForOrdinaryTurnExecution(sessions, identity), error => error === undefined);
 });
 
@@ -85,6 +85,7 @@ test("普通关闭隔离session owner且空集合正常完成", async () => {
   const failed = {}, healthy = {}, original = { failure: "tail-failed" };
   owners.trackOrdinaryTurnExecution(failed, scope(), async () => { throw original; });
   await owners.drainOrdinaryTurnExecutions(healthy);
-  await assert.rejects(owners.drainOrdinaryTurnExecutions(failed), error => error === original);
+  await assert.rejects(owners.waitForOrdinaryTurnExecution(failed, scope()), error => error === original);
+  await owners.drainOrdinaryTurnExecutions(failed);
   await owners.drainOrdinaryTurnExecutions(healthy);
 });

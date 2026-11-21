@@ -50,7 +50,7 @@ for (const cancelled of [false, true]) test(`one explicit restart preserves the 
     operation: "idle", window: {} as unknown, preparedUpdate: { manifest: { releaseId: "resource-2" } },
     shellDetails: { result: "prepared" }, shellOwner: undefined as unknown, runtime: {}, restartRequested: false,
     updateCheckFailure: null, shellUpdateFailure: null, updatesSuppressed: false,
-    input: { shellUpdate: { boundary: {} }, host: { relaunch() {}, confirmUpdate: async () => true } },
+    input: { shellUpdate: { boundary: {} }, host: { relaunch() {} } },
     async beginUpdateCheck(manual: boolean, allowRestart: boolean) {
       assert.equal(manual, true); assert.equal(allowRestart, true);
       calls.push("native transfer with pending resource");
@@ -66,7 +66,7 @@ for (const cancelled of [false, true]) test(`one explicit restart preserves the 
   assert.deepEqual(calls, ["native transfer with pending resource"]);
 });
 
-for (const failureStage of ["executor", "interrupt"] as const) test(`native shell ${failureStage} failure resumes only its own Client changes`, async () => {
+test("native shell executor failure restarts only its original Client", async () => {
   const file = new URL("../src/desktopApplication.ts", import.meta.url);
   const source = ts.createSourceFile(file.pathname, await fs.readFile(file, "utf8"), ts.ScriptTarget.Latest, true);
   let initializer: ts.Expression | undefined;
@@ -93,7 +93,6 @@ for (const failureStage of ["executor", "interrupt"] as const) test(`native shel
     async discoverUpdatesInternal() { return {}; },
     async readPendingRelease() { return null; }, async clearPendingRelease() {},
     async controlUpdate(_runtime: unknown, method: string) {
-      if (failureStage === "interrupt" && method === "runtime.update.interrupt") throw new Error("INTERRUPT_FAILED");
       if (method === "runtime.update.cancel") calls.push("cancel admission");
       return { hasRunningSessions: false };
     },
@@ -109,8 +108,8 @@ for (const failureStage of ["executor", "interrupt"] as const) test(`native shel
   const compiled = ts.transpileModule(`const operation = ${initializer.getText(source)}; operation;`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   const operation = vm.runInNewContext(compiled, context);
-  await assert.rejects(operation(crypto.randomUUID(), new AbortController().signal, true, true), failureStage === "executor" ? /EXECUTOR_START_FAILED/u : /INTERRUPT_FAILED/u);
-  assert.deepEqual(calls, failureStage === "executor" ? ["drain active resource/schema90", "start active resource/schema90", "ready active resource/schema90"] : ["cancel admission"]);
+  await assert.rejects(operation(crypto.randomUUID(), new AbortController().signal, true, true), /EXECUTOR_START_FAILED/u);
+  assert.deepEqual(calls, ["drain active resource/schema90", "start active resource/schema90", "ready active resource/schema90"]);
   assert.equal(context.shellDrainedRuntime, undefined, "resumed Client must be drained normally on the next exit");
 });
 
@@ -580,7 +579,8 @@ for (const phase of ["spawn", "ready"] as const) for (const shutdown of ["normal
       } });
     let runtime!: ClientRuntime, migration!: LegacyClientMigration;
     const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host,
-      createRuntime: entry => (runtime = createClientRuntime({ entry, dataDir: f.dataDir, spawn: () => {
+      createRuntime: entry => (runtime = createClientRuntime({ entry, dataDir: f.dataDir,
+        forceKill: async () => { throw new Error('fixture-force-stop-denied'); }, spawn: () => {
         spawned(); if (phase === 'ready') queueMicrotask(() => child.emit('spawn')); return child;
       } })),
       createMigration: ({ identity }) => (migration = createLegacyClientMigration({ dataDir: f.dataDir, identity, workerEntry: 'unused',
@@ -592,7 +592,10 @@ for (const phase of ["spawn", "ready"] as const) for (const shutdown of ["normal
     await new Promise(resolve => setImmediate(resolve));
     if (shutdown === 'normal') await app.exit();
     else {
-      await assert.rejects(app.exit(), /review-shutdown-failed/u);
+      await assert.rejects(app.exit(), (error: any) => {
+        assert.equal(error.message, "CLIENT_FORCE_STOP_FAILED");
+        assert.match(error.errors[0].message, /review-shutdown-failed/u); return true;
+      });
       child.emit('exit', 0, null); child.emit('close', 0, null);
     }
     const error = await result; assert.ok(error);
@@ -947,7 +950,7 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
   f.runtime.snapshot = () => ({ status: "ready", requestId: "client-ready-1", releaseId: runtimeReleaseId, errorCode: null, pid: client.pid, health,
     ...(heldId ? { startup: { continuationId: heldId, admission: "paused" as const } } : {}) });
   const store = createShellUpdateAttemptStore(f.dataDir), identity = await loadOrCreateDeviceIdentity(f.dataDir), errors: unknown[] = [], serverErrors: unknown[] = [];
-  const control = { available: true, hotAvailable: hotUpdate, resourceAuthorized: true, busy: false, confirm: true, fail: "", spawned: false, closed: false, drained: false, failHot: false, quitFail: false,
+  const control = { available: true, hotAvailable: hotUpdate, resourceAuthorized: true, busy: false, fail: "", spawned: false, closed: false, drained: false, failHot: false, quitFail: false,
     shellChannelFailed: false, resourceChannelFailed: false,
     holdHealth: undefined as (() => Promise<void>) | undefined, holdDrain: undefined as (() => Promise<void>) | undefined };
   let hotManifest = manifest, archive: Buffer = Buffer.alloc(0);
@@ -1024,7 +1027,6 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
   f.runtime.request = async request => { f.actions.push(request.method); if (request.method === "runtime.update.interrupt" && control.fail === "interrupt") throw new Error("interrupt failed"); return { status: 200, body: { ok: true, ...(request.method === "runtime.update.prepare" ? { hasRunningSessions: control.busy } : {}) } }; };
   f.runtime.drain = async () => { f.actions.push("drain"); await control.holdDrain?.(); if (control.fail === "drain") { control.fail = ""; throw new Error("drain failed"); } control.drained = true; };
   f.runtime.start = async () => { control.drained = false; f.actions.push("start"); };
-  f.host.confirmUpdate = async () => { f.actions.push("confirm"); return control.confirm; };
   f.host.onUpdateError = error => { errors.push(error); }; f.host.onUpdateRetry = () => {};
   f.host.quit = () => { f.actions.push("quit"); if (control.quitFail) throw new Error("quit failed"); };
   f.host.relaunch = () => { f.actions.push("relaunch"); };
@@ -1133,15 +1135,14 @@ test('pending remote receipt delivery cannot block a new update check', async t 
   await f.app.exit();
 });
 
-test("用户重启更新前确认运行中会话，取消后保留应用", async t => {
+test("用户明确重启更新后直接停止运行环境，不再二次确认", async t => {
   const f = await shellApplicationFixture(t);
   await f.app.checkForUpdates();
   f.control.busy = true;
-  f.control.confirm = false;
   await f.app.restartForUpdate();
-  assert.ok(f.actions.includes("confirm"), "有运行中会话时必须先确认");
-  assert.equal(f.actions.includes("quit"), false, "取消后不得退出应用");
-  assert.equal(f.actions.includes("drain"), false, "取消后不得中断运行环境");
+  assert.equal(f.actions.includes("confirm"), false);
+  assert.equal(f.actions.includes("quit"), true);
+  assert.equal(f.actions.includes("drain"), true);
 });
 
 test("shell preparation shares the checking flight and explicit restart exits once without self waiting", async t => {
@@ -1316,12 +1317,12 @@ test("explicit shell restart also restarts for resources first discovered by tha
   assert.ok(await readPendingRelease(f.dataDir));
 });
 
-test("newly discovered resources still honor cancellation of an explicit shell restart", async t => {
+test("newly discovered resources restart directly after an explicit update click", async t => {
   const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
-  await f.app.checkForUpdates(); f.control.hotAvailable = true; f.control.busy = true; f.control.confirm = false;
+  await f.app.checkForUpdates(); f.control.hotAvailable = true; f.control.busy = true;
   await f.app.restartForUpdate();
-  assert.equal(f.actions.filter(action => action === "confirm").length, 1);
-  assert.equal(f.actions.includes("quit"), false); assert.equal(f.control.drained, false);
+  assert.equal(f.actions.filter(action => action === "confirm").length, 0);
+  assert.equal(f.actions.includes("quit"), true); assert.equal(f.control.drained, true);
   assert.equal((await f.app.getUpdateDetails()).bundle.result, "prepared");
   await f.app.exit();
 });
@@ -1475,56 +1476,40 @@ test("hot failure prevents shell work and preserves its original failure boundar
   assert.equal(f.actions.includes("shell-discover"), false); await f.app.exit();
 });
 
-test("shell later cancels original admission before helper creation and leaves the attempt reusable", async t => {
-  const f = await shellApplicationFixture(t); f.control.busy = true; f.control.confirm = false;
+test("shell explicit restart does not pause admission for a confirmation dialog", async t => {
+  const f = await shellApplicationFixture(t); f.control.busy = true;
   assert.equal(await f.app.checkForUpdates(), null);
   await f.app.restartForUpdate();
-  assert.deepEqual(f.actions.slice(-3), ["runtime.update.prepare", "confirm", "runtime.update.cancel"]);
-  assert.equal((await f.app.getUpdateDetails()).shell.result, "postponed");
-  assert.equal(f.actions.includes("quit"), false); assert.equal(f.app.shellUpdateFailure, null);
-  assert.equal(f.control.spawned, false); assert.equal((await f.store.read())?.schemaVersion, 5);
-  await f.app.exit();
+  assert.equal(f.actions.includes("runtime.update.prepare"), false);
+  assert.equal(f.actions.includes("confirm"), false);
+  assert.equal(f.actions.includes("quit"), true); assert.equal(f.app.shellUpdateFailure, null);
+  assert.equal(f.control.spawned, true);
 });
 
-test("shell interrupt failure closes its helper and cancels admission without restarting the untouched Client", async t => {
+test("shell restart does not depend on the old update interrupt control request", async t => {
   const f = await shellApplicationFixture(t); await f.app.checkForUpdates(); f.control.fail = "interrupt";
-  await assert.rejects(f.app.restartForUpdate()); assert.equal(f.control.closed, true); assert.equal(f.actions.includes("start"), false);
-  assert.equal(f.actions.includes("runtime.update.cancel"), true); assert.equal(f.actions.includes("drain"), false);
-  assert.equal(f.actions.includes("quit"), false); assert.equal(f.app.updateCheckFailure, null); assert.ok(f.app.shellUpdateFailure);
-  await f.app.exit();
+  await f.app.restartForUpdate();
+  assert.equal(f.actions.includes("runtime.update.interrupt"), false);
+  assert.equal(f.actions.includes("drain"), true);
+  assert.equal(f.actions.includes("quit"), true); assert.equal(f.app.shellUpdateFailure, null);
 });
 
-for (const rejectResume of [false, true]) test(`shell prearm failure logs before held Client cancel ${rejectResume ? "rejects" : "completes"}`, { timeout: 10_000 }, async t => {
-  const f = await shellApplicationFixture(t), primary = new Error("prearm snapshot failed"), additional = new Error("cancel failed");
+test("shell prearm failure retains its cause without pausing or restarting the untouched Client", async t => {
+  const f = await shellApplicationFixture(t), primary = new Error("prearm snapshot failed");
   await f.app.checkForUpdates();
-  const snapshot = f.boundary.snapshot!, request = f.runtime.request, reports: { error: any; context: any }[] = [];
-  let injected = false, enter!: () => void, release!: () => void, settled = false;
-  const entered = new Promise<void>(resolve => { enter = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+  const snapshot = f.boundary.snapshot!, reports: { error: any; context: any }[] = [];
+  let injected = false;
   f.boundary.snapshot = async () => { if (f.control.spawned && !injected) { injected = true; throw primary; } return await snapshot(); };
   f.host.onUpdateError = (error, context) => { reports.push({ error, context }); };
-  f.runtime.request = async input => {
-    if (input.method === "runtime.update.cancel") { enter(); await held; if (rejectResume) throw additional; }
-    return await request(input);
-  };
-  const flight = f.app.restartForUpdate().then(() => { settled = true; throw new Error("EXPECTED_FAILURE"); }, error => { settled = true; return error; });
-  const attemptAtGate = await (async () => {
-    try {
-      await entered;
-      assert.equal(injected, true); assert.equal(f.control.closed, true); assert.equal(settled, false);
-      assert.equal(reports.length, 1); assert.equal(reports[0].context.logOnly, true); assert.equal(reports[0].error.cause, primary);
-      assert.equal(reports[0].context.requestId, reports[0].error.requestId);
-      assert.equal(reports[0].context.deviceId, reports[0].error.deviceId);
-      assert.equal(f.app.shellUpdateFailure, null); assert.equal(f.app.updateCheckFailure, null);
-      assert.equal(f.actions.includes("quit"), false); assert.equal(f.actions.includes("arm"), false);
-      return await f.store.read();
-    } finally { release(); }
-  })();
-  const failure = await flight;
-  assert.equal(reports.length, 2); assert.equal(reports[1].context.logOnly, undefined); assert.equal(reports[1].error, failure);
-  assert.equal(f.app.shellUpdateFailure?.error, failure); assert.equal(failure.helperOwner, undefined);
-  if (rejectResume) { assert.notEqual(failure, reports[0].error); assert.deepEqual(failure.cause.errors, [primary, additional]); }
-  else assert.equal(failure, reports[0].error);
-  assert.deepEqual(await f.store.read(), attemptAtGate); await f.app.exit();
+  await assert.rejects(f.app.restartForUpdate(), (error: any) => {
+    assert.equal(error.cause, primary); assert.equal(f.app.shellUpdateFailure?.error, error); return true;
+  });
+  assert.equal(injected, true); assert.equal(f.control.closed, true);
+  assert.equal(reports.length, 2); assert.equal(reports[0].context.logOnly, true); assert.equal(reports[1].context.logOnly, undefined);
+  assert.equal(f.actions.includes("runtime.update.prepare"), false);
+  assert.equal(f.actions.includes("runtime.update.cancel"), false);
+  assert.equal(f.actions.includes("start"), false); assert.equal(f.actions.includes("quit"), false);
+  await f.app.exit();
 });
 
 test("shell prearm log failure retains its cause and stops Client cancel", async t => {
@@ -2124,73 +2109,64 @@ test("简化启动后的首次更新失败，回退前必须全量核验基线",
   await app.exit();
 });
 
-for (const busy of [false, true]) test(`update ${busy ? "confirms and interrupts busy sessions" : "silently switches an idle Client"}`, async t => {
+for (const busy of [false, true]) test(`update closes the ${busy ? "busy" : "idle"} Client through one bounded shutdown without prompting`, async t => {
   const f = await fixture(t);
   f.runtime.request = async request => {
     f.actions.push(request.method);
     return { status: 200, body: { ok: true, ...(request.method === "runtime.update.prepare" ? { hasRunningSessions: busy } : {}) } };
   };
-  f.host.confirmUpdate = async () => { f.actions.push("confirm"); return true; };
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
   await app.start();
   const directory = await createUpdatePackage(f.dataDir);
   f.actions.length = 0;
   const result = await app.applyRelease(directory);
   assert.equal(result?.releaseId, "new-release");
-  assert.deepEqual(f.actions.slice(0, busy ? 4 : 3), busy
-    ? ["runtime.update.prepare", "confirm", "runtime.update.interrupt", "drain"]
-    : ["runtime.update.prepare", "runtime.update.interrupt", "drain"]);
-  assert.equal(f.actions.includes("confirm"), busy);
+  assert.equal(f.actions[0], "drain");
+  assert.equal(f.actions.some(action => action.startsWith("runtime.update.")), false);
   await app.exit();
 });
 
-test("postponing an update resumes admission without interrupting or switching", async t => {
+test("update does not depend on activity or update-control requests being healthy", async t => {
   const f = await fixture(t);
   f.runtime.request = async request => {
-    f.actions.push(request.method);
-    return { status: 200, body: { ok: true, hasRunningSessions: true } };
+    throw new Error(`obsolete activity query: ${request.method}`);
   };
-  f.host.confirmUpdate = async () => false;
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
   await app.start();
   const directory = await createUpdatePackage(f.dataDir);
   f.actions.length = 0;
-  assert.equal(await app.applyRelease(directory), null);
-  assert.deepEqual(f.actions, ["runtime.update.prepare", "runtime.update.cancel"]);
-  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal((await app.applyRelease(directory))?.releaseId, "new-release");
+  assert.equal(await readActivePointer(f.dataDir), "new-release");
   await assert.rejects(() => fs.access(path.join(f.dataDir, "errors.jsonl")), { code: "ENOENT" });
   await app.exit();
 });
 
-test("postponed update retries the same request with the original prepared receipts", async t => {
+test("direct application keeps its original request in the prepared receipts", async t => {
   const f = await fixture(t);
   const requestId = crypto.randomUUID();
-  const receipts: Array<{ stage: string; at: string; payloadSha256: string }> = [];
-  let accept = false;
-  f.host.confirmUpdate = async () => accept;
   f.runtime.request = async () => ({ status: 200, body: { ok: true, hasRunningSessions: true } });
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host,
-    createRuntime: () => f.runtime, reportReceipt: async receipt => { receipts.push(receipt); } });
+    createRuntime: () => f.runtime, reportReceipt: async () => {} });
   await app.start();
   const directory = await createUpdatePackage(f.dataDir);
-  assert.equal(await app.applyRelease(directory, { requestId }), null);
-  assert.equal(await app.applyRelease(directory, { requestId }), null);
-  assert.deepEqual(await fs.readdir(path.join(f.dataDir, ".staging")), []);
-  accept = true;
   assert.equal((await app.applyRelease(directory, { requestId }))?.releaseId, "new-release");
-  assert.deepEqual(receipts.filter(value => value.stage === "verified")[1], receipts[0]);
-  assert.deepEqual(receipts.filter(value => value.stage === "prepared")[1], receipts[1]);
+  const identity = await loadOrCreateDeviceIdentity(f.dataDir), journal = createUpdateReceiptJournal(f.dataDir);
+  assert.equal((await journal.find(identity.deviceId, requestId, "verified"))?.requestId, requestId);
+  assert.equal((await journal.find(identity.deviceId, requestId, "prepared"))?.requestId, requestId);
   await app.exit();
 });
 
-test("confirmation owns the update lifecycle while existing interaction requests remain available", async t => {
+test("shutdown owns the update lifecycle until the old Client is confirmed closed", async t => {
   const f = await fixture(t);
   let bridge!: DesktopBridgeApi;
   f.host.registerBridge = value => { bridge = value; return () => {}; };
-  let confirm!: (accepted: boolean) => void;
+  let release!: () => void;
   let prompting!: () => void;
   const prompted = new Promise<void>(resolve => { prompting = resolve; });
-  f.host.confirmUpdate = async () => { prompting(); return await new Promise<boolean>(resolve => { confirm = resolve; }); };
+  f.runtime.drain = async (_timeout, options) => {
+    assert.equal(options?.force, true);
+    prompting(); await new Promise<void>(resolve => { release = resolve; });
+  };
   f.runtime.request = async request => ({ status: 200, body: { ok: true, hasRunningSessions: true, method: request.method } });
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
   await app.start();
@@ -2201,88 +2177,71 @@ test("confirmation owns the update lifecycle while existing interaction requests
   await assert.rejects(() => app.exit(), /DESKTOP_OPERATION_IN_PROGRESS/);
   assert.equal((await bridge.request({ method: "approvals.respond" })).status, 200);
   await assert.rejects(() => bridge.request({ method: "runtime.update.cancel" } as any), /DESKTOP_UPDATE_CONTROL_FORBIDDEN/);
-  confirm(false);
-  assert.equal(await pending, null);
+  f.runtime.drain = async () => {};
+  release();
+  assert.equal((await pending)?.releaseId, "new-release");
   await app.exit();
 });
 
-test("failed admission recovery preserves both errors and prevents switching", async t => {
+test("unconfirmed Client shutdown prevents switching and retains the original failure", async t => {
   const f = await fixture(t);
-  f.runtime.request = async request => {
-    if (request.method === "runtime.update.prepare") throw new Error("query-failed");
-    throw new Error("resume-failed");
-  };
+  f.runtime.drain = async () => { throw new Error("CLIENT_FORCE_STOP_FAILED"); };
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
   await app.start();
   const directory = await createUpdatePackage(f.dataDir);
   f.actions.length = 0;
-  await assert.rejects(() => app.applyRelease(directory), (error: unknown) => {
-    assert.ok(error instanceof AggregateError);
-    assert.equal(error.message, "DESKTOP_UPDATE_ADMISSION_RESUME_FAILED");
-    assert.deepEqual(error.errors.map(value => value.message), ["query-failed", "resume-failed"]);
-    return true;
-  });
+  await assert.rejects(() => app.applyRelease(directory), /CLIENT_FORCE_STOP_FAILED/);
+  assert.deepEqual(f.actions, []);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  f.runtime.drain = async () => {};
+  await app.exit();
+});
+
+test("cancelling before shutdown preserves the active release without pausing task admission", async t => {
+  const f = await fixture(t);
+  const controller = new AbortController();
+  f.runtime.request = async request => {
+    f.actions.push(request.method);
+    return { status: 200, body: { ok: true, hasRunningSessions: true } };
+  };
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
+  await app.start();
+  const directory = await createUpdatePackage(f.dataDir);
+  controller.abort(new Error("cancel-update"));
+  f.actions.length = 0;
+  await assert.rejects(() => app.applyRelease(directory, { signal: controller.signal }), /cancel-update/);
   assert.deepEqual(f.actions, []);
   assert.equal(await readActivePointer(f.dataDir), null);
   await app.exit();
 });
 
-test("cancelling while confirmation is open resumes admission without interrupting", async t => {
+test("once shutdown has committed, late cancellation completes the version handoff", async t => {
   const f = await fixture(t);
   const controller = new AbortController();
-  f.runtime.request = async request => {
-    f.actions.push(request.method);
-    return { status: 200, body: { ok: true, hasRunningSessions: true } };
-  };
-  f.host.confirmUpdate = async () => { controller.abort(new Error("cancel-update")); return true; };
+  f.runtime.drain = async () => { controller.abort(new Error("cancel-after-interrupt")); };
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
   await app.start();
   const directory = await createUpdatePackage(f.dataDir);
   f.actions.length = 0;
-  await assert.rejects(() => app.applyRelease(directory, { signal: controller.signal }), /cancel-update/);
-  assert.deepEqual(f.actions, ["runtime.update.prepare", "runtime.update.cancel"]);
-  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal((await app.applyRelease(directory, { signal: controller.signal }))?.releaseId, "new-release");
+  assert.equal(f.actions.some(action => action.startsWith("runtime.update.")), false);
+  assert.equal(await readActivePointer(f.dataDir), "new-release");
   await app.exit();
 });
 
-test("cancelling during interruption prevents the subsequent version switch", async t => {
+test("update shutdown failure is journaled at its original drain boundary", async t => {
   const f = await fixture(t);
-  const controller = new AbortController();
-  f.runtime.request = async request => {
-    f.actions.push(request.method);
-    if (request.method === "runtime.update.interrupt") controller.abort(new Error("cancel-after-interrupt"));
-    return { status: 200, body: { ok: true, hasRunningSessions: false } };
-  };
-  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
-  await app.start();
-  const directory = await createUpdatePackage(f.dataDir);
-  f.actions.length = 0;
-  await assert.rejects(() => app.applyRelease(directory, { signal: controller.signal }), /cancel-after-interrupt/);
-  assert.deepEqual(f.actions, ["runtime.update.prepare", "runtime.update.interrupt", "runtime.update.cancel"]);
-  assert.equal(await readActivePointer(f.dataDir), null);
-  await app.exit();
-});
-
-for (const failure of ["query", "interrupt", "malformed", "missing-confirmation"]) test(`update ${failure} failure preserves the current Client and releases admission`, async t => {
-  const f = await fixture(t);
-  f.runtime.request = async request => {
-    f.actions.push(request.method);
-    if (failure === "query" && request.method === "runtime.update.prepare"
-      || failure === "interrupt" && request.method === "runtime.update.interrupt") return { status: 500, body: { ok: false, code: "UPDATE_TEST_FAILED" } };
-    if (failure === "malformed" && request.method === "runtime.update.prepare") return { status: 200, body: { ok: true } };
-    return { status: 200, body: { ok: true, hasRunningSessions: true } };
-  };
-  if (failure !== "missing-confirmation") f.host.confirmUpdate = async () => true;
+  f.runtime.drain = async () => { throw new Error("CLIENT_FORCE_STOP_FAILED"); };
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
   await app.start();
   const directory = await createUpdatePackage(f.dataDir);
   f.actions.length = 0;
   await assert.rejects(() => app.applyRelease(directory));
   assert.equal(f.actions.includes("drain"), false);
-  assert.equal(f.actions.at(-1), "runtime.update.cancel");
   assert.equal(await readActivePointer(f.dataDir), null);
   const records = (await fs.readFile(path.join(f.dataDir, "errors.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
   assert.equal(records.at(-1).phase, "drain");
+  f.runtime.drain = async () => {};
   await app.exit();
 });
 

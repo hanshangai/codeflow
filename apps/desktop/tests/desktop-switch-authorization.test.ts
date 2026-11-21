@@ -17,13 +17,6 @@ import { readActivePointer } from '../src/releaseBundleCoordinator.js';
 import { createUpdateFailureJournal } from '../src/updateFailureJournal.js';
 import { createUpdateReceiptJournal } from '../src/updateReceiptJournal.js';
 
-/** 确认窗口和网络检查使用显式屏障，避免以延迟推断操作顺序。 */
-function barrier() {
-  let release!: () => void;
-  const promise = new Promise<void>(resolve => { release = resolve; });
-  return { promise, release };
-}
-
 /** 原应用、签名传输与日志使用临时真实资源，运行时替身仅记录调度。 */
 async function fixture(t: test.TestContext, options: { busy?: boolean; expiresAt?: number } = {}) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cf-d12m-desktop-'));
@@ -63,8 +56,7 @@ async function fixture(t: test.TestContext, options: { busy?: boolean; expiresAt
       health: { protocolVersion: 1, clientVersion: '1.0.0', dbSchemaVersion: 88, database: 'ready' } }; },
   };
   const host: DesktopHost = { createWindow: () => window, async loadWeb() { actions.push('reload-web'); },
-    createTray: () => ({ destroy() {} }), registerBridge: () => () => {}, quit() {},
-    async confirmUpdate() { actions.push('confirm'); return true; } };
+    createTray: () => ({ destroy() {} }), registerBridge: () => () => {}, quit() {} };
   const ack = (authorized = true) => ({ ok: true, authorized, deviceId: identity.deviceId, requestId, releaseId: manifest.releaseId,
     ...(authorized ? { archiveSha256: manifest.archiveSha256 } : {}) });
   const control = { respond: async (_request: http.IncomingMessage, response: http.ServerResponse) => { response.end(JSON.stringify(ack())); } };
@@ -118,32 +110,27 @@ async function assertPreserved(f: Awaited<ReturnType<typeof fixture>>) {
   assert.equal(f.actions.includes('runtime.update.interrupt'), false);
   assert.equal(f.actions.includes('drain'), false);
   assert.equal(f.actions.includes('reload-web'), false);
-  assert.equal(f.actions.at(-1), 'runtime.update.cancel');
+  assert.equal(f.actions.includes('runtime.update.prepare'), false);
   assert.equal(await readActivePointer(f.dataDir), null);
   await fs.access(path.join(f.dataDir, 'releases', f.manifest.releaseId, 'web', 'index.html'));
   assert.deepEqual(f.receipts.map(record => record.stage), ['received', 'verified', 'prepared']);
 }
 
-for (const busy of [false, true]) test(`switch authorization runs after ${busy ? 'confirmation' : 'idle preparation'} before interruption`, async t => {
+for (const busy of [false, true]) test(`switch authorization precedes shutdown without ${busy ? 'busy' : 'idle'} session confirmation`, async t => {
   const f = await fixture(t, { busy });
   assert.equal((await f.app.applyRelease(f.packageDir, { requestId: f.requestId }))?.releaseId, f.manifest.releaseId);
   await f.app.flushReceipts();
-  assert.deepEqual(f.actions.slice(0, busy ? 5 : 4), busy
-    ? ['runtime.update.prepare', 'confirm', 'switch-authorization', 'runtime.update.interrupt', 'drain']
-    : ['runtime.update.prepare', 'switch-authorization', 'runtime.update.interrupt', 'drain']);
+  assert.deepEqual(f.actions.slice(0, 2), ['switch-authorization', 'drain']);
   assert.deepEqual(f.authorizationRequests, [f.requestId]);
   assert.deepEqual(f.receipts.map(record => record.stage), ['received', 'verified', 'prepared', 'switched', 'healthy']);
   assert.equal(f.receipts.every(record => record.requestId === f.requestId), true);
 });
 
-test('pause during confirmation preserves package and original receipts, then retry rechecks the same attempt', async t => {
+test('server pause preserves package and original receipts, then retry rechecks the same attempt', async t => {
   const f = await fixture(t, { busy: true });
-  const confirming = barrier(); const answer = barrier(); let authorized = true;
-  f.host.confirmUpdate = async () => { f.actions.push('confirm'); confirming.release(); await answer.promise; return true; };
+  let authorized = false;
   f.control.respond = async (_request, response) => { response.end(JSON.stringify(f.ack(authorized))); };
-  const applying = f.app.applyRelease(f.packageDir, { requestId: f.requestId });
-  await confirming.promise; assert.deepEqual(f.authorizationRequests, []);
-  authorized = false; answer.release(); assert.equal(await applying, null);
+  assert.equal(await f.app.applyRelease(f.packageDir, { requestId: f.requestId }), null);
   await assertPreserved(f); assert.deepEqual(f.failures(), []);
   const journal = createUpdateReceiptJournal(f.dataDir);
   const originalPrepared = await journal.find(f.identity.deviceId, f.requestId, 'prepared');
@@ -157,28 +144,25 @@ test('pause during confirmation preserves package and original receipts, then re
   assert.deepEqual(await fs.readdir(path.join(f.dataDir, '.staging')), []);
 });
 
-test('choosing later skips the authorization request and resumes admission without a failure', async t => {
+test('server withdrawal stops before Client shutdown without pausing admission', async t => {
   const f = await fixture(t, { busy: true });
-  f.host.confirmUpdate = async () => { f.actions.push('confirm'); return false; };
+  f.control.respond = async (_request, response) => { response.end(JSON.stringify(f.ack(false))); };
   assert.equal(await f.app.applyRelease(f.packageDir, { requestId: f.requestId }), null);
-  await assertPreserved(f); assert.deepEqual(f.authorizationRequests, []); assert.deepEqual(f.failures(), []);
+  await assertPreserved(f); assert.deepEqual(f.authorizationRequests, [f.requestId]); assert.deepEqual(f.failures(), []);
 });
 
-test('cancelling at confirmation prevents authorization and keeps the existing cancellation failure contract', async t => {
+test('cancelling before apply prevents authorization and keeps the existing cancellation failure contract', async t => {
   const f = await fixture(t, { busy: true }); const controller = new AbortController();
-  f.host.confirmUpdate = async () => { f.actions.push('confirm'); controller.abort(new Error('confirmation-cancelled')); return true; };
+  controller.abort(new Error('confirmation-cancelled'));
   await assert.rejects(() => f.app.applyRelease(f.packageDir, { requestId: f.requestId, signal: controller.signal }), /confirmation-cancelled/u);
-  await assertPreserved(f); assert.deepEqual(f.authorizationRequests, []); assert.equal(f.failures().length, 1);
+  assert.equal(f.actions.includes('drain'), false); assert.deepEqual(f.authorizationRequests, []);
+  assert.equal(await readActivePointer(f.dataDir), null);
 });
 
 test('an authorization already returned is a time snapshot rather than a live pause subscription', async t => {
   const f = await fixture(t); let paused = false;
   f.control.respond = async (_request, response) => { response.end(JSON.stringify(f.ack(!paused))); };
-  const original = f.runtime.request;
-  f.runtime.request = async request => {
-    if (request.method === 'runtime.update.interrupt') paused = true;
-    return await original(request);
-  };
+  f.runtime.drain = async () => { paused = true; f.actions.push('drain'); };
   assert.equal((await f.app.applyRelease(f.packageDir, { requestId: f.requestId }))?.releaseId, f.manifest.releaseId);
   assert.equal(paused, true); assert.deepEqual(f.authorizationRequests, [f.requestId]);
   assert.deepEqual(f.failures(), []);
@@ -223,7 +207,7 @@ for (const kind of ['http', 'json', 'cancel'] as const) test(`switch authorizati
   assert.equal(JSON.stringify(f.failures()).includes('PRIVATE_BROKEN_JSON'), false);
 });
 
-test('negative authorization whose admission recovery fails remains a real aggregate failure', async t => {
+test('negative authorization does not call obsolete admission recovery', async t => {
   const f = await fixture(t);
   f.control.respond = async (_request, response) => { response.end(JSON.stringify(f.ack(false))); };
   const original = f.runtime.request;
@@ -231,18 +215,14 @@ test('negative authorization whose admission recovery fails remains a real aggre
     if (request.method === 'runtime.update.cancel') { f.actions.push(request.method); throw new Error('ADMISSION_RESUME_FAILED'); }
     return await original(request);
   };
-  await assert.rejects(() => f.app.applyRelease(f.packageDir, { requestId: f.requestId }), error => {
-    assert.ok(error instanceof AggregateError); assert.equal(error.message, 'DESKTOP_UPDATE_ADMISSION_RESUME_FAILED');
-    assert.equal(error.errors[1].message, 'ADMISSION_RESUME_FAILED'); return true;
-  });
-  await assertPreserved(f); assert.equal(f.failures().length, 1);
+  assert.equal(await f.app.applyRelease(f.packageDir, { requestId: f.requestId }), null);
+  await assertPreserved(f); assert.equal(f.failures().length, 0);
 });
 
 test('a positive authorization cannot switch a package that expired while confirmation was open', async t => {
   let now = Date.parse('2026-10-26T12:00:00.000Z'); const expiresAt = now + 60_000;
   t.mock.method(Date, 'now', () => now);
   const f = await fixture(t, { busy: true, expiresAt });
-  f.host.confirmUpdate = async () => { f.actions.push('confirm'); now = expiresAt - 1; return true; };
   f.control.respond = async (_request, response) => { now = expiresAt; response.end(JSON.stringify(f.ack())); };
   await assert.rejects(() => f.app.applyRelease(f.packageDir, { requestId: f.requestId }), { code: 'DESKTOP_RELEASE_EXPIRED' });
   await assertPreserved(f); assert.equal(f.failures().length, 1);

@@ -386,7 +386,7 @@ function installProcessDiagnostics(): void {
 
 installProcessDiagnostics();
 
-/** Flushes pending client logs before an explicit process exit. */
+/** 用户批准普通诊断失败不阻断退出；保存错误已由业务边界记录，日志失败补记 stderr。 */
 async function exitAfterLogFlush(exitCode: number): Promise<never> {
   process.exitCode = exitCode;
   try {
@@ -394,7 +394,6 @@ async function exitAfterLogFlush(exitCode: number): Promise<never> {
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error("[codeflowai] client logger flush failed:", error instanceof Error ? error.message : String(error));
-    exitCode = 1;
   }
   process.exit(exitCode);
 }
@@ -3168,8 +3167,12 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         cleanupErrors.push({ step, error });
       }
     };
+    /** 普通诊断单独降级；正文与资源清理继续由原失败边界处理。 */
+    const runDiagnostic = (action: () => void): void => {
+      runClientCleanupStep(() => {}, phase => { if (phase === "start") action(); });
+    };
     runCleanupStep("workspace_migration_stop", () => workspaceMigrationService.stop());
-    runCleanupStep("begin_diagnostic", () => logClientStep("info", "shutdown.begin", "start", "client shutdown requested", {
+    runDiagnostic(() => logClientStep("info", "shutdown.begin", "start", "client shutdown requested", {
       target: { clientId: config.clientId },
       reason,
       pendingConversationEventAcks: conversationEventAckBuffer.getPendingCount(),
@@ -3178,9 +3181,9 @@ async function main(options?: { apiKeyOverride?: unknown }) {
       recentEventLoopLag: lastEventLoopLagSnapshot,
       requestedExitCode: exitCode,
     }));
-    runCleanupStep("request_diagnostic", () => logger.info("client", "shutdown requested", { reason }));
+    runDiagnostic(() => logger.info("client", "shutdown requested", { reason }));
     if (desktopLifecycle) {
-      try { await desktopLifecycle.drainRequests(10_000, { keepEventPublishing: true }); }
+      try { await desktopLifecycle.drainRequests(2_000, { keepEventPublishing: true }); }
       catch (error) {
         resourcesDrained = false;
         runCleanupStep("desktop_api_drain", () => { throw error; });
@@ -3194,7 +3197,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
     runCleanupStep("event_flow_monitor_stop", () => eventFlowMonitor.dispose());
     runCleanupStep("client_db_cleanup_stop", () => dbCleanup?.dispose());
 
-    /** 关闭总预算；从进入关闭开始计时，宿主 drain 默认 30s，这里留出日志与退出余量。 */
+    /** Client 自身保留清理预算；桌面宿主在 10 秒未关闭时统一强杀进程树。 */
     const shutdownDrainDeadline = shutdownStartedAt + 25_000;
     /** 关闭排空必须有界；超时保留资源未排空事实，但不允许进程永久挂起。 */
     const withShutdownTimeout = async <T>(step: string, run: () => Promise<T>, timeoutMs = shutdownDrainDeadline - Date.now()): Promise<T> => {
@@ -3257,13 +3260,14 @@ async function main(options?: { apiKeyOverride?: unknown }) {
       runAsyncCleanupStep("orchestration_drain", () => orchEngine.stopAndDrain()),
     ]);
     await runAsyncCleanupStep("ordinary_turns_drain", () => drainOrdinaryTurnExecutions(sessions));
+    await runAsyncCleanupStep("managed_services_drain", () => orchEngine.disposeManagedServices("client-shutdown"));
     await runAsyncCleanupStep("event_index_drain", () => runtime.waitForIdle());
     await runAsyncCleanupStep("desktop_credentials_drain", async () => {
       await Promise.all(retiredCredentialDrains);
       if (retiredCredentialFailures.length) throw new AggregateError(retiredCredentialFailures, "DESKTOP_CREDENTIAL_RELEASE_FAILED");
     });
     await runAsyncCleanupStep("event_pipeline_close", async () => { await eventPipeline?.close(); });
-    await runAsyncCleanupStep("desktop_event_bridge_close", async () => { await desktopLifecycle?.drainRequests(); });
+    await runAsyncCleanupStep("desktop_event_bridge_close", async () => { await desktopLifecycle?.drainRequests(2_000); });
     await runAsyncCleanupStep("conversation_ack_buffer_dispose", async () => { await conversationEventAckBuffer.dispose(); });
     await runAsyncCleanupStep("raw_ack_buffer_dispose", async () => { await rawEventAckBuffer.dispose(); });
     await runAsyncCleanupStep("thread_touch_buffer_dispose", async () => { await threadTouchBuffer.dispose(); });
@@ -3287,13 +3291,21 @@ async function main(options?: { apiKeyOverride?: unknown }) {
     if (resourcesDrained) runCleanupStep("process_lock_release", () => clientProcessLock.release());
 
     const hasCleanupErrors = cleanupErrors.length > 0;
-    runCleanupStep("complete_diagnostic", () => logClientStep(hasCleanupErrors ? "error" : "info", "shutdown.complete", hasCleanupErrors ? "fail" : "success", "client shutdown cleanup finished", {
+    runDiagnostic(() => logClientStep(hasCleanupErrors ? "error" : "info", "shutdown.complete", hasCleanupErrors ? "fail" : "success", "client shutdown cleanup finished", {
       target: { clientId: config.clientId },
       reason,
       durationMs: Date.now() - shutdownStartedAt,
       requestedExitCode: exitCode,
       failedSteps: cleanupErrors.map(failure => failure.step),
     }));
+    // 显式桌面关闭遇到真实资源失败时保留父链，交给宿主超时强杀，避免先退出后遗留孤儿进程。
+    if (reason === "desktop_exit" && desktopLifecycle && process.connected && !resourcesDrained) {
+      await new Promise<void>(resolve => {
+        process.once("disconnect", resolve);
+        // 父进程失联后不再等待其强杀；沿原失败退出结束，避免永远等待不存在的宿主。
+        if (!process.connected) { process.removeListener("disconnect", resolve); resolve(); }
+      });
+    }
     return exitAfterLogFlush(cleanupErrors.length ? 1 : exitCode);
   }
   // 本地启动不等于云端已授权；账号关联完成前不启动云端写回任务。
