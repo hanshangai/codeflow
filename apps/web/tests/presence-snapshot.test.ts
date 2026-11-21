@@ -39,6 +39,39 @@ test("桌面启动等待期间不采用云端离线快照，本机就绪后独�
   }
 });
 
+test("远端工作区所属 Client 在线时，本机运行时未就绪不覆盖为离线", t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { codeflowDesktop: { getState() {}, request() {} } } });
+  t.after(() => original ? Object.defineProperty(globalThis, "window", original) : Reflect.deleteProperty(globalThis, "window"));
+  setActivePinia(createPinia());
+  const config = useConfigStore(), presence = usePresenceStore(), workspaces = useWorkspacesStore();
+  config.workspaceId = "remote-client:repo";
+  config.desktopRuntime = { status: "failed", requestId: "local", releaseId: null, errorCode: "CLIENT_BOOT_FAILED" };
+  config.desktopClient = null;
+  workspaces.workspaces = [{
+    id: "remote-client:repo", title: "Remote Repo", path: "/remote/repo",
+    ownerClientId: "remote-client", createdAt: 1, updatedAt: 1,
+  }] as any;
+  presence.applyPresenceEvent({
+    type: "presence.updated",
+    ts: 1,
+    payload: {
+      onlineWebCount: 1,
+      clientOnline: true,
+      onlineClients: [{
+        clientId: "remote-client",
+        name: "Remote Client",
+        version: "1.0.0",
+        connectedAt: 1,
+        workspaceIds: ["remote-client:repo"],
+      }],
+    },
+  });
+
+  assert.deepEqual(presence.activeWorkspaceRuntimeState, { kind: "local", status: "online" });
+  assert.equal(presence.isCurrentWorkspaceClientOnline, true);
+});
+
 test("workspace Client offline errors are recognized and active notices are throttled", () => {
   assert.equal(isWorkspaceClientOfflineError(new Error("CLIENT_OFFLINE: 该工作区对应的 client 未连接")), true);
   assert.equal(isWorkspaceClientOfflineError(new Error("client 未连接")), true);
