@@ -13,6 +13,7 @@ import {
   useAssetGroups,
 } from "../src/features/orchestration/composables/useAssetGroups.ts";
 import { useConfigStore } from "../src/store/config.ts";
+import { useOrchestrationStore } from "../src/store/orchestration.ts";
 
 const WORKSPACE_A = "workspace-a" as WorkspaceId;
 const WORKSPACE_B = "workspace-b" as WorkspaceId;
@@ -49,6 +50,21 @@ test("asset group async results require the exact workspace generation", () => {
   assert.equal(isCurrentAssetGroupWorkspace(WORKSPACE_A, WORKSPACE_A, 2, 2), true);
   assert.equal(isCurrentAssetGroupWorkspace(WORKSPACE_A, WORKSPACE_B, 2, 2), false);
   assert.equal(isCurrentAssetGroupWorkspace(WORKSPACE_A, WORKSPACE_A, 1, 2), false);
+});
+
+test("Client原件不能被移动到Server分组，同ID账号资产仍可正常移动", async () => {
+  setupStores();
+  const orch = useOrchestrationStore();
+  const workspaceId = "remote:asset-group-guard" as WorkspaceId;
+  orch.resetForWorkspace(workspaceId);
+  orch.assetListHostIds.workflow = ["host-workflow"];
+  const groups = useAssetGroups({ workspaceId: ref(workspaceId), assetType: "workflow" });
+  let writes = 0;
+  globalThis.fetch = (async () => { writes++; return jsonResponse({ ok: true, groupId: "group-1" }); }) as typeof fetch;
+  await assert.rejects(groups.assign("host-workflow", "group-1"), /Host.*只读/u);
+  assert.equal(writes, 0);
+  await groups.assign("server-workflow", "group-1");
+  assert.equal(writes, 1);
 });
 
 test("asset group assignments preserve special asset IDs without prototype inheritance", () => {

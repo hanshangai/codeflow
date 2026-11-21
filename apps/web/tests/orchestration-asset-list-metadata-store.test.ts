@@ -263,6 +263,121 @@ for (const { assetType, path, listKey } of [
   });
 }
 
+for (const { assetType, path, listKey } of [
+  { assetType: "role", path: "roles", listKey: "roles" },
+  { assetType: "workflow", path: "workflows", listKey: "workflows" },
+  { assetType: "knowledge_bundle", path: "knowledge-bundles", listKey: "bundles" },
+  { assetType: "skill", path: "skills", listKey: "skills" },
+  { assetType: "toolset", path: "toolsets", listKey: "toolsets" },
+] as const) test(`桌面远程普通工作区补读目标 Client ${assetType}，不把空账号目录当作完整列表`, async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "remote-client:server" as WorkspaceId;
+  const ctx = { ...createApiContext(), desktopClientId: "local-client" };
+  const purposes: Array<string | null> = [];
+  globalThis.fetch = (async input => {
+    const url = new URL(String(input));
+    assert.equal(url.pathname, `/api/orch/${path}`);
+    assert.equal(url.searchParams.get("workspaceId"), workspaceId);
+    purposes.push(url.searchParams.get("purpose"));
+    return jsonResponse(url.searchParams.has("purpose")
+      ? { ok: true, [listKey]: [{ id: "remote-builtin", kind: "builtin" }, { id: "remote-custom", kind: "custom" }] }
+      : { ok: true, [listKey]: [], assetMetadata: [] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(ctx, workspaceId, assetType);
+  const list = assetType === "knowledge_bundle" ? store.knowledgeBundles : store[listKey];
+  assert.deepEqual(list.map(item => [item.id, item.workspaceId]), [["remote-builtin", workspaceId], ["remote-custom", workspaceId]]);
+  assert.deepEqual(store.assetListHostIds[assetType], ["remote-builtin", "remote-custom"]);
+  assert.deepEqual(store.assetListMetadata[assetType], []);
+  assert.equal(store.assetListLoaded[assetType], true);
+  assert.deepEqual(purposes, [null, "execution"]);
+});
+
+test("远程 Client 列表保留账号修订，同 ID 不覆盖，原件保存删除不可误写 Server", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "remote-client:workspace" as WorkspaceId;
+  const ctx = { ...createApiContext(), desktopClientId: "local-client" };
+  let writes = 0;
+  globalThis.fetch = (async (input, init) => {
+    if (init?.method === "POST") { writes++; throw new Error("UNEXPECTED_REMOTE_ASSET_WRITE"); }
+    return jsonResponse(new URL(String(input)).searchParams.has("purpose")
+      ? { ok: true, roles: [{ ...executionAssetFixture("role", "same-id"), name: "Client" }, executionAssetFixture("role", "remote-role")] }
+      : { ok: true, roles: [{ ...executionAssetFixture("role", "same-id"), name: "Server" }], assetMetadata: [metadata("role", "same-id", 5)] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(ctx, workspaceId, "role");
+  assert.deepEqual(store.roles.map(item => item.id), ["same-id", "remote-role"]);
+  assert.equal(store.roles[0].name, "Server");
+  assert.equal(store.assetListMetadata.role?.[0].revision, 5);
+  assert.deepEqual(store.assetListHostIds.role, ["remote-role"]);
+  await assert.rejects(store.saveRole(ctx, workspaceId, store.roles[1]), /Host.*只读/u);
+  await assert.rejects(store.removeRole(ctx, workspaceId, "remote-role" as RoleId), /Host.*只读/u);
+  assert.equal(writes, 0);
+});
+
+test("远程 Client 读取失败不能缓存空列表，重试恢复目标资产", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "remote-client:retry" as WorkspaceId;
+  const ctx = { ...createApiContext(), desktopClientId: "local-client" };
+  let attempts = 0;
+  globalThis.fetch = (async input => {
+    if (!new URL(String(input)).searchParams.has("purpose")) return jsonResponse({ ok: true, workflows: [], assetMetadata: [] });
+    return jsonResponse(++attempts === 1 ? { ok: false, code: "CLIENT_OFFLINE", message: "Remote offline" }
+      : { ok: true, workflows: [{ id: "remote-workflow", kind: "builtin" }] });
+  }) as typeof fetch;
+  await assert.rejects(store.ensureAssetListLoaded(ctx, workspaceId, "workflow"), /Remote offline/u);
+  assert.equal(store.assetListLoaded.workflow, false);
+  await store.ensureAssetListLoaded(ctx, workspaceId, "workflow");
+  assert.deepEqual(store.workflows.map(item => item.id), ["remote-workflow"]);
+  assert.equal(store.assetListLoaded.workflow, true);
+});
+
+test("远程资产补读中的工作区切换丢弃迟到列表，不恢复旧Client来源", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), oldWorkspace = "remote-client:old" as WorkspaceId, newWorkspace = "another-client:new" as WorkspaceId;
+  const ctx = { ...createApiContext(), desktopClientId: "local-client" };
+  const entered = createDeferred<void>(), response = createDeferred<Response>();
+  globalThis.fetch = (async input => {
+    if (new URL(String(input)).searchParams.has("purpose")) { entered.resolve(); return response.promise; }
+    return jsonResponse({ ok: true, workflows: [], assetMetadata: [] });
+  }) as typeof fetch;
+  const loading = store.ensureAssetListLoaded(ctx, oldWorkspace, "workflow");
+  await entered.promise;
+  store.resetForWorkspace(newWorkspace);
+  response.resolve(jsonResponse({ ok: true, workflows: [{ id: "old-client-workflow", kind: "builtin" }] }));
+  await loading;
+  assert.deepEqual(store.workflows, []);
+  assert.deepEqual(store.assetListHostIds.workflow, []);
+  assert.equal(store.workspaceScopeId, newWorkspace);
+  assert.equal(store.assetListLoaded.workflow, false);
+});
+
+test("远程执行和旧Client列表只读一次，不额外合并账号目录", async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "remote-client:execution" as WorkspaceId;
+  const ctx = { ...createApiContext(), desktopClientId: "local-client" };
+  const purposes: Array<string | null> = [];
+  globalThis.fetch = (async input => {
+    purposes.push(new URL(String(input)).searchParams.get("purpose"));
+    return jsonResponse({ ok: true, workflows: [{ id: "client-workflow", kind: "builtin" }] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(ctx, workspaceId, "workflow", "execution");
+  await store.ensureAssetListLoaded(ctx, workspaceId, "workflow");
+  assert.deepEqual(purposes, ["execution", null]);
+  assert.deepEqual(store.workflows.map(item => item.id), ["client-workflow"]);
+});
+
+for (const [workspaceId, desktopClientId] of [["remote:workspace", undefined], ["local:workspace", "local"], ["unnamespaced", "local"]] as const)
+test(`资产补读不改变浏览器、本机或未知归属范围 ${workspaceId}/${desktopClientId}`, async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore();
+  let calls = 0;
+  globalThis.fetch = (async input => {
+    calls++; assert.equal(new URL(String(input)).searchParams.has("purpose"), false);
+    return jsonResponse({ ok: true, workflows: [], assetMetadata: [] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded({ ...createApiContext(), desktopClientId }, workspaceId as WorkspaceId, "workflow");
+  assert.equal(calls, 1);
+});
+
 test("共享 Host 内置列表读取失败明确拒绝，不把不完整列表缓存为成功", async () => {
   setActivePinia(createPinia());
   const store = useOrchestrationStore();

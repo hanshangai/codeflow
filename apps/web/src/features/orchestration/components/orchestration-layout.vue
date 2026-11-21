@@ -1705,7 +1705,7 @@ function summaryToneClass(tone: string | null | undefined): string {
               <template #action><a-button size="small" @click="retryAssetPageLoad">重新加载</a-button></template>
             </a-alert>
             <a-alert v-if="selectedHostAsset && !selectedBuiltinAsset" type="info" show-icon
-              message="Host 共享资产只读，请在承载工作区维护原定义" />
+              message="此资产来自工作区所在电脑，仅供查看；请在该电脑上维护原定义。" />
             <div v-if="assetPageLoading && !activeAssetDataAvailable && !isSkillMarketView" class="orch-layout__asset-state">
               <a-spin size="large" />
               <span>资产加载中...</span>

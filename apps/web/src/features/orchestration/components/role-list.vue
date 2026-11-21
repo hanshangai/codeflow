@@ -474,7 +474,7 @@ function isRoleAvailable(role: unknown): boolean {
           <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === role.id" spin />
           <CopyOutlined v-else />
         </button>
-        <a-dropdown v-if="!props.maintenanceForbidden && role.kind !== 'builtin'" :trigger="['click']">
+        <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.role.includes(role.id) && role.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="role-list__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>
             <a-menu>

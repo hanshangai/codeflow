@@ -451,7 +451,7 @@ function isWorkflowAvailable(workflow: unknown): boolean {
           <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === wf.id" spin />
           <CopyOutlined v-else />
         </button>
-        <a-dropdown v-if="!props.maintenanceForbidden && wf.kind !== 'builtin'" :trigger="['click']">
+        <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.workflow.includes(wf.id) && wf.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="wf-sidebar__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>
             <a-menu>
@@ -461,7 +461,7 @@ function isWorkflowAvailable(workflow: unknown): boolean {
             </a-menu>
           </template>
         </a-dropdown>
-        <button v-else-if="!props.maintenanceForbidden && isSuperAdmin" class="wf-sidebar__item-delete" :disabled="props.locked" @click="confirmDelete(wf.id, wf.name, $event)"><DeleteOutlined /></button>
+        <button v-else-if="!props.maintenanceForbidden && !orch.assetListHostIds.workflow.includes(wf.id) && isSuperAdmin" class="wf-sidebar__item-delete" :disabled="props.locked" @click="confirmDelete(wf.id, wf.name, $event)"><DeleteOutlined /></button>
       </div>
       <div v-if="!orch.workflowsLoading && filteredWorkflows.length === 0" class="wf-sidebar__empty">
         当前分组暂无流程模板

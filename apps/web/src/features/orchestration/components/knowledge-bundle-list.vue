@@ -384,7 +384,7 @@ function confirmDelete(bundleId: KnowledgeBundleId, name: string, event?: Event)
           <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === bundle.id" spin />
           <CopyOutlined v-else />
         </button>
-        <a-dropdown v-if="!props.maintenanceForbidden && bundle.kind !== 'builtin'" :trigger="['click']">
+        <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.knowledge_bundle.includes(bundle.id) && bundle.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="kb-sidebar__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>
             <a-menu>

@@ -5,6 +5,7 @@ import type { OrchAssetGroup, OrchAssetGroupType, WorkspaceId } from "@codeflowa
 import { assignOrchAssetGroup, createOrchAssetGroup, deleteOrchAssetGroup, listOrchAssetGroups, renameOrchAssetGroup } from "../../../api/orchestration";
 import { trackProductEvent } from "../../../analytics/analytics";
 import { useApiContext } from "../../../composables/useApiContext";
+import { useOrchestrationStore } from "../../../store/orchestration";
 import { isSharedWorkspaceSelectionId } from "../../../utils/workspaceId";
 
 export type AssetGroupFilter = "all" | "ungrouped" | string;
@@ -18,6 +19,7 @@ const cachedGroupsByScope = new Map<string, {
 /** 统一管理单类资产的分组加载、筛选和维护操作。 */
 export function useAssetGroups(input: { workspaceId: Ref<WorkspaceId>; assetType: OrchAssetGroupType }) {
   const { ctx } = useApiContext();
+  const orch = useOrchestrationStore();
   const groups = ref<OrchAssetGroup[]>([]);
   const assignments = ref<Record<string, string>>(copyAssetGroupAssignments({}));
   const selectedGroup = ref<AssetGroupFilter>("all");
@@ -135,8 +137,12 @@ export function useAssetGroups(input: { workspaceId: Ref<WorkspaceId>; assetType
     });
   }
 
-  /** 移动自定义资产；空分组表示未分组。 */
+  /** 只移动本列表可维护资产；Host 原件不得误写 Server 分组，空分组表示未分组。 */
   async function assign(assetId: string, groupId: string | null): Promise<void> {
+    const assetType = input.assetType === "knowledge" ? "knowledge_bundle" : input.assetType;
+    if (orch.workspaceScopeId === input.workspaceId.value && orch.assetListHostIds[assetType].includes(assetId)) {
+      throw new Error("Host 资产只读，请在承载工作区维护原定义");
+    }
     const request = beginMutation();
     const result = await assignOrchAssetGroup(ctx.value, { workspaceId: request.workspaceId, assetType: input.assetType, assetId, groupId });
     if (!result.ok) throw new Error(result.message || "移动资产分组失败");

@@ -274,7 +274,7 @@ export type OrchestrationState = {
   assetListRefreshVersions: OrchestrationAssetListRefreshVersionState;
   /** 当前工作区内已成功读取的资产列表；空列表也会标记为已读取。 */
   assetListLoaded: OrchestrationAssetListLoadedState;
-  /** 当前共享列表中仅存于 Host 的定义；展示不授予 Server 修订写入权。 */
+  /** 当前列表中仅存于共享 Host 或远程 Client 的定义；展示不授予 Server 修订写入权。 */
   assetListHostIds: Record<OrchAssetType, string[]>;
   /** 首次读取中的列表请求，供快速切换 Tab 时复用。 */
   assetListLoadPromises: OrchestrationAssetListLoadPromiseState;
@@ -3499,13 +3499,15 @@ function getAssetDefinitionIds(state: OrchestrationState, assetType: OrchAssetTy
   return definitions.filter(item => !hostIds.has(item.id)).map(item => item.id);
 }
 
-/** 合并当前授权 Host 的定义；Host 失败显式返回失败事实，Server 快照仍可展示。 */
+/** 共享及桌面远程工作区补读目标 Client；保留 Server 修订，Client 原件沿 Host 只读边界展示。 */
 async function prepareSharedAssetListSnapshot<T extends OrchAssetType, D extends { id: string }>(
   ctx: ApiRequestContext, workspaceId: WorkspaceId, assetType: T, definitions: D[],
   metadata: OrchAssetListMetadata<T>[] | undefined, purpose?: "execution",
 ): Promise<{ definitions: D[]; metadata: OrchAssetListMetadata<T>[] | null; hostAssetIds?: string[]; hostFailure?: { cause: unknown } }> {
   const snapshot = prepareAssetListSnapshot(assetType, definitions, metadata);
-  if (!isSharedWorkspaceSelectionId(workspaceId) || purpose || snapshot.metadata === null) return snapshot;
+  const localClientId = ctx.desktopClientId?.trim();
+  const remoteDesktopWorkspace = Boolean(localClientId && workspaceId.indexOf(":") > 0 && !workspaceId.startsWith(`${localClientId}:`));
+  if ((!isSharedWorkspaceSelectionId(workspaceId) && !remoteDesktopWorkspace) || purpose || snapshot.metadata === null) return snapshot;
   const list = assetType === "role" ? listOrchRoles : assetType === "workflow" ? listOrchWorkflows
     : assetType === "knowledge_bundle" ? listOrchKnowledgeBundles : assetType === "skill" ? listOrchSkills : listOrchToolsets;
   try {

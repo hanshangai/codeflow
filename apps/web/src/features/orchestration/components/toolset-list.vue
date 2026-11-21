@@ -388,7 +388,7 @@ function confirmDelete(toolsetId: ToolsetId, name: string, event?: Event) {
           <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === toolset.id" spin />
           <CopyOutlined v-else />
         </button>
-        <a-dropdown v-if="!props.maintenanceForbidden && toolset.kind !== 'builtin'" :trigger="['click']">
+        <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.toolset.includes(toolset.id) && toolset.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="tool-sidebar__menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>
             <a-menu>

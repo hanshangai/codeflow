@@ -614,7 +614,7 @@ function yamlDoubleQuoted(value: string): string {
           <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === skill.id" spin />
           <CopyOutlined v-else />
         </button>
-        <a-dropdown v-if="!props.maintenanceForbidden && skill.kind !== 'builtin'" :trigger="['click']">
+        <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.skill.includes(skill.id) && skill.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="skill-sidebar__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>
             <a-menu>
