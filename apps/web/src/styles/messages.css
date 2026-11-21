@@ -253,6 +253,8 @@
 }
 
 .msg__role {
+  flex: 0 0 auto;
+  white-space: nowrap;
   font-weight: 700;
   font-size: 12px;
 }
