@@ -875,7 +875,19 @@ async function refreshManagedServices(): Promise<void> {
 /** 资源失败由原 store 错误态展示；此边界补充可检索日志与操作反馈。 */
 function showAsyncError(error: unknown): void {
   if (isCancelledRequestError(error)) return;
+  const rootCause = error instanceof Error ? error.message : String(error);
   const details = isApiResultError(error) ? error.details as { requestId?: unknown } | undefined : undefined;
+  // 会话删除后迟到的资源刷新属于预期竞态；记录日志，不再逐条打扰用户。
+  if (/本机本地会话不存在|会话已不存在|thread\s*不存在/u.test(rootCause)) {
+    console.warn("[chat-panel.operation.thread-missing]", {
+      code: isApiResultError(error) ? error.code : "CHAT_PANEL_THREAD_MISSING",
+      requestId: details?.requestId ?? null,
+      workspaceId: props.workspaceId,
+      threadId: activeThreadId.value,
+      rootCause,
+    });
+    return;
+  }
   console.error("[chat-panel.operation.failed]", {
     code: isApiResultError(error) ? error.code : "CHAT_PANEL_OPERATION_FAILED",
     requestId: details?.requestId ?? null,
@@ -883,7 +895,7 @@ function showAsyncError(error: unknown): void {
     threadId: activeThreadId.value,
     error,
   });
-  message.error(error instanceof Error ? error.message : String(error));
+  message.error(rootCause);
 }
 
 /** 用户手动展开/收起队列浮层；入队时不再自动展开遮挡主界面。 */
