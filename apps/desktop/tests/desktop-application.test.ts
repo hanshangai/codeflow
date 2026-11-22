@@ -435,6 +435,47 @@ test("迁移提示先加载同一窗口，明确选择前不启动Client，业�
   await app.exit();
 });
 
+for (const reopened of [false, true]) for (const journalExists of [false, true]) test(`迁移失败后可跳过并开放正常账号IPC：重启=${reopened}，journal=${journalExists}`, { timeout: 5_000 }, async t => {
+  const f = await fixture(t);
+  let bridge!: DesktopBridgeApi, migration!: LegacyClientMigration;
+  f.host.registerBridge = value => { bridge = value; return () => {}; };
+  f.runtime.request = async request => {
+    assert.equal(request.method, "runtime.cloudAccount.status");
+    return { status: 200, body: { ok: true, currentAccount: "desktop-account" } };
+  };
+  if (reopened) {
+    const identity = await loadOrCreateDeviceIdentity(f.dataDir);
+    await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-account.json"), JSON.stringify({ schemaVersion: 1,
+      targetClientId: "local_existing", migrationId: identity.deviceId, nonce: identity.deviceId, cancelled: false, delivered: false }));
+  }
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host,
+    createRuntime: () => f.runtime,
+    createMigration: ({ identity }) => (migration = createLegacyClientMigration({ dataDir: f.dataDir, identity, workerEntry: "unused",
+      execute: async request => {
+        if (journalExists && request.action === "defer") return { candidateId: null, workspaceCount: 0, migrationId: request.migrationId, deferred: true };
+        if (journalExists && request.action === "discover" && await fs.stat(path.join(f.dataDir, "legacy-client-migration-journal.json")).then(() => true, error => {
+          if (error.code === "ENOENT") return false; throw error;
+        })) return { candidateId: "source-1", workspaceCount: 1, migrationId: request.migrationId, resume: true, canDefer: true };
+        if (request.action === "discover") return { candidateId: "source-1", workspaceCount: 1 };
+        if (journalExists) await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-journal.json"), "fixture prepublication journal");
+        throw Object.assign(new Error("target conflict"), { code: "TARGET_CONFLICT" });
+      }, restoreAccount: async () => { assert.fail("不能恢复旧Client账号"); } })) });
+  const starting = app.start();
+  const started = assert.doesNotReject(starting);
+  try {
+    while (!migration) await new Promise(resolve => setImmediate(resolve));
+    await migration.whenDiscovered();
+    if (!reopened || journalExists) await assert.rejects(bridge.startMigration!("source-1"), /target conflict/u);
+    assert.equal((await bridge.getMigrationState!()).canDefer, true);
+    await bridge.deferMigration!();
+    await started;
+    assert.equal(f.actions.includes("start"), true);
+    assert.equal((await bridge.getState()).status, "ready");
+    assert.deepEqual(await bridge.request({ method: "runtime.cloudAccount.status" }),
+      { status: 200, body: { ok: true, currentAccount: "desktop-account" } });
+  } finally { await app.exit(); await started; }
+});
+
 test("迁移与标准页面就绪并行，页面可等待迁移及Client真正完成启动", { timeout: 5_000 }, async t => {
   const f = await fixture(t);
   let migration!: LegacyClientMigration;

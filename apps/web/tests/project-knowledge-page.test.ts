@@ -68,11 +68,11 @@ test("批量生成提供并发配置，页面保留状态并按需刷新", () =>
 });
 
 test("生成入口集中顶部，待确认导航位于左侧并复用已有多选范围", () => {
-  assert.match(pageSource, /@click="openSpecificationConversation">规格对话/u);
+  assert.match(pageSource, /@click="openQuickGenerate">一键生成规格/u);
+  assert.match(pageSource, /quickScopeLabel/u);
   assert.match(pageSource, /@click="openUpdates\(null\)">待确认更新/u);
-  assert.match(pageSource, /完善所选 · \$\{checkedIds\.length\}项/u);
   assert.doesNotMatch(pageSource, /data-testid="tree-batch-actions"/u);
-  assert.match(pageSource, /startBuild\(checkedIds.length \? checkedIds/u);
+  assert.match(pageSource, /@improve="openQuickGenerate"/u);
   assert.match(pageSource, /KnowledgeUpdates/u);
   assert.doesNotMatch(pageSource, /revision\.adopt\.batch/u);
   assert.match(pageSource, /selectionResetKey/u);
@@ -82,12 +82,16 @@ test("批量生成允许独立选择执行引擎，并在切换时清理模型�
   assert.match(pageSource, /aria-label="批量生成引擎"/u);
   assert.match(pageSource, /changeBatchEngineEvent/u);
   assert.match(pageSource, /batchEngine\.value = value as EngineType/u);
-  assert.match(pageSource, /引擎、模型和思考强度只作用于本次批量任务/u);
+  assert.doesNotMatch(pageSource, /引擎、模型和思考强度只作用于本次批量任务/u);
+  assert.match(pageSource, /v-if="buildSettingsMode && batchHasGeneration"><span>思考强度/u);
 });
 
-test("复检支持配置最大轮次和发现问题后的自动修订", () => {
-  assert.match(pageSource, /aria-label="最大复检轮次"/u);
+test("复检固定 1 轮并沿用生成模型和自动修订", () => {
+  assert.doesNotMatch(pageSource, /aria-label="最大复检轮次"/u);
   assert.match(pageSource, /aria-label="发现问题后自动修订"/u);
+  assert.match(pageSource, /maxRounds: 1/u);
+  assert.match(pageSource, /model: batchModel\.value\.model, effort: batchModel\.value\.effort/u);
+  assert.doesNotMatch(pageSource, /batchReviewModelId/u);
   assert.match(pageSource, /autoRepair: batchReviewAutoRepair\.value/u);
 });
 

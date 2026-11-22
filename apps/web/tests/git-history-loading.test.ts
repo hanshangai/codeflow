@@ -34,6 +34,258 @@ function fixture(t: test.TestContext, request: (request: DesktopApiRequest) => P
   return store;
 }
 
+test("文件树已有内容时后台刷新不显示加载遮罩，完成后更新列表", async t => {
+  let respond!: (value: unknown) => void;
+  const store = fixture(t, async () => new Promise(resolve => { respond = resolve; }));
+  store.treeNodes = [{ name: "old.txt", path: "old.txt", isDir: false }];
+  const snapshot = store.treeNodes;
+  const refresh = store.loadTree(ctx, workspaceId);
+  assert.equal(store.treeLoading, false);
+  assert.equal(store.treeNodes, snapshot);
+  respond({ status: 200, body: { ok: true, nodes: [{ name: "new.txt", path: "new.txt", isDir: false }] } });
+  await refresh;
+  assert.equal(store.treeNodes[0]?.path, "new.txt");
+  assert.equal(store.treeLoading, false);
+});
+
+test("文件树首次读取显示加载，后台读取失败保留原列表并报错", async t => {
+  let respond!: (value: unknown) => void;
+  const store = fixture(t, async () => new Promise(resolve => { respond = resolve; }));
+  const first = store.loadTree(ctx, workspaceId);
+  assert.equal(store.treeLoading, true);
+  respond({ status: 200, body: { ok: true, nodes: [{ name: "old.txt", path: "old.txt", isDir: false }] } });
+  await first;
+  assert.equal(store.treeLoading, false);
+  const snapshot = store.treeNodes;
+  const refresh = store.loadTree(ctx, workspaceId);
+  assert.equal(store.treeLoading, false);
+  respond({ status: 500, body: { ok: false, code: "INTERNAL_ERROR", message: "file tree refresh failed" } });
+  await assert.rejects(refresh, /file tree refresh failed/u);
+  assert.equal(store.treeNodes, snapshot);
+  assert.equal(store.treeLoading, false);
+});
+
+test("文件树并发刷新合并成串行两轮，等待者取得最终结果", async t => {
+  const responses: Array<(value: unknown) => void> = [];
+  const store = fixture(t, async () => new Promise(resolve => { responses.push(resolve); }));
+  const first = store.loadTree(ctx, workspaceId);
+  const waiting = Array.from({ length: 20 }, () => store.loadTree(ctx, workspaceId));
+  assert.equal(responses.length, 1);
+  responses[0]!({ status: 200, body: { ok: true, nodes: [{ name: "old.txt", path: "old.txt", isDir: false }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(responses.length, 2);
+  responses[1]!({ status: 200, body: { ok: true, nodes: [{ name: "latest.txt", path: "latest.txt", isDir: false }] } });
+  const results = await Promise.all([first, ...waiting]);
+  assert.equal(responses.length, 2);
+  assert.ok(results.every(nodes => nodes[0]?.path === "latest.txt"));
+  assert.equal(store.treeLoading, false);
+});
+
+test("持续变更期间每轮成功文件树仍发布，不必等待写入停止", async t => {
+  const responses: Array<(value: unknown) => void> = [];
+  const store = fixture(t, async () => new Promise(resolve => { responses.push(resolve); }));
+  store.treeNodes = [{ name: "initial", path: "initial", isDir: false }];
+  const first = store.loadTree(ctx, workspaceId);
+  const second = store.loadTree(ctx, workspaceId);
+  responses[0]!({ status: 200, body: { ok: true, nodes: [{ name: "round1", path: "round1", isDir: false }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  const afterFirst = store.treeNodes[0]?.path;
+  const third = store.loadTree(ctx, workspaceId);
+  responses[1]!({ status: 200, body: { ok: true, nodes: [{ name: "round2", path: "round2", isDir: false }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  const afterSecond = store.treeNodes[0]?.path;
+  responses[2]!({ status: 200, body: { ok: true, nodes: [{ name: "round3", path: "round3", isDir: false }] } });
+  await Promise.all([first, second, third]);
+  assert.equal(afterFirst, "round1");
+  assert.equal(afterSecond, "round2");
+  assert.equal(store.treeNodes[0]?.path, "round3");
+});
+
+test("普通后台刷新不取消用户正在展开的目录，重读后使用最新子节点", async t => {
+  let respondDirectory!: (value: unknown) => void;
+  let reads = 0;
+  const store = fixture(t, async request => {
+    if (!request.body?.dirPath) return { status: 200, body: { ok: true, nodes: [{ name: "dir", path: "dir", isDir: true }] } };
+    if (++reads === 1) return new Promise(resolve => { respondDirectory = resolve; });
+    return { status: 200, body: { ok: true, nodes: [{ name: "latest", path: "dir/latest", isDir: false }] } };
+  });
+  await store.loadTree(ctx, workspaceId);
+  const expanding = store.expandDir(ctx, workspaceId, "dir");
+  const result = Promise.allSettled([expanding]);
+  await store.loadTree(ctx, workspaceId);
+  respondDirectory({ status: 200, body: { ok: true, nodes: [{ name: "old", path: "dir/old", isDir: false }] } });
+  const [settled] = await result;
+  assert.equal(settled!.status, "fulfilled");
+  assert.equal(reads, 2);
+  assert.equal(store.treeNodes[0]?.children?.[0]?.path, "dir/latest");
+  assert.deepEqual(store.expandedKeys, ["dir"]);
+});
+
+test("旧工作区迟到展开调用不能修改新工作区的同名目录", async t => {
+  let directoryReads = 0;
+  const store = fixture(t, async request => {
+    if (request.body?.dirPath) {
+      directoryReads++;
+      return { status: 200, body: { ok: true, nodes: [{ name: "old", path: "dir/old", isDir: false }] } };
+    }
+    return { status: 200, body: { ok: true, nodes: [{ name: "dir", path: "dir", isDir: true }] } };
+  });
+  await store.loadTree(ctx, "desktop:other" as WorkspaceId);
+  await assert.rejects(store.expandDir(ctx, workspaceId, "dir"), /取消/u);
+  assert.equal(directoryReads, 0);
+  assert.equal(store.treeNodes[0]?.children, undefined);
+});
+
+test("文件树合并刷新失败共同报错并停止补刷，下一次调用可重试", async t => {
+  const responses: Array<(value: unknown) => void> = [];
+  const store = fixture(t, async () => new Promise(resolve => { responses.push(resolve); }));
+  const first = assert.rejects(store.loadTree(ctx, workspaceId), /tree failed/u);
+  const waiting = assert.rejects(store.loadTree(ctx, workspaceId), /tree failed/u);
+  responses[0]!({ status: 500, body: { ok: false, code: "INTERNAL_ERROR", message: "tree failed" } });
+  await Promise.all([first, waiting]);
+  assert.equal(responses.length, 1);
+  assert.equal(store.treeLoading, false);
+  const retry = store.loadTree(ctx, workspaceId);
+  responses[1]!({ status: 200, body: { ok: true, nodes: [] } });
+  await retry;
+  assert.equal(store.treeLoading, false);
+});
+
+test("文件树相同快照保留根与展开节点引用，不重建组件", async t => {
+  const requests: string[] = [];
+  const store = fixture(t, async request => {
+    const dir = String(request.body?.dirPath ?? "");
+    requests.push(dir);
+    return { status: 200, body: { ok: true, nodes: dir
+      ? [{ name: "file.txt", path: "dir/file.txt", isDir: false, size: 12 }]
+      : [{ name: "dir", path: "dir", isDir: true }] } };
+  });
+  store.treeNodes = [{ name: "dir", path: "dir", isDir: true, children: [{ name: "file.txt", path: "dir/file.txt", isDir: false, size: 12 }] }];
+  store.expandedKeys = ["dir"];
+  const snapshot = store.treeNodes, directory = snapshot[0], children = directory!.children, version = store.treeVersion;
+  await store.loadTree(ctx, workspaceId);
+  assert.deepEqual(requests, ["", "dir"]);
+  assert.equal(store.treeNodes, snapshot);
+  assert.equal(store.treeNodes[0], directory);
+  assert.equal(store.treeNodes[0]?.children, children);
+  assert.equal(store.treeVersion, version);
+});
+
+test("展开目录读取失败不发布半棵文件树，后续刷新可重试", async t => {
+  let fail = true;
+  const store = fixture(t, async request => request.body?.dirPath
+    ? fail ? { status: 500, body: { ok: false, code: "INTERNAL_ERROR", message: "directory failed" } }
+      : { status: 200, body: { ok: true, nodes: [] } }
+    : { status: 200, body: { ok: true, nodes: [{ name: "dir", path: "dir", isDir: true }, { name: "new", path: "new", isDir: false }] } });
+  store.treeNodes = [{ name: "dir", path: "dir", isDir: true, children: [{ name: "old", path: "dir/old", isDir: false }] }];
+  store.expandedKeys = ["dir"];
+  const snapshot = store.treeNodes, version = store.treeVersion;
+  await assert.rejects(store.loadTree(ctx, workspaceId), /directory failed/u);
+  assert.equal(store.treeNodes, snapshot);
+  assert.equal(store.treeVersion, version);
+  fail = false;
+  await store.loadTree(ctx, workspaceId);
+  assert.equal(store.treeNodes.length, 2);
+  assert.deepEqual(store.treeNodes[0]?.children, []);
+});
+
+test("切换工作区取消旧文件树及补刷，迟到结果不覆盖新工作区", async t => {
+  const responses: Array<(value: unknown) => void> = [];
+  const store = fixture(t, async () => new Promise(resolve => { responses.push(resolve); }));
+  const old = store.loadTree(ctx, workspaceId);
+  const stale = assert.rejects(old, /取消/u);
+  const queued = assert.rejects(store.loadTree(ctx, workspaceId), /取消/u);
+  store.resetForWorkspace();
+  const current = store.loadTree(ctx, "desktop:other" as WorkspaceId);
+  responses[0]!({ status: 200, body: { ok: true, nodes: [{ name: "old", path: "old", isDir: false }] } });
+  await Promise.all([stale, queued]);
+  assert.equal(responses.length, 2);
+  assert.equal(store.treeNodes.length, 0);
+  assert.equal(store.treeLoading, true);
+  responses[1]!({ status: 200, body: { ok: true, nodes: [{ name: "current", path: "current", isDir: false }] } });
+  await current;
+  assert.equal(store.treeNodes[0]?.path, "current");
+});
+
+test("文件树大量展开目录读取最多四个并发，关闭目录不扫描", async t => {
+  const pending: Array<() => void> = [];
+  const paths: string[] = [];
+  let active = 0, maximum = 0;
+  const store = fixture(t, async request => {
+    const dir = String(request.body?.dirPath ?? "");
+    paths.push(dir);
+    if (!dir) return { status: 200, body: { ok: true, nodes: Array.from({ length: 10 }, (_, i) => ({ name: `dir${i}`, path: `dir${i}`, isDir: true })) } };
+    active++;
+    maximum = Math.max(maximum, active);
+    return new Promise(resolve => pending.push(() => {
+      active--;
+      resolve({ status: 200, body: { ok: true, nodes: [] } });
+    }));
+  });
+  store.expandedKeys = Array.from({ length: 9 }, (_, i) => `dir${i}`);
+  const refresh = store.loadTree(ctx, workspaceId);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pending.length, 4);
+  for (const expected of [4, 4, 1]) {
+    assert.equal(pending.length, expected);
+    pending.splice(0).forEach(resolve => resolve());
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  await refresh;
+  assert.equal(maximum, 4);
+  assert.equal(paths.length, 10);
+  assert.equal(paths.includes("dir9"), false);
+});
+
+test("文件树刷新期间新展开目录的结果保留，刷新不会清除展开状态", async t => {
+  let respondRoot!: (value: unknown) => void;
+  let firstRoot = true;
+  const store = fixture(t, async request => {
+    if (request.body?.dirPath) return { status: 200, body: { ok: true, nodes: [{ name: "file", path: "dir/file", isDir: false }] } };
+    if (firstRoot) { firstRoot = false; return new Promise(resolve => { respondRoot = resolve; }); }
+    return { status: 200, body: { ok: true, nodes: [{ name: "dir", path: "dir", isDir: true }] } };
+  });
+  store.treeNodes = [{ name: "dir", path: "dir", isDir: true }];
+  store._rebuildTreeIndex();
+  const refresh = store.loadTree(ctx, workspaceId);
+  await store.expandDir(ctx, workspaceId, "dir");
+  respondRoot({ status: 200, body: { ok: true, nodes: [{ name: "dir", path: "dir", isDir: true }] } });
+  await refresh;
+  assert.deepEqual(store.expandedKeys, ["dir"]);
+  assert.equal(store.treeNodes[0]?.children?.[0]?.path, "dir/file");
+});
+
+test("切换隐藏文件后迟到懒加载不能写入新目录树", async t => {
+  let respond!: (value: unknown) => void;
+  const store = fixture(t, async request => request.body?.dirPath
+    ? new Promise(resolve => { respond = resolve; })
+    : { status: 200, body: { ok: true, nodes: [{ name: ".hidden", path: ".hidden", isDir: false }] } });
+  store.treeNodes = [{ name: "dir", path: "dir", isDir: true }];
+  store._rebuildTreeIndex();
+  const expand = store.expandDir(ctx, workspaceId, "dir");
+  const stale = assert.rejects(expand, /取消/u);
+  await store.setShowHiddenFiles(ctx, workspaceId, true, false);
+  respond({ status: 200, body: { ok: true, nodes: [{ name: "old", path: "dir/old", isDir: false }] } });
+  await stale;
+  assert.equal(store.treeNodes[0]?.path, ".hidden");
+  assert.deepEqual(store.expandedKeys, []);
+});
+
+test("切换工作区后旧完整树读取取消，不覆盖新工作区或loading", async t => {
+  let respond!: (value: unknown) => void;
+  const store = fixture(t, async request => request.body?.depth === 99
+    ? new Promise(resolve => { respond = resolve; })
+    : { status: 200, body: { ok: true, nodes: [{ name: "current", path: "current", isDir: false }] } });
+  const full = store.loadFullTree(ctx, workspaceId);
+  const stale = assert.rejects(full, /取消/u);
+  store.resetForWorkspace();
+  await store.loadTree(ctx, "desktop:other" as WorkspaceId);
+  respond({ status: 200, body: { ok: true, nodes: [{ name: "old", path: "old", isDir: false }] } });
+  await stale;
+  assert.equal(store.treeNodes[0]?.path, "current");
+  assert.equal(store.treeLoading, false);
+});
+
 test("Git 定时复查保留已有空态，不进入加载展示且相同快照不替换引用", async t => {
   let resolveStatus!: (value: unknown) => void;
   const store = fixture(t, async () => new Promise(resolve => { resolveStatus = resolve; }));

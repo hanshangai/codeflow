@@ -181,23 +181,138 @@ test("检测成功选择稍后也不恢复旧账号或交付旧登录", async t 
   assert.equal(owner.snapshot().workspaceCount, 0);
 });
 
-for (const scenario of ["unsafe", "journal", "bound", "stage"] as const) {
-  test(`检测失败暂缓门禁拒绝 ${scenario}`, async t => {
-    const f = await fixture(t, async (_request, progress) => {
-      if (scenario === "stage") progress({ stage: "snapshot", completed: 0, total: 1 });
-      throw Object.assign(new Error("fixture failure"), { code: scenario === "unsafe" ? "SOURCE_PATH_UNSAFE" : "SOURCE_ACCOUNT_UNRESOLVED" });
-    });
-    if (scenario === "journal") await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-journal.json"), "{}");
-    if (scenario === "bound") await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-account.json"), JSON.stringify({
-      schemaVersion: 1, targetClientId: "local_fixture", migrationId: f.identity.deviceId, nonce: f.identity.deviceId, cancelled: false, delivered: false }));
-    const owner = createLegacyClientMigration(f);
-    const waiting = assert.rejects(owner.prepare(), /MIGRATION_STOPPED/u);
-    await owner.whenDiscovered();
-    assert.equal(owner.snapshot().canDefer, false);
-    await assert.rejects(owner.defer(), /MIGRATION_DECISION_INVALID/u);
-    await owner.stop(); await waiting;
+test("存在迁移日志时不能绕过待恢复的数据", async t => {
+  const f = await fixture(t, async () => {
+    throw Object.assign(new Error("fixture failure"), { code: "SOURCE_ACCOUNT_UNRESOLVED" });
   });
-}
+  await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-journal.json"), "{}");
+  const owner = createLegacyClientMigration(f);
+  const waiting = assert.rejects(owner.prepare(), /MIGRATION_STOPPED/u);
+  await owner.whenDiscovered();
+  assert.equal(owner.snapshot().canDefer, false);
+  await assert.rejects(owner.defer(), /MIGRATION_DECISION_INVALID/u);
+  await owner.stop(); await waiting;
+});
+
+for (const failure of ["worker", "record", "confirmation", "none"] as const)
+test(`有journal暂缓必须确认Worker和选择落盘后才开放桌面：${failure}`, async t => {
+  let finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const f = await fixture(t, async request => {
+    if (request.action === "discover") return request.migrationId
+      ? { candidateId: "source-1", workspaceCount: 1, migrationId: request.migrationId, resume: true, canDefer: true }
+      : { candidateId: "source-1", workspaceCount: 1 };
+    if (request.action === "migrate") {
+      await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-journal.json"), "fixture prepublication journal");
+      throw Object.assign(new Error("fixture interruption"), { code: "FIXTURE_INTERRUPTED" });
+    }
+    await pending;
+    if (failure === "worker") throw Object.assign(new Error("fixture defer failure"), { code: "FIXTURE_DEFER_FAILED" });
+    return { candidateId: null, workspaceCount: 0, migrationId: request.migrationId, deferred: failure !== "confirmation" };
+  });
+  let restored = false, released = false;
+  const owner = createLegacyClientMigration({ ...f, restoreAccount: async () => { restored = true; throw new Error("unexpected restore"); } });
+  const waiting = owner.prepare().then(() => { released = true; });
+  t.after(async () => { await owner.stop(); if (failure === "none") await waiting; else await assert.rejects(waiting, /MIGRATION_STOPPED/u); });
+  await owner.whenDiscovered(); await assert.rejects(owner.start("source-1"), /fixture interruption/u);
+  assert.equal(owner.snapshot().canDefer, true);
+  if (failure === "record") {
+    const nativeFs = await import("node:fs");
+    t.mock.method(nativeFs.default, "renameSync", () => { throw new Error("fixture account write failure"); });
+  }
+  const deferring = owner.defer();
+  // 立即绑定失败断言，避免异步完成时产生未处理拒绝。
+  const completed = failure === "none" ? deferring : assert.rejects(deferring, /fixture defer failure|fixture account write failure|MIGRATION_DEFER_NOT_CONFIRMED/u);
+  assert.equal(owner.snapshot().status, "running"); assert.equal(released, false);
+  await assert.rejects(owner.defer(), /MIGRATION_DECISION_INVALID/u);
+  finish(); await completed;
+  if (failure === "none") {
+    await waiting; await owner.runtimeReady();
+    assert.equal(released, true); assert.equal(restored, false); assert.equal(owner.snapshot().account.status, "not_requested");
+  } else {
+    assert.equal(released, false); assert.equal(owner.snapshot().status, "failed");
+    assert.ok(owner.snapshot().errorCode); assert.equal(restored, false);
+  }
+});
+
+test("目标已有数据导致迁移失败后仍可进入桌面，不修改现有数据或恢复旧账号", async t => {
+  const f = await fixture(t, async request => {
+    if (request.action === "discover") return { candidateId: "source-1", workspaceCount: 1 };
+    throw Object.assign(new Error("target already used"), { code: "TARGET_CONFLICT" });
+  });
+  const configPath = path.join(f.dataDir, "config.json"), databasePath = path.join(f.dataDir, "codeflowai.db");
+  const config = JSON.stringify({ clientId: "local_existing", serverWs: "wss://test.example/ws/client" });
+  const database = Buffer.from("existing desktop account data");
+  await fs.writeFile(configPath, config);
+  await fs.writeFile(databasePath, database);
+  let restores = 0;
+  const owner = createLegacyClientMigration({ ...f, restoreAccount: async () => { restores++; throw new Error("unexpected restore"); } });
+  const waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  await assert.rejects(owner.start("source-1"), /target already used/u);
+  assert.equal(owner.snapshot().status, "failed");
+  assert.equal(owner.snapshot().canDefer, true);
+  await owner.defer();
+  await waiting;
+  await owner.runtimeReady();
+  assert.equal(owner.snapshot().status, "ready");
+  assert.equal(owner.snapshot().migrationId, null);
+  assert.equal(owner.snapshot().account.status, "not_requested");
+  assert.equal(await owner.takeAccount(), null);
+  assert.equal(restores, 0);
+  assert.equal(await fs.readFile(configPath, "utf8"), config);
+  assert.deepEqual(await fs.readFile(databasePath), database);
+  const record = JSON.parse(await fs.readFile(path.join(f.dataDir, "legacy-client-migration-account.json"), "utf8"));
+  assert.equal(record.migrationId, null);
+});
+
+test("重启后只有迁移编号没有提交日志时仍可稍后进入，不再锁死", async t => {
+  const f = await fixture(t, async () => ({ candidateId: "source-1", workspaceCount: 1 }));
+  await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-account.json"), JSON.stringify({
+    schemaVersion: 1, targetClientId: "local_fixture", migrationId: f.identity.deviceId, nonce: f.identity.deviceId, cancelled: false, delivered: false }));
+  const owner = createLegacyClientMigration(f), waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  assert.equal(owner.snapshot().status, "available");
+  assert.equal(owner.snapshot().canDefer, true);
+  await owner.defer(); await waiting; await owner.runtimeReady();
+  assert.equal(owner.snapshot().status, "ready");
+  assert.equal(owner.snapshot().account.status, "not_requested");
+});
+
+test("旧数据检测失败但没有迁移提交记录时可保留旧数据进入桌面", async t => {
+  const f = await fixture(t, async () => { throw Object.assign(new Error("old data unavailable"), { code: "SOURCE_PATH_UNSAFE" }); });
+  const owner = createLegacyClientMigration(f), waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  assert.equal(owner.snapshot().canDefer, true);
+  await owner.defer(); await waiting; await owner.runtimeReady();
+  assert.equal(owner.snapshot().status, "ready");
+});
+
+test("放弃未提交迁移的选择写入失败时不释放门禁，修复存储后可重试", async t => {
+  const f = await fixture(t, async () => ({ candidateId: "source-1", workspaceCount: 1 }));
+  const file = path.join(f.dataDir, "legacy-client-migration-account.json");
+  const original = JSON.stringify({ schemaVersion: 1, targetClientId: "local_fixture", migrationId: f.identity.deviceId,
+    nonce: f.identity.deviceId, cancelled: false, delivered: false });
+  await fs.writeFile(file, original);
+  const owner = createLegacyClientMigration(f);
+  let released = false;
+  const waiting = owner.prepare().then(() => { released = true; });
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  const nativeFs = await import("node:fs"), failure = new Error("migration record write failed");
+  const rename = t.mock.method(nativeFs.default, "renameSync", () => { throw failure; });
+  await assert.rejects(owner.defer(), error => error === failure);
+  assert.equal(released, false);
+  assert.equal(owner.snapshot().status, "available");
+  assert.equal(owner.snapshot().migrationId, f.identity.deviceId);
+  assert.equal(await fs.readFile(file, "utf8"), original);
+  rename.mock.restore();
+  await owner.defer(); await waiting;
+  assert.equal(released, true);
+});
 
 test("暂缓执行前重新检查磁盘迁移记录，拒绝检测后出现的日志", async t => {
   const f = await fixture(t, async () => ({ candidateId: "source-1", workspaceCount: 1 }));

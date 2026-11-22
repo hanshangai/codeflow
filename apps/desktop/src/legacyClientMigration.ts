@@ -8,12 +8,12 @@ import { createDesktopUpdateTransport } from "./updateTransport.js";
 
 type AccountSource = { sourceClientId: string; apiKey: string; serverWs: string };
 export type LegacyMigrationRequest = {
-  action: "discover" | "migrate"; dataDir: string; targetClientId: string; targetDeviceId: string;
+  action: "discover" | "migrate" | "defer"; dataDir: string; targetClientId: string; targetDeviceId: string;
   candidateId?: string; migrationId?: string;
 };
 export type LegacyMigrationResult = {
   candidateId: string | null; workspaceCount: number; migrationId?: string;
-  completed?: boolean; resume?: boolean; accountSource?: AccountSource;
+  completed?: boolean; resume?: boolean; canDefer?: boolean; deferred?: boolean; accountSource?: AccountSource;
 };
 type Progress = { stage: string; completed: number; total: number | null; workspaceCount?: number };
 export type LegacyMigrationExecutor = (request: LegacyMigrationRequest, progress: (value: Progress) => void) => Promise<LegacyMigrationResult>;
@@ -50,6 +50,7 @@ export function createLegacyClientMigration(input: {
   let flight: Promise<void> | undefined;
   let accountFlight: Promise<void> | undefined;
   let source: AccountSource | undefined;
+  let journalCanDefer = false, journalSeen = false, dataDeferred = false;
   let account: DesktopMigrationAccount | null = null;
   let generation = 0;
   let release!: () => void;
@@ -59,11 +60,12 @@ export function createLegacyClientMigration(input: {
   const listeners = new Set<(state: DesktopMigrationState) => void>();
   let prepared: Promise<void> | undefined;
 
+  /** 磁盘记录存在不代表已发布；有journal时仅采用Worker核实的资格，执行时仍须复验。 */
+  const hasJournal = (): boolean => !!fs.lstatSync(path.join(input.dataDir, "legacy-client-migration-journal.json"), { throwIfNoEntry: false });
+  const canDefer = (): boolean => !stopped
+    && (hasJournal() ? journalCanDefer : !journalSeen)
+    && (state.status === "available" || state.status === "failed");
   /** 状态只广播脱敏副本，不共享宿主可变对象。 */
-  const canDefer = (): boolean => !stopped && !record.migrationId
-    && !fs.lstatSync(path.join(input.dataDir, "legacy-client-migration-journal.json"), { throwIfNoEntry: false })
-    && (state.status === "available" || state.status === "failed" && state.stage === "discover"
-      && state.errorCode === "SOURCE_ACCOUNT_UNRESOLVED" && !state.candidateId);
   const snapshot = (): DesktopMigrationState => structuredClone({ ...state, canDefer: canDefer() });
   const publish = (): void => { for (const listener of listeners) listener(snapshot()); };
   /** 只持久保存重试身份和用户选择，不保存 Key、session 或账号正文。 */
@@ -144,14 +146,22 @@ export function createLegacyClientMigration(input: {
         try {
           const result = await execute({ action: "discover", dataDir: input.dataDir, targetClientId: record.targetClientId, targetDeviceId: input.identity.deviceId }, progress);
           assertMigrationResult(result);
+          dataDeferred = result.deferred === true;
+          journalCanDefer = result.canDefer === true;
+          journalSeen = result.resume === true || dataDeferred;
           source = result.accountSource;
           state = { ...state, candidateId: result.candidateId, workspaceCount: result.workspaceCount };
           if (result.migrationId && record.migrationId && result.migrationId !== record.migrationId) throw new Error("MIGRATION_ID_CONFLICT");
-          if (result.migrationId && !record.migrationId) {
+          if (dataDeferred && record.migrationId) {
+            const next = { ...record, migrationId: null, targetClientId: readTargetClientId(input.dataDir) ?? record.targetClientId };
+            writeAccountRecord(accountPath, next); record = next;
+            state = { ...state, migrationId: null };
+          }
+          if (result.migrationId && !record.migrationId && !dataDeferred) {
             record = { ...record, migrationId: result.migrationId }; save();
             state = { ...state, migrationId: record.migrationId };
           }
-          if (result.completed) { state = { ...state, status: "running", stage: "runtime_starting" }; release(); }
+          if (result.completed || dataDeferred) { state = { ...state, status: "running", stage: "runtime_starting" }; release(); }
           else if (result.resume) {
             state = { ...state, status: "available" };
             await owner.start(result.candidateId!);
@@ -162,7 +172,7 @@ export function createLegacyClientMigration(input: {
           const code = errorCode(error, "MIGRATION_DISCOVERY_FAILED");
           log(error, code, "discover");
           state = { ...state, status: "failed", errorCode: code };
-          if (code === "SOURCE_ACCOUNT_UNRESOLVED" && canDefer()) {
+          if (code === "SOURCE_ACCOUNT_UNRESOLVED" && !record.migrationId && state.stage === "discover" && !state.candidateId && canDefer()) {
             state = { ...state, status: "running", stage: "runtime_starting", candidateId: null, workspaceCount: 0,
               completed: 0, total: null, errorCode: code,
               message: "旧 Client 所属 Server 暂不可用，旧数据已保留；未迁移旧数据，新桌面将继续启动。" };
@@ -185,6 +195,7 @@ export function createLegacyClientMigration(input: {
       if (candidateId !== state.candidateId || !candidateId) return Promise.reject(new Error("MIGRATION_CANDIDATE_CHANGED"));
       if (flight) return flight;
       if (!["available", "failed"].includes(state.status) || stopped) return Promise.reject(new Error("MIGRATION_DECISION_INVALID"));
+      journalCanDefer = false;
       state = { ...state, status: "running", stage: "quiesce", errorCode: null, message: null }; publish();
       flight = (async () => {
         try {
@@ -199,32 +210,69 @@ export function createLegacyClientMigration(input: {
           state = { ...state, stage: "runtime_starting" }; publish(); release();
         } catch (error) {
           log(error, errorCode(error, "MIGRATION_DATA_FAILED"), state.stage);
-          state = { ...state, status: "failed", errorCode: errorCode(error, "MIGRATION_DATA_FAILED"), message: "迁移失败，原数据保留。请重试本次迁移。" }; publish();
-          throw error;
+          let failure = error;
+          try {
+            if (!stopped && hasJournal()) {
+              journalSeen = true;
+              const result = await execute({ action: "discover", dataDir: input.dataDir, migrationId: record.migrationId!,
+                targetClientId: record.targetClientId, targetDeviceId: input.identity.deviceId }, () => {});
+              assertMigrationResult(result);
+              if (result.migrationId !== record.migrationId) throw new Error("MIGRATION_ID_CONFLICT");
+              journalCanDefer = result.canDefer === true && result.resume === true;
+            }
+          } catch (checkError) {
+            log(checkError, "MIGRATION_DEFER_CHECK_FAILED", "defer_check");
+            failure = Object.assign(new AggregateError([error, checkError], "MIGRATION_DEFER_CHECK_FAILED", { cause: error }), { code: "MIGRATION_DEFER_CHECK_FAILED" });
+          }
+          state = { ...state, status: "failed", errorCode: errorCode(failure, "MIGRATION_DATA_FAILED"), message: "迁移失败，原数据保留。可重试，或在允许暂缓时进入桌面。" }; publish();
+          throw failure;
         } finally { flight = undefined; }
       })();
       return flight;
     },
-    /** 仅未开始迁移的候选或账号检测失败可稍后，数据提交及安全失败仍保留屏障。 */
+    /** 有journal先由Worker持久暂缓并正常退出；无journal只清预分配编号，不恢复旧账号。 */
     async defer(): Promise<void> {
       if (!canDefer()) throw new Error("MIGRATION_DECISION_INVALID");
+      if (hasJournal()) {
+        state = { ...state, status: "running", stage: "defer" }; publish();
+        try {
+          const result = await execute({ action: "defer", dataDir: input.dataDir, migrationId: record.migrationId!,
+            targetClientId: record.targetClientId, targetDeviceId: input.identity.deviceId }, () => {});
+          assertMigrationResult(result);
+          if (!result.deferred || result.migrationId !== record.migrationId) throw new Error("MIGRATION_DEFER_NOT_CONFIRMED");
+          if (stopped) throw new Error("MIGRATION_STOPPED");
+          const next = { ...record, migrationId: null };
+          writeAccountRecord(accountPath, next); record = next;
+          dataDeferred = true;
+        } catch (error) {
+          journalCanDefer = false;
+          log(error, errorCode(error, "MIGRATION_DEFER_FAILED"), "defer");
+          state = { ...state, status: "failed", errorCode: errorCode(error, "MIGRATION_DEFER_FAILED"), message: "暂缓未确认，尚未启动桌面。请退出后重试。" }; publish();
+          throw error;
+        }
+      } else if (record.migrationId) {
+        const next = { ...record, migrationId: null };
+        writeAccountRecord(accountPath, next);
+        record = next;
+      }
       generation++; source = undefined; account = null;
-      state = { ...state, status: "running", stage: "runtime_starting", candidateId: null, workspaceCount: 0,
+      state = { ...state, status: "running", stage: "runtime_starting", migrationId: null, candidateId: null, workspaceCount: 0,
         completed: 0, total: null, errorCode: null, message: null }; publish(); release();
     },
     /** 正常 Client ready 后才开放页面；账号恢复有独立失败态及有限网络预算。 */
     async runtimeReady(): Promise<void> {
-      if (record.migrationId && !source && !record.cancelled && !record.delivered) {
+      if (!dataDeferred && record.migrationId && !source && !record.cancelled && !record.delivered) {
         state = { ...state, account: { status: "failed", errorCode: "MIGRATION_ACCOUNT_SOURCE_MISSING",
           message: "本地数据迁移完成，旧登录凭据不可用，请重新登录。" } };
         log(new Error("MIGRATION_ACCOUNT_SOURCE_MISSING"), "MIGRATION_ACCOUNT_SOURCE_MISSING", "account");
       }
-      if (source && !record.cancelled && !record.delivered) { accountFlight = restore(); try { await accountFlight; } finally { accountFlight = undefined; } }
+      if (!dataDeferred && source && !record.cancelled && !record.delivered) { accountFlight = restore(); try { await accountFlight; } finally { accountFlight = undefined; } }
       if (stopped) throw Object.assign(new Error("MIGRATION_STOPPED"), { code: "MIGRATION_STOPPED" });
       state = { ...state, status: "ready", stage: "completed", completed: state.total ?? state.completed }; publish();
     },
     /** 有效待交付结果只重交付；过期或缺失时才重新兑换，不再执行数据导入。 */
     async retryAccount(): Promise<void> {
+      if (dataDeferred) throw new Error("MIGRATION_DATA_DEFERRED");
       if (record.cancelled) throw new Error("MIGRATION_ACCOUNT_CANCELLED");
       if (state.status !== "ready") throw new Error("MIGRATION_NOT_READY");
       if (account && account.session.sessionExpiresAt > Date.now() + 5_000) return;
@@ -337,6 +385,10 @@ function assertMigrationResult(value: LegacyMigrationResult): void {
     || value.migrationId !== undefined && (typeof value.migrationId !== "string" || !/^[0-9a-f-]{36}$/u.test(value.migrationId))
     || value.completed !== undefined && typeof value.completed !== "boolean"
     || value.resume !== undefined && typeof value.resume !== "boolean"
+    || value.canDefer !== undefined && typeof value.canDefer !== "boolean"
+    || value.deferred !== undefined && typeof value.deferred !== "boolean"
+    || value.deferred && (!value.migrationId || value.completed || value.resume || value.accountSource || value.candidateId !== null)
+    || value.canDefer && (!value.resume || value.completed || value.deferred || !value.migrationId)
     || value.resume && !value.candidateId
     || value.accountSource && (typeof value.accountSource.sourceClientId !== "string" || !value.accountSource.sourceClientId
       || typeof value.accountSource.apiKey !== "string" || !value.accountSource.apiKey

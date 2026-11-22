@@ -67,6 +67,19 @@ test("全部新旧文档格式共用提取入口，按提取文字而非二进�
   assert.equal(seen.length, 7);
 });
 
+test("常用文本与日志格式按文本附件内联", async (t) => {
+  const attachments = harness(t, async () => { throw new Error("文本文件不应触发文档提取"); });
+  const names = ["事件日志.jsonl", "数据.ndjson", "指标.csv", "脚本.mjs", "样式.scss", "配置.ini"];
+  for (const name of names) await attachments.addAttachments([new File([`内容:${name}`], name)]);
+  assert.deepEqual(attachments.textFileAttachments.value.map((file) => file.name), names);
+});
+
+test("无扩展名的 Dockerfile 与 Makefile 按文本附件内联", async (t) => {
+  const attachments = harness(t, async () => { throw new Error("文本文件不应触发文档提取"); });
+  for (const name of ["Dockerfile", "Makefile"]) await attachments.addAttachments([new File([`内容:${name}`], name)]);
+  assert.deepEqual(attachments.textFileAttachments.value.map((file) => file.name), ["Dockerfile", "Makefile"]);
+});
+
 test("选择、拖放、粘贴文件均提取文字", async (t) => {
   const attachments = harness(t, async (file) => `文字：${file.name}`);
   const file = new File(["bytes"], "资料.doc");
@@ -115,6 +128,14 @@ test("文档源文件统一 20MB", async (t) => {
 
   const oversized = new File([Buffer.alloc(DOCUMENT_ATTACHMENT_LIMITS.maxSourceBytes + 1)], "超过上限.pdf");
   await assert.rejects(attachments.addAttachments([oversized]), /文档文件过大/);
+});
+
+test("文本附件单文件上限为 2MB", async (t) => {
+  const attachments = harness(t, async () => "unused");
+  await attachments.addAttachments([new File([Buffer.alloc(1.5 * 1024 * 1024, 0x61)], "日志.jsonl")]);
+  assert.equal(attachments.textFileAttachments.value.length, 1);
+  await attachments.addAttachments([new File([Buffer.alloc(INLINE_ATTACHMENT_LIMITS.maxTextFileBytes + 1, 0x61)], "超大.jsonl")]);
+  assert.equal(attachments.textFileAttachments.value.length, 1);
 });
 
 test("图片源文件统一 12MB", async (t) => {

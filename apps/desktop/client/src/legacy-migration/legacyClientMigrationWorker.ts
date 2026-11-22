@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { discoverLegacyClientMigration, migrateLegacyClientMigration } from './legacyClientMigration.js';
+import { discoverLegacyClientMigration, migrateLegacyClientMigration, deferLegacyClientMigration } from './legacyClientMigration.js';
 import { parseLegacyClientMigrationRequest, type LegacyClientMigrationMessage } from './legacyClientMigrationProtocol.js';
 
 /** IPC 写入必须确认，父进程断开不能被当作结果已交付。 */
@@ -28,7 +28,9 @@ export function startLegacyClientMigrationWorker(): void {
           process.send({ type: 'progress', progress }, error => { if (error) controller.abort(error); });
         } };
       const result = request.action === 'discover' ? await discoverLegacyClientMigration(request, dependencies)
-        : await migrateLegacyClientMigration(request, dependencies);
+        : request.action === 'defer' ? deferLegacyClientMigration(request) : await migrateLegacyClientMigration(request, dependencies);
+      if (request.action === 'defer') process.stderr.write(`${JSON.stringify({ event: 'LEGACY_MIGRATION_DEFERRED', requestId,
+        migrationId, targetClientId, stage: 'defer', outcome: 'success' })}\n`);
       controller.signal.throwIfAborted(); await send({ type: 'result', result });
       process.exitCode = 0;
     } catch (error) {

@@ -17,7 +17,7 @@ function loadModule(source: string, load: (id: string) => unknown) {
   return module.exports;
 }
 
-for (const scenario of ["allowed", "denied", "old-shell", "bound", "running", "unsafe"] as const) {
+for (const scenario of ["allowed", "denied", "old-shell", "bound", "running", "unsafe", "target-conflict", "journal-unpublished", "available-allowed", "available-denied"] as const) {
   test(`迁移失败页暂缓入口 ${scenario}：真实组件渲染与点击`, async t => {
     const source = fs.readFileSync(new URL("../src/features/desktop/components/desktop-migration-startup.vue", import.meta.url), "utf8");
     const { descriptor } = parse(source);
@@ -25,11 +25,15 @@ for (const scenario of ["allowed", "denied", "old-shell", "bound", "running", "u
     const template = compileTemplate({ source: descriptor.template!.content, filename: "desktop-migration-startup.vue", id: "migration-defer",
       compilerOptions: { bindingMetadata: script.bindings } });
     assert.deepEqual(template.errors, []);
-    const snapshot: DesktopMigrationState = { status: scenario === "running" ? "running" : "failed", stage: "discover",
-      migrationId: scenario === "bound" ? "migration-1" : null, candidateId: null, workspaceCount: 0, completed: 0, total: null,
-      errorCode: scenario === "unsafe" ? "SOURCE_PATH_UNSAFE" : "SOURCE_ACCOUNT_UNRESOLVED", message: "旧账号无法确认",
+    const allowed = scenario === "allowed" || scenario === "target-conflict" || scenario === "journal-unpublished" || scenario === "available-allowed";
+    const available = scenario.startsWith("available-");
+    const snapshot: DesktopMigrationState = { status: scenario === "running" ? "running" : available ? "available" : "failed", stage: "discover",
+      migrationId: scenario === "bound" || scenario === "target-conflict" || scenario === "journal-unpublished" ? "migration-1" : null,
+      candidateId: available || scenario === "target-conflict" ? "candidate" : null, workspaceCount: 1, completed: 0, total: null,
+      errorCode: scenario === "unsafe" ? "SOURCE_PATH_UNSAFE" : scenario === "target-conflict" ? "TARGET_CONFLICT" : "SOURCE_ACCOUNT_UNRESOLVED",
+      message: scenario === "target-conflict" ? "目标桌面已有数据，迁移未完成" : "旧账号无法确认",
       account: { status: "not_requested", errorCode: null, message: null },
-      ...(scenario === "old-shell" ? {} : { canDefer: scenario === "allowed" }) };
+      ...(scenario === "old-shell" ? {} : { canDefer: allowed }) };
     let mounted!: () => Promise<void>;
     let deferrals = 0;
     let ready = 0;
@@ -52,12 +56,13 @@ for (const scenario of ["allowed", "denied", "old-shell", "bound", "running", "u
     const render = loadModule(template.code, id => { assert.equal(id, "vue"); return vue; }).render;
     const app = vue.createSSRApp({ setup: () => () => render({}, [], {}, vue.proxyRefs(state), {}, {}) });
     const html = await renderToString(app);
-    const allowed = scenario === "allowed";
-    assert.equal(html.includes("暂不迁移，进入新桌面"), allowed, html);
+    assert.equal(html.includes("暂不迁移，进入新桌面"), allowed && !available, html);
+    if (available) assert.equal(html.includes("稍后再说"), allowed, html);
+    if (scenario === "target-conflict") assert.ok(html.includes(snapshot.message!), html);
     assert.equal(ready, 0, "未完成正常 Client 启动前不得开放主应用");
     assert.equal(deferrals, 0, "渲染页面不自动跳过");
     if (allowed) {
-      assert.ok(html.includes("旧数据保持原样"), html);
+      if (!available) assert.ok(html.includes("旧数据保持原样"), html);
       await state.perform("defer");
       assert.equal(deferrals, 1);
       assert.equal(config.serverWsOrigin, "ws://test-server.test:39280");

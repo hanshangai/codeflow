@@ -1,5 +1,5 @@
 export type LegacyClientMigrationRequest = {
-  action: 'discover' | 'migrate';
+  action: 'discover' | 'migrate' | 'defer';
   dataDir: string;
   targetClientId: string;
   targetDeviceId: string;
@@ -14,6 +14,8 @@ export type LegacyClientMigrationResult = {
   migrationId?: string;
   completed?: boolean;
   resume?: boolean;
+  canDefer?: boolean;
+  deferred?: boolean;
   accountSource?: { sourceClientId: string; apiKey: string; serverWs: string };
 };
 export type LegacyClientMigrationMessage =
@@ -24,13 +26,14 @@ export type LegacyClientMigrationMessage =
 /** 只接受宿主固定参数；页面不能通过 Worker 协议指定任意来源路径。 */
 export function parseLegacyClientMigrationRequest(value: unknown): LegacyClientMigrationRequest {
   const input = value as Partial<LegacyClientMigrationRequest> | null;
-  if (!input || !['discover', 'migrate'].includes(String(input.action))
+  if (!input || !['discover', 'migrate', 'defer'].includes(String(input.action))
     || typeof input.dataDir !== 'string' || !input.dataDir.trim()
     || typeof input.targetClientId !== 'string' || !input.targetClientId.startsWith('local_') || !uuid(input.targetClientId.slice(6))
     || typeof input.targetDeviceId !== 'string' || !uuid(input.targetDeviceId)
     || input.candidateId !== undefined && (typeof input.candidateId !== 'string' || !/^[0-9a-f]{64}$/.test(input.candidateId))
     || input.migrationId !== undefined && (typeof input.migrationId !== 'string' || !uuid(input.migrationId))
-    || input.action === 'migrate' && (!input.candidateId || !input.migrationId)) {
+    || input.action === 'migrate' && (!input.candidateId || !input.migrationId)
+    || input.action === 'defer' && !input.migrationId) {
     throw Object.assign(new Error('迁移参数无效'), { code: 'MIGRATION_REQUEST_INVALID' });
   }
   return input as LegacyClientMigrationRequest;

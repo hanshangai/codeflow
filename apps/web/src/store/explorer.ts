@@ -4,7 +4,7 @@ import type {
   GitStatusResult, GitLogEntry, GitBranchInfo, GitFileStatus, GitFileStat, GitRepositoryInfo, GitShowResponseBody,
   WorkspaceId,
 } from "@codeflowai/shared";
-import { createApiResultError, type ApiRequestContext } from "../api/request";
+import { createApiResultError, createCancelledRequestError, type ApiRequestContext } from "../api/request";
 import { fetchFsTree } from "../api/fs";
 import {
   fetchGitStatus, fetchGitDiffFiles, fetchGitStage, fetchGitUnstage, fetchGitDiscard,
@@ -24,6 +24,9 @@ const pendingGitStatusRequests = new Map<string, Promise<GitStatusApiResult>>();
 const pendingGitStatusLoads = new WeakMap<object, GitStatusLoad>();
 const pendingGitLogLoads = new WeakMap<object, Map<string, GitLogLoad>>();
 const pendingPreviewLoads = new WeakMap<object, { epoch: number; scopeKey: string; promise: Promise<void> }>();
+const pendingTreeLoads = new WeakMap<object, { epoch: number; scopeKey: string; dirty: boolean; promise: Promise<FsTreeNode[]> }>();
+const treeRequestScopes = new WeakMap<object, { key: string }>();
+const TREE_DIRECTORY_CONCURRENCY = 4;
 const GIT_STATUS_CACHE_TTL_MS = 60_000;
 const GIT_STATUS_CACHE_MAX = 32;
 
@@ -33,6 +36,32 @@ type GitStatusCacheEntry = {
 };
 
 const gitStatusCache = new Map<string, GitStatusCacheEntry>();
+
+/** 文件树在途请求按账号、工作区与隐藏文件选项隔离，键仅保留在内存。 */
+function treeRequestScopeKey(ctx: ApiRequestContext, workspaceId: WorkspaceId, showHidden: boolean): string {
+  return JSON.stringify([ctx.serverWsOrigin, ctx.webSessionId ?? null, ctx.desktopClientId ?? null,
+    ctx.sessionToken ?? null, workspaceId, showHidden]);
+}
+
+/** 同一工作区普通刷新保留作用域身份；账号、选项变更和重置才使目录展开失效。 */
+function enterTreeRequestScope(store: object, key: string): { key: string } {
+  const current = treeRequestScopes.get(store);
+  if (current?.key === key) return current;
+  const scope = { key };
+  treeRequestScopes.set(store, scope);
+  return scope;
+}
+
+/** 仅比较已加载节点的展示数据，内容相同就保留原树和组件引用。 */
+function sameTreeNodes(previous: FsTreeNode[] | undefined, next: FsTreeNode[] | undefined): boolean {
+  if (previous === next) return true;
+  if (!previous || !next || previous.length !== next.length) return false;
+  return previous.every((node, index) => {
+    const other = next[index]!;
+    return node.path === other.path && node.name === other.name && node.isDir === other.isDir
+      && node.size === other.size && node.mtime === other.mtime && sameTreeNodes(node.children, other.children);
+  });
+}
 
 /** 历史列表按工作区/仓库/HEAD 作用域缓存；面板重开时先展示再后台刷新。 */
 const GIT_LOG_CACHE_MAX = 20;
@@ -215,6 +244,8 @@ export type ExplorerState = {
 
   /** 树加载状态 */
   treeLoading: boolean;
+  /** 失效旧文件树、完整树和懒加载请求，防止工作区切换后回写。 */
+  _treeRequestEpoch: number;
 
   /** 是否已加载完整文件树 */
   _fullTreeLoaded: boolean;
@@ -272,6 +303,7 @@ export const useExplorerStore = defineStore("explorer", {
 
     operating: false,
     treeLoading: false,
+    _treeRequestEpoch: 0,
     _fullTreeLoaded: false,
     showHiddenFiles: false,
     _treeNodeByPath: new Map(),
@@ -288,7 +320,11 @@ export const useExplorerStore = defineStore("explorer", {
       const gitStatusRequestEpoch = this._gitStatusRequestEpoch + 1;
       const gitLogRequestEpoch = this._gitLogRequestEpoch + 1;
       const gitCommitDetailRequestEpoch = this._gitCommitDetailRequestEpoch + 1;
+      const treeRequestEpoch = this._treeRequestEpoch + 1;
       this.$reset();
+      this._treeRequestEpoch = treeRequestEpoch;
+      pendingTreeLoads.delete(this);
+      treeRequestScopes.delete(this);
       this._previewRequestEpoch = previewRequestEpoch;
       this._gitStatusRequestEpoch = gitStatusRequestEpoch;
       this._gitLogRequestEpoch = gitLogRequestEpoch;
@@ -299,58 +335,109 @@ export const useExplorerStore = defineStore("explorer", {
       this.selectedGitRepositoriesByWorkspace = selectedGitRepositoriesByWorkspace;
     },
 
-    /** 加载文件树根目录 */
-    async loadTree(ctx: ApiRequestContext, workspaceId: WorkspaceId, dirPath?: string) {
-      this.treeLoading = true;
-      try {
-        const res = await fetchFsTree(ctx, { workspaceId, dirPath: dirPath ?? "", depth: 1, showHidden: this.showHiddenFiles });
-        if (res.ok) {
-          if (!dirPath) {
-            this.treeNodes = (res as any).nodes ?? [];
-            this._rebuildTreeIndex();
-            this._fullTreeLoaded = false;
-            // 刷新后重新加载已展开目录的子节点（按深度排序，保证父目录先加载）
-            await this._reExpandDirs(ctx, workspaceId);
-            // 根树整体被重建后，强制重建 Tree，避免 antd 复用旧的 loadedKeys。
-            this.treeVersion += 1;
-          }
-          return (res as any).nodes as FsTreeNode[] ?? [];
-        }
-        return [];
-      } finally {
-        this.treeLoading = false;
+    /** 同作用域刷新串行合并；期间的新变更补刷一次，成功后整体发布，已有列表不遮罩。 */
+    async loadTree(ctx: ApiRequestContext, workspaceId: WorkspaceId, dirPath?: string): Promise<FsTreeNode[]> {
+      if (dirPath) {
+        const res = await fetchFsTree(ctx, { workspaceId, dirPath, depth: 1, showHidden: this.showHiddenFiles });
+        if (!res.ok) throw createApiResultError(res);
+        return res.nodes;
       }
+      const scopeKey = treeRequestScopeKey(ctx, workspaceId, this.showHiddenFiles);
+      enterTreeRequestScope(this, scopeKey);
+      const existing = pendingTreeLoads.get(this);
+      if (existing?.epoch === this._treeRequestEpoch && existing.scopeKey === scopeKey) {
+        existing.dirty = true;
+        return existing.promise;
+      }
+      const epoch = ++this._treeRequestEpoch;
+      /** 每次异步返回后复验原读取身份；取消不得改动新工作区。 */
+      const assertCurrent = (): void => {
+        if (this._treeRequestEpoch !== epoch || treeRequestScopeKey(ctx, workspaceId, this.showHiddenFiles) !== scopeKey) {
+          throw createCancelledRequestError("scope-change");
+        }
+      };
+      const showLoading = this.treeNodes.length === 0;
+      this.treeLoading = showLoading;
+      const load = { epoch, scopeKey, dirty: false, promise: null as unknown as Promise<FsTreeNode[]> };
+      load.promise = (async () => {
+        try {
+          do {
+            load.dirty = false;
+            const res = await fetchFsTree(ctx, { workspaceId, dirPath: "", depth: 1, showHidden: this.showHiddenFiles });
+            assertCurrent();
+            if (!res.ok) throw createApiResultError(res);
+            const nodes = res.nodes;
+            const expandedBefore = new Set(this.expandedKeys);
+            const directories = await this._reExpandDirs(ctx, workspaceId, nodes, assertCurrent);
+            assertCurrent();
+            if (this.expandedKeys.some(key => !expandedBefore.has(key))) {
+              load.dirty = true;
+              continue;
+            }
+            if (!sameTreeNodes(this.treeNodes, nodes)) {
+              this.treeNodes = nodes;
+              this._rebuildTreeIndex();
+              // 实际内容变化才清理 antd 的 loadedKeys。
+              this.treeVersion += 1;
+            }
+            const expanded = this.expandedKeys.filter(key => directories.has(key));
+            if (expanded.length !== this.expandedKeys.length) this.expandedKeys = expanded;
+            this._fullTreeLoaded = false;
+          } while (load.dirty);
+          return this.treeNodes;
+        } finally {
+          if (this._treeRequestEpoch === epoch) this.treeLoading = false;
+          if (pendingTreeLoads.get(this) === load) pendingTreeLoads.delete(this);
+        }
+      })();
+      pendingTreeLoads.set(this, load);
+      return load.promise;
     },
 
-    /** 加载完整文件树（用于搜索），只加载一次 */
+    /** 完整树读取替代根刷新；复验读取代次，切区或重置后不回写。 */
     async loadFullTree(ctx: ApiRequestContext, workspaceId: WorkspaceId) {
       if (this._fullTreeLoaded) return;
+      const epoch = ++this._treeRequestEpoch;
+      const scopeKey = treeRequestScopeKey(ctx, workspaceId, this.showHiddenFiles);
+      enterTreeRequestScope(this, scopeKey);
+      pendingTreeLoads.delete(this);
       this.treeLoading = true;
       try {
         const res = await fetchFsTree(ctx, { workspaceId, dirPath: "", depth: 99, showHidden: this.showHiddenFiles });
-        if (res.ok) {
-          this.treeNodes = (res as any).nodes ?? [];
-          this._rebuildTreeIndex();
-          this._fullTreeLoaded = true;
-          this.treeVersion += 1;
+        if (this._treeRequestEpoch !== epoch || treeRequestScopeKey(ctx, workspaceId, this.showHiddenFiles) !== scopeKey) {
+          throw createCancelledRequestError("scope-change");
         }
+        if (!res.ok) throw createApiResultError(res);
+        this.treeNodes = res.nodes;
+        this._rebuildTreeIndex();
+        this._fullTreeLoaded = true;
+        this.treeVersion += 1;
       } finally {
-        this.treeLoading = false;
+        if (this._treeRequestEpoch === epoch) this.treeLoading = false;
       }
     },
 
-    /** 展开目录（懒加载子节点） */
+    /** 同作用域刷新后重读目录；真正切区时取消，避免旧目录覆盖新快照。 */
     async expandDir(ctx: ApiRequestContext, workspaceId: WorkspaceId, dirPath: string) {
-      const res = await fetchFsTree(ctx, { workspaceId, dirPath, depth: 1, showHidden: this.showHiddenFiles });
-      if (res.ok) {
-        const children = (res as any).nodes as FsTreeNode[] ?? [];
-        this._insertChildren(dirPath, children);
-        if (!this.expandedKeys.includes(dirPath)) {
-          this.expandedKeys.push(dirPath);
+      const scopeKey = treeRequestScopeKey(ctx, workspaceId, this.showHiddenFiles);
+      const currentScope = treeRequestScopes.get(this);
+      if (currentScope && currentScope.key !== scopeKey) throw createCancelledRequestError("scope-change");
+      const scope = currentScope ?? enterTreeRequestScope(this, scopeKey);
+      for (;;) {
+        const epoch = this._treeRequestEpoch;
+        const res = await fetchFsTree(ctx, { workspaceId, dirPath, depth: 1, showHidden: this.showHiddenFiles });
+        if (treeRequestScopes.get(this) !== scope || treeRequestScopeKey(ctx, workspaceId, this.showHiddenFiles) !== scopeKey) {
+          throw createCancelledRequestError("scope-change");
         }
+        if (!res.ok) throw createApiResultError(res);
+        if (this._treeRequestEpoch !== epoch) continue;
+        const children = res.nodes;
+        this._insertChildren(dirPath, children);
+        if (!this.expandedKeys.includes(dirPath)) this.expandedKeys.push(dirPath);
+        const refreshing = pendingTreeLoads.get(this);
+        if (refreshing?.epoch === epoch) refreshing.dirty = true;
         return children;
       }
-      return [];
     },
 
     /** 将子节点插入到指定目录下 */
@@ -418,30 +505,36 @@ export const useExplorerStore = defineStore("explorer", {
       }
     },
 
-    /** 刷新后按深度逐层重新加载已展开目录的子节点 */
-    async _reExpandDirs(ctx: ApiRequestContext, workspaceId: WorkspaceId) {
-      const keys = [...this.expandedKeys];
-      if (!keys.length) return;
-      // 按路径深度分组（浅层先加载，确保父节点存在后再插入子节点）
-      const byDepth = new Map<number, string[]>();
-      for (const key of keys) {
-        const depth = key.split("/").length;
-        let list = byDepth.get(depth);
-        if (!list) { list = []; byDepth.set(depth, list); }
-        list.push(key);
+    /** 在独立快照内按层读取展开目录，并限制并发；失败不发布半棵树。 */
+    async _reExpandDirs(ctx: ApiRequestContext, workspaceId: WorkspaceId, nodes: FsTreeNode[], assertCurrent: () => void) {
+      const directories = new Map<string, FsTreeNode>();
+      /** 索引快照中的目录，供父层完成后定位下一层。 */
+      const index = (items: FsTreeNode[]): void => {
+        for (const node of items) {
+          if (node.isDir) directories.set(node.path, node);
+          if (node.children) index(node.children);
+        }
+      };
+      index(nodes);
+      const keys = [...new Set(this.expandedKeys)].sort((a, b) => a.split("/").length - b.split("/").length);
+      let offset = 0;
+      while (offset < keys.length) {
+        const depth = keys[offset]!.split("/").length;
+        const batch: string[] = [];
+        while (offset < keys.length && batch.length < TREE_DIRECTORY_CONCURRENCY && keys[offset]!.split("/").length === depth) batch.push(keys[offset++]!);
+        const results = await Promise.allSettled(batch.map(async dirPath => {
+          assertCurrent();
+          const directory = directories.get(dirPath);
+          if (!directory) return;
+          const res = await fetchFsTree(ctx, { workspaceId, dirPath, depth: 1, showHidden: this.showHiddenFiles });
+          assertCurrent();
+          if (!res.ok) throw createApiResultError(res);
+          directory.children = res.nodes;
+          index(res.nodes);
+        }));
+        for (const result of results) if (result.status === "rejected") throw result.reason;
       }
-      const depths = [...byDepth.keys()].sort((a, b) => a - b);
-      for (const depth of depths) {
-        const batch = byDepth.get(depth)!;
-        const existingBatch = batch.filter((dirPath) => {
-          if (!this._treeNodeByPath.has(dirPath)) {
-            this.expandedKeys = this.expandedKeys.filter((key) => key !== dirPath);
-            return false;
-          }
-          return true;
-        });
-        await Promise.all(existingBatch.map((dirPath) => this.expandDir(ctx, workspaceId, dirPath)));
-      }
+      return directories;
     },
 
     /** 选中文件并复用预览读取入口，同时清除之前的 diff。 */

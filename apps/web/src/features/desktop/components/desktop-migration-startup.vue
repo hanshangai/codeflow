@@ -17,7 +17,9 @@ const actionError = ref<string | null>(null);
 const busy = ref(false);
 const localReady = ref(false);
 const accountNoticeDismissed = ref(false);
-const canDeferDiscovery = computed(() => state.value?.status === "failed" && state.value.canDefer === true && Boolean(bridge?.deferMigration));
+/** 可暂缓能力由宿主核验磁盘事实，候选页也不能展示会被主进程拒绝的按钮。 */
+const canDeferMigration = computed(() => (state.value?.status === "available" || state.value?.status === "failed")
+  && state.value.canDefer === true && Boolean(bridge?.deferMigration));
 const deferredMigrationNotice = computed(() => localReady.value && state.value?.status === "ready"
   && state.value.errorCode === "SOURCE_ACCOUNT_UNRESOLVED" ? state.value.message : null);
 /** 已有有效登录时不再提醒恢复；保存失败仍明确展示，关闭只影响本次界面。 */
@@ -36,7 +38,7 @@ let stateRevision = 0;
 const percent = computed(() => state.value?.total ? Math.min(99, Math.floor(state.value.completed * 100 / state.value.total)) : undefined);
 // 启动与迁移共用入口，尚未拿到状态时不提前显示迁移文案。
 const stageLabel = computed(() => ({ discover: "正在检查本地数据", quiesce: "正在停止旧 Client", snapshot: "正在备份旧数据",
-  convert: "正在迁移工作区与会话", verify: "正在校验数据", publish: "正在保存迁移结果",
+  convert: "正在迁移工作区与会话", verify: "正在校验数据", publish: "正在保存迁移结果", defer: "正在保留旧数据并进入桌面",
   runtime_starting: props.startupLabel || "正在启动本地服务", completed: props.startupLabel || "正在加载工作台" }[state.value?.stage ?? ""]
   ?? (state.value?.status === "running" ? "正在迁移本地数据" : props.startupLabel || "正在连接本地工作台")));
 // 只有已确认的迁移选择/失败处理页可独立就绪，自动启动仍等待实际工作台挂载。
@@ -140,7 +142,7 @@ onBeforeUnmount(() => { unsubscribe?.(); });
         <div class="desktop-migration__heading" aria-live="polite">
           <h1>{{ state?.status === 'available' ? '把工作带到新桌面' : state?.status === 'failed' ? '迁移暂未完成' : '正在准备您的工作台' }}</h1>
           <p v-if="state?.status === 'available'">发现旧版 Client 数据，迁移后即可继续工作。</p>
-          <p v-else-if="canDeferDiscovery">旧数据保持原样，可稍后再迁移。</p>
+          <p v-else-if="canDeferMigration">旧数据保持原样，可稍后再迁移。</p>
           <p v-else-if="state?.status === 'failed'">请查看下方信息，然后重试迁移。</p>
         </div>
         <template v-if="state?.status === 'available'">
@@ -151,14 +153,14 @@ onBeforeUnmount(() => { unsubscribe?.(); });
           <p class="desktop-migration__note">迁移期间请稍候，完成后请使用桌面版。</p>
           <Space :size="12" wrap class="desktop-migration__actions">
             <Button type="primary" size="large" :loading="busy" @click="perform('start')">开始迁移</Button>
-            <Button type="text" size="large" :disabled="busy" @click="perform('defer')">稍后再说</Button>
+            <Button v-if="canDeferMigration" type="text" size="large" :disabled="busy" @click="perform('defer')">稍后再说</Button>
           </Space>
         </template>
         <template v-else-if="state?.status === 'failed'">
-          <Alert v-if="!canDeferDiscovery" class="desktop-migration__error" type="error" show-icon :message="state.message || '迁移失败，原数据保留'" />
+          <Alert class="desktop-migration__error" type="error" show-icon :message="state.message || '迁移失败，原数据保留'" />
           <Space :size="12" wrap class="desktop-migration__actions">
             <Button v-if="state.candidateId" type="primary" size="large" :loading="busy" @click="perform('start')">重试迁移</Button>
-            <Button v-if="canDeferDiscovery" type="primary" size="large" :loading="busy" @click="perform('defer')">暂不迁移，进入新桌面</Button>
+            <Button v-if="canDeferMigration" type="primary" size="large" :loading="busy" @click="perform('defer')">暂不迁移，进入新桌面</Button>
           </Space>
         </template>
         <template v-else>

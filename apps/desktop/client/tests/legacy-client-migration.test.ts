@@ -62,6 +62,147 @@ async function service() {
   return await import('../src/legacy-migration/legacyClientMigration.js');
 }
 
+for (const stage of ['quiesce', 'snapshot', 'convert', 'verify']) test(`发布前${stage}失败有journal仍可暂缓，重开不续迁或切换账号`, async t => {
+  const f = fixture(t), api = await service(); history(f.db);
+  let restores = 0;
+  /** 真实磁盘迁移只在指定阶段中断；账号恢复不应进入。 */
+  const execute: LegacyMigrationExecutor = async (request, onProgress) => {
+    if (request.action === 'discover') return await api.discoverLegacyClientMigration(request, f.dependencies);
+    if (request.action === 'defer') return api.deferLegacyClientMigration(request);
+    return await api.migrateLegacyClientMigration(request, { ...f.dependencies, onProgress: value => {
+      onProgress(value); if (value.stage === stage) throw Object.assign(new Error('fixture interruption'), { code: 'FIXTURE_INTERRUPTED' });
+    } });
+  };
+  const options = { dataDir: f.dataDir, workerEntry: 'unused', execute,
+    identity: { deviceId: targetDeviceId, createdAt: new Date().toISOString(), publicKeyBase64: 'fixture' },
+    restoreAccount: async () => { restores++; throw new Error('unexpected account restore'); } };
+  // 宿主绑定与真实Worker共用既有目标身份，不修改来源账号配置。
+  fs.writeFileSync(path.join(f.dataDir, 'config.json'), JSON.stringify({ clientId: targetClientId, apiKey: '' }));
+  const configBefore = fs.readFileSync(path.join(f.dataDir, 'config.json'));
+  const owner = createLegacyClientMigration(options), waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  await assert.rejects(owner.start(owner.snapshot().candidateId!), { code: 'FIXTURE_INTERRUPTED' });
+  const journalPath = path.join(f.dataDir, 'legacy-client-migration-journal.json');
+  const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+  assert.equal(journal.completed, false); assert.equal(owner.snapshot().canDefer, true);
+  const sourceBefore = sourceSnapshot(f.sourceDir);
+  await owner.defer(); await waiting; await owner.runtimeReady();
+  assert.equal(owner.snapshot().status, 'ready'); assert.equal(owner.snapshot().account.status, 'not_requested');
+  assert.equal(restores, 0); assert.equal(await owner.takeAccount(), null);
+  assert.equal(fs.existsSync(path.join(f.dataDir, 'codeflowai.db')), false);
+  assert.deepEqual(fs.readFileSync(path.join(f.dataDir, 'config.json')), configBefore);
+  assert.deepEqual(sourceSnapshot(f.sourceDir), sourceBefore);
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, 'utf8')).deferred, true);
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, 'utf8')).schemaVersion, 2, '旧Worker必须拒绝新暂缓记录，不能忽略字段自动续迁');
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, 'utf8')).completed, false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.dataDir, 'legacy-client-migration-account.json'), 'utf8')).migrationId, null);
+  // 新桌面已有账号/数据后仍读取暂缓事实，不再触发旧账号认证或导入。
+  fs.writeFileSync(path.join(f.dataDir, 'config.json'), JSON.stringify({ clientId: targetClientId, apiKey: 'desktop-account-B' }));
+  const reopened = createLegacyClientMigration(options); await reopened.prepare(); await reopened.runtimeReady();
+  assert.equal(reopened.snapshot().status, 'ready'); assert.equal(restores, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.dataDir, 'config.json'), 'utf8')).apiKey, 'desktop-account-B');
+  await assert.rejects(reopened.retryAccount(), /MIGRATION_DATA_DEFERRED/u);
+  await reopened.stop();
+});
+
+test('暂缓必须复验发布事实，rename与journal更新之间的中断不能绕过', async t => {
+  const f = fixture(t), api = await service(); history(f.db);
+  const found = await api.discoverLegacyClientMigration(f.input, f.dependencies);
+  const request = { ...f.input, candidateId: found.candidateId!, migrationId: crypto.randomUUID() };
+  await assert.rejects(api.migrateLegacyClientMigration(request, { ...f.dependencies,
+    afterPublish: () => { throw new Error('interrupted'); } }), /interrupted/u);
+  const filename = path.join(f.dataDir, 'legacy-client-migration-journal.json'), journal = JSON.parse(fs.readFileSync(filename, 'utf8'));
+  journal.files[0].published = false; fs.writeFileSync(filename, JSON.stringify(journal));
+  assert.equal((await api.discoverLegacyClientMigration(f.input, f.dependencies)).canDefer, false);
+  assert.throws(() => api.deferLegacyClientMigration(request), { code: 'MIGRATION_DEFER_UNSAFE' });
+  // 即使阶段字段被写成verify，也不能忽略已消失的暂存文件。
+  journal.stage = 'verify'; fs.writeFileSync(filename, JSON.stringify(journal));
+  assert.equal((await api.discoverLegacyClientMigration(f.input, f.dependencies)).canDefer, false);
+  assert.throws(() => api.deferLegacyClientMigration(request), { code: 'MIGRATION_DEFER_UNSAFE' });
+});
+
+test('暂缓持久化失败保持原journal，成功后凭据清理和重装仍可接续', async t => {
+  const f = fixture(t), api = await service(); history(f.db);
+  const found = await api.discoverLegacyClientMigration(f.input, f.dependencies);
+  const request = { ...f.input, candidateId: found.candidateId!, migrationId: crypto.randomUUID() };
+  await assert.rejects(api.migrateLegacyClientMigration(request, { ...f.dependencies, onProgress: value => {
+    if (value.stage === 'verify') throw new Error('interrupted');
+  } }), /interrupted/u);
+  const filename = path.join(f.dataDir, 'legacy-client-migration-journal.json'), before = fs.readFileSync(filename);
+  const rename = fs.renameSync;
+  const mock = t.mock.method(fs, 'renameSync', (...args: Parameters<typeof rename>) => {
+    if (args[1] === filename) throw new Error('fixture journal write failure');
+    return rename(...args);
+  });
+  assert.throws(() => api.deferLegacyClientMigration(request), /fixture journal write failure/u);
+  assert.deepEqual(fs.readFileSync(filename), before); mock.mock.restore();
+  assert.equal(api.deferLegacyClientMigration(request).deferred, true);
+  api.clearLegacyMigrationCredentials(f.input);
+  // 没有旧桌面配置时，正常Client会生成自己的身份；已暂缓归档不再绑定运行时身份。
+  const nextClientId = `local_${crypto.randomUUID()}`, current = { ...f.input, targetClientId: nextClientId };
+  assert.equal((await api.discoverLegacyClientMigration(current, f.dependencies)).deferred, true);
+  api.clearLegacyMigrationCredentials(current);
+  const nextDeviceId = crypto.randomUUID();
+  api.rebindLegacyMigrationForReinstall({ dataDir: f.dataDir, clientId: nextClientId, oldDeviceId: targetDeviceId, nextDeviceId });
+  const restored = await api.discoverLegacyClientMigration({ ...current, targetDeviceId: nextDeviceId }, f.dependencies);
+  assert.equal(restored.deferred, true); assert.notEqual(restored.resume, true); assert.notEqual(restored.completed, true);
+  await assert.rejects(api.migrateLegacyClientMigration({ ...request, targetDeviceId: nextDeviceId }, f.dependencies), { code: 'MIGRATION_DATA_DEFERRED' });
+});
+
+test('损坏的阶段和布尔字段不得被当作可暂缓，检查后进入发布也必须拒绝', async t => {
+  const f = fixture(t), api = await service();
+  const found = await api.discoverLegacyClientMigration(f.input, f.dependencies);
+  const request = { ...f.input, candidateId: found.candidateId!, migrationId: crypto.randomUUID() };
+  await assert.rejects(api.migrateLegacyClientMigration(request, { ...f.dependencies, onProgress: () => { throw new Error('interrupted'); } }), /interrupted/u);
+  const filename = path.join(f.dataDir, 'legacy-client-migration-journal.json'), before = JSON.parse(fs.readFileSync(filename, 'utf8'));
+  for (const defect of [{ stage: 'unknown' }, { completed: 'false' }, { snapshotsReady: 0 }, { converted: null }, { deferred: 'true' }, { deferred: true }, { schemaVersion: 2 }]) {
+    fs.writeFileSync(filename, JSON.stringify({ ...before, ...defect }));
+    await assert.rejects(api.discoverLegacyClientMigration(f.input, f.dependencies), { code: 'MIGRATION_JOURNAL_INVALID' });
+    assert.throws(() => api.deferLegacyClientMigration(request), { code: 'MIGRATION_JOURNAL_INVALID' });
+  }
+  fs.writeFileSync(filename, JSON.stringify(before));
+  assert.equal((await api.discoverLegacyClientMigration(f.input, f.dependencies)).canDefer, true);
+  fs.writeFileSync(filename, JSON.stringify({ ...before, stage: 'publish' }));
+  assert.throws(() => api.deferLegacyClientMigration(request), { code: 'MIGRATION_DEFER_UNSAFE' });
+  fs.writeFileSync(filename, JSON.stringify({ ...before, schemaVersion: 2, stage: 'publish', deferred: true }));
+  await assert.rejects(api.discoverLegacyClientMigration(f.input, f.dependencies), { code: 'MIGRATION_DEFER_UNSAFE' });
+  assert.throws(() => api.clearLegacyMigrationCredentials(f.input), { code: 'MIGRATION_DEFER_UNSAFE' });
+});
+
+test('真实Worker可检查并持久暂缓发布前journal，正常退出且日志无凭据', async t => {
+  const f = fixture(t), api = await service();
+  const found = await api.discoverLegacyClientMigration(f.input, f.dependencies);
+  const migrationId = crypto.randomUUID();
+  await assert.rejects(api.migrateLegacyClientMigration({ ...f.input, candidateId: found.candidateId!, migrationId },
+    { ...f.dependencies, onProgress: () => { throw new Error('interrupted'); } }), /interrupted/u);
+  const entry = fileURLToPath(new URL('../src/legacy-migration/legacyClientMigrationWorker.ts', import.meta.url));
+  for (const action of ['discover', 'defer', 'bundled-discover'] as const) {
+    const output = await new Promise<{ code: number | null; messages: any[]; stderr: string }>((resolve, reject) => {
+      const bundled = action === 'bundled-discover';
+      const child = fork(bundled ? fileURLToPath(new URL('../dist/legacyClientMigrationWorker.cjs', import.meta.url)) : entry, [], {
+        execArgv: bundled ? [] : ['--conditions=development', '--import', 'tsx'], silent: true,
+        env: { ...process.env, USERPROFILE: f.homeDir, HOME: f.homeDir } });
+      const messages: any[] = []; let stderr = '';
+      child.stdout!.resume(); child.stderr!.on('data', chunk => { stderr += chunk; }); child.on('message', value => messages.push(value));
+      child.once('error', reject); child.once('close', code => resolve({ code, messages, stderr }));
+      child.send({ ...f.input, action: action === 'bundled-discover' ? 'discover' : action, migrationId });
+    });
+    assert.equal(output.messages.length, 1);
+    if (action === 'bundled-discover') {
+      // 已有dist可能来自修复前：旧版本须显式拒绝，新版本只能返回已暂缓，均不得自动续迁。
+      if (output.code === 0) assert.equal(output.messages[0].result.deferred, true);
+      else assert.equal(output.messages[0].error.code, 'MIGRATION_JOURNAL_CONFLICT');
+      continue;
+    }
+    assert.equal(output.code, 0, output.stderr);
+    assert.equal(output.messages[0].result[action === 'discover' ? 'canDefer' : 'deferred'], true);
+    assert.equal(output.stderr.includes(apiKey), false);
+    if (action === 'defer') assert.ok(output.stderr.includes('LEGACY_MIGRATION_DEFERRED'));
+  }
+  assert.equal((await api.discoverLegacyClientMigration(f.input, f.dependencies)).deferred, true);
+});
+
 /** 写入一组可独立核验的 canonical/raw、草稿附件和排队消息。 */
 function history(db: SqliteDb, workspaceId = 'old-client:one') {
   db.prepare("INSERT INTO threads(id,workspace_id,engine,title,created_at,updated_at) VALUES('thread',?,'codex','保留会话',1,2)").run(workspaceId);
@@ -768,19 +909,22 @@ test('真实Worker发送加密排除结果后退出0，非法请求返回失败�
   assert.equal(failure.messages[0].error.code, 'MIGRATION_REQUEST_INVALID'); assert.ok(!failure.stderr.includes(apiKey));
 });
 
-test('最终复核：真实owner稍后启动、取消账号并重开后沿正常Client身份接管空初始化', { timeout: 30_000 }, async t => {
-  const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration } = await service();
+for (const interrupted of [false, true]) test(`真实owner暂缓后启动正常Client，重开和维护沿实际身份：已有journal=${interrupted}`, { timeout: 30_000 }, async t => {
+  const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration, deferLegacyClientMigration } = await service();
   const ids: string[] = [];
   /** 复用真实迁移服务，仅隔离旧HOME与namespace认证。 */
   const execute: LegacyMigrationExecutor = async request => {
     ids.push(request.targetClientId);
-    return await (request.action === 'discover' ? discoverLegacyClientMigration : migrateLegacyClientMigration)(request, f.dependencies);
+    if (request.action === 'defer') return deferLegacyClientMigration(request);
+    return await (request.action === 'discover' ? discoverLegacyClientMigration : migrateLegacyClientMigration)(request,
+      { ...f.dependencies, ...(interrupted ? { onProgress: () => { throw new Error('fixture prepublication interruption'); } } : {}) });
   };
   const identity = { deviceId: targetDeviceId, createdAt: new Date().toISOString(), publicKeyBase64: 'fixture' };
   const options = { dataDir: f.dataDir, workerEntry: 'unused', identity, execute };
   const owner = createLegacyClientMigration(options), preparation = owner.prepare();
   await owner.whenDiscovered();
   assert.equal(owner.snapshot().status, 'available');
+  if (interrupted) await assert.rejects(owner.start(owner.snapshot().candidateId!), /fixture prepublication interruption/u);
   await owner.defer(); await preparation;
   fs.writeFileSync(path.join(f.dataDir, 'device-identity.json'), JSON.stringify({ deviceId: targetDeviceId, createdAt: new Date().toISOString() }));
   const defaultWorkspace = path.join(f.dataDir, 'workspace'); fs.mkdirSync(defaultWorkspace);
@@ -808,9 +952,19 @@ test('最终复核：真实owner稍后启动、取消账号并重开后沿正常
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.dataDir, 'legacy-client-migration-account.json'), 'utf8')).migrationId, null);
   const reopened = createLegacyClientMigration(options), next = reopened.prepare();
   await reopened.whenDiscovered();
-  assert.equal(reopened.snapshot().status, 'available');
-  await reopened.start(reopened.snapshot().candidateId!); await next;
-  assert.deepEqual(ids.slice(1), [normalClientId, normalClientId]);
+  if (interrupted) {
+    await next; await reopened.runtimeReady(); assert.equal(reopened.snapshot().status, 'ready');
+    assert.equal(ids.at(-1), normalClientId);
+    runDesktopUninstallCleanup({ schemaVersion: 1, requestId: 'review:deferred-keep', dataDir: f.dataDir, clientId: normalClientId, deviceId: targetDeviceId });
+    const nextDeviceId = crypto.randomUUID();
+    runDesktopReinstallLocalTasks({ schemaVersion: 1, action: 'reinstall_local_tasks', requestId: 'review:deferred-reinstall',
+      dataDir: f.dataDir, clientId: normalClientId, oldDeviceId: targetDeviceId, nextDeviceId });
+    assert.equal((await discoverLegacyClientMigration({ dataDir: f.dataDir, targetClientId: normalClientId, targetDeviceId: nextDeviceId }, f.dependencies)).deferred, true);
+  } else {
+    assert.equal(reopened.snapshot().status, 'available');
+    await reopened.start(reopened.snapshot().candidateId!); await next;
+    assert.deepEqual(ids.slice(1), [normalClientId, normalClientId]);
+  }
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.dataDir, 'config.json'), 'utf8')).clientId, normalClientId);
   await reopened.stop();
 });

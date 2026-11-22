@@ -4,6 +4,7 @@ import {
   formatByteSize,
   DOCUMENT_ATTACHMENT_LIMITS,
   isDocumentAttachmentName,
+  isTextFileAttachmentName,
   INLINE_ATTACHMENT_LIMITS,
   measureTextFileAttachmentBytes,
   type TextFileAttachment,
@@ -166,33 +167,7 @@ export function useComposerAttachments(opts: {
 
   function isProbablyTextFile(file: File): boolean {
     if (file.type.startsWith("text/")) return true;
-    const name = String(file.name ?? "").toLowerCase();
-    return (
-      name.endsWith(".md") ||
-      name.endsWith(".txt") ||
-      name.endsWith(".json") ||
-      name.endsWith(".yaml") ||
-      name.endsWith(".yml") ||
-      name.endsWith(".toml") ||
-      name.endsWith(".sql") ||
-      name.endsWith(".log") ||
-      name.endsWith(".env") ||
-      name.endsWith(".ts") ||
-      name.endsWith(".tsx") ||
-      name.endsWith(".js") ||
-      name.endsWith(".jsx") ||
-      name.endsWith(".vue") ||
-      name.endsWith(".css") ||
-      name.endsWith(".html") ||
-      name.endsWith(".xml") ||
-      name.endsWith(".java") ||
-      name.endsWith(".go") ||
-      name.endsWith(".py") ||
-      name.endsWith(".rs") ||
-      name.endsWith(".sh") ||
-      name.endsWith(".ps1") ||
-      name.endsWith(".bat")
-    );
+    return isTextFileAttachmentName(file.name);
   }
 
   /**

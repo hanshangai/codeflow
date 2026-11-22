@@ -356,7 +356,7 @@ async function saveMaintenance(): Promise<void> {
   const result = await requestKnowledgeAsset(props.context, "update.save", { workspaceId: props.workspaceId, expectedHash: view.hash,
     schedule: { enabled: maintenanceEnabled.value, cronExpr: `${minute} ${hour} * * *`, timezone, selectedNodeIds: [], includeDescendants: true,
       engine: props.run.engine, model: props.run.model, effort: props.run.effort, concurrency: props.run.concurrency ?? 5, prompt: "",
-      reviewConfig: props.run.reviewConfig ?? { enabled: true, autoRepair: true, maxRounds: 2, model: props.run.model, effort: props.run.effort } } }, { method: "POST", signal: controller?.signal });
+      reviewConfig: props.run.reviewConfig ?? { enabled: true, autoRepair: true, maxRounds: 1, model: props.run.model, effort: props.run.effort } } }, { method: "POST", signal: controller?.signal });
   if (!result.ok) throw createApiResultError(result);
   if (current !== generation) return;
   updateView.value = result.data; maintenancePending.value = false;

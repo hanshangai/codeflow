@@ -31,9 +31,9 @@ type SourceConfig = { apiKey: string; serverWs: string; clientId: string };
 type Source = { configPath: string; dbPath: string; accountNamespace: string; sourceClientId: string; serverWs: string;
   workspaces: Array<PersistedWorkspace & { workspaceDbPath: string | null }>; candidateId: string };
 type PublishedFile = { target: string; staged: string; sha256: string; originalSha256: string | null; published: boolean };
-type Journal = { schemaVersion: 1; migrationId: string; candidateId: string; targetClientId: string; targetDeviceId: string;
+type Journal = { schemaVersion: 1 | 2; migrationId: string; candidateId: string; targetClientId: string; targetDeviceId: string;
   source: Source; stage: string; files: PublishedFile[]; snapshotsReady: boolean; converted: boolean;
-  completed: boolean; errorCode: string | null; snapshotGeneration: string | null;
+  completed: boolean; deferred?: boolean; errorCode: string | null; snapshotGeneration: string | null;
   targetInitialization: { dbSha256: string; metaSha256: string } | null;
   snapshotHashes: Array<{ name: string; sha256: string }> };
 export type LegacyClientMigrationDependencies = {
@@ -62,20 +62,55 @@ export async function discoverLegacyClientMigration(input: Input, dependencies: 
   validateInput(input);
   const journal = readJournal(input);
   if (journal) {
+    if (journal.deferred) {
+      if (!isPrepublication(journal)) fail('MIGRATION_DEFER_UNSAFE');
+      return { candidateId: null, workspaceCount: 0, migrationId: journal.migrationId, deferred: true };
+    }
     if (journal.completed) { validateCompleted(input, journal); return await journalResult(journal, dependencies); }
-    return { candidateId: journal.candidateId, workspaceCount: journal.source.workspaces.length, migrationId: journal.migrationId, resume: true };
+    return { candidateId: journal.candidateId, workspaceCount: journal.source.workspaces.length, migrationId: journal.migrationId,
+      resume: true, canDefer: canDeferJournal(journal) };
   }
   const source = await discoverSource(input, dependencies);
   return { candidateId: source?.candidateId ?? null, workspaceCount: source?.workspaces.length ?? 0 };
 }
 
-/** 卸载只清本安装已完成迁移的私有归档凭据，保留历史，原Client及项目不写。 */
+/** 仅未进入发布的任务可暂缓；保留journal归属，后续启动不再自动导入或恢复旧账号。 */
+export function deferLegacyClientMigration(input: Input): LegacyClientMigrationResult {
+  parseLegacyClientMigrationRequest({ ...input, action: 'defer' }); validateInput(input);
+  const lock = acquireClientProcessLock({ dbPath: path.join(input.dataDir, 'codeflowai.db'), clientId: input.targetClientId });
+  let failure: unknown;
+  try {
+    const journal = readJournal(input);
+    if (!journal || !canDeferJournal(journal)) fail('MIGRATION_DEFER_UNSAFE');
+    // 旧Worker只接受版本1；暂缓升级格式，防止忽略新字段后自动续迁。
+    journal.deferred = true; journal.schemaVersion = 2; writeJournal(input, journal);
+    return { candidateId: null, workspaceCount: 0, migrationId: journal.migrationId, deferred: true };
+  } catch (error) { failure = error; throw error; }
+  finally {
+    try { lock.release(); }
+    catch (error) { throw failure === undefined ? error : new AggregateError([failure, error], 'MIGRATION_LOCK_RELEASE_FAILED', { cause: failure }); }
+  }
+}
+
+/** 发布阶段包括rename落地但journal未更新的窗口，任何published计数都不能绕过。 */
+function isPrepublication(journal: Journal): boolean {
+  return !journal.completed && ['quiesce', 'snapshot', 'convert', 'verify'].includes(journal.stage)
+    && journal.files.every(file => !file.published);
+}
+
+/** 暂缓前复验暂存仍在、原目标未替换；已暂缓后正常桌面可合法更新原目标。 */
+function canDeferJournal(journal: Journal): boolean {
+  return isPrepublication(journal) && (journal.deferred === true || journal.files.every(file => exists(file.staged)
+    && (file.originalSha256 === null ? !exists(file.target) : exists(file.target) && sha256File(file.target) === file.originalSha256)));
+}
+
+/** 卸载清本安装已完成或已暂缓的私有归档凭据，保留历史，原Client及项目不写。 */
 export function clearLegacyMigrationCredentials(input: Input): void {
   const root = path.join(input.dataDir, 'legacy-client-migration'), journal = readJournal(input);
   if (!journal) { if (exists(root)) fail('MIGRATION_ARCHIVE_OWNER_MISSING'); return; }
   validateInput(input);
-  if (!journal.completed) fail('MIGRATION_NOT_COMPLETED');
-  validateCompleted(input, journal);
+  if (journal.deferred) { if (!isPrepublication(journal)) fail('MIGRATION_DEFER_UNSAFE'); }
+  else { if (!journal.completed) fail('MIGRATION_NOT_COMPLETED'); validateCompleted(input, journal); }
   if (!exists(root)) return;
   assertDirectory(root);
   const archive = archiveDirectory(input, journal);
@@ -137,7 +172,7 @@ function clearArchivedDatabaseCredentials(filename: string): void {
   });
 }
 
-/** 重装只按明确旧/新身份补清归档并接续完成事实；原发现入口仍严格核身份。 */
+/** 重装按明确旧/新身份清归档并接续完成或暂缓事实；不把暂缓伪造成完成。 */
 export function rebindLegacyMigrationForReinstall(input: { dataDir: string; clientId: string; oldDeviceId: string; nextDeviceId: string }): void {
   const filename = path.join(input.dataDir, JOURNAL);
   if (!exists(filename)) return;
@@ -146,8 +181,8 @@ export function rebindLegacyMigrationForReinstall(input: { dataDir: string; clie
   const target = { dataDir: input.dataDir, targetClientId: input.clientId, targetDeviceId: value.targetDeviceId as string };
   validateInput(target);
   const journal = readJournal(target)!;
-  if (!journal.completed) fail('MIGRATION_NOT_COMPLETED');
-  validateCompleted(target, journal);
+  if (journal.deferred) { if (!isPrepublication(journal)) fail('MIGRATION_DEFER_UNSAFE'); }
+  else { if (!journal.completed) fail('MIGRATION_NOT_COMPLETED'); validateCompleted(target, journal); }
   clearLegacyMigrationCredentials(target);
   if (journal.targetDeviceId !== input.nextDeviceId) writeJournal(target, { ...readJournal(target)!, targetDeviceId: input.nextDeviceId });
 }
@@ -156,6 +191,7 @@ export function rebindLegacyMigrationForReinstall(input: { dataDir: string; clie
 export async function migrateLegacyClientMigration(input: Input, dependencies: LegacyClientMigrationDependencies = {}): Promise<LegacyClientMigrationResult> {
   parseLegacyClientMigrationRequest({ ...input, action: 'migrate' }); validateInput(input);
   let journal = readJournal(input);
+  if (journal?.deferred) fail('MIGRATION_DATA_DEFERRED');
   if (journal?.completed) { validateCompleted(input, journal); return await journalResult(journal, dependencies); }
   if (!journal) {
     const source = await discoverSource(input, dependencies);
@@ -844,15 +880,20 @@ function archiveEmptyInitialization(input: Input, journal: Journal): void {
   }
 }
 
-/** 同一迁移编号和安装身份才可接管 journal，损坏记录永不当作首次安装。 */
+/** 活跃迁移严格绑定目标；暂缓归档只绑定原任务和设备，允许正常Client生成独立身份。 */
 function readJournal(input: Input): Journal | null {
   const filename = path.join(input.dataDir, JOURNAL); if (!exists(filename)) return null;
   const journal = readObject(filename) as Journal;
-  if (journal.schemaVersion !== 1 || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(journal.migrationId)
+  if (![1, 2].includes(journal.schemaVersion) || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(journal.migrationId)
     || journal.snapshotGeneration !== null && !/^[0-9a-f-]{36}$/i.test(journal.snapshotGeneration)
     || !journal.source || !Array.isArray(journal.source.workspaces) || !Array.isArray(journal.files) || !Array.isArray(journal.snapshotHashes)
-    || journal.targetClientId !== input.targetClientId || journal.targetDeviceId !== input.targetDeviceId
+    || journal.targetClientId !== input.targetClientId && journal.deferred !== true || journal.targetDeviceId !== input.targetDeviceId
     || input.migrationId && input.migrationId !== journal.migrationId) fail('MIGRATION_JOURNAL_CONFLICT');
+  if (!['quiesce', 'snapshot', 'convert', 'verify', 'publish', 'completed'].includes(journal.stage)
+    || typeof journal.completed !== 'boolean' || typeof journal.converted !== 'boolean' || typeof journal.snapshotsReady !== 'boolean'
+    || journal.deferred !== undefined && typeof journal.deferred !== 'boolean'
+    || (journal.schemaVersion === 2) !== (journal.deferred === true)) fail('MIGRATION_JOURNAL_INVALID');
+  parseLegacyClientMigrationRequest({ action: 'discover', dataDir: input.dataDir, targetClientId: journal.targetClientId, targetDeviceId: journal.targetDeviceId });
   for (const file of journal.files) {
     const targets = [path.join(input.dataDir, 'codeflowai.db'), path.join(input.dataDir, 'config.json'), path.join(input.dataDir, 'codeflowai.db.meta.json'),
       ...journal.source.workspaces.map(work => path.join(work.path, '.codeflow', 'workspace.db'))];

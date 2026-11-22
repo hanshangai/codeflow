@@ -34,6 +34,7 @@ import {
   validateInlineThreadPayload,
   DOCUMENT_ATTACHMENT_EXTENSIONS,
   DOCUMENT_ATTACHMENT_LIMITS,
+  TEXT_FILE_ATTACHMENT_EXTENSIONS,
   type AccessMode,
   type CodexServiceTier,
   type CodexSkillMentionBinding,
@@ -415,7 +416,7 @@ const cliRepairHint = ref<string | null>(null);
 const allowImages = computed(() =>
   resolveEngineImageInputAllowed(engine.value, engineStatus.value, resolvedModelInfo.value));
 
-const TEXT_ACCEPT = "text/*,.md,.txt,.json,.yaml,.yml,.toml,.sql,.log,.env,.ts,.tsx,.js,.jsx,.vue,.css,.html,.xml,.java,.go,.py,.rs,.sh,.ps1,.bat";
+const TEXT_ACCEPT = ["text/*", ...TEXT_FILE_ATTACHMENT_EXTENSIONS.map((extension) => `.${extension}`)].join(",");
 const DOCUMENT_ACCEPT = DOCUMENT_ATTACHMENT_EXTENSIONS.map((extension) => `.${extension}`).join(",");
 const fileAccept = computed(() => `${allowImages.value ? "image/*," : ""}${TEXT_ACCEPT},${DOCUMENT_ACCEPT}`);
 
@@ -1766,7 +1767,7 @@ async function toggleKnowledgeEnabled(): Promise<void> {
     if (!result.ok) throw createApiResultError(result);
     if (workspaceId !== props.workspaceId || threadId !== props.threadId) return;
     if (!result.data.initialized) {
-      message.info("当前项目尚未初始化规格库，请先进入“规格库”点击“完善全项目”");
+      message.info("当前项目尚未初始化规格库，请先进入“规格库”点击“一键生成规格”");
       return;
     }
     patchThreadPrefs({ knowledgeEnabled: true }, { immediateSave: true });

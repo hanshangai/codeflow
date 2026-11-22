@@ -15,6 +15,31 @@ export type TextFileAttachment = {
   text: string;
 };
 
+/** 作为纯文本内联的常用扩展名；与图片、Office 文档分支互斥。 */
+export const TEXT_FILE_ATTACHMENT_EXTENSIONS = [
+  "md", "txt", "json", "jsonl", "ndjson", "csv", "tsv",
+  "yaml", "yml", "toml", "ini", "conf", "cfg", "properties", "env",
+  "log", "out", "err", "trace",
+  "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "svelte", "astro",
+  "css", "scss", "sass", "less", "html", "htm", "xml",
+  "java", "kt", "kts", "scala", "groovy", "go", "py", "rb", "php", "rs", "cs", "fs",
+  "c", "h", "cpp", "cc", "cxx", "hpp", "swift", "lua", "r", "pl", "dart",
+  "sh", "bash", "zsh", "ps1", "bat", "cmd", "sql",
+  "proto", "graphql", "gql", "tf", "tfvars", "hcl", "nix",
+  "rst", "tex", "adoc", "gitignore", "dockerignore", "editorconfig",
+] as const;
+/** 无扩展名但属于纯文本的常见文件名。 */
+export const TEXT_FILE_ATTACHMENT_FILE_NAMES = ["dockerfile", "makefile"] as const;
+
+/** 按扩展名或文件名识别纯文本附件；调用方仍可额外接受 text/* MIME。 */
+export function isTextFileAttachmentName(name: string): boolean {
+  const lower = String(name ?? "").toLowerCase();
+  const baseName = lower.split(/[\\/]/u).pop() ?? lower;
+  if ((TEXT_FILE_ATTACHMENT_FILE_NAMES as readonly string[]).includes(baseName)) return true;
+  const extension = lower.split(".").pop();
+  return typeof extension === "string" && (TEXT_FILE_ATTACHMENT_EXTENSIONS as readonly string[]).includes(extension);
+}
+
 /** 文档只提取文字，不传原始二进制给引擎；提取结果复用文本附件预算。 */
 export const DOCUMENT_ATTACHMENT_EXTENSIONS = ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf"] as const;
 export const DOCUMENT_ATTACHMENT_LIMITS = { maxSourceBytes: 20 * 1024 * 1024, timeoutMs: 25_000 } as const;
@@ -58,9 +83,9 @@ export const INLINE_ATTACHMENT_LIMITS = {
   maxImageSourceBytes: 12 * 1024 * 1024,
   maxImageTotalBytes: 8 * 1024 * 1024,
   maxImageCount: 10,
-  maxTextFileBytes: 200 * 1024,
+  maxTextFileBytes: 2 * 1024 * 1024,
   maxTextFileCount: 6,
-  maxTextFileTotalBytes: 512 * 1024,
+  maxTextFileTotalBytes: 4 * 1024 * 1024,
   maxPathReferenceCount: 20,
   // 低于 server 默认 16MB bodyLimit，给 workspaceId/threadId/model 等元数据留余量。
   maxSerializedPayloadBytes: 12 * 1024 * 1024,
