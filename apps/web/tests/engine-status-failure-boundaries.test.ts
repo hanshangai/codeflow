@@ -339,6 +339,7 @@ test("构建引擎配置检查后的目录失败不会被通用确认文案覆�
   };
   Object.assign(h.context, {
     snapshot: ref({ treeHash: "tree" }), buildStarting: ref(false), updatesBusy: ref(false), binding: ref(false),
+    formalNodeIds: ref(new Set(["node"])),
     bindingReady: ref(true), taskList: ref([]), knowledgeModelPrefs: ref({ engine: "codex", model: null, effort: null }),
     pendingBuild: ref(null), dismissError() {},
     createTaskConversation: async () => { creates++; throw new Error("must not create task"); },
@@ -350,4 +351,23 @@ test("构建引擎配置检查后的目录失败不会被通用确认文案覆�
   assert.equal(h.context.buildStarting.value, false);
   assert.equal(creates, 0);
   assert.equal(h.logs.length, 1);
+});
+
+for (const ids of [["candidate"], ["node", "candidate"]]) test(`非正式选区 ${ids.join("+")} 在创建任务和读取引擎前明确失败`, async t => {
+  const h = batchHarness(engineFixture(t));
+  let reads = 0, creates = 0;
+  globalThis.fetch = async () => { reads++; return engineResponse(); };
+  Object.assign(h.context, {
+    snapshot: ref({ treeHash: "tree" }), buildStarting: ref(false), updatesBusy: ref(false), binding: ref(false),
+    bindingReady: ref(true), taskList: ref([]), formalNodeIds: ref(new Set(["node"])), errorText: ref(null),
+    createTaskConversation: async () => { creates++; throw new Error("must not create task"); },
+  });
+  const text = source("features/project-knowledge/components/project-knowledge-page.vue");
+  const startBuild = execute(functions(text, ["errorMessage", "reportError", "startBuild"]), h.context, "startBuild");
+  await startBuild(ids);
+  assert.match(h.context.errorText.value, /尚未采用/);
+  assert.equal(h.context.buildStarting.value, false);
+  assert.equal(reads, 0);
+  assert.equal(creates, 0);
+  assert.equal(h.logs[0][1].code, "KNOWLEDGE_BUILD_SCOPE_UNAVAILABLE");
 });

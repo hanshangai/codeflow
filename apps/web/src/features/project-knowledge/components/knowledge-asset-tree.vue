@@ -25,10 +25,7 @@ watch(() => props.workspaceKey, () => {
   catch (error) { expanded.value = new Set(); report(error); }
   if (viewport.value) viewport.value.scrollTop = 0;
 }, { immediate: true });
-watch(() => props.nodes, () => {
-  const ids = new Set(props.nodes.filter(n => !n.archived).map(n => n.id));
-  checked.value = checked.value.filter(id => ids.has(id)); emit("checkedChange", checked.value);
-});
+watch(() => [props.nodes, props.newNodeIds], () => { updateChecked(checked.value); });
 watch(() => props.selectionResetKey, () => {
   if (!checked.value.length) return;
   checked.value = []; emit("checkedChange", []);
@@ -110,15 +107,16 @@ function rootsExcluding(scopeId: string, excludedId: string): string[] {
   return children.flatMap(child => rootsExcluding(child.id, excludedId));
 }
 
-/** 更新选择根并通知页面，子目录由树组件根据根节点派生显示状态。 */
+/** 仅保留可处理的正式选择根，避免取消父选区时混入待采用候选。 */
 function updateChecked(ids: string[]): void {
-  const next = [...new Set(ids)].filter(id => nodeById.value.has(id));
+  const next = [...new Set(ids)].filter(id => nodeById.value.has(id) && !props.newNodeIds?.includes(id));
   checked.value = next;
   emit("checkedChange", next);
 }
 
-/** 父目录选择会覆盖整棵后代；取消子目录时保留其余同级范围。 */
+/** 鼠标与键盘均拒绝候选选区；取消子目录时保留其余正式同级范围。 */
 function check(id: string): void {
+  if (!props.canWrite || props.busy || props.newNodeIds?.includes(id)) return;
   const owner = selectionOwner(id);
   if (owner) {
     const outside = checked.value.filter(root => !isWithin(root, owner));
@@ -131,8 +129,8 @@ function check(id: string): void {
   updateChecked(hasSelectedDescendant ? [...outside, id] : [...checked.value, id]);
 }
 
-/** 节点被自身或任一已选父目录覆盖时，显示为已勾选。 */
-function isChecked(id: string): boolean { return checked.value.some(root => isWithin(id, root)); }
+/** 仅正式节点继承父目录的勾选，候选不暗示已进入生成范围。 */
+function isChecked(id: string): boolean { return !props.newNodeIds?.includes(id) && checked.value.some(root => isWithin(id, root)); }
 
 /** 仅部分后代被选中时显示原生半选状态。 */
 function isIndeterminate(id: string): boolean {
@@ -168,7 +166,7 @@ onBeforeUnmount(() => observer?.disconnect());
         <div v-for="(row, index) in rendered" :key="row.node.id" class="asset-tree-row" role="treeitem" :aria-level="row.depth + 1" :aria-selected="selectedId === row.node.id" :aria-expanded="row.hasChildren ? row.expanded : undefined" :class="{ selected: selectedId === row.node.id }" :style="{ top: `${(start + index) * rowHeight}px`, paddingInlineStart: `${Math.min(row.depth, 3) * 18}px` }">
           <button v-if="row.hasChildren" class="disclosure" type="button" :aria-label="`${row.expanded ? '折叠' : '展开'}${row.node.title}`" @click="toggle(row.node.id)"><CaretRightOutlined :rotate="row.expanded ? 90 : 0" /></button>
           <span v-else class="disclosure" aria-hidden="true" />
-          <input v-if="canWrite" type="checkbox" :checked="isChecked(row.node.id)" :indeterminate="isIndeterminate(row.node.id)" :aria-checked="isIndeterminate(row.node.id) ? 'mixed' : isChecked(row.node.id) ? 'true' : 'false'" :aria-label="`选择${row.node.title}`" @change="check(row.node.id)">
+          <input v-if="canWrite" type="checkbox" :disabled="newNodeIds?.includes(row.node.id)" :title="newNodeIds?.includes(row.node.id) ? '请先采用新候选，再完善或复检；修订请打开原工作会话。' : undefined" :checked="isChecked(row.node.id)" :indeterminate="isIndeterminate(row.node.id)" :aria-checked="isIndeterminate(row.node.id) ? 'mixed' : isChecked(row.node.id) ? 'true' : 'false'" :aria-label="`选择${row.node.title}`" @change="check(row.node.id)">
           <button class="node-label" type="button" :title="row.node.title" @click="select(row.node.id)">
             <component :is="row.node.contentMode === 'directory' || row.hasChildren ? (row.expanded ? FolderOpenOutlined : FolderOutlined) : FileMarkdownOutlined" class="node-icon" :class="{ document: row.node.contentMode !== 'directory' && !row.hasChildren }" aria-hidden="true" />
             <span class="node-title">{{ row.node.title }}</span>
@@ -178,7 +176,7 @@ onBeforeUnmount(() => observer?.disconnect());
           <span v-if="counts?.[row.node.id]" class="pending-count" :title="`${counts[row.node.id]} 篇文档待确认更新`">{{ counts[row.node.id] }}</span>
           <span v-if="structureCounts?.[row.node.id]" class="pending-count" :title="`${structureCounts[row.node.id]} 项变更待确认`">变更</span>
           <span v-if="row.node.contentMode !== 'directory' && !generatingCounts?.[row.node.id]" class="state-dot" :class="{ reference: row.node.contentMode === 'reference', ready: states.get(row.node.id)?.revisionId, draft: counts?.[row.node.id] || states.get(row.node.id)?.draftCount, error: states.get(row.node.id)?.error }" :title="states.get(row.node.id)?.error?.message ?? (row.node.contentMode === 'reference' ? '实时引用原文' : counts?.[row.node.id] ? '有待确认更新' : states.get(row.node.id)?.revisionId ? '已入库启用' : '待生成')" />
-          <a-dropdown v-if="row.node.contentMode === 'directory'" :trigger="['click']"><a-button class="directory-actions" type="text" size="small" :aria-label="`${row.node.title}目录操作`" :disabled="busy" @keydown.stop><template #icon><EllipsisOutlined /></template></a-button><template #overlay><a-menu><a-menu-item v-if="counts?.[row.node.id] || structureCounts?.[row.node.id] || generatingCounts?.[row.node.id]" @click="emit('updates', row.node.id)">查看此目录更新</a-menu-item><a-menu-item :disabled="!canWrite" @click="emit('generate', row.node.id)">生成此目录</a-menu-item><a-menu-item :disabled="!canWrite" @click="emit('review', row.node.id)">复检此目录</a-menu-item></a-menu></template></a-dropdown>
+          <a-dropdown v-if="row.node.contentMode === 'directory'" :trigger="['click']"><a-button class="directory-actions" type="text" size="small" :aria-label="`${row.node.title}目录操作`" :disabled="busy" @keydown.stop><template #icon><EllipsisOutlined /></template></a-button><template #overlay><a-menu><a-menu-item v-if="counts?.[row.node.id] || structureCounts?.[row.node.id] || generatingCounts?.[row.node.id]" @click="emit('updates', row.node.id)">查看此目录更新</a-menu-item><a-menu-item :disabled="!canWrite || newNodeIds?.includes(row.node.id)" @click="emit('generate', row.node.id)">生成此目录</a-menu-item><a-menu-item :disabled="!canWrite || newNodeIds?.includes(row.node.id)" @click="emit('review', row.node.id)">复检此目录</a-menu-item></a-menu></template></a-dropdown>
         </div>
       </div>
     </div>

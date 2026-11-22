@@ -67,12 +67,11 @@ test("批量生成提供并发配置，页面保留状态并按需刷新", () =>
   assert.match(pageSource, /async function stopGeneration/u);
 });
 
-test("常用操作收敛到顶部，左树仍复用多选生成状态", () => {
+test("生成入口集中顶部，待确认导航位于左侧并复用已有多选范围", () => {
   assert.match(pageSource, /@click="openSpecificationConversation">规格对话/u);
   assert.match(pageSource, /@click="openUpdates\(null\)">待确认更新/u);
-  assert.match(pageSource, />完善规格<\/a-button>/u);
-  assert.match(pageSource, /data-testid="tree-batch-actions"/u);
-  assert.match(pageSource, /生成选中 \$\{checkedIds\.length\} 项/u);
+  assert.match(pageSource, /完善所选 · \$\{checkedIds\.length\}项/u);
+  assert.doesNotMatch(pageSource, /data-testid="tree-batch-actions"/u);
   assert.match(pageSource, /startBuild\(checkedIds.length \? checkedIds/u);
   assert.match(pageSource, /KnowledgeUpdates/u);
   assert.doesNotMatch(pageSource, /revision\.adopt\.batch/u);

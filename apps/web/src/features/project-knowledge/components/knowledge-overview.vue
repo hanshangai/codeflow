@@ -13,7 +13,7 @@ const props = defineProps<{
   canWrite: boolean;
   busy: boolean;
 }>();
-const emit = defineEmits<{ improve: []; discuss: []; updates: []; select: [nodeId: string]; retry: [] }>();
+const emit = defineEmits<{ improve: []; discuss: []; updates: []; policy: []; select: [nodeId: string]; retry: [] }>();
 const overview = computed(() => knowledgeOverview(props.snapshot, props.runs, props.changes));
 const categories = computed(() => props.snapshot?.tree.nodes.filter(node => node.parentId === null && node.category && !node.archived) ?? []);
 const labels = { state_error: "读取失败", generation_failed: "生成失败", review_failed: "复检失败", review_issues: "复检问题", review_stale: "依据待核对", review_pending: "待完成复检", gap: "记录缺口" };
@@ -21,7 +21,8 @@ const labels = { state_error: "读取失败", generation_failed: "生成失败",
 
 <template>
   <section class="knowledge-overview" data-testid="knowledge-overview" aria-label="项目规格概览">
-    <header class="overview-intro"><div><span class="eyebrow">项目规格</span><h2>{{ overview.initialized ? '要求有归处，研发有依据' : '建立项目的研发依据' }}</h2><p>维护已确认要求，结合架构与产品资料，指导设计、编码和验证。</p></div><a-tag v-if="snapshot && !canWrite">只读</a-tag></header>
+    <header class="overview-intro"><div><span class="eyebrow">项目规格</span><h2>{{ overview.initialized ? '要求有归处，研发有依据' : '建立项目的研发依据' }}</h2><p>把项目要求沉淀为可维护的规格，让 AI 在设计、编码和交付时有据可查，减少反复说明和偏离。</p></div><a-tag v-if="snapshot && !canWrite">只读</a-tag></header>
+    <p class="overview-guide">整理或补充要求 → 核对并采用 → 研发会话开启 Spec。<a-button type="link" size="small" @click="emit('policy')">了解使用原则</a-button></p>
     <a-alert v-if="stateError || runError" type="error" show-icon :message="stateError || runError"><template #description><p>读取失败的部分尚不能判断，请重试后再核对。</p><a-button size="small" @click="emit('retry')">重新读取状态</a-button></template></a-alert>
     <div v-if="loading" class="overview-loading" role="status"><a-spin /><p>正在读取项目规格…</p></div>
     <template v-else>
@@ -31,8 +32,8 @@ const labels = { state_error: "读取失败", generation_failed: "生成失败",
         <article><strong>{{ overview.generatingCount }}</strong><span>文档处理中</span><small>生成与复检的实际状态</small></article>
         <article><strong>{{ overview.issues.length }}</strong><span>记录待核对项</span><small>仅代表已检查的范围</small></article>
       </div>
-      <div class="overview-actions">
-        <a-button :disabled="!canWrite || busy" @click="emit('improve')"><strong>从项目完善</strong><span>结合已有代码和资料，整理必要更新。</span></a-button>
+      <div v-if="!overview.adoptedCount && !overview.pendingCount && !overview.generatingCount" class="overview-actions">
+        <a-button :disabled="!canWrite || busy" @click="emit('improve')"><strong>从项目完善</strong><span>使用顶部所示范围，生成更新草稿。</span></a-button>
         <a-button :disabled="!canWrite || busy" @click="emit('discuss')"><strong>通过对话补充</strong><span>直接说明要求，确认内容和适用范围。</span></a-button>
         <a-button @click="emit('updates')"><strong>核对待确认更新</strong><span>查看差异和依据，决定是否生效。</span></a-button>
       </div>
@@ -57,14 +58,15 @@ p { margin: 8px 0 0; line-height: 1.7; } .overview-intro p, .overview-section-he
 .overview-loading { padding: 50px 16px; text-align: center; color: var(--app-muted); }
 .overview-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 22px 0; }
 .overview-stats article { display: flex; flex-direction: column; padding: 16px; border: 1px solid var(--app-border); border-radius: 10px; background: var(--app-panel-bg); }
-.overview-stats strong { font-size: 27px; line-height: 1.3; font-weight: 500; } .overview-stats span { font-size: 12px; margin-top: 8px; }.overview-stats small { color: var(--app-muted); font-size: 10px; margin-top: 4px; }
+.overview-stats strong { font-size: 27px; line-height: 1.3; font-weight: 500; } .overview-stats span { font-size: 12px; margin-top: 8px; }.overview-stats small { color: var(--app-muted); font-size: 12px; margin-top: 4px; }
+.overview-guide { color: var(--app-muted); font-size: 12px; }
 .overview-actions, .overview-categories { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .overview-actions .ant-btn, .overview-categories .ant-btn { display: flex; flex-direction: column; align-items: flex-start; text-align: left; height: auto; min-height: 86px; padding: 16px; white-space: normal; gap: 8px; }
-.overview-actions strong, .overview-categories strong { font-size: 13px; }.overview-actions span, .overview-categories span { font-size: 11px; color: var(--app-muted); line-height: 1.6; }
+.overview-actions strong, .overview-categories strong { font-size: 13px; }.overview-actions span, .overview-categories span { font-size: 12px; color: var(--app-muted); line-height: 1.6; }
 .overview-section { margin-top: 28px; }.overview-section-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
 .overview-issues { border: 1px solid var(--app-border); border-radius: 10px; overflow: hidden; background: var(--app-panel-bg); }
 .overview-issues article { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px 18px; border-bottom: 1px solid var(--app-divider); }.overview-issues article:last-child { border: 0; }
 .overview-issues strong { font-size: 12px; }.overview-issues p { font-size: 12px; color: var(--app-muted); overflow-wrap: anywhere; }.overview-issues .ant-btn { flex-shrink: 0; }
-.overview-boundary { font-size: 11px; color: var(--app-muted); margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--app-divider); }
+.overview-boundary { font-size: 12px; color: var(--app-muted); margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--app-divider); }
 @media (max-width: 900px) { .knowledge-overview { padding: 22px 18px; }.overview-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }.overview-actions, .overview-categories { grid-template-columns: 1fr; }.overview-actions .ant-btn { min-height: 66px; }.overview-issues article { flex-wrap: wrap; } }
 </style>

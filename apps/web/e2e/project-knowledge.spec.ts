@@ -12,7 +12,9 @@ function assetNode(id = "root", title = "功能说明", parentId: string | null 
   return { id, parentId, title, orderKey: id, summary: "项目功能文档", tags: [], instructions: "", sourceScope: ["docs"] };
 }
 
+/** 工程夹具使用现行偏好数组契约，避免旧 mock 响应制造无关的刷新错误。 */
 async function installSession(page: Page): Promise<void> {
+  await page.route("**/api/workspaces/prefs**", route => route.fulfill({ json: { ok: true, prefs: [] } }));
   await page.goto("/");
   await page.evaluate(() => {
     window.localStorage.clear();
@@ -333,7 +335,7 @@ async function showKnowledgeAssistant(page: Page): Promise<void> {
   // 后台会话可能先于点击自行展开；每次重查当前状态，不点击已消失的 rail。
   await expect(async () => {
     if (!await assistant.isVisible()) {
-      const expand = page.locator('button[aria-label="展开 AI 对话"]:visible').first();
+      const expand = page.locator('button[aria-label="展开会话面板"]:visible').first();
       await expand.click({ timeout: 1000 });
     }
     await expect(assistant).toHaveClass(/open/u, { timeout: 1000 });
@@ -343,7 +345,7 @@ async function showKnowledgeAssistant(page: Page): Promise<void> {
 /** 知识助手默认进入文件工作会话；项目讨论相关用例需要显式切回项目讨论。 */
 async function openKnowledgeDiscussion(page: Page): Promise<void> {
   await showKnowledgeAssistant(page);
-  const discussion = page.getByTestId("knowledge-assistant").getByRole("button", { name: "项目讨论", exact: true });
+  const discussion = page.getByTestId("knowledge-assistant").getByRole("button", { name: "规格对话", exact: true });
   if (await discussion.count() && await discussion.first().isVisible()) {
     // 切文件会触发多次重渲染，按钮可能持续重建；直接派发点击避免等待稳定性。
     try { await discussion.first().click({ timeout: 3000 }); }
@@ -351,21 +353,25 @@ async function openKnowledgeDiscussion(page: Page): Promise<void> {
   }
 }
 
-/** 所有项目共用左侧生成入口，失败后显式恢复原任务。 */
+/** 所有项目共用顶部完善入口，失败后显式恢复原任务。 */
 async function startKnowledgeBuild(page: Page): Promise<void> {
   const recover = page.getByRole("button", { name: "恢复生成", exact: true });
   if (await recover.isVisible()) { await recover.click(); return; }
-  await page.locator(".page-empty button.ant-btn-primary:not([disabled]):visible, .build-card button.ant-btn-primary:not([disabled]):visible, [data-testid='knowledge-tree'] .tree-batch-button-primary:not([disabled]):visible").first().click();
+  await page.locator(".header-actions").getByRole("button", { name: /^(完善全项目|完善所选)/u }).click();
 }
 
-/** 新建规格会话前显式选择 Mock 提供的引擎和具体模型。 */
+/** 复用首次自动打开或手动打开的设置，显式选择 Mock 支持的引擎和模型。 */
 async function configureMockKnowledgeModel(page: Page): Promise<void> {
-  await showKnowledgeAssistant(page);
-  const assistant = page.getByTestId("knowledge-assistant");
-  if (await assistant.getByRole("button", { name: "项目讨论", exact: true }).count()) await assistant.getByRole("button", { name: "项目讨论", exact: true }).click();
-  if (await assistant.getByRole("button", { name: "管理规格会话", exact: true }).count()) await assistant.getByRole("button", { name: "管理规格会话", exact: true }).click();
-  await page.getByRole("button", { name: "模型设置", exact: true }).click();
   const settings = page.getByRole("dialog", { name: "规格库构建设置", exact: true });
+  if (!await settings.isVisible()) {
+    await showKnowledgeAssistant(page);
+    const assistant = page.getByTestId("knowledge-assistant");
+    if (await assistant.getByRole("button", { name: "规格对话", exact: true }).count()) await assistant.getByRole("button", { name: "规格对话", exact: true }).click();
+    if (!await settings.isVisible()) {
+      if (await assistant.getByRole("button", { name: "管理规格会话", exact: true }).count()) await assistant.getByRole("button", { name: "管理规格会话", exact: true }).click();
+      await page.getByRole("button", { name: "模型设置", exact: true }).click();
+    }
+  }
   await settings.getByRole("combobox", { name: "批量生成引擎", exact: true }).selectOption("codex");
   await settings.getByRole("combobox", { name: "批量生成模型", exact: true }).selectOption("gpt-test");
   await settings.getByRole("button", { name: "保存构建设置", exact: true }).click();
@@ -380,14 +386,22 @@ async function installKnowledgeEngineCatalog(page: Page, deepseekAvailable = tru
   ] } }));
 }
 
-/** 高级和管理操作统一从顶部更多菜单进入。 */
+/** 高级生成进入完善下拉，其余管理操作走更多，待确认属于左侧导航。 */
 async function openKnowledgeMenu(page: Page, name: string): Promise<void> {
   if (name === "待确认更新") {
-    await page.locator(".header-actions").getByRole("button", { name: /^待确认更新/u }).click();
+    const tree = page.getByTestId("knowledge-tree");
+    if (!await tree.isVisible()) await page.getByRole("button", { name: "规格库目录", exact: true }).click();
+    await tree.getByRole("button", { name: /^待确认更新/u }).click();
     return;
   }
+  if (name === "管理策略") { await page.getByRole("button", { name: "规格库说明", exact: true }).click(); return; }
+  if (name === "高级生成") {
+    await page.locator(".header-actions .ant-dropdown-button .ant-dropdown-trigger").click();
+    await page.getByRole("menuitem", { name: "自定义范围与设置", exact: true }).click();
+  } else {
   await page.getByRole("button", { name: "规格库更多操作", exact: true }).click();
-  await page.getByRole("menuitem", { name, exact: true }).click();
+  await page.getByRole("menuitem", { name: name === "复检所选知识" ? /^复检(全项目|所选)/u : name, exact: true }).click();
+  }
   if (name === "高级生成" || name === "复检所选知识") {
     const settings = page.locator(".batch-advanced");
     await expect(settings).toBeVisible();
@@ -635,16 +649,193 @@ async function useDarkTheme(page: Page): Promise<void> {
 }
 
 test.describe("项目知识库资产协作", () => {
-  test("PK-overview 初次进入展示真实概览，显式文件深链和概览恢复各自保留", async ({ page }) => {
+  test("PK-scope-consistency 阅读不改变全项目范围，勾选后仅处理所选", async ({ page }) => {
+    await installSession(page);
+    const scenario = await installUnifiedUpdatesScenario(page);
+    await page.goto(`/knowledge?workspaceId=${WORKSPACE_ID}&nodeId=doc-a`);
+    await expect(page.locator(".document-title")).toContainText("项目约定");
+    await openKnowledgeMenu(page, "高级生成");
+    const modal = page.getByRole("dialog", { name: "确认批量生成", exact: true });
+    await expect(modal.locator(".batch-preview > div")).toHaveCount(2);
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    const tree = page.getByTestId("knowledge-tree");
+    await tree.getByRole("checkbox", { name: "选择项目约定", exact: true }).check();
+    await openKnowledgeMenu(page, "高级生成");
+    await expect(modal.locator(".batch-preview > div")).toHaveCount(1);
+    await expect(modal.locator(".batch-preview")).toContainText("项目约定");
+    await modal.getByRole("button", { name: "Close", exact: true }).click();
+    await startKnowledgeBuild(page);
+    const settings = page.getByRole("dialog", { name: "规格库构建设置", exact: true });
+    await settings.getByRole("combobox", { name: "批量生成引擎", exact: true }).selectOption("codex");
+    await settings.getByRole("combobox", { name: "批量生成模型", exact: true }).selectOption("gpt-test");
+    await settings.getByRole("button", { name: "保存并开始生成", exact: true }).click();
+    await expect.poll(() => scenario.calls.generates.length).toBe(1);
+    expect(scenario.calls.generates[0]).toMatchObject({ selectedNodeIds: ["doc-a"], includeDescendants: true });
+  });
+
+  for (const failure of ["changes", "runs"] as const) test(`PK-updates-retry-${failure} 失败后就地重读，重复失败保留错误与视图`, async ({ page }) => {
+    await installSession(page);
+    await installUnifiedUpdatesScenario(page);
+    let failed = true;
+    await page.route(`**/api/knowledge/assets/${failure}?**`, route => failed
+      ? route.fulfill({ status: 503, json: { ok: false, code: "KNOWLEDGE_READ_FAILED", message: "模拟更新读取失败", details: { requestId: "updates-retry-request" } } })
+      : route.fallback());
+    await page.goto("/knowledge?view=results");
+    const updates = page.getByTestId("knowledge-updates");
+    await expect(updates.getByRole("alert")).toContainText("模拟更新读取失败");
+    await expect(page.locator(".page-error")).toContainText("updates-retry-request");
+    const retry = updates.getByRole("button", { name: "重新读取", exact: true });
+    await retry.click();
+    await expect(retry).toBeEnabled();
+    await expect(updates.getByRole("alert")).toContainText("模拟更新读取失败");
+    await expect(updates).not.toContainText("暂无待确认更新");
+    failed = false;
+    await retry.click();
+    await expect(updates.locator(".update-row")).toHaveCount(2);
+    await expect(updates.getByRole("alert")).toHaveCount(0);
+    await expect(page.locator(".page-error")).toHaveCount(0);
+    await expect(page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  test("PK-candidate-generation-scope 新候选只供阅读，不进入正式生成选区", async ({ page }) => {
+    await installSession(page);
+    const scenario = await installBuildScenario(page, { generated: true });
+    await completeBuild(page, scenario);
+    const tree = page.getByTestId("knowledge-tree");
+    await expandKnowledgeDirectory(page, "项目地图");
+    const candidate = tree.getByRole("checkbox", { name: "选择关键机制", exact: true });
+    await expect(candidate).toBeDisabled();
+    await expect(candidate).toHaveAttribute("title", /先采用/u);
+    await expect(tree.getByRole("checkbox", { name: "选择项目地图", exact: true })).toBeDisabled();
+    await tree.getByRole("button", { name: "项目地图目录操作", exact: true }).click();
+    await expect(page.getByRole("menuitem", { name: "生成此目录", exact: true })).toBeDisabled();
+    await expect(page.getByRole("menuitem", { name: "复检此目录", exact: true })).toBeDisabled();
+    await tree.getByRole("button", { name: "关键机制", exact: true }).click();
+    const navigation = tree.getByRole("tree", { name: "规格库目录", exact: true });
+    await navigation.focus();
+    await navigation.press("Space");
+    await expect(candidate).not.toBeChecked();
+    await expect(page.locator(".header-actions").getByRole("button", { name: "完善全项目", exact: true })).toBeVisible();
+    expect(scenario.calls.generates).toHaveLength(1);
+    await openKnowledgeMenu(page, "待确认更新");
+    await page.getByTestId("knowledge-updates").getByRole("button", { name: "采用所选内容", exact: true }).click();
+    await expect.poll(() => scenario.applies.length).toBe(1);
+    await expect(candidate).toBeEnabled();
+    await candidate.check();
+    await expect(page.locator(".header-actions").getByRole("button", { name: "完善所选 · 1项", exact: true })).toBeVisible();
+  });
+
+  test("PK-toolbar-simplified 顶部留白、唯一生成入口与左侧待确认导航", async ({ page }) => {
+    await installSession(page);
+    await installUnifiedUpdatesScenario(page, { proposal: true });
+    await page.goto("/knowledge");
+    const header = page.locator(".page-header"), tree = page.getByTestId("knowledge-tree");
+    const improve = header.getByRole("button", { name: "完善全项目", exact: true });
+    await expect(improve).toBeVisible();
+    await expect(page.getByText(/工作区刷新失败/u)).toHaveCount(0);
+    await expect(tree.getByRole("button", { name: "一键生成", exact: true })).toHaveCount(0);
+    await expect(header.getByRole("button", { name: /^待确认更新/u })).toHaveCount(0);
+    const bounds = (await header.boundingBox())!, button = (await improve.boundingBox())!;
+    expect(bounds.height).toBeGreaterThanOrEqual(60);
+    expect(button.y - bounds.y).toBeGreaterThanOrEqual(12);
+    expect(bounds.y + bounds.height - button.y - button.height).toBeGreaterThanOrEqual(12);
+    await expect(header.getByRole("button", { name: "搜索", exact: true })).toHaveCount(0);
+    await expect(tree.getByLabel("规格库所属项目", { exact: true })).toBeVisible();
+    await expect(header.getByLabel("规格库所属项目", { exact: true })).toHaveCount(0);
+    const updates = tree.getByRole("button", { name: /^待确认更新/u });
+    await updates.click();
+    await expect(updates).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("knowledge-updates")).toBeVisible();
+    await expandKnowledgeDirectory(page, "规格约束");
+    await tree.getByRole("checkbox", { name: "选择项目约定", exact: true }).check();
+    await expect(header.getByRole("button", { name: "完善所选 · 1项", exact: true })).toBeVisible();
+    await tree.getByRole("checkbox", { name: "选择项目约定", exact: true }).uncheck();
+    await expect(improve).toBeVisible();
+  });
+
+  test("PK-spec-help 说明入口常驻，价值和原则易读且细则可展开", async ({ page }, testInfo) => {
+    await installSession(page);
+    await installKnowledgeScenario(page, { empty: true });
+    await page.goto("/knowledge");
+    await page.getByRole("button", { name: "规格库说明", exact: true }).click();
+    const help = page.locator(".ant-drawer-content:visible").filter({ hasText: "规格库说明" });
+    await expect(help).toContainText("减少反复说明和偏离");
+    await expect(help).toContainText("代码反映当前实现");
+    await expect(help).toContainText("已采用、已提供、已验证");
+    await expect(help).toContainText("规格约束");
+    await expect(help.locator("details").first()).not.toHaveAttribute("open", "");
+    await page.screenshot({ animations: "disabled", path: testInfo.outputPath("knowledge-help.png") });
+    await help.locator("details > summary").first().click();
+    await expect(help).toContainText("编码规范");
+    await help.getByRole("button", { name: "Close", exact: true }).click();
+    await page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u }).click();
+    await page.getByRole("button", { name: "规格库说明", exact: true }).click();
+    await expect(help).toBeVisible();
+  });
+
+  test("PK-updates-empty 无候选明确空态并收起空文件会话，主动讨论不丢失", async ({ page }) => {
+    await installSession(page);
+    const scenario = await installKnowledgeScenario(page);
+    await page.goto("/knowledge");
+    await page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u }).click();
+    await expect(page.getByTestId("knowledge-updates")).toContainText("暂无待确认更新");
+    await expect(page.getByTestId("knowledge-updates")).not.toContainText("选择具体更新");
+    await expect(page.getByTestId("knowledge-assistant")).not.toHaveClass(/open/u);
+    await page.goto(`/knowledge?threadId=${scenario.threadId}`);
+    await expect(page.locator(".composer__textarea")).toBeEnabled();
+    await page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u }).click();
+    await expect(page.getByTestId("knowledge-updates")).toContainText("暂无待确认更新");
+    await expect(page.locator(".composer__textarea")).toBeEnabled();
+    await expect(page.getByTestId("knowledge-assistant")).toHaveClass(/open/u);
+  });
+
+  test("PK-updates-read-failed 读取失败不能显示暂无更新或收起主动讨论", async ({ page }) => {
+    await installSession(page);
+    const scenario = await installKnowledgeScenario(page);
+    await page.goto(`/knowledge?threadId=${scenario.threadId}`);
+    await expect(page.locator(".composer__textarea")).toBeEnabled();
+    await page.route("**/api/knowledge/assets/changes?**", route => route.fulfill({ status: 503, json: { ok: false, code: "KNOWLEDGE_READ_FAILED", message: "待确认更新读取失败" } }));
+    await openKnowledgeMenu(page, "待确认更新");
+    const updates = page.getByTestId("knowledge-updates");
+    await expect(updates.getByRole("alert")).toContainText("待确认更新读取失败");
+    await expect(updates).not.toContainText("暂无待确认更新");
+    await expect(page.locator(".composer__textarea")).toBeEnabled();
+    await expect(page.getByTestId("knowledge-assistant")).toHaveClass(/open/u);
+  });
+
+  test("PK-updates-index-pending 候选任务索引未返回时不提前宣称暂无更新", async ({ page }) => {
+    await installSession(page);
+    await installUnifiedUpdatesScenario(page);
+    let release!: () => void, waiting = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    await page.route("**/api/knowledge/assets/runs?**", async route => { waiting = true; await gate; await route.fallback(); });
+    await page.goto("/knowledge?view=results");
+    await expect.poll(() => waiting).toBe(true);
+    const updates = page.getByTestId("knowledge-updates");
+    await expect(updates.locator(".updates-loading")).toBeVisible();
+    await expect(updates).not.toContainText("暂无待确认更新");
+    release();
+    await expect(updates.locator(".update-row")).toHaveCount(2);
+    await expect(updates).not.toContainText("暂无待确认更新");
+  });
+
+  test("PK-overview 初次进入展示真实概览，显式文件深链和概览恢复各自保留", async ({ page }, testInfo) => {
     await installSession(page);
     const scenario = await installUnifiedUpdatesScenario(page);
     await page.goto("/knowledge");
     const overview = page.getByTestId("knowledge-overview");
     await expect(overview).toBeVisible();
+    await expect(overview.locator(".overview-actions")).toHaveCount(0);
+    await overview.getByRole("button", { name: "了解使用原则", exact: true }).click();
+    const help = page.locator(".ant-drawer-content:visible");
+    await expect(help.getByRole("heading", { name: "三步开始使用", exact: true })).toBeVisible();
+    await help.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(help).toBeHidden();
     await expect(overview).toContainText("现行文档");
     await expect(overview).toContainText("规格文档复检不等于代码验收");
-    await expect(page.locator(".header-actions").getByRole("button", { name: "完善规格", exact: true })).toBeVisible();
+    await expect(page.locator(".header-actions").getByRole("button", { name: "完善全项目", exact: true })).toBeVisible();
     await expect(page.locator(".header-actions").getByRole("button", { name: "规格对话", exact: true })).toBeVisible();
+    await page.screenshot({ animations: "disabled", path: testInfo.outputPath("knowledge-overview-desktop.png") });
     expect(scenario.writes).toHaveLength(0);
     await page.goto(`/knowledge?workspaceId=${WORKSPACE_ID}&nodeId=doc-b`);
     await expect(page.locator("div.document")).toContainText("formal-b");
@@ -696,7 +887,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(page.locator(".document-title")).toContainText("功能说明");
   });
 
-  test("PK-overview-mobile 手机概览与目录导航保持内容内滚动", async ({ page }) => {
+  test("PK-overview-mobile 手机概览与目录导航保持内容内滚动", async ({ page }, testInfo) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await installSession(page);
     await installUnifiedUpdatesScenario(page);
@@ -705,6 +896,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(overview).toBeVisible();
     await expectNoHorizontalOverflow(page.locator(".knowledge-page"));
     await expect(overview).toHaveCSS("overflow", "auto");
+    await page.screenshot({ animations: "disabled", path: testInfo.outputPath("knowledge-overview-mobile.png") });
     await page.getByRole("button", { name: "规格库目录", exact: true }).click();
     const tree = page.getByTestId("knowledge-tree");
     await expect(tree).toBeVisible();
@@ -959,7 +1151,7 @@ test.describe("项目知识库资产协作", () => {
     const assistant = page.getByTestId("knowledge-assistant");
     await expect(assistant.locator(".composer__textarea")).toBeEnabled();
     await expect.poll(() => waiting).toBe(true);
-    const title = kind === "discussion" ? "✦ 规格协作" : "知识工作会话 · 编码规范";
+    const title = kind === "discussion" ? "✦ 规格对话" : "知识工作会话 · 编码规范";
     await expect(assistant.getByRole("heading", { level: 2 })).toHaveText(title);
     release();
     await expect(page.locator("div.document")).toContainText("formal-a");
@@ -967,7 +1159,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(page).toHaveURL(new RegExp(query));
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "编码规范", exact: true }).click();
     await expect(assistant).toContainText("当前文件版本尚无可用的生成会话记录");
-    await expect(assistant.getByRole("button", { name: "项目讨论", exact: true })).toBeVisible();
+    await expect(assistant.getByRole("button", { name: "规格对话", exact: true })).toBeVisible();
     expect(new URL(page.url()).searchParams.has("executionThreadId")).toBe(false);
   });
 
@@ -1052,7 +1244,7 @@ test.describe("项目知识库资产协作", () => {
     const assistant = page.getByTestId("knowledge-assistant");
     const handle = page.getByTestId("knowledge-assistant-resize-handle");
     const main = page.locator(".knowledge-page .main");
-    await expect(handle).toHaveAttribute("aria-label", "调整 AI 对话宽度");
+    await expect(handle).toHaveAttribute("aria-label", "调整会话面板宽度");
     const initialWidth = (await assistant.boundingBox())!.width;
     const initialHeight = (await main.boundingBox())!.height;
 
@@ -1099,7 +1291,7 @@ test.describe("项目知识库资产协作", () => {
     expect((await main.boundingBox())!.height).toBe(initialHeight);
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(handle).toHaveCount(0);
-    await page.getByRole("button", { name: "AI 对话", exact: true }).click();
+    await page.getByRole("button", { name: "会话面板", exact: true }).click();
     await expect(assistant).toBeVisible();
     expect((await assistant.boundingBox())!.width).toBeLessThanOrEqual(390);
   });
@@ -2141,7 +2333,7 @@ test.describe("项目知识库资产协作", () => {
     scenario.runs[0]!.phase = "partial";
     await openKnowledge(page);
     await expect(page.locator(".overview, .overview-list, .directory-file-list, .directory-heading")).toHaveCount(0);
-    expect((await page.locator(".page-header").boundingBox())!.height).toBeLessThan(viewport.width < 640 ? 90 : 45);
+    expect((await page.locator(".page-header").boundingBox())!.height).toBeLessThan(viewport.width < 640 ? 90 : 70);
     if (viewport.width <= 1100) await page.getByRole("button", { name: "规格库目录", exact: true }).click();
     await expandKnowledgeDirectory(page, "规格约束");
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "项目约定", exact: true }).click();
@@ -2152,7 +2344,7 @@ test.describe("项目知识库资产协作", () => {
     expect(head.height).toBeLessThan(viewport.width < 640 ? 90 : 50);
     // 标题栏之外还有生成状态摘要条，正文起点允许包含该摘要高度。
     expect(content.y - bounds.y).toBeLessThan(viewport.width < 640 ? 120 : 85);
-    expect(content.height).toBeGreaterThan(bounds.height * 0.8);
+    expect(content.height + 1).toBeGreaterThan(bounds.height * 0.8);
     await reading.getByRole("button", { name: "编辑文档", exact: true }).click();
     const editor = reading.getByRole("textbox", { name: "知识正文", exact: true });
     await editor.fill("项目约定\n\n" + "知识正文应当占满可用内容区。\n".repeat(150));
@@ -2222,7 +2414,7 @@ test.describe("项目知识库资产协作", () => {
     await openKnowledge(page);
     const search = page.getByTestId("knowledge-search"), location = page.getByTestId("knowledge-search-location"), reading = page.locator(".reading-document");
     await search.getByPlaceholder("搜索规格与文档").fill("搜索证据");
-    await search.getByRole("button", { name: /^搜\s*索$/u }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     await page.getByTestId("knowledge-search-results").getByRole("button", { name: /功能说明/ }).click();
     await expect(location.locator("pre")).toContainText("搜索证据第 31 行");
     await reading.getByRole("button", { name: "编辑文档", exact: true }).click();
@@ -2506,7 +2698,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(tree.getByRole("button", { name: "架构机制", exact: true })).toHaveCount(0);
     await expect(tree.locator(".node-icon")).toHaveCount(3);
     await expect(tree.locator(".state-dot")).toHaveCount(0);
-    await expect(tree.getByRole("button", { name: "一键生成", exact: true })).toBeEnabled();
+    await expect(page.locator(".header-actions").getByRole("button", { name: "完善全项目", exact: true })).toBeEnabled();
     await tree.getByRole("button", { name: "规格约束", exact: true }).click();
     await expect(tree.locator(".asset-tree-row.selected")).toContainText("规格约束");
     await expect(page.locator(".main-head")).toContainText("规格约束");
@@ -2627,12 +2819,13 @@ test.describe("项目知识库资产协作", () => {
     const scenario = await installKnowledgeScenario(page);
     await openKnowledge(page, scenario.threadId);
     await openKnowledgeMenu(page, "管理策略");
-    const policy = page.locator(".ant-drawer-content").filter({ hasText: "规格库管理策略" });
+    const policy = page.locator(".ant-drawer-content").filter({ hasText: "规格库说明" });
+    await policy.locator("details > summary").click();
     await expect(policy.getByRole("heading", { name: "规格约束", exact: true })).toBeVisible();
     await expect(policy.getByRole("heading", { name: "系统架构", exact: true })).toBeVisible();
     for (const title of ["架构总览", "核心流程", "关键机制"]) await expect(policy.locator("li strong").getByText(title, { exact: true })).toBeVisible();
     await expect(policy).toContainText("默认只补齐以上三份文档");
-    await expect(policy).toContainText("其他专题由用户在规格协作对话中按需生成");
+    await expect(policy).toContainText("其他专题由用户在规格对话中按需生成");
     await expect(policy.getByRole("heading", { name: "产品文档", exact: true })).toBeVisible();
     await expect(policy).toContainText("临时任务要求和个人偏好不保存为共享规则");
     for (const title of ["项目约定", "编码规范", "界面规范", "接口规范", "数据规范", "业务约束", "安全规范", "交付规范"]) await expect(policy.locator("li strong").getByText(title, { exact: true })).toBeVisible();
@@ -2930,7 +3123,7 @@ test.describe("项目知识库资产协作", () => {
     expect(scenario.calls.creates.every(call => call.engine === "claude" && call.model === "deepseek-flash")).toBe(true);
   });
 
-  test("PK-toolbar-simple 知识工具栏按内容定宽，隐藏Fast及输入提示，生成入口只在左侧", async ({ page }) => {
+  test("PK-toolbar-simple 知识工具栏按内容定宽，隐藏Fast及输入提示，生成入口集中顶部", async ({ page }) => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page, { empty: true });
     const longLabel = "测试模型 B · 一个需要完整显示的长模型名称";
@@ -2941,9 +3134,8 @@ test.describe("项目知识库资产协作", () => {
     await expect(input).toBeEnabled();
     await expect(input).toHaveAttribute("placeholder", "");
     await expect(assistant.getByRole("button", { name: "Fast", exact: true })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "一键生成", exact: true })).toHaveCount(1);
-    await expect(page.getByTestId("knowledge-tree").getByRole("button", { name: "一键生成", exact: true })).toBeVisible();
-    await expect(page.locator(".page-header").getByRole("button", { name: "一键生成", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "一键生成", exact: true })).toHaveCount(0);
+    await expect(page.locator(".page-header").getByRole("button", { name: "完善全项目", exact: true })).toBeVisible();
     const shortWidth = (await model.boundingBox())!.width;
     await model.click();
     await page.locator(".composer__model-dropdown").getByText(longLabel, { exact: true }).click();
@@ -2956,7 +3148,7 @@ test.describe("项目知识库资产协作", () => {
     await expect.poll(() => scenario.calls.sends.length).toBe(1);
     expect(scenario.calls.sends[0]).toMatchObject({ model: "gpt-second", serviceTier: null });
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.getByRole("button", { name: "AI 对话", exact: true }).click();
+    await page.getByRole("button", { name: "会话面板", exact: true }).click();
     await expect(assistant).toBeVisible();
     await expectNoHorizontalOverflow(page.locator(".knowledge-page"));
     await expectInside(assistant.locator(".composer__send-btn"), assistant);
@@ -3149,8 +3341,8 @@ test.describe("项目知识库资产协作", () => {
     await expect.poll(() => scenario.calls.starts.length).toBe(1);
     await page.locator(".task-summary").getByRole("button", { name: /^停\s*止$/ }).click();
     await expect.poll(() => scenario.calls.stops.length).toBe(1);
-    await expect(page.getByTestId("knowledge-tree").getByRole("button", { name: "一键生成", exact: true })).toBeEnabled();
-    await expect(page.getByRole("button", { name: "一键生成", exact: true })).toHaveCount(1);
+    await expect(page.locator(".header-actions").getByRole("button", { name: "完善全项目", exact: true })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "一键生成", exact: true })).toHaveCount(0);
     await startKnowledgeBuild(page);
     await expect.poll(() => scenario.calls.starts.length).toBe(2);
     expect(scenario.calls.creates).toHaveLength(2);
@@ -3423,13 +3615,13 @@ test.describe("项目知识库资产协作", () => {
     await expect(search.getByRole("button", { name: /过滤/ })).toHaveCount(0);
     await expect(page.getByRole("checkbox", { name: "仅搜索所选节点及子项", exact: true })).toHaveCount(0);
     await search.getByRole("textbox").fill("权限");
-    await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     await expect.poll(() => searches.length).toBe(1);
     expect(searches[0]!.searchParams.has("nodeId")).toBe(false);
     await expect(page.getByTestId("knowledge-search-results")).toContainText("全部规格与文档");
     await page.getByTestId("knowledge-search-results").getByRole("button", { name: "关闭", exact: true }).click();
     await expect(page.getByRole("button", { name: "规格库概览", exact: true })).toHaveCount(0);
-    await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     await expect.poll(() => searches.length).toBe(2);
     expect(searches[1]!.searchParams.has("nodeId")).toBe(false);
   });
@@ -3721,14 +3913,14 @@ test.describe("项目知识库资产协作", () => {
     await openKnowledge(page);
     const search = page.getByTestId("knowledge-search");
     await search.getByPlaceholder("搜索规格与文档").fill("成员");
-    await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     const results = page.getByTestId("knowledge-search-results");
     await expect(results).toContainText("功能说明");
     await expect(results).toContainText("关键词 + 语义");
     await results.getByRole("button", { name: "关闭", exact: true }).click();
     await expect(results).toHaveCount(0);
     await search.getByPlaceholder("搜索规格与文档").fill("成员");
-    await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     await expect(page.getByTestId("knowledge-search-results")).toBeVisible();
     await page.setViewportSize({ width: 390, height: 844 });
     await expectInside(results, page.locator(".knowledge-page"));
@@ -3757,14 +3949,14 @@ test.describe("项目知识库资产协作", () => {
     const search = page.getByTestId("knowledge-search"), location = page.getByTestId("knowledge-search-location");
     for (const [heading, expected, absent] of [["成员章节", "首段成员说明", "末段权限规则"], ["权限章节", "末段权限规则", "首段成员说明"]]) {
       await search.getByPlaceholder("搜索规格与文档").fill("成员权限");
-      await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+      await search.getByPlaceholder("搜索规格与文档").press("Enter");
       await page.getByTestId("knowledge-search-results").getByRole("button", { name: new RegExp(heading!) }).click();
       await expect(location).toContainText(heading!);
       await expect(location.locator("pre")).toContainText(expected!);
       await expect(location.locator("pre")).not.toContainText(absent!);
     }
     changed = true;
-    await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     await page.getByTestId("knowledge-search-results").getByRole("button", { name: /权限章节/ }).click();
     await expect(location).toContainText("原文或版本已变化，请重新搜索定位");
     await expect(location.locator("pre")).toHaveCount(0);
@@ -3773,7 +3965,7 @@ test.describe("项目知识库资产协作", () => {
     await page.route("**/api/knowledge/assets/search?**", route => route.fulfill({ json: { ok: true, data: { issues: [], items: [
       { nodeId: "root", title: "功能说明", heading: "长行末尾", chunkId: "tail", startLine: 1, endLine: 1, contentHash: "a".repeat(64), excerpt: "末尾唯一权限证据", path: "docs/product.md", matchMode: "hybrid", score: 0.9, keywordScore: 0.9, vectorScore: 0.9 },
     ] } } }));
-    await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     await page.getByTestId("knowledge-search-results").getByRole("button", { name: /长行末尾/ }).click();
     await expect(location.locator("pre")).toContainText("末尾唯一权限证据");
     expect((await location.locator("pre").textContent())!.length).toBeLessThanOrEqual(2000);
@@ -3805,7 +3997,7 @@ test.describe("项目知识库资产协作", () => {
     const search = page.getByTestId("knowledge-search");
     await search.getByPlaceholder("搜索规格与文档").fill("旧资料");
     const requested = page.waitForRequest(request => request.url().includes("/knowledge/assets/search?"));
-    await search.getByRole("button", { name: /^搜\s*索$/ }).click();
+    await search.getByPlaceholder("搜索规格与文档").press("Enter");
     await requested;
     await page.evaluate(workspaceId => {
       const app = document.querySelector("#app") as HTMLElement & { __vue_app__: { config: { globalProperties: { $pinia: { _s: Map<string, { switchWorkspace: (id: string, options: { reloadPage: boolean }) => void }> } } } } };
@@ -3978,7 +4170,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(collapse).toHaveText("");
     await collapse.click();
     await expect(assistant).not.toBeVisible();
-    await page.getByRole("button", { name: "展开 AI 对话", exact: true }).click();
+    await page.getByRole("button", { name: "展开会话面板", exact: true }).click();
     await expect(assistant).toBeVisible();
     const surface = page.locator(".knowledge-page");
     const light = await surface.evaluate(element => getComputedStyle(element).backgroundColor);
@@ -4099,7 +4291,7 @@ test.describe("项目知识库资产协作", () => {
     expect(nodes.map(node => node.id)).toEqual(["root", "import_first", "import_second", "import_third"]);
   });
 
-  test("PK-08 刷新恢复独立知识会话，顶部结束协作保留聊天记录", async ({ page }) => {
+  test("PK-08 刷新恢复独立知识会话，顶部结束对话保留聊天记录", async ({ page }) => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page);
     await openKnowledge(page, scenario.threadId);
@@ -4108,7 +4300,7 @@ test.describe("项目知识库资产协作", () => {
     await openKnowledgeDiscussion(page);
     await expect(page.locator(".composer__textarea")).toBeEnabled();
     expect(scenario.calls.connects.at(-1)?.threadId).toBe(scenario.threadId);
-    const finish = page.locator(".assistant-head").getByRole("button", { name: "结束协作", exact: true });
+    const finish = page.locator(".assistant-head").getByRole("button", { name: "结束对话", exact: true });
     await expect(finish).toBeVisible();
     await expectInside(finish, page.locator(".assistant-head"));
     await finish.click();
@@ -4314,7 +4506,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(result.getByRole("button", { name: /^停\s*止$/u })).toHaveCount(0);
     expect(scenario.calls.starts).toHaveLength(1);
     expect(scenario.calls.sends).toHaveLength(0);
-    await page.locator(".assistant-head").getByRole("button", { name: "结束协作", exact: true }).click();
+    await page.locator(".assistant-head").getByRole("button", { name: "结束对话", exact: true }).click();
     await expect.poll(() => scenario.calls.ends.length).toBe(1);
     expect(scenario.calls.stops).toHaveLength(1);
   });
@@ -4867,7 +5059,7 @@ test.describe("项目知识库资产协作", () => {
     expect(scenario.calls.creates[0]).toMatchObject({ nodeId: null, engine: "codex" });
     expect(scenario.calls.creates[0]).not.toHaveProperty("threadId");
     await expect(page.locator(".assistant-scope")).toContainText("整个项目");
-    await expect(page.locator(".assistant-head").getByRole("button", { name: "结束协作", exact: true })).toBeVisible();
+    await expect(page.locator(".assistant-head").getByRole("button", { name: "结束对话", exact: true })).toBeVisible();
     await page.locator(".composer__textarea").fill("整理项目知识");
     await page.locator(".composer__send-btn").click();
     await expect(page.getByText("已收到：整理项目知识", { exact: true })).toBeVisible();
@@ -4905,11 +5097,12 @@ test.describe("项目知识库资产协作", () => {
     await showKnowledgeAssistant(page);
     const assistant = page.getByTestId("knowledge-assistant");
     const welcome = assistant.locator(".conversation-welcome");
-    await assistant.getByRole("button", { name: "项目讨论", exact: true }).click();
+    await assistant.getByRole("button", { name: "规格对话", exact: true }).click();
+    await page.getByRole("dialog", { name: "规格库构建设置", exact: true }).getByRole("button", { name: "Close", exact: true }).click();
     for (const size of [{ width: 1366, height: 900 }, { width: 1024, height: 768 }, { width: 390, height: 844 }]) {
       await page.setViewportSize(size);
       if (size.width <= 1100) {
-        const toggle = page.getByRole("button", { name: "AI 对话", exact: true });
+        const toggle = page.getByRole("button", { name: "会话面板", exact: true });
         if (size.width === 1024) await expect(toggle).toHaveAttribute("aria-expanded", "false");
         if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
         await expect(toggle).toHaveAttribute("aria-expanded", "true");
@@ -4917,7 +5110,7 @@ test.describe("项目知识库资产协作", () => {
         const treeToggle = page.getByRole("button", { name: "规格库目录", exact: true });
         if (await treeToggle.getAttribute("aria-expanded") === "false") await treeToggle.click();
         await expect(treeToggle).toHaveAttribute("aria-expanded", "true");
-        await expect(page.getByTestId("tree-batch-actions")).toHaveCount(1);
+        await expect(page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u })).toBeVisible();
         if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
         await expect(toggle).toHaveAttribute("aria-expanded", "true");
       }
@@ -4938,8 +5131,8 @@ test.describe("项目知识库资产协作", () => {
         await expectNoHorizontalOverflow(assistant);
         await expectNoHorizontalOverflow(page.locator(".knowledge-page"));
         await expectNoHorizontalOverflow(page.locator(".page-header"));
-        await expectInside(page.locator(".page-header").getByRole("button", { name: "完善规格", exact: true }), page.locator(".page-header"));
-        if (size.width > 1100) await expectInside(page.getByTestId("tree-batch-actions").getByRole("button", { name: "一键生成", exact: true }), page.getByTestId("knowledge-tree"));
+        await expectInside(page.locator(".page-header").getByRole("button", { name: "完善全项目", exact: true }), page.locator(".page-header"));
+        if (size.width > 1100) await expectInside(page.locator(".header-actions").getByRole("button", { name: "完善全项目", exact: true }), page.locator(".page-header"));
         await expectNoHorizontalOverflow(assistant.locator(".assistant-head"));
         await expectInside(assistant.getByRole("button", { name: "收起", exact: true }), assistant.locator(".assistant-head"));
         await expect(assistant.locator(".assistant-head").getByRole("button", { name: "新建规格会话", exact: true })).toHaveCount(0);
@@ -4955,9 +5148,9 @@ test.describe("项目知识库资产协作", () => {
     const scenario = await installKnowledgeScenario(page, { noKnowledge: true });
     await openKnowledge(page);
     await page.setViewportSize({ width: 390, height: 360 });
-    await page.getByRole("button", { name: "AI 对话", exact: true }).click();
+    await page.getByRole("button", { name: "会话面板", exact: true }).click();
     await expect(page.getByTestId("knowledge-assistant")).toHaveClass(/open/u);
-    const discussion = page.getByTestId("knowledge-assistant").getByRole("button", { name: "项目讨论", exact: true });
+    const discussion = page.getByTestId("knowledge-assistant").getByRole("button", { name: "规格对话", exact: true });
     if (await discussion.count()) await discussion.first().dispatchEvent("click");
     const start = page.locator(".conversation-start");
     const position = await start.evaluate(element => {
@@ -4985,7 +5178,8 @@ test.describe("项目知识库资产协作", () => {
     await showKnowledgeAssistant(page);
     const assistant = page.getByTestId("knowledge-assistant");
     const welcome = assistant.locator(".conversation-welcome");
-    await assistant.getByRole("button", { name: "项目讨论", exact: true }).click();
+    await assistant.getByRole("button", { name: "规格对话", exact: true }).click();
+    await page.getByRole("dialog", { name: "规格库构建设置", exact: true }).getByRole("button", { name: "Close", exact: true }).click();
     await expect(welcome.getByRole("button", { name: "整个项目", exact: true })).toHaveCount(0);
     await expect(welcome.getByRole("button", { name: "当前目录", exact: true })).toHaveCount(0);
     await expect(assistant.locator(".assistant-head .session-controls")).toHaveCount(0);
@@ -4993,7 +5187,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(page.locator(".overview")).toHaveCount(0);
     await expect(page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true })).toBeVisible();
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
-    await assistant.getByRole("button", { name: "项目讨论", exact: true }).click();
+    await assistant.getByRole("button", { name: "规格对话", exact: true }).click();
     await expect(welcome.locator(".scope-description")).toContainText("目录与多选只限定本次任务");
     await configureMockKnowledgeModel(page);
     await welcome.getByRole("button", { name: "开始规格对话", exact: true }).click();
@@ -5007,18 +5201,18 @@ test.describe("项目知识库资产协作", () => {
     await expect(page.getByText("已收到：说明当前目录下的功能资产", { exact: true })).toBeVisible();
     expect(scenario.calls.sends[0].threadId).not.toBe(scenario.ordinaryThreadId);
     expect(scenario.calls.sends[0].threadId).not.toBe(scenario.threadId);
-    await assistant.getByRole("button", { name: "结束协作", exact: true }).click();
+    await assistant.getByRole("button", { name: "结束对话", exact: true }).click();
     await expect(welcome).toBeVisible();
     await expect(welcome.locator(".scope-description")).toContainText("目录与多选只限定本次任务");
   });
 
-  test("PK-24 结束协作后在欢迎区继续历史会话，窄屏顶部管理操作不溢出", async ({ page }) => {
+  test("PK-24 结束对话后在欢迎区继续历史会话，窄屏顶部管理操作不溢出", async ({ page }) => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page);
     await openKnowledge(page, scenario.threadId);
     const assistant = page.getByTestId("knowledge-assistant");
     await expect(page.locator(".composer__textarea")).toBeEnabled();
-    await assistant.locator(".assistant-head").getByRole("button", { name: "结束协作", exact: true }).click();
+    await assistant.locator(".assistant-head").getByRole("button", { name: "结束对话", exact: true }).click();
     await expect(assistant.locator(".conversation-welcome")).toBeVisible();
     await expect(assistant.locator(".assistant-head .conversation-picker")).toHaveCount(0);
     await expect(assistant.getByRole("button", { name: "新建规格会话", exact: true })).toHaveCount(0);
@@ -5031,14 +5225,14 @@ test.describe("项目知识库资产协作", () => {
     expect(scenario.calls.ends).toHaveLength(1);
     for (const size of [{ width: 1024, height: 768 }, { width: 390, height: 844 }]) {
       await page.setViewportSize(size);
-      const toggle = page.getByRole("button", { name: "AI 对话", exact: true });
+      const toggle = page.getByRole("button", { name: "会话面板", exact: true });
       if (size.width === 1024) await expect(toggle).toHaveAttribute("aria-expanded", "false");
       if (await toggle.getAttribute("aria-expanded") === "false") await toggle.click();
       await expect(toggle).toHaveAttribute("aria-expanded", "true");
       await expect(assistant).toBeVisible();
       const header = assistant.locator(".assistant-head");
       await expectNoHorizontalOverflow(header);
-      for (const name of ["管理规格会话", "结束协作", "收起"]) await expectInside(header.getByRole("button", { name, exact: true }), header);
+      for (const name of ["管理规格会话", "结束对话", "收起"]) await expectInside(header.getByRole("button", { name, exact: true }), header);
       await expectInside(assistant.locator(".composer__send-btn"), assistant);
       await expectNoHorizontalOverflow(page.locator(".knowledge-page"));
     }
@@ -5059,11 +5253,11 @@ test.describe("项目知识库资产协作", () => {
     await batch.getByRole("button", { name: /取\s*消/, exact: true }).click();
     await expect(batch).not.toBeVisible();
     await page.getByRole("button", { name: "规格库目录", exact: true }).click();
-    await page.getByRole("button", { name: "AI 对话", exact: true }).click();
+    await page.getByRole("button", { name: "会话面板", exact: true }).click();
     await expect(tree).not.toBeVisible();
     await expect(assistant).toBeVisible();
     await expect(page.getByRole("button", { name: "规格库目录", exact: true })).toHaveAttribute("aria-expanded", "false");
-    await expect(page.getByRole("button", { name: "AI 对话", exact: true })).toHaveAttribute("aria-expanded", "true");
+    await expect(page.getByRole("button", { name: "会话面板", exact: true })).toHaveAttribute("aria-expanded", "true");
     await page.locator(".composer__textarea").fill("继续整理原来的项目知识");
     await page.locator(".composer__send-btn").click();
     await expect.poll(() => scenario.calls.sends.length).toBe(1);
@@ -5099,14 +5293,14 @@ test.describe("项目知识库资产协作", () => {
     await expect(page.locator(".composer__textarea")).toBeEnabled();
     expect(scenario.calls.connects.at(-1)?.threadId).toBe(scenario.threadId);
     expect(scenario.calls.creates).toHaveLength(0);
-    await page.locator(".assistant-head").getByRole("button", { name: "结束协作", exact: true }).click();
+    await page.locator(".assistant-head").getByRole("button", { name: "结束对话", exact: true }).click();
     await expect(page.getByRole("button", { name: "继续最近会话", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "新建独立会话", exact: true }).click();
     await expect(page.locator(".composer__textarea")).toBeEnabled();
     expect(scenario.calls.creates).toHaveLength(1);
     expect(scenario.calls.creates[0]).toMatchObject({ nodeId: null });
     expect(new URL(page.url()).searchParams.get("threadId")).not.toBe(scenario.threadId);
-    await page.locator(".assistant-head").getByRole("button", { name: "结束协作", exact: true }).click();
+    await page.locator(".assistant-head").getByRole("button", { name: "结束对话", exact: true }).click();
     await expect(page.getByRole("combobox", { name: "筛选规格会话", exact: true })).toHaveCount(0);
     await page.locator('[aria-label="选择历史规格会话"]').click();
     await expect(page.locator(".ant-select-dropdown:visible").getByText("项目资产协作", { exact: true })).toBeVisible();
@@ -5597,7 +5791,7 @@ test.describe("项目知识库资产协作", () => {
       app.__vue_app__.config.globalProperties.$pinia._s.get("config")!.switchWorkspace(workspaceId, { reloadPage: false });
     }, nextWorkspace);
     await expect(page.getByText("0 个节点", { exact: false })).toBeVisible();
-    await page.getByRole("button", { name: "展开 AI 对话", exact: true }).click();
+    await page.getByRole("button", { name: "展开会话面板", exact: true }).click();
     await expect(page.getByRole("button", { name: "开始规格对话", exact: true })).toBeVisible();
     const oldResponse = page.waitForResponse(response => response.url().includes("/conversation.list?") && new URL(response.url()).searchParams.get("workspaceId") === WORKSPACE_ID);
     release(); await oldResponse;

@@ -10,8 +10,8 @@ import type { KnowledgeDocumentContext, KnowledgeLibraryUpdate } from "../knowle
 import KnowledgeBuildPreview from "./knowledge-build-preview.vue";
 import KnowledgeChangeInbox from "./knowledge-change-inbox.vue";
 
-const props = defineProps<{ workspaceId: string; context: ApiRequestContext; nodes: KnowledgeAssetNode[]; formalNodes: KnowledgeAssetNode[]; runs: KnowledgeGenerationRunView[]; updates: KnowledgeLibraryUpdate[]; scopeNodeId: string | null; canWrite: boolean; actionsBusy?: boolean; changeId?: string | null; focusId?: string | null; focusReport?: boolean; recoveryRunId?: string; afterApply: (context: KnowledgeDocumentContext, count: number) => Promise<boolean> }>();
-const emit = defineEmits<{ changed: [run?: KnowledgeGenerationRunView]; focus: [id: string]; preview: [context: KnowledgeDocumentContext | null]; close: []; openFile: [path: string]; recheck: [change: KnowledgeChangeDetail]; review: [nodeId: string]; resumeReview: [context: KnowledgeDocumentContext]; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView, runId: string]; busy: [value: boolean]; error: [cause: unknown, context: Record<string, unknown>] }>();
+const props = defineProps<{ workspaceId: string; context: ApiRequestContext; nodes: KnowledgeAssetNode[]; formalNodes: KnowledgeAssetNode[]; runs: KnowledgeGenerationRunView[]; updates: KnowledgeLibraryUpdate[]; scopeNodeId: string | null; canWrite: boolean; actionsBusy?: boolean; indexLoading?: boolean; indexError?: string | null; changeId?: string | null; focusId?: string | null; focusReport?: boolean; recoveryRunId?: string; retryIndex: () => Promise<void>; afterApply: (context: KnowledgeDocumentContext, count: number) => Promise<boolean> }>();
+const emit = defineEmits<{ changed: [run?: KnowledgeGenerationRunView]; focus: [id: string]; preview: [context: KnowledgeDocumentContext | null]; empty: [value: boolean]; close: []; openFile: [path: string]; recheck: [change: KnowledgeChangeDetail]; review: [nodeId: string]; resumeReview: [context: KnowledgeDocumentContext]; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView, runId: string]; busy: [value: boolean]; error: [cause: unknown, context: Record<string, unknown>] }>();
 type Row = { id: string; nodeId: string; title: string; body: boolean; structure: boolean; generating: boolean; runId: string | null; revisionId: string | null; changeId: string | null; source: string; createdAt: string; reason: string | null; canApply: boolean };
 const previews = shallowRef(new Map<string, KnowledgeGenerationPreview>());
 const changes = shallowRef<KnowledgeChangeSummary[]>([]);
@@ -19,6 +19,7 @@ const validatedChanges = shallowRef(new Map<string, { hash: string; stale: boole
 const selected = ref<string[]>([]), activeId = ref<string | null>(null);
 const touchedNodes = new Set<string>();
 const loading = ref(false), saving = ref(false), errorText = ref("");
+const retrying = ref(false);
 const childBusy = ref(false);
 const locked = computed(() => saving.value || childBusy.value);
 const outcome = ref("");
@@ -40,7 +41,7 @@ const rows = computed<Row[]>(() => {
     const pending = run?.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled);
     const reviewActivity = knowledgeDocumentReviewActivity(props.runs, update.nodeId, update.revisionId);
     return { ...update, id: `${update.id}:${update.revisionId ?? 'structure'}`, title: node?.title ?? update.nodeId,
-      changeId: null, source: run?.maintenance ? "自动维护" : run?.mode === "conversation" ? "规格协作" : "生成修订", createdAt: run?.createdAt ? new Date(run.createdAt).toLocaleString() : "",
+      changeId: null, source: run?.maintenance ? "自动维护" : run?.mode === "conversation" ? "规格对话" : "生成修订", createdAt: run?.createdAt ? new Date(run.createdAt).toLocaleString() : "",
       reason: pending ? "有未完成采用，请恢复原清单或终止" : reviewActivity ?? (run?.active ? update.generating ? "生成中" : "当前任务尚未完成" : legacyPlan ? "历史目录计划，请重新构建" : item?.applied ? update.structure ? "正文已采用，结构变化需要重新构建" : "已采用" : item?.dismissed ? "本次不采用" : item?.reason ?? (!preview ? "正在核对采用条件" : null)),
       canApply: Boolean(!pending && !legacyPlan && !run?.active && !reviewActivity && item?.canApply && !item.applied && !item.dismissed) };
   }).filter(row => row.reason !== "已采用" && row.reason !== "本次不采用");
@@ -93,7 +94,7 @@ function focusCandidate(): void {
   activeId.value = props.changeId || props.focusId ? requested?.id ?? null : first && rows.value.filter(row => row.nodeId === first.nodeId).length === 1 ? first.id : null;
 }
 
-/** 先读正文再核对采用条件；恢复操作只读取原任务，失败时保持采用禁用。 */
+/** 先读正文再核对采用条件；只在读取成功后通知空态，失败不伪装成暂无更新。 */
 async function load(): Promise<void> {
   if (locked.value) return;
   const ticket = ++epoch;
@@ -124,6 +125,18 @@ async function load(): Promise<void> {
     focusCandidate();
   } catch (cause) { if (ticket === epoch && !controller.signal.aborted) fail(cause, { operation: "updates.read" }); }
   finally { if (ticket === epoch) loading.value = false; }
+}
+
+/** 先重读任务索引再校验候选，任一步失败保留错误和当前定位。 */
+async function retryRead(): Promise<void> {
+  if (retrying.value || loading.value || props.indexLoading || locked.value || props.actionsBusy) return;
+  retrying.value = true;
+  const ticket = epoch;
+  try {
+    await props.retryIndex();
+    if (ticket !== epoch || props.indexError) return;
+    await load();
+  } finally { retrying.value = false; }
 }
 
 /** 同一文件只选一个候选，选择内容不会自动提交任何写操作。 */
@@ -334,14 +347,16 @@ watch(() => props.focusId, id => {
 /** 独立复检开始或结束时重新核对资格，阶段变化不打断当前正文。 */
 watch(() => JSON.stringify(props.updates.map(update => [update.id, update.revisionId, update.body, update.structure, update.generating, runMap.value.get(update.runId)?.active, Boolean(knowledgeDocumentReviewActivity(props.runs, update.nodeId, update.revisionId))])), () => { if (!saving.value) void load(); });
 onBeforeUnmount(() => { epoch++; controller.abort(); });
+/** 任务索引与提案读取均成功完成后才确认空态；迟到候选或读取失败不能被当作空库。 */
+watch(() => !loading.value && !props.indexLoading && !props.indexError && !errorText.value && rows.value.length === 0 && !props.recoveryRunId, value => emit("empty", value));
 </script>
 
 <template>
   <section class="knowledge-updates" data-testid="knowledge-updates">
     <header class="updates-heading"><div><strong>{{ recoveryRunId ? '恢复未完成操作' : allGenerating ? '生成中' : '待确认更新' }}</strong><span v-if="documentCount">{{ documentCount }} 篇文档</span><span v-if="generatingCount">{{ generatingCount }} 篇文档生成中</span><span v-if="structureCount">另含 {{ structureCount }} 项结构调整</span><span v-if="active" class="candidate-status" :class="{ generating: active.generating }">{{ active.generating ? '生成中' : active.reason === '已采用' ? '已采用，已生效' : '尚未采用，未生效' }}{{ multiple ? ' · 请选择候选版本' : '' }}</span></div></header>
-    <a-alert v-if="errorText" type="error" show-icon :message="errorText" />
+    <a-alert v-if="errorText || indexError" type="error" show-icon :message="indexError || errorText"><template #action><a-button size="small" :loading="retrying" :disabled="loading || indexLoading || locked || actionsBusy" @click="retryRead">重新读取</a-button></template></a-alert>
     <a-alert v-if="outcome" :type="errorText ? 'warning' : 'success'" show-icon :message="outcome" />
-    <a-spin v-if="loading && !active" class="updates-loading" />
+    <a-spin v-if="(loading || indexLoading) && !active" class="updates-loading" />
     <div v-else class="updates-layout" :class="{ 'single-file': !rows.length || scopeIsFile && rows.length === 1 }">
       <aside v-if="rows.length && (!scopeIsFile || rows.length !== 1)" class="update-list" aria-label="待确认更新清单">
         <label v-for="row in rows" :key="row.id" class="update-row" :class="{ selected: activeId === row.id }"><input type="checkbox" :aria-label="`采用 ${row.title} · ${row.source} · ${row.createdAt}`" :checked="selected.includes(row.id)" :disabled="!canWrite || locked || !row.canApply" @change="toggle(row, ($event.target as HTMLInputElement).checked)"><button type="button" :disabled="locked" @click="selectRow(row)"><strong>{{ row.title }}</strong><small>{{ row.source }} · {{ row.createdAt }} · {{ row.generating ? '生成中' : row.structure ? row.body ? '正文与结构调整' : '结构调整' : '尚未采用' }}</small><span v-if="row.reason" class="row-reason" :class="{ generating: row.generating }">{{ row.reason }}</span></button></label>
@@ -350,7 +365,8 @@ onBeforeUnmount(() => { epoch++; controller.abort(); });
         <KnowledgeBuildPreview v-if="activeRun && (!activeRun.active || activeReviewActivity || active?.revisionId && !active.generating)" :key="active?.id ?? activeRun.id" ref="buildRef" embedded :recovery-only="!active" :workspace-id="workspaceId" :context="context" :run="activeRun" :runs="runs" :nodes="nodes" :supplied-preview="previews.get(activeRun.id)" :can-write="canWrite" :actions-busy="locked || actionsBusy" :can-start-task="formalNodes.some(node => node.id === active?.nodeId)" :scope-node-id="active?.nodeId" :focus="activeFocus" @busy="childLock" @changed="receiveRun" @open-file="emit('openFile', $event)" @review="emit('review', $event)" @resume-review="emit('resumeReview', $event)" @repair="emit('repair', $event)" @repair-issue="(report, issue) => emit('repairIssue', report, issue)" @return-to-generation="(report, runId) => emit('returnToGeneration', report, runId)" @error="(cause, context) => fail(cause, context)" />
         <KnowledgeChangeInbox v-else-if="active?.changeId" :key="active.changeId" ref="changeRef" embedded :workspace-id="workspaceId" :context="context" :can-write="canWrite" :change-id="active.changeId" @recheck="emit('recheck', $event)" @selected="validateChange" @changed="emit('changed')" />
         <div v-else-if="active && activeRun?.active" class="updates-processing" role="status" aria-live="polite" aria-busy="true"><a-spin size="large" aria-hidden="true" /><span>{{ active.reason }}</span></div>
-        <p v-else class="updates-empty">{{ active?.reason || '选择具体更新查看内容与对比。多个版本不会自动取最新。' }}</p>
+        <div v-else-if="!rows.length && !errorText && !indexError" class="updates-empty"><h3>暂无待确认更新</h3><p>从项目整理或通过规格对话补充要求后，更新会出现在这里。</p></div>
+        <p v-else-if="rows.length" class="updates-empty">{{ active?.reason || '选择具体更新查看内容与对比。多个版本不会自动取最新。' }}</p>
       </div>
     </div>
     <footer v-if="rows.length"><span>已选 {{ chosen.length }} 项<span v-if="rows.some(row => row.reason)"> · 不可采用项已注明原因</span></span><div><a-button :disabled="!canWrite || !active || loading || locked" @click="dismiss">本次不采用</a-button><a-button v-if="scopeIsFile" type="primary" :disabled="!canWrite || !active?.canApply || loading || locked" @click="active && applyRows([active])">采用此版本</a-button><a-button v-else type="primary" :disabled="!canWrite || !chosen.length || loading || locked" :loading="saving" @click="applyRows(chosen)">采用所选内容</a-button></div></footer>
@@ -375,6 +391,7 @@ onBeforeUnmount(() => { epoch++; controller.abort(); });
 .updates-heading .candidate-status.generating, .row-reason.generating { color: var(--app-accent); }
 .updates-processing { display: flex; flex-direction: column; align-items: center; gap: 16px; margin: auto; padding: 24px; color: var(--app-text); font-size: 16px; font-weight: 500; line-height: 1.6; text-align: center; }
 .updates-empty { margin: auto; padding: 20px; color: var(--app-muted); font-size: 12px; line-height: 1.7; }.updates-loading { margin: auto; }
+.updates-empty h3 { color: var(--app-text); margin: 0 0 8px; font-size: 16px; }.updates-empty p { margin: 0; }
 footer { justify-content: space-between; border-top: 1px solid var(--app-divider); border-bottom: 0; }footer > div { display: flex; flex-wrap: wrap; gap: 8px; }
 @media (max-width: 640px) { .updates-heading > div { flex-basis: 100%; gap: 4px 8px; }.updates-heading strong { white-space: nowrap; }.updates-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(100px, 30%) minmax(0, 1fr); }.updates-layout.single-file { grid-template-rows: minmax(0, 1fr); }.update-list { border-right: 0; border-bottom: 1px solid var(--app-divider); } }
 </style>

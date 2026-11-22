@@ -1766,7 +1766,7 @@ async function toggleKnowledgeEnabled(): Promise<void> {
     if (!result.ok) throw createApiResultError(result);
     if (workspaceId !== props.workspaceId || threadId !== props.threadId) return;
     if (!result.data.initialized) {
-      message.info("当前项目尚未初始化规格库，请先进入顶部“规格库”一键生成");
+      message.info("当前项目尚未初始化规格库，请先进入“规格库”点击“完善全项目”");
       return;
     }
     patchThreadPrefs({ knowledgeEnabled: true }, { immediateSave: true });

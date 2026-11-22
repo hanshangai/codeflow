@@ -5,7 +5,7 @@ import type {
   KnowledgeGenerationRunView, KnowledgeConversationSummary, KnowledgeAssetDocument, KnowledgeReviewIssue, KnowledgeReviewReportView, KnowledgePendingChangeNode, ThreadId, ThreadSummary, WorkspaceId,
 } from "@codeflowai/shared";
 import { message, Modal } from "ant-design-vue";
-import { FileTextOutlined, FolderOutlined, RightOutlined, UploadOutlined } from "@ant-design/icons-vue";
+import { FileTextOutlined, FolderOutlined, RightOutlined, UploadOutlined, QuestionCircleOutlined, EllipsisOutlined, DownOutlined } from "@ant-design/icons-vue";
 import dayjs from "dayjs";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter, type LocationQueryRaw } from "vue-router";
@@ -107,7 +107,7 @@ const pendingBuildIds = ref<string[] | null>(null);
 type KnowledgeBuildPrefs = { engine: EngineType; model: string | null; effort: string | null };
 const KNOWLEDGE_BUILD_PREFS_KEY = "codeflow:knowledge-build-prefs";
 
-/** 构建设置按工作区持久化：一键生成不打开设置弹窗时也要沿用上次选的引擎与模型。 */
+/** 构建设置按工作区持久化：直接完善时沿用上次选的引擎与模型。 */
 function readKnowledgeBuildPrefs(workspaceId: string): KnowledgeBuildPrefs | null {
   if (!workspaceId || typeof window === "undefined") return null;
   const parsed = JSON.parse(window.localStorage.getItem(`${KNOWLEDGE_BUILD_PREFS_KEY}:${workspaceId}`) ?? "null") as Partial<KnowledgeBuildPrefs> | null;
@@ -116,7 +116,7 @@ function readKnowledgeBuildPrefs(workspaceId: string): KnowledgeBuildPrefs | nul
   return { engine: parsed.engine, model: parsed.model ?? null, effort: parsed.effort ?? null };
 }
 
-/** 记住本次构建设置，供后续一键生成直接沿用。 */
+/** 记住本次构建设置，供后续完善规格直接沿用。 */
 function writeKnowledgeBuildPrefs(workspaceId: string, prefs: KnowledgeBuildPrefs): void {
   if (!workspaceId || typeof window === "undefined") return;
   window.localStorage.setItem(`${KNOWLEDGE_BUILD_PREFS_KEY}:${workspaceId}`, JSON.stringify(prefs));
@@ -164,7 +164,7 @@ const documentReadError = ref<{ message: string; revisionId: string | null } | n
 const snapshotStatesError = ref<string | null>(null);
 const busy = ref(false);
 const errorText = ref<string | null>(null);
-const errorDiagnostics = ref<{ code: string; requestId: string | null; operation: string | null; rootCause: string | null } | null>(null);
+const errorDiagnostics = ref<{ code: string; source: string; requestId: string | null; operation: string | null; rootCause: string | null } | null>(null);
 const treeOpen = ref(true);
 const assistantOpen = ref(false);
 const sessionMenuOpen = ref(false);
@@ -267,6 +267,8 @@ const snapshotStatesReady = computed(() => {
 const visibleWorkTree = computed(() => knowledgeLibraryTree(snapshot.value?.tree.nodes ?? [], snapshot.value?.states ?? [], taskList.value, pendingChangeNodes.value));
 const visibleTreeNodes = computed(() => visibleWorkTree.value.nodes);
 const nodeMap = computed(() => new Map(visibleTreeNodes.value.map(item => [item.id, item])));
+/** 生成范围只接受正式树节点，待采用候选保留阅读和原任务修订入口。 */
+const formalNodeIds = computed(() => new Set(snapshot.value?.tree.nodes.filter(item => !item.archived).map(item => item.id) ?? []));
 const selectedNode = computed(() => selectedId.value ? nodeMap.value.get(selectedId.value) ?? null : null);
 const readingNodeId = computed(() => selectedId.value);
 const node = computed(() => readingNodeId.value ? nodeMap.value.get(readingNodeId.value) ?? null : null);
@@ -575,7 +577,7 @@ function reportError(error: unknown, code: string, extras: Record<string, unknow
   const requestId = String(apiDetails?.requestId ?? (error && typeof error === "object" && "requestId" in error ? (error as { requestId?: unknown }).requestId : "") ?? "").trim() || null;
   const operation = String(apiDetails?.operation ?? "").trim() || null;
   const rootCause = String(apiDetails?.rootCause ?? "").trim() || null;
-  if (!options.background) errorDiagnostics.value = { code: isApiResultError(error) ? error.code : code, requestId, operation, rootCause };
+  if (!options.background) errorDiagnostics.value = { code: isApiResultError(error) ? error.code : code, source: typeof extras.operation === "string" ? extras.operation : code, requestId, operation, rootCause };
   console.error("[knowledge-page]", { code, workspaceId: workspaceId.value, nodeId: selectedId.value,
     requestId, runId: activeRun.value?.id ?? null, threadId: assistantThreadId.value, rootCause: rootCause || text, ...extras });
   return requestId ? `${text}（请求 ID：${requestId}）` : text;
@@ -968,6 +970,13 @@ async function retryOverview(): Promise<void> {
   await refreshSnapshotStates(workspaceId.value, scopeEpoch, snapshot.value?.treeHash ?? null);
   await refreshRuns();
 }
+/** 重读成功后按入口和诊断身份清除旧读取错误，不覆盖期间出现的其他错误。 */
+async function retryUpdatesIndex(): Promise<void> {
+  const previous = errorDiagnostics.value;
+  await restoreRunsInBackground(workspaceId.value, scopeEpoch);
+  if (!resultsLoadError.value && previous && errorDiagnostics.value === previous
+    && ["updates.read", "KNOWLEDGE_RUN_INITIAL_LOAD_FAILED", "KNOWLEDGE_RUN_REFRESH_FAILED"].includes(previous.source)) dismissError();
+}
 
 /** 未保存编辑离开时提供保存、放弃和继续编辑，写入失败不会继续导航。 */
 async function guardEdits(): Promise<boolean> {
@@ -991,6 +1000,7 @@ async function setContentView(value: "node" | "sources" | "review"): Promise<voi
 async function openUpdates(scopeNodeId: string | null = selectedId.value): Promise<boolean> {
   const scope = workspaceId.value, epoch = scopeEpoch;
   if (!await guardEdits() || !isCurrent(epoch, scope)) return false;
+  const keepDiscussion = showProjectConversation.value;
   const query: LocationQueryRaw = { ...route.query, view: "results" };
   delete query.changeId; delete query.executionThreadId;
   try {
@@ -1001,10 +1011,16 @@ async function openUpdates(scopeNodeId: string | null = selectedId.value): Promi
   } catch (error) { errorText.value = reportError(error, "KNOWLEDGE_UPDATES_ROUTE_FAILED"); return false; }
   if (!isCurrent(epoch, scope)) return false;
   closeExecutionSession();
+  showProjectConversation.value = keepDiscussion;
   overviewOpen.value = false;
   updatesTarget.value = { scopeNodeId }; selectedChangeId.value = null;
-  if (narrowScreen.value) { treeOpen.value = false; assistantOpen.value = false; }
+  if (narrowScreen.value) { treeOpen.value = false; if (!keepDiscussion) assistantOpen.value = false; }
   return true;
+}
+
+/** 更新列表确认读取成功且无候选时收起空文件会话；主动项目讨论与运行中任务保留。 */
+function handleUpdatesEmpty(empty: boolean): void {
+  if (empty && showUpdates.value && !updatesBusy.value && !busy.value && !showProjectConversation.value && !displayedExecutionSession.value && !executionSessionLoading.value && !requestedExecutionThreadId.value && !executionThreadRunning.value && !executionRunActive.value) assistantOpen.value = false;
 }
 
 /** 返回正式内容，空文件保留可见占位，不自动再次打开候选。 */
@@ -1716,9 +1732,14 @@ async function saveBuildSettings(): Promise<void> {
   pendingBuildIds.value = null; batchOpen.value = false; buildSettingsMode.value = false;
   if (ids) await startBuild(ids);
 }
-/** 一次点击串联价值筛选、候选目录、正文生成和复检，正式内容最后采用。 */
+/** 先校验正式选区再创建任务；串联生成与复检，正式内容最后采用。 */
 async function startBuild(ids: string[] = []): Promise<void> {
   if (!canWrite.value || !snapshot.value || buildStarting.value || busy.value || updatesBusy.value || binding.value || assistantThreadId.value && !bindingReady.value || taskList.value.some(run => run.active && run.mode === "build")) return;
+  const unavailable = ids.filter(id => !formalNodeIds.value.has(id));
+  if (unavailable.length) {
+    errorText.value = reportError(new Error("所选内容尚未采用或已不在正式规格库中，请先核对采用；修订候选请打开原工作会话。"), "KNOWLEDGE_BUILD_SCOPE_UNAVAILABLE", { nodeIds: unavailable });
+    return;
+  }
   const scope = workspaceId.value, epoch = scopeEpoch;
   const treeHash = snapshot.value.treeHash, selectedNodeIds = [...ids];
   const execution = { ...knowledgeModelPrefs.value };
@@ -1786,7 +1807,7 @@ async function resetPendingGeneration(kind: "build" | "batch"): Promise<void> {
   } catch (error) { if (isCurrent(epoch, scope)) errorText.value = reportError(error, "KNOWLEDGE_GENERATION_RECOVERY_RESET_FAILED"); }
   finally { if (isCurrent(epoch, scope)) busy.value = false; }
 }
-/** 先停止所属任务再结束协作，保留知识结果和其他会话历史。 */
+/** 先停止所属任务再结束对话，保留知识结果和其他会话历史。 */
 async function disconnectConversation(): Promise<void> {
   if (!assistantThreadId.value || binding.value) return;
   const id = assistantThreadId.value, scope = workspaceId.value, epoch = scopeEpoch;
@@ -1800,12 +1821,12 @@ async function disconnectConversation(): Promise<void> {
     assistantThreadId.value = null; boundNodeId.value = null; bindingReady.value = false; bindingError.value = null; sessionMenuOpen.value = false;
     activeRun.value = null; rememberConversation(null);
     await syncConversationRoute(null);
-    message.success("已结束规格协作，可以选择历史会话继续");
+    message.success("已结束规格对话，可以选择历史会话继续");
   } catch (error) { if (isCurrent(epoch, scope)) bindingError.value = reportError(error, "KNOWLEDGE_CONVERSATION_END_FAILED"); }
   finally { if (isCurrent(epoch, scope)) binding.value = false; }
 }
-/** 高级任务复用选区和模型控件，确认前不建立或切换知识会话。 */
-async function openBatch(ids = checkedIds.value.length ? checkedIds.value : selectedId.value ? [selectedId.value] : snapshot.value?.tree.nodes.filter(n => n.parentId === null && !n.archived).map(n => n.id) ?? [], includeDescendants = true, mode: "batch" | "review" = "batch"): Promise<void> {
+/** 全局入口按勾选或全项目初始化，文件入口显式传入范围；确认前不切换会话。 */
+async function openBatch(ids = checkedIds.value.length ? checkedIds.value : snapshot.value?.tree.nodes.filter(n => n.parentId === null && !n.archived).map(n => n.id) ?? [], includeDescendants = true, mode: "batch" | "review" = "batch"): Promise<void> {
   if (updatesBusy.value || executionThreadRunning.value) return;
   batchRevisionRunId.value = null;
   if (pendingBatch.value) {
@@ -1888,7 +1909,7 @@ async function repairIssue(report: KnowledgeReviewReportView, issue: KnowledgeRe
     .flatMap(run => run.items)
     .find(candidate => candidate.nodeId === report.nodeId && candidate.revisionId === report.revisionId && candidate.executionThreadId);
   if (!item?.executionThreadId) {
-    message.info("找不到这份知识对应的工作会话，请通过规格协作继续讨论");
+    message.info("找不到这份知识对应的工作会话，请通过规格对话继续讨论");
     return;
   }
   const prompt = [
@@ -1910,7 +1931,7 @@ async function returnToGeneration(report: KnowledgeReviewReportView, runId?: str
     .flatMap(run => run.items)
     .find(candidate => candidate.nodeId === report.nodeId && candidate.revisionId === report.revisionId && candidate.executionThreadId);
   if (!item?.executionThreadId) {
-    message.info("找不到这份知识对应的工作会话，请通过规格协作继续讨论");
+    message.info("找不到这份知识对应的工作会话，请通过规格对话继续讨论");
     return;
   }
   const issueText = report.issues.map((issue, index) => `${index + 1}. ${issue.title}：${issue.detail}\n修改建议：${issue.suggestion}`).join("\n\n");
@@ -1994,7 +2015,7 @@ async function resumeGeneration(run: KnowledgeGenerationRunView, retryFailed = f
   } catch (error) { if (isCurrent(epoch, scope)) errorText.value = reportError(error, retryFailed ? "KNOWLEDGE_BATCH_RETRY_FAILED" : "KNOWLEDGE_RUN_RESUME_FAILED", { runId: run.id }); }
   finally { if (flight === knowledgeActionFlight && isCurrent(epoch, scope)) busy.value = false; }
 }
-/** 主页面停止指定任务；失败返回明确结果，阻止结束协作继续执行。 */
+/** 主页面停止指定任务；失败返回明确结果，阻止结束对话继续执行。 */
 async function stopGeneration(targetRun: KnowledgeGenerationRunView | null = activeRun.value): Promise<boolean> {
   if (!canWrite.value || !targetRun || busy.value) return false;
   const scope = workspaceId.value, epoch = scopeEpoch;
@@ -2283,20 +2304,24 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
   <div class="knowledge-page">
     <header class="page-header">
       <div class="page-nav">
-        <a-tag :title="workspaceId" aria-label="规格库所属项目">{{ workspaceName }}</a-tag>
+        <strong>规格库</strong>
+        <a-tooltip title="规格库的价值、原则与使用方法"><a-button type="text" shape="circle" aria-label="规格库说明" @click="policyOpen = true"><template #icon><QuestionCircleOutlined /></template></a-button></a-tooltip>
       </div>
       <div class="knowledge-search" role="search" data-testid="knowledge-search">
-        <a-input-search v-model:value="searchQuery" size="middle" placeholder="搜索规格与文档" enter-button="搜索" :loading="searchLoading" @search="runKnowledgeSearch" />
+        <a-input-search v-model:value="searchQuery" size="middle" placeholder="搜索规格与文档" :loading="searchLoading" @search="runKnowledgeSearch" />
       </div>
       <div class="header-actions">
         <a-tag v-if="snapshot && !canWrite">只读</a-tag>
         <a-button :size="narrowScreen ? 'small' : 'middle'" :disabled="!canWrite || busy || updatesBusy || binding || conversationLoading" @click="openSpecificationConversation">规格对话</a-button>
-        <a-button :size="narrowScreen ? 'small' : 'middle'" :disabled="busy || updatesBusy" @click="openUpdates(null)">待确认更新 <span v-if="visibleWorkTree.targetCount">{{ visibleWorkTree.targetCount }}</span></a-button>
-        <a-button :size="narrowScreen ? 'small' : 'middle'" type="primary" :loading="buildStarting" :disabled="!canWrite || busy || updatesBusy || !snapshotStatesReady || taskList.some(run => run.active)" @click="startBuild(checkedIds.length ? checkedIds : [])">完善规格</a-button>
-        <a-dropdown :trigger="['click']"><a-button :size="narrowScreen ? 'small' : 'middle'" aria-label="规格库更多操作">更多</a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || updatesBusy" @click="openImport(importDirectory)">导入文档</a-menu-item><a-menu-item @click="changeHistoryOpen = true">修改建议记录</a-menu-item><a-menu-item @click="policyOpen = true">管理策略</a-menu-item><a-menu-item :disabled="!canWrite || !nodeCount" @click="updateSettingsOpen = true">定时更新</a-menu-item><a-menu-divider /><a-menu-item :disabled="!canWrite || busy || updatesBusy || !nodeCount" @click="openBatch()">高级生成</a-menu-item><a-menu-item :disabled="!canWrite || busy || updatesBusy || !nodeCount" @click="openReview()">复检所选知识</a-menu-item></a-menu></template></a-dropdown>
+        <a-dropdown-button :title="`${checkedIds.length ? `所选 ${checkedIds.length} 项及其后代` : '整个项目'}：立即根据代码和资料生成更新草稿，确认采用后生效。`" type="primary" :trigger="['click']" :size="narrowScreen ? 'small' : 'middle'" :loading="buildStarting" :disabled="!canWrite || busy || updatesBusy || !snapshotStatesReady || taskList.some(run => run.active)" @click="startBuild(checkedIds.length ? checkedIds : [])">
+          {{ checkedIds.length ? `完善所选 · ${checkedIds.length}项` : '完善全项目' }}
+          <template #icon><DownOutlined /></template>
+          <template #overlay><a-menu><a-menu-item @click="openBatch()">自定义范围与设置</a-menu-item></a-menu></template>
+        </a-dropdown-button>
+        <a-dropdown :trigger="['click']"><a-button :size="narrowScreen ? 'small' : 'middle'" type="text" shape="circle" aria-label="规格库更多操作"><template #icon><EllipsisOutlined /></template></a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || updatesBusy" @click="openImport(importDirectory)">导入文档</a-menu-item><a-menu-item @click="changeHistoryOpen = true">修改建议记录</a-menu-item><a-menu-item :disabled="!canWrite || !nodeCount" @click="updateSettingsOpen = true">定时更新</a-menu-item><a-menu-divider /><a-menu-item :disabled="!canWrite || busy || updatesBusy || !nodeCount" @click="openReview()">{{ checkedIds.length ? `复检所选 · ${checkedIds.length}项` : '复检全项目' }}</a-menu-item></a-menu></template></a-dropdown>
       </div>
     </header>
-    <nav class="mobile-panels" aria-label="规格库面板"><button type="button" aria-label="规格库目录" :aria-expanded="treeOpen" @click="openMobilePanel('tree')">{{ treeTitle }} <span>{{ visibleTreeCount }}</span></button><button type="button" aria-label="AI 对话" :aria-expanded="assistantOpen" @click="openMobilePanel('assistant')">✦ AI 对话 <span v-if="threadRunning || activeRun?.active" class="working-indicator" /></button></nav>
+    <nav class="mobile-panels" aria-label="规格库面板"><button type="button" aria-label="规格库目录" :aria-expanded="treeOpen" @click="openMobilePanel('tree')">{{ treeTitle }} <span>{{ visibleTreeCount }}</span></button><button type="button" aria-label="会话面板" :aria-expanded="assistantOpen" @click="openMobilePanel('assistant')">✦ 会话面板 <span v-if="threadRunning || activeRun?.active" class="working-indicator" /></button></nav>
     <div v-if="errorText && errorDiagnostics?.code !== 'CLIENT_OFFLINE'" class="page-error" role="alert">
       <div class="page-error-content">
         <span>{{ errorText }}</span>
@@ -2329,12 +2354,11 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         <div class="tree-head">
           <div class="panel-heading">
             <h2 :title="`${treeTitle} · ${visibleTreeCount} 个节点`">{{ treeTitle }} <small class="node-count">{{ visibleTreeCount }} 个节点</small></h2>
-            <section class="tree-batch-actions" aria-label="文档生成" data-testid="tree-batch-actions">
-              <a-button class="tree-batch-button tree-batch-button-primary" type="primary" size="small" :aria-label="checkedIds.length ? `生成选中 ${checkedIds.length} 项` : '一键生成'" :disabled="!canWrite || busy || buildStarting || taskList.some(run => run.active) || !snapshotStatesReady" @click="startBuild(checkedIds.length ? checkedIds : [])">{{ buildStarting || taskList.some(run => run.active) ? '生成中' : checkedIds.length ? '生成所选知识' : '一键生成' }}</a-button>
-            </section>
           </div>
+          <div class="tree-workspace" :title="workspaceId" aria-label="规格库所属项目">{{ workspaceName }}</div>
         </div>
         <a-button class="overview-link" type="text" :aria-pressed="overviewOpen" :disabled="busy || updatesBusy" @click="openOverview">项目概览</a-button>
+        <a-button class="overview-link" type="text" :aria-pressed="showUpdates" :disabled="busy || updatesBusy" @click="openUpdates(null)">待确认更新 <a-badge :count="visibleWorkTree.targetCount" :show-zero="true" :overflow-count="99" color="var(--app-muted)" /></a-button>
         <a-skeleton v-if="treeLoading" active :paragraph="{ rows: 7 }" />
         <KnowledgeAssetTree v-else :nodes="visibleTreeNodes" :states="snapshot?.states ?? []" :selected-id="selectedId" :workspace-key="treeStorageKey()" :legacy-workspace-key="conversationStorageKey()" :can-write="canWrite && !busy && !updatesBusy" :busy="busy || updatesBusy" :counts="visibleWorkTree.documentCounts" :structure-counts="visibleWorkTree.structureCounts" :generating-counts="visibleWorkTree.generatingCounts" :new-node-ids="visibleWorkTree.newIds" :empty-text="treeEmptyText" :selection-reset-key="selectionResetKey" @select="selectTreeNode" @checked-change="checkedIds = $event" @generate="startBuild([$event])" @review="openReview([$event], true)" @updates="openUpdates($event)" />
         <footer aria-label="规格库统计"><a-button v-if="snapshotStatesError" type="text" size="small" :disabled="resultsLoading || Boolean(activeRun?.active)" :title="snapshotStatesError" @click="refreshSnapshotStates(workspaceId, scopeEpoch, snapshot?.treeHash ?? null)">状态读取失败，重试</a-button><a-spin v-else-if="snapshot && !snapshotStatesReady" size="small" /><template v-else><span><i class="legend-dot ready" />已有 {{ readyCount }}</span><span><i class="legend-dot" />待生成 {{ emptyCount }}</span><span v-if="visibleWorkTree.generatingCount"><i class="legend-dot generating" />生成中 {{ visibleWorkTree.generatingCount }}</span><span><i class="legend-dot draft" />待确认 {{ draftCount }}</span></template></footer>
@@ -2352,8 +2376,8 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           <section class="reading-document">
         <!-- 采用至结果定位完成前持续加载，保留组件执行请求和失败恢复。 -->
         <div v-if="showUpdates && updatesBusy" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
-        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :scope-node-id="updatesTarget?.scopeNodeId ?? (updatesTarget ? null : readingNodeId)" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :after-apply="afterApply" @focus="rememberUpdateFocus" @preview="updatePreview = $event" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(activeRun?.active) || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
-        <KnowledgeOverview v-else-if="overviewOpen" :snapshot="snapshot" :runs="taskList" :changes="pendingChangeNodes" :loading="loading || Boolean(snapshot && !snapshotStatesReady && !snapshotStatesError)" :state-error="snapshotStatesError" :run-error="resultsLoadError" :can-write="canWrite" :busy="busy || updatesBusy || buildStarting || binding || conversationLoading || taskList.some(run => run.active)" @improve="startBuild([])" @discuss="openSpecificationConversation" @updates="openUpdates(null)" @select="selectTreeNode" @retry="retryOverview" />
+        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesTarget?.scopeNodeId ?? (updatesTarget ? null : readingNodeId)" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @focus="rememberUpdateFocus" @preview="updatePreview = $event" @empty="handleUpdatesEmpty" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(activeRun?.active) || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
+        <KnowledgeOverview v-else-if="overviewOpen" :snapshot="snapshot" :runs="taskList" :changes="pendingChangeNodes" :loading="loading || Boolean(snapshot && !snapshotStatesReady && !snapshotStatesError)" :state-error="snapshotStatesError" :run-error="resultsLoadError" :can-write="canWrite" :busy="busy || updatesBusy || buildStarting || binding || conversationLoading || taskList.some(run => run.active)" @improve="startBuild(checkedIds.length ? checkedIds : [])" @discuss="openSpecificationConversation" @updates="openUpdates(null)" @select="selectTreeNode" @retry="retryOverview" @policy="policyOpen = true" />
         <!-- 尚未确定正式正文或候选预览时保持加载，避免先渲染普通正文页。 -->
         <div v-else-if="documentReadError" class="empty" role="alert"><h3>文档读取失败</h3><p>{{ documentReadError.message }}</p><a-button :disabled="busy || updatesBusy" @click="retryReadDocument">重新读取文档</a-button></div>
         <div v-else-if="readingPending" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
@@ -2366,7 +2390,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
                 <a-button v-if="!editing && !previewIsDraft" size="small" :disabled="!canWrite" @click="editing = true">编辑文档</a-button>
                 <template v-else-if="editing"><a-button size="small" @click="editing = false; editContent = documentText">取消</a-button><a-button size="small" type="primary" :loading="busy" :disabled="!canWrite" @click="saveManual">保存到项目</a-button></template>
               </template>
-              <a-button v-if="currentUpdatesCount" size="small" @click="openUpdates(node.id)">查看更新 {{ currentUpdatesCount }}</a-button><a-button v-if="viewTab !== 'node'" size="small" @click="setContentView('node')">返回文档</a-button><a-dropdown :trigger="['click']"><a-button size="small" :aria-label="`${node.title}更多操作`">更多</a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy" @click="startBuild([node!.id])">重新生成此文档</a-menu-item><a-menu-item :disabled="!canWrite || busy" @click="openReview([node!.id], false)">复检此文档</a-menu-item><a-menu-item @click="setContentView('sources')">来源依据</a-menu-item><a-menu-item @click="setContentView('review')">复检报告</a-menu-item></a-menu></template></a-dropdown>
+              <a-button v-if="currentUpdatesCount" size="small" @click="openUpdates(node.id)">查看更新 {{ currentUpdatesCount }}</a-button><a-button v-if="viewTab !== 'node'" size="small" @click="setContentView('node')">返回文档</a-button><a-dropdown :trigger="['click']"><a-button size="small" :aria-label="`${node.title}更多操作`">更多</a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="startBuild([node!.id])">重新生成此文档</a-menu-item><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="openReview([node!.id], false)">复检此文档</a-menu-item><a-menu-item @click="setContentView('sources')">来源依据</a-menu-item><a-menu-item @click="setContentView('review')">复检报告</a-menu-item></a-menu></template></a-dropdown>
             </div>
           </div>
           <div class="content" :class="{ 'editing-content': editing && viewTab === 'node', 'document-loading': documentLoading }">
@@ -2408,13 +2432,13 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         <div v-else class="empty page-empty">
           <span class="empty-symbol" aria-hidden="true">✦</span>
           <h2>{{ selectedNode ? '此目录暂无内容' : '建立规格知识库' }}</h2>
-          <p>先明确规格约束，再实现与验证。点击“一键生成”整理规格及支撑文档，确认采用后，在研发会话中开启 Spec 使用。</p>
+          <p>先明确规格约束，再实现与验证。点击“完善全项目”整理规格及支撑文档，确认采用后，在研发会话中开启 Spec 使用。</p>
         </div>
           </section>
         </div>
       </main>
 
-      <button v-if="!assistantOpen" class="collapsed-rail assistant-rail" type="button" aria-label="展开 AI 对话" @click="assistantOpen = true">‹ AI 对话</button>
+      <button v-if="!assistantOpen" class="collapsed-rail assistant-rail" type="button" aria-label="展开会话面板" @click="assistantOpen = true">‹ 会话面板</button>
       <div ref="assistantContainer" class="assistant-container" :class="{ open: assistantOpen }">
         <DesktopPanelResizeHandle
           v-if="assistantOpen && !narrowScreen"
@@ -2422,7 +2446,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           :value="assistantEffectiveWidth"
           :min="assistantMinWidth"
           :max="assistantMaxWidth"
-          aria-label="调整 AI 对话宽度"
+          aria-label="调整会话面板宽度"
           data-testid="knowledge-assistant-resize-handle"
           @resize-start="startAssistantResize"
           @resize-preview="assistantPreviewWidth = $event"
@@ -2431,8 +2455,8 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         />
       <aside class="assistant" :class="{ open: assistantOpen, 'active-conversation': fileConversationMode ? displayedExecutionSession : assistantThreadId }" aria-label="AI 规格助手" data-testid="knowledge-assistant">
         <div class="assistant-head">
-          <div class="panel-heading"><div class="assistant-title"><h2 :title="fileConversationMode ? '生成、复检与修订集中在文件工作会话；切换文件自动定位对应记录。' : '项目讨论不改变已创建任务的配置。'">{{ fileConversationMode ? displayedExecutionSession ? `${displayedExecutionSession.kind} · ${displayedExecutionSession.title}` : '文件工作会话' : '✦ 规格协作' }}</h2><span v-if="bindingReady && !fileConversationMode" class="assistant-scope" :title="boundScopeTitle">{{ boundScopeTitle }}</span></div><div class="assistant-heading-actions">
-            <a-button v-if="fileConversationMode" size="small" @click="showProjectConversation = true">项目讨论</a-button>
+          <div class="panel-heading"><div class="assistant-title"><h2 :title="fileConversationMode ? '生成、复检与修订集中在文件工作会话；切换文件自动定位对应记录。' : '项目讨论不改变已创建任务的配置。'">{{ fileConversationMode ? displayedExecutionSession ? `${displayedExecutionSession.kind} · ${displayedExecutionSession.title}` : '文件工作会话' : '✦ 规格对话' }}</h2><span v-if="bindingReady && !fileConversationMode" class="assistant-scope" :title="boundScopeTitle">{{ boundScopeTitle }}</span></div><div class="assistant-heading-actions">
+            <a-button v-if="fileConversationMode" size="small" @click="openSpecificationConversation">规格对话</a-button>
             <a-button v-else-if="showProjectConversation" size="small" @click="showProjectConversation = false">文件会话</a-button>
             <a-popover v-if="assistantThreadId && !fileConversationMode" v-model:open="sessionMenuOpen" trigger="click" placement="bottomRight" :arrow="false">
               <template #content>
@@ -2446,8 +2470,8 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
               </template>
               <a-button size="small" aria-label="管理规格会话" :disabled="binding">会话</a-button>
             </a-popover>
-            <a-button v-if="assistantThreadId && !fileConversationMode" size="small" :loading="binding" :disabled="!canWrite" @click="disconnectConversation">结束协作</a-button>
-            <a-button type="text" size="small" aria-label="收起" title="收起 AI 对话" @click="assistantOpen = false"><template #icon><RightOutlined aria-hidden="true" /></template></a-button>
+            <a-button v-if="assistantThreadId && !fileConversationMode" size="small" :loading="binding" :disabled="!canWrite" @click="disconnectConversation">结束对话</a-button>
+            <a-button type="text" size="small" aria-label="收起" title="收起会话面板" @click="assistantOpen = false"><template #icon><RightOutlined aria-hidden="true" /></template></a-button>
           </div></div>
         </div>
 
@@ -2491,14 +2515,14 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
     <a-modal v-model:open="batchOpen" :title="buildSettingsMode ? '规格库构建设置' : batchMode === 'review' ? '复检已有文档' : batchRepairReports.length ? '根据报告生成修订版' : '确认批量生成'" :z-index="1100" :closable="!busy && !binding" :mask-closable="!busy && !binding" :keyboard="!busy && !binding" :footer="null" width="640px" :style="{ top: '24px' }">
       <div class="batch-scroll">
       <p v-if="buildSettingsMode" class="batch-explanation">目标项目：{{ workspaceName }}</p>
-      <p class="batch-explanation">{{ buildSettingsMode ? '保存后同步规格协作及后续构建配置；切换引擎会新建会话并保留草稿。已创建任务保留原配置。默认自动复检最多 2 轮，结果统一预览后采用。' : '本次任务在后台执行，无需打开或切换规格会话。' }}</p>
+      <p class="batch-explanation">{{ buildSettingsMode ? '保存后同步规格对话及后续构建配置；切换引擎会新建会话并保留草稿。已创建任务保留原配置。默认自动复检最多 2 轮，结果统一预览后采用。' : '本次任务在后台执行，无需打开或切换规格会话。' }}</p>
       <details class="batch-advanced" :open="buildSettingsMode || batchMode === 'review'"><summary>引擎、模型与复检设置</summary>
       <section class="batch-model-settings" aria-label="本批次引擎配置">
         <div class="batch-model-heading"><strong>执行引擎</strong></div>
         <label class="batch-engine-field"><span>引擎</span><select v-model="batchEngine" aria-label="批量生成引擎" :disabled="batchLocked" @change="changeBatchEngineEvent">
           <option v-for="option in batchEngineOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
         </select></label>
-        <p class="batch-model-note">{{ buildSettingsMode ? '当前规格会话与后续一键生成共用此配置。切换引擎会保留旧会话历史。' : '引擎、模型和思考强度只作用于本次批量任务，不会修改当前规格会话的配置。' }}</p>
+        <p class="batch-model-note">{{ buildSettingsMode ? '当前规格会话与后续完善规格共用此配置。切换引擎会保留旧会话历史。' : '引擎、模型和思考强度只作用于本次批量任务，不会修改当前规格会话的配置。' }}</p>
       </section>
       <section v-if="batchHasGeneration" class="batch-model-settings" aria-label="本批次模型配置">
         <div class="batch-model-heading"><strong>生成配置</strong></div>
@@ -2561,7 +2585,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           <a-collapse v-if="importCategory === 'specifications'" class="import-scope" ghost expand-icon-position="end"><a-collapse-panel key="scope" :header="`适用范围：${importAppliesTo.trim() ? '指定路径' : '整个项目'}`">
             <a-textarea v-model:value="importAppliesTo" :disabled="busy" :rows="2" aria-label="规格适用范围" placeholder="例如 apps/web，每行一个路径" />
             <p class="import-hint">填写项目相对文件或目录，留空适用于整个项目。</p>
-            <p class="import-hint">包含多个专题的综合规则文件，建议通过一键生成提取到对应规格文档。</p>
+            <p class="import-hint">包含多个专题的综合规则文件，建议通过完善规格提取到对应规格文档。</p>
           </a-collapse-panel></a-collapse>
           <div class="import-destination"><span>导入位置</span><strong>{{ importDestination.title }}</strong></div>
           <p class="import-description">导入后直接引用原文，按章节检索；原文更新时读取最新内容。</p>
@@ -2589,10 +2613,10 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 
 <style scoped>
 .knowledge-page { position: relative; height: 100%; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--app-bg); color: var(--app-text); }
-.page-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--app-divider); min-height: 42px; box-sizing: border-box; }
+.page-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 16px 20px; border-bottom: 1px solid var(--app-divider); min-height: 64px; box-sizing: border-box; }
 .node-count { font-size: 11px; color: var(--app-muted); }
-.header-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding-block: 4px; }
-.knowledge-search { display: flex; align-items: center; gap: 6px; min-width: 260px; max-width: 460px; flex: 1 1 320px; }
+.header-actions { min-width: 0; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.knowledge-search { display: flex; align-items: center; gap: 6px; min-width: 180px; max-width: 480px; flex: 1 1 360px; }
 .knowledge-search :deep(.ant-input-search) { min-width: 0; flex: 1; }
 .search-results-popover { position: absolute; z-index: 20; top: 60px; left: 50%; width: min(680px, calc(100% - 44px)); max-height: min(58vh, 520px); overflow: auto; transform: translateX(-50%); padding: 10px 12px; border: 1px solid var(--app-border); border-radius: 10px; background: var(--app-panel-bg); box-shadow: var(--app-shadow); }
 .search-results-heading { display: flex; align-items: center; gap: 8px; padding: 2px 2px 8px; border-bottom: 1px solid var(--app-divider); font-size: 12px; }
@@ -2628,8 +2652,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .tree-head h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .overview-link.ant-btn { flex: 0 0 auto; margin: 0 10px 8px; text-align: left; color: var(--app-muted); }
 .overview-link[aria-pressed="true"] { color: var(--app-accent); background: var(--app-sidebar-hover-bg); }
-.tree-batch-actions { display: flex; flex: 0 0 auto; }
-.tree-batch-button.ant-btn { min-width: 0; height: 26px; min-height: 26px; padding: 2px 7px; overflow: hidden; border-radius: 5px; font-size: 11px; line-height: 20px; }
+.tree-workspace { padding: 0 12px 12px; color: var(--app-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .all-work-link { padding: 0; color: var(--app-muted); }
 .tree footer { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--app-divider); padding: 8px 12px; color: var(--app-muted); font-size: 12px; }
 .tree footer > span { display: flex; align-items: center; gap: 5px; }
@@ -2652,7 +2675,8 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .reference-status code { min-width: 0; overflow-wrap: anywhere; }
 .reference-status span { color: var(--app-muted); }
 .search-hit-preview { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
-.page-nav { display: flex; align-items: center; align-self: stretch; gap: 24px; flex: 0 0 auto; min-width: 0; background: var(--app-bg); }
+.page-nav { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; min-width: 0; background: var(--app-bg); }
+.page-nav strong { font-size: 15px; white-space: nowrap; }
 .main-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 8px 16px; border-bottom: 1px solid var(--app-divider); flex: 0 0 auto; min-width: 0; }
 .document-title { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 160px; }
 .document-title h2 { margin: 0; min-width: 0; font-size: 16px; line-height: 1.5; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2816,15 +2840,14 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
   .mobile-panels button[aria-expanded="true"] { color: var(--app-accent); background: color-mix(in srgb, var(--app-accent) 8%, transparent); }
   .mobile-panels button span { font-size: 10px; }
   .working-indicator { width: 5px; height: 5px; border-radius: 50%; background: var(--app-accent); }
-  .page-header { padding: 0 16px; gap: 10px; }
-  .knowledge-search { min-width: 220px; }
+  .page-header { padding: 12px 16px; gap: 12px; }
+  .knowledge-search { min-width: 140px; }
 }
 @media (max-width: 560px) {
   .batch-model-fields { grid-template-columns: minmax(0, 1fr); gap: 12px; }
-  .page-header { display: grid; grid-template-columns: minmax(0, 110px) minmax(0, 1fr); gap: 6px 8px; padding: 6px 12px; }
+  .page-header { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 12px; padding: 8px 12px; }
   .header-actions { grid-column: 1 / -1; padding: 0; justify-content: flex-end; }
   .page-nav { min-width: 0; }
-  .page-nav .ant-tag { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .knowledge-search { grid-column: 2; grid-row: 1; width: 100%; max-width: none; min-width: 0; }
   .search-results-popover { top: 72px; width: calc(100% - 24px); }
   .conversation-start { padding: 24px; }
@@ -2833,6 +2856,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
   .page-empty h2 { font-size: 18px; }
 }
 @media (max-height: 560px) {
+  .editing-content { padding-block: 8px; }
   .assistant.active-conversation { overflow-y: auto; }
   .assistant.active-conversation .assistant-body { flex: 1 0 260px; }
 }
