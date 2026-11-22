@@ -40,10 +40,13 @@ let disposed = false;
 const currentRows = computed(() => [
   { label: "当前版本", value: formatDesktopCurrentVersion(details.value?.current ?? null) },
 ]);
-/** 下载起按待更新目标与当前未更新部分合成对外版本，历史失败目标不参与展示。 */
+/** 两通道完成前不展示临时组合号；完成后按有效目标合成，历史失败目标不参与。 */
 const targetRows = computed(() => {
   const value = details.value;
   if (!value) return [];
+  if (updateInProgress.value && (value.bundle.result === "unknown" || value.shell.result === "unknown")) {
+    return [{ label: "新版本", value: "新版本检测中" }];
+  }
   // same/failure/restored 时宿主仍保留目标快照，不能当成待安装的新版本展示。
   const active = (result: string | null | undefined) => result === "prepared" || result === "unknown" && updateInProgress.value;
   const bundle = active(value.bundle.result) ? value.bundle.target : null;
