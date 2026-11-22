@@ -11,19 +11,11 @@ export function shouldShowDesktopLocalClientPopover(input: DesktopLocalPopoverIn
   return input.isDesktop && !input.hasActiveSession && !input.isCurrentSharedWorkspace;
 }
 
-/** 本机版本优先取桌面运行时事实，其次使用服务端下发版本。 */
-export function resolveDesktopClientVersionLabel(
-  desktopVersion: string | null | undefined,
-  serverVersion: string | null | undefined,
-): string {
-  return desktopVersion?.trim() || serverVersion?.trim() || "未知";
-}
-
-/** 本机应用版本与更新弹窗同源；旧壳缺少壳或资源版本时返回 null 由调用方回退。 */
+/** 本机应用版本与更新弹窗同源；缺少事实返回 null，不能借目标工作区Client号代填。 */
 export function resolveDesktopAppVersionLabel(details: DesktopUpdateDetails | null | undefined): string | null {
   const shellVersion = details?.current.shellVersion?.trim();
   const bundleVersion = details?.current.bundle?.version.trim();
-  if (!shellVersion || !bundleVersion) return null;
+  if (!shellVersion || !bundleVersion || shellVersion === "unknown" || bundleVersion === "unknown") return null;
   return formatDesktopVersion(shellVersion, bundleVersion);
 }
 

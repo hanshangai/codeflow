@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { formatDesktopVersion } from "@codeflowai/shared";
-import { version as desktopShellVersion } from "../../../../../desktop/package.json";
 import { getDesktopDownload, type DesktopDownloadInfo } from "../../../api/desktopDownload";
 import { wsOriginToHttpOrigin } from "../../../api/request";
 import { trackProductEvent } from "../../../analytics/analytics";
@@ -23,7 +21,8 @@ const loading = ref(false);
 const error = ref("");
 let request: AbortController | undefined;
 const downloadUrl = computed(() => info.value ? `${wsOriginToHttpOrigin(config.serverWsOrigin)}${info.value.downloadPath}` : "");
-const displayVersion = computed(() => info.value ? formatDesktopVersion(desktopShellVersion, info.value.version) : "");
+const versionLabel = computed(() => info.value?.displayVersion
+  ? `版本 ${info.value.displayVersion}` : `应用版本未标记（资源版本 ${info.value?.version ?? ""}）`);
 
 /** 服务切换或重试均作废旧响应，失败在页面明确展示并记录请求归属。 */
 async function load(): Promise<void> {
@@ -70,7 +69,7 @@ onBeforeUnmount(() => request?.abort());
         <h2>Windows</h2><p>Windows x64 · 完整安装包</p>
         <a-spin v-if="loading" tip="读取可用版本..." />
         <template v-else-if="info">
-          <p>版本 {{ displayVersion }} · {{ new Date(info.publishedAt).toLocaleDateString() }} · {{ (info.size / 1024 / 1024).toFixed(1) }} MB</p>
+          <p>{{ versionLabel }} · {{ new Date(info.publishedAt).toLocaleDateString() }} · {{ (info.size / 1024 / 1024).toFixed(1) }} MB</p>
           <a-button type="primary" size="large" :href="downloadUrl" @click="trackDownload">下载 Windows 桌面版</a-button>
         </template>
         <template v-else>

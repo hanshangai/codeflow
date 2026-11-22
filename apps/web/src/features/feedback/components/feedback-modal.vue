@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { CloseOutlined, PlusOutlined, DeleteOutlined } from "@ant-design/icons-vue";
-import type { FeedbackAttachmentInput, FeedbackType } from "@codeflowai/shared";
+import type { FeedbackAttachmentInput, FeedbackType, WorkspaceId } from "@codeflowai/shared";
 
 import { useApiContext } from "../../../composables/useApiContext";
 import { useConfigStore } from "../../../store/config";
 import { useUiStore } from "../../../store/ui";
+import { usePresenceStore } from "../../../store/presence";
+import { useWorkspacesStore } from "../../../store/workspaces";
+import { resolveWorkspaceClientInfo } from "../../../composables/useAppShell";
+import { resolveDesktopAppVersionLabel } from "../../../components/app-shell/desktopLocalClientStatus";
 import { submitFeedback } from "../../../api/feedback";
-import { subscribeDesktopFeedbackRequested, takeDesktopFeedbackRequest } from "../../../services/desktop";
+import { getDesktopUpdateCapabilities, getDesktopUpdateDetails, subscribeDesktopFeedbackRequested, takeDesktopFeedbackRequest } from "../../../services/desktop";
 import { compressImageFile } from "../../composer/useComposerAttachments";
 
 defineOptions({ name: "FeedbackModal" });
@@ -19,6 +23,8 @@ const emit = defineEmits<{ "update:open": [value: boolean] }>();
 
 const config = useConfigStore();
 const ui = useUiStore();
+const presence = usePresenceStore();
+const workspaces = useWorkspacesStore();
 const { ctx } = useApiContext();
 
 type ImageItem = FeedbackAttachmentInput & { previewUrl: string; size: number };
@@ -42,9 +48,14 @@ const contactRequired = computed(() => !isLoggedIn.value);
 const canSubmit = computed(() => content.value.trim().length >= 10 && content.value.trim().length <= 2000
   && (!contactRequired.value || Boolean(contactEmail.value.trim())) && !submitting.value);
 const contentCount = computed(() => content.value.length);
+const appVersion = ref<string | null>(null);
+/** 反馈关联的Client始终来自所选工作区；本机应用版本单独读取宿主事实。 */
 const environment = computed(() => ({
-  appVersion: config.clientVersion,
-  clientVersion: config.desktopClient?.version ?? config.clientVersion,
+  appVersion: appVersion.value,
+  clientVersion: resolveWorkspaceClientInfo({ workspaceId: config.workspaceId,
+    ownerClientId: workspaces.byId.get(config.workspaceId as WorkspaceId)?.ownerClientId,
+    hostClientId: workspaces.byId.get(config.workspaceId as WorkspaceId)?.shared?.hostClientId,
+    clients: presence.availableClients })?.version ?? null,
   platform: config.desktopClient?.platform ?? (typeof navigator !== "undefined" ? navigator.platform : null),
   mainView: ui.mainView,
   workspaceId: config.workspaceId,
@@ -114,6 +125,7 @@ function validate(): string {
   return "";
 }
 
+/** 提交前固化本机版本；旧壳明确无详情能力时不伪造，读取故障交给原提交错误入口。 */
 async function submit(): Promise<void> {
   if (submitting.value) return;
   const issue = validate();
@@ -121,13 +133,19 @@ async function submit(): Promise<void> {
   submitting.value = true;
   errorText.value = "";
   try {
-    const result = await submitFeedback(ctx.value, {
+    const requestContext = { ...ctx.value }, workspaceId = config.workspaceId;
+    const submittedEnvironment = { ...environment.value };
+    appVersion.value = config.isDesktop && getDesktopUpdateCapabilities().details
+      ? resolveDesktopAppVersionLabel(await getDesktopUpdateDetails()) : null;
+    if (config.workspaceId !== workspaceId || ctx.value.serverWsOrigin !== requestContext.serverWsOrigin
+      || ctx.value.sessionToken !== requestContext.sessionToken) throw new Error("账号、服务器或工作区已变化，请重新提交反馈");
+    const result = await submitFeedback(requestContext, {
       type: type.value,
       title: title.value.trim() || undefined,
       content: content.value.trim(),
       contactEmail: isLoggedIn.value ? contactEmail.value.trim() || undefined : contactEmail.value.trim(),
       source: activeSource.value,
-      environment: environment.value,
+      environment: { ...submittedEnvironment, appVersion: appVersion.value },
       attachments: images.value.map(({ name, mimeType, dataBase64 }) => ({ name, mimeType, dataBase64 })),
     }, isLoggedIn.value);
     ticketNo.value = result.ticketNo;

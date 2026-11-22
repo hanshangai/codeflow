@@ -62,7 +62,7 @@ export async function buildShellLauncher(input) {
   return await buildShellNativeTool(input, "launcher");
 }
 
-/** 原生壳工具共享编译与路径防护，仅接受仓内固定源码，不执行生成物。 */
+/** 原生壳工具共享编译与路径防护；数字版本补四段，展示字符串保留真实壳号。 */
 export async function buildShellNativeTool(input, kind) {
   if (process.platform !== "win32") throw new Error("DESKTOP_SHELL_BUILD_WINDOWS_REQUIRED");
   if (kind !== "launcher" && kind !== "switch") throw new Error("DESKTOP_SHELL_BUILD_TOOL_INVALID");
@@ -90,8 +90,8 @@ export async function buildShellNativeTool(input, kind) {
       '/XVIAddVersionKey /LANG=1033 "ProductName" "CodeFlow"',
       '/XVIAddVersionKey /LANG=1033 "FileDescription" "CodeFlow"',
       '/XVIAddVersionKey /LANG=1033 "LegalCopyright" "CodeFlow"',
-      `/XVIAddVersionKey /LANG=1033 "FileVersion" "${version}"`,
-      `/XVIAddVersionKey /LANG=1033 "ProductVersion" "${version}"`);
+      `/XVIAddVersionKey /LANG=1033 "FileVersion" "${input.version}"`,
+      `/XVIAddVersionKey /LANG=1033 "ProductVersion" "${input.version}"`);
   }
   await fs.mkdir(outputDir);
   if (sharedCache) await fs.mkdir(cacheDir, { recursive: true });

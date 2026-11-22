@@ -24,3 +24,12 @@ test("无发布、网络失败、错误字段和外站下载地址均明确拒�
   probe.mock.mockImplementation(async () => { throw new Error("network failed"); });
   await assert.rejects(getDesktopDownload("wss://downloads.test"), /network failed/u);
 });
+
+test("公开下载保留服务端真实展示号，缺少事实不构造壳号", async t => {
+  const probe = t.mock.method(globalThis, "fetch", async () => Response.json({ ...metadata, version: "2026.11.21.02", displayVersion: "1.13.1121.2" }));
+  assert.equal((await getDesktopDownload("wss://downloads.test")).displayVersion, "1.13.1121.2");
+  for (const displayVersion of ["", "unknown", 123, null, "2026.11.21.02"]) {
+    probe.mock.mockImplementation(async () => Response.json({ ...metadata, displayVersion }));
+    await assert.rejects(getDesktopDownload("wss://downloads.test"), /格式无效/u);
+  }
+});

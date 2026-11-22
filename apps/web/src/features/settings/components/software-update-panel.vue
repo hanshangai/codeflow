@@ -620,7 +620,7 @@ watch(() => [configStore.serverWsOrigin, configStore.sessionToken, configStore.u
       <a-button :disabled="!canLoadSoftwareStatus || installInProgress || relaySyncInProgress" :loading="loading" @click="load({ forceRefresh: true })">刷新</a-button>
       <a-tag v-if="isPrivateMode" color="blue">应用私有</a-tag>
       <span style="font-size: 12px; color: var(--app-muted)">
-        {{ isPrivateMode ? "检测应用私有 CLI 安装状态与固定版本" : "检测本机 CLI 安装状态与 npm 最新版本" }}
+        {{ isPrivateMode ? "检测应用私有 CLI 安装状态与固定版本" : "检测目标电脑的 CLI 安装状态与 npm 最新版本" }}
       </span>
     </div>
 

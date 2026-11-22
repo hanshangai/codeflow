@@ -10,6 +10,7 @@ import { createBuilderProject, removeBuilderProject, resolveInstalledElectronDis
 import { readDesktopReleasePlan } from "../../../tools/release/desktop-release-plan.mjs";
 import { readDesktopShellInputs } from "../../../tools/release/desktop-shell-version.mjs";
 import { buildShellSwitch } from "./build-shell-switch.mjs";
+import { writeWindowsDisplayVersion } from "./windows-install-layout.mjs";
 
 const requestId = crypto.randomUUID();
 
@@ -127,9 +128,11 @@ async function packageLocalWindows() {
     throw new Error("DESKTOP_SHELL_ELECTRON_LOCK_MISMATCH");
   }
   const hasBaselineProof = baselineProof !== null;
-  /** 对外文件名与界面共用同一展示版本；非日期基线退回打包用三段壳版本，避免文件名与安装后版本脱节。 */
-  const composedVersion = baselineProof && formatDesktopVersion(shellVersion, baselineProof.version);
-  const displayVersion = composedVersion && /^\d+(?:\.\d+){1,3}$/u.test(composedVersion) ? composedVersion : toBuilderVersion(shellVersion);
+  // 展示与文件名保留真实版本；builder 的补零仅供内部数字字段使用。
+  const displayVersion = baselineProof ? formatDesktopVersion(shellVersion, baselineProof.version) : shellVersion;
+  if (!displayVersion || /[<>:"/\\|?*$\u0000-\u001f]/u.test(displayVersion) || [".", ".."].includes(displayVersion)) {
+    throw new Error("DESKTOP_PACKAGE_DISPLAY_VERSION_INVALID");
+  }
   // mkdir 的非递归原子创建同时拒绝既有目录、文件及链接，不覆盖旧工件。
   await fs.mkdir(outputDir);
   process.env.CSC_IDENTITY_AUTO_DISCOVERY = "false";
@@ -144,7 +147,7 @@ async function packageLocalWindows() {
     const shellSwitch = await buildShellSwitch({ outputDir: path.join(builderProjectDir, "native-tools"), version: shellVersion });
     // 独立配置复用原 YAML，避免 builder 深合并数组后把旧资源再复制一次。
     await fs.writeFile(configPath, `${JSON.stringify({ ...original,
-      directories: { output: outputDir }, extraMetadata: { version: toBuilderVersion(shellVersion) },
+      directories: { output: outputDir }, extraMetadata: { version: toBuilderVersion(shellVersion), desktopDisplayVersion: displayVersion },
       electronVersion, electronDist,
       artifactName: `CodeFlowAI-${displayVersion}-win32-x64.\${ext}`,
       npmRebuild: false,
@@ -166,9 +169,12 @@ async function packageLocalWindows() {
       ],
     }, null, 2)}\n`, "utf8");
     artifacts = await build({ projectDir: builderProjectDir, targets: Platform.WINDOWS.createTarget(target, Arch.x64), publish: "never", config: configPath,
-      /** NSIS 显示精确壳号；builder/PE 内部仍使用合法的三段版本。 */
-      effectiveOptionComputed: async ([defines]) => {
+      /** 品牌与文件属性使用产品展示号；安装登记仍记录真实壳号，固定数字版本保持原值。 */
+      effectiveOptionComputed: async ([defines, commands]) => {
         defines.CODEFLOW_SHELL_VERSION = shellVersion;
+        defines.VERSION = displayVersion;
+        commands.VIAddVersionKey = commands.VIAddVersionKey.map(value => value.replace(
+          /\b(ProductVersion|FileVersion) "[^"]*"$/u, (_, key) => `${key} "${displayVersion}"`));
         return false;
       },
     });
@@ -185,7 +191,7 @@ async function packageLocalWindows() {
   let destination;
   if (target === "dir") {
     const executable = path.join(outputDir, "win-unpacked", "CodeFlowAI.exe");
-    await fs.access(executable); destination = { executable };
+    await writeWindowsDisplayVersion(executable, displayVersion); destination = { executable };
   } else {
     const installers = artifacts.filter(file => path.extname(file).toLowerCase() === ".exe");
     if (installers.length !== 1) throw new Error("DESKTOP_LOCAL_INSTALLER_RESULT_INVALID");

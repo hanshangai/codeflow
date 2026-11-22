@@ -62,6 +62,7 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
     effectiveOptionComputed?: (options: [Record<string, string>, unknown]) => Promise<boolean> }> = [];
   const manifests: Array<{ version: string; shellVersion: string }> = [];
   const nativeTools: Array<{ outputDir: string; version: string }> = [];
+  const versionWrites: Array<{ executable: string; version: string }> = [];
   /** 仅隔离 NSIS 编译；实际资源装配和临时项目清理继续执行原逻辑。 */
   const buildShellSwitch = async (input: { outputDir: string; version: string }) => {
     nativeTools.push(input);
@@ -116,15 +117,16 @@ async function runScript(f: Fixture, output: string, input = f.resources, extra:
   const execute = compileFunction(`return (async () => {${source}\n})();`,
     ["fs", "path", "crypto", "createRequire", "fileURLToPath", "build", "Platform", "Arch", "process", "console", "formatDesktopVersion",
       "createBuilderProject", "removeBuilderProject", "resolveInstalledElectronDist", "toBuilderVersion",
-      "assertTrustedReleaseKeys", "verifyReleaseBundlePayload", "readDesktopReleasePlan", "readDesktopShellInputs", "buildShellSwitch"]);
+      "assertTrustedReleaseKeys", "verifyReleaseBundlePayload", "readDesktopReleasePlan", "readDesktopShellInputs", "buildShellSwitch", "writeWindowsDisplayVersion"]);
   await execute(fs, { ...path, resolve: (...segments: string[]) => path.resolve(f.root, ...segments) }, crypto, createRequire, fileURLToPath, build,
     { WINDOWS: { createTarget: (target: string, arch: number) => [target, arch] } }, { x64: 1 }, state,
     { log: (line: string) => messages.push(JSON.parse(line)), error: (line: string) => messages.push(JSON.parse(line)) }, formatDesktopVersion,
     createBuilderProject, removeBuilderProject, resolveInstalledElectronDist, toBuilderVersion,
     assertTrustedReleaseKeys, verifyReleaseBundlePayload,
     (options: Parameters<typeof readDesktopReleasePlan>[0]) => readDesktopReleasePlan({ ...options, root: fileURLToPath(new URL("../../..", import.meta.url)) }),
-    () => readDesktopShellInputs(fileURLToPath(new URL("../../..", import.meta.url))), buildShellSwitch);
-  return { state, messages, calls, manifests, nativeTools };
+    () => readDesktopShellInputs(fileURLToPath(new URL("../../..", import.meta.url))), buildShellSwitch,
+    async (executable: string, version: string) => { versionWrites.push({ executable, version }); });
+  return { state, messages, calls, manifests, nativeTools, versionWrites };
 }
 
 test("Windows dir packaging retains signed-tree dotfiles before reporting a ready artifact", async t => {
@@ -144,7 +146,7 @@ test("planned packaging injects the exact allocated shell version and refuses a 
   assert.equal(result.messages[0]?.shellVersion, plan.shellVersion);
   const installerDefines: Record<string, string> = {};
   assert.ok(result.calls[0]?.effectiveOptionComputed);
-  assert.equal(await result.calls[0].effectiveOptionComputed!([installerDefines, {}]), false);
+  assert.equal(await result.calls[0].effectiveOptionComputed!([installerDefines, { VIAddVersionKey: [] }]), false);
   assert.equal(installerDefines.CODEFLOW_SHELL_VERSION, plan.shellVersion);
   assert.deepEqual({ version: result.manifests[0]?.version, shellVersion: result.manifests[0]?.shellVersion }, { version: `${plan.shellVersion}.0`, shellVersion: plan.shellVersion });
   assert.equal(JSON.parse(await fs.readFile(path.join(f.shell, "package.json"), "utf8")).version, "1.0");
@@ -241,6 +243,8 @@ test("allows a separate output with a shared name prefix and preserves the local
   await assert.rejects(fs.lstat(result.calls[0]!.projectDir), { code: "ENOENT" });
   const config = JSON.parse(await fs.readFile(path.join(output, "local-builder.json"), "utf8"));
   assert.equal(config.extraMetadata.version, "1.0.0", "builder metadata normalizes two-segment shell versions");
+  assert.equal(result.messages[0]?.displayVersion, "1.0");
+  assert.deepEqual(result.versionWrites, [{ executable: path.join(output, "win-unpacked/CodeFlowAI.exe"), version: "1.0" }]);
   assert.equal(config.electronDist, path.join(f.root, "electron-dist"));
   assert.equal(config.electronVersion, "45.0.0");
   assert.equal(config.extraResources.some((entry: { to: string }) => ["npm", "cli-runtime.json"].includes(entry.to)), false);
@@ -353,13 +357,41 @@ for (const required of [false, true]) test(`local package carries the same verif
   assert.deepEqual(await snapshot(f.resources), before);
 });
 
-test("non-date baseline version falls back to the normalized shell version", async t => {
+test("non-date baseline version retains the actual resource version", async t => {
   const f = await fixture(t), output = path.join(f.root, "output");
   await writeBaselineProof(f, 1, "baseline");
   const result = await runScript(f, output, f.resources, ["--target", "nsis"]);
+  const config = JSON.parse(await fs.readFile(result.calls[0]!.config, "utf8"));
+  assert.equal(config.extraMetadata.desktopDisplayVersion, "baseline");
   assert.equal(result.state.exitCode, undefined);
-  assert.equal(result.messages[0]?.displayVersion, "1.0.0");
-  assert.equal(result.messages[0]?.installer, path.join(output, "CodeFlowAI-1.0.0-win32-x64.exe"));
+  assert.equal(result.messages[0]?.displayVersion, "baseline");
+  assert.equal(result.messages[0]?.installer, path.join(output, "CodeFlowAI-baseline-win32-x64.exe"));
+});
+
+test("NSIS installer shows the product version while preserving its fixed numeric version", async t => {
+  const f = await fixture(t), output = path.join(f.root, "output");
+  await writeBaselineProof(f, 1, "2026.11.21.02");
+  const result = await runScript(f, output, f.resources, ["--target", "nsis"]);
+  const defines: Record<string, string> = {};
+  const commands = { VIProductVersion: "1.0.0.0", VIAddVersionKey: [
+    '/LANG=1033 ProductName "CodeFlow"', '/LANG=1033 ProductVersion "1.0.0"', '/LANG=1033 FileVersion "1.0.0"',
+  ] };
+  await result.calls[0]!.effectiveOptionComputed!([defines, commands]);
+  assert.equal(defines.VERSION, "1.0.1121.2");
+  assert.equal(defines.CODEFLOW_SHELL_VERSION, "1.0");
+  assert.equal(commands.VIProductVersion, "1.0.0.0");
+  assert.deepEqual(commands.VIAddVersionKey, [
+    '/LANG=1033 ProductName "CodeFlow"', '/LANG=1033 ProductVersion "1.0.1121.2"', '/LANG=1033 FileVersion "1.0.1121.2"',
+  ]);
+});
+
+test("an unsafe resource version fails before packaging can write a filename outside the output", async t => {
+  const f = await fixture(t), output = path.join(f.root, "output");
+  await writeBaselineProof(f, 1, "preview/bad");
+  const result = await runScript(f, output);
+  assert.equal(result.messages[0]?.rootCause, "DESKTOP_PACKAGE_DISPLAY_VERSION_INVALID");
+  assert.equal(result.calls.length, 0);
+  await assert.rejects(fs.access(output), { code: "ENOENT" });
 });
 
 test("required missing baseline proof fails before creating output or invoking builder", async t => {

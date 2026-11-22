@@ -138,9 +138,11 @@ async function packageLocalMac() {
     throw new Error("DESKTOP_SHELL_ELECTRON_LOCK_MISMATCH");
   }
   const hasBaselineProof = baselineProof !== null;
-  /** 对外文件名与界面共用同一展示版本；非日期基线退回打包用三段壳版本，避免文件名与安装后版本脱节。 */
-  const composedVersion = baselineProof && formatDesktopVersion(shellVersion, baselineProof.version);
-  const displayVersion = composedVersion && /^\d+(?:\.\d+){1,3}$/u.test(composedVersion) ? composedVersion : toBuilderVersion(shellVersion);
+  // 展示与文件名保留真实版本；builder 的补零仅供内部数字字段使用。
+  const displayVersion = baselineProof ? formatDesktopVersion(shellVersion, baselineProof.version) : shellVersion;
+  if (!displayVersion || /[<>:"/\\|?*$\u0000-\u001f]/u.test(displayVersion) || [".", ".."].includes(displayVersion)) {
+    throw new Error("DESKTOP_PACKAGE_DISPLAY_VERSION_INVALID");
+  }
   // mkdir 的非递归原子创建同时拒绝既有目录、文件及链接，不覆盖旧工件。
   await fs.mkdir(outputDir);
   const unsignedMarker = hasBaselineProof ? undefined : await writeUnsignedMarker(outputDir);
@@ -156,9 +158,11 @@ async function packageLocalMac() {
       artifactName: `CodeFlowAI-${displayVersion}-darwin-\${arch}.\${ext}`,
       npmRebuild: false,
       // 本地包不进入官方签名，但仍做 ad-hoc 签名并保留图标、分类与包标识。
-      mac: { ...original.mac, identity: null, hardenedRuntime: false, gatekeeperAssess: false },
+      // Apple 系统版本须为三段数字，四段产品号只写入说明字段。
+      mac: { ...original.mac, identity: null, hardenedRuntime: false, gatekeeperAssess: false,
+        extendInfo: { ...original.mac?.extendInfo, CFBundleGetInfoString: `CodeFlow ${displayVersion}` } },
       afterPack: path.join(desktopDir, "scripts/packaged-resource-copy.mjs"),
-      dmg: { ...(original.dmg ?? {}), title: `CodeFlow ${displayVersion}`, contents: [
+      dmg: { ...(original.dmg ?? {}), title: "CodeFlow", contents: [
         { x: 130, y: 220 },
         { x: 410, y: 220, type: "link", path: "/Applications" },
       ] },

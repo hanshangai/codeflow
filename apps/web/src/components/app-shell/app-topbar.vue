@@ -35,7 +35,6 @@ import { resolveWorkspaceDisplayTitle } from "../../utils/workspaceTitle";
 import { resolveWorkspaceRuntimeDisplay } from "../../utils/workspaceRuntimeDisplay";
 import {
   resolveDesktopAppVersionLabel,
-  resolveDesktopClientVersionLabel,
   resolveDesktopRuntimeStatusHint,
   shouldShowDesktopLocalClientPopover,
 } from "./desktopLocalClientStatus";
@@ -79,14 +78,10 @@ const showDesktopLocalPopover = computed(() => shouldShowDesktopLocalClientPopov
   hasActiveSession: props.shell.config.hasActiveSession,
   isCurrentSharedWorkspace: isCurrentSharedWorkspace.value,
 }) || (props.shell.config.isDesktop && !isCurrentSharedWorkspace.value && Boolean(props.shell.desktopAccountFailureDescription)));
-const desktopClientVersionLabel = computed(() => resolveDesktopClientVersionLabel(
-  props.shell.config.desktopClient?.version,
-  props.shell.config.clientVersion,
-));
 const desktopAppVersionLabel = ref<string | null>(null);
 let desktopAppVersionLoading = false;
 
-/** 读取与更新弹窗同源的桌面壳+资源版本；旧壳或失败时回退运行时 Client 版本。 */
+/** 读取与更新弹窗同源的桌面壳+资源版本；缺失时明确未知，不借Client号代填。 */
 async function loadDesktopAppVersion(): Promise<void> {
   if (!props.shell.config.isDesktop || desktopAppVersionLabel.value || desktopAppVersionLoading) return;
   desktopAppVersionLoading = true;
@@ -106,7 +101,7 @@ async function loadDesktopAppVersion(): Promise<void> {
   }
 }
 
-const desktopVersionDisplay = computed(() => desktopAppVersionLabel.value || desktopClientVersionLabel.value);
+const desktopVersionDisplay = computed(() => desktopAppVersionLabel.value || "未知");
 const desktopPlatformLabel = computed(() => {
   const platform = props.shell.config.desktopClient?.platform;
   if (!platform) return "";

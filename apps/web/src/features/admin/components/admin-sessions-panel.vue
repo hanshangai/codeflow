@@ -341,12 +341,13 @@ function formatLoginAuditActorRole(record: AuditLogItem): string {
 
 /** 会话管理里的客户端版本展示：有值显示版本，否则统一显示未知版本。 */
 function formatSessionClientVersion(record: Pick<AdminSessionInfo, "clientVersion">): string {
-  return record.clientVersion || "未知版本";
+  const version = record.clientVersion?.trim();
+  return !version || version.toLowerCase() === "unknown" ? "未知版本" : version;
 }
 
 /** 未知版本原因提示：区分 client 未上报、web 未绑定工作区、web 无法唯一匹配三类场景。 */
 function resolveUnknownVersionHint(record: Pick<AdminSessionInfo, "sessionKind" | "clientVersion" | "activeWorkspaceId">): string | null {
-  if (record.clientVersion) return null;
+  if (formatSessionClientVersion(record) !== "未知版本") return null;
   if (record.sessionKind === "client") {
     return "对应在线 Client 连接在建立时未上报版本，通常需要客户端重连后才会带上版本号。";
   }

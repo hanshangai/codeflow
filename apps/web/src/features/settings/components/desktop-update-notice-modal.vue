@@ -61,7 +61,7 @@ async function close(action: "later" | "session"): Promise<void> {
   }
 }
 
-/** 资源更新直接进入现有重启流程；运行中会话仍由宿主确认。 */
+/** 用户选择更新后直接进入现有统一重启流程。 */
 async function updateNow(): Promise<void> {
   if (!notice.value || restarting.value) return;
   restarting.value = true;

@@ -5,6 +5,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 
 const scriptUrl = new URL("../scripts/build-shell-launcher.mjs", import.meta.url);
 const repository = fileURLToPath(new URL("../../..", import.meta.url));
@@ -34,6 +35,23 @@ test("shared shell builder cache stays outside the repository", async () => {
   assert.equal(path.isAbsolute(cache), true);
   const relative = path.relative(repository, cache);
   assert.equal(path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`), true);
+});
+
+test("native shell tools retain four-part fixed versions and the exact shell display version", async t => {
+  const f = await fixture(t), { buildShellNativeTool } = await builder();
+  const requireBuilder = createRequire(createRequire(import.meta.url).resolve("electron-builder"));
+  const requireLibrary = createRequire(requireBuilder.resolve("app-builder-lib"));
+  const { NtExecutable, NtExecutableResource, Resource } = requireLibrary("resedit");
+  for (const kind of ["launcher", "switch"] as const) {
+    const executable = await buildShellNativeTool({ outputDir: path.join(f.root, kind), version: "1.13" }, kind);
+    const resources = NtExecutableResource.from(NtExecutable.from(await fs.readFile(executable)));
+    const version = Resource.VersionInfo.fromEntries(resources.entries)[0];
+    assert.equal(version.fixedInfo.fileVersionMS, 0x0001000d);
+    assert.equal(version.fixedInfo.fileVersionLS, 0);
+    const strings = version.getStringValues(version.getAllLanguagesForStringValues()[0]);
+    assert.equal(strings.FileVersion, "1.13");
+    assert.equal(strings.ProductVersion, "1.13");
+  }
 });
 
 /** 等待真实子进程关闭，保留退出码和诊断，不启动 shell。 */

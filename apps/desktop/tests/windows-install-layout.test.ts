@@ -6,11 +6,54 @@ import test, { type TestContext } from "node:test";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { compileFunction } from "node:vm";
 import { build, Platform, Arch } from "electron-builder";
 import { resolveInstalledElectronDist } from "../scripts/package-local-builder.mjs";
 import { readShellLaunchState } from "../src/shellLaunchState.js";
 
 const moduleUrl = new URL("../scripts/windows-install-layout.mjs", import.meta.url);
+const requireLibrary = createRequire(createRequire(createRequire(import.meta.url).resolve("electron-builder")).resolve("app-builder-lib"));
+const { NtExecutable, NtExecutableResource, Resource } = requireLibrary("resedit");
+
+/** 构造最小真实 PE 版本资源，验证字符串修改不污染固定数字版本。 */
+async function writeVersionedExecutable(file: string) {
+  const executable = NtExecutable.createEmpty(false, false), resources = NtExecutableResource.from(executable);
+  const version = Resource.VersionInfo.createEmpty();
+  version.setFileVersion("1.13.0.0");
+  version.setProductVersion("1.13.0.0");
+  version.setStringValues({ lang: 1033, codepage: 1200 }, { FileVersion: "1.13.0", ProductVersion: "1.13.0.0" });
+  version.outputToResourceEntries(resources.entries);
+  resources.outputResource(executable);
+  await fs.writeFile(file, Buffer.from(executable.generate()));
+}
+
+test("afterSign writes product strings before moving Electron and compiles the launcher with its actual shell version", async t => {
+  const f = await fixture(t);
+  await writeVersionedExecutable(path.join(f.appOutDir, "CodeFlowAI.exe"));
+  const source = (await fs.readFile(moduleUrl, "utf8")).replace(/^import .*;\r?\n/gmu, "")
+    .replaceAll("import.meta.url", JSON.stringify(moduleUrl.href))
+    .replace("export default async function afterSign", "async function afterSign").replaceAll("export async function", "async function");
+  const versions: string[] = [];
+  const run = compileFunction(`${source}\nreturn afterSign;`, ["fs", "os", "path", "createRequire", "buildShellLauncher"]);
+  const afterSign = run(fs, os, path, createRequire, async (input: { version: string }) => {
+    versions.push(input.version);
+    return f.launcherExecutable;
+  });
+  await afterSign({ appOutDir: f.appOutDir, electronPlatformName: "win32", packager: {
+    getIconPath: async () => null, appInfo: { version: "1.13.0" },
+    info: { metadata: { shellVersion: "1.13", desktopDisplayVersion: "1.13.1121.2" } },
+  } });
+  assert.deepEqual(versions, ["1.13"]);
+  const executable = NtExecutable.from(await fs.readFile(path.join(f.appOutDir, "shells/installation/CodeFlowAI.exe")));
+  const version = Resource.VersionInfo.fromEntries(NtExecutableResource.from(executable).entries)[0];
+  assert.equal(version.fixedInfo.fileVersionMS, 0x0001000d);
+  assert.equal(version.fixedInfo.fileVersionLS, 0);
+  assert.equal(version.fixedInfo.productVersionMS, 0x0001000d);
+  assert.equal(version.fixedInfo.productVersionLS, 0);
+  assert.equal(version.getStringValues({ lang: 1033, codepage: 1200 }).FileVersion, "1.13.1121.2");
+  assert.equal(version.getStringValues({ lang: 1033, codepage: 1200 }).ProductVersion, "1.13.1121.2");
+});
 
 /** 独占目录模拟 builder 已完成的平铺 Electron 包，不接触运行安装。 */
 async function fixture(t: TestContext) {

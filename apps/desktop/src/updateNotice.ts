@@ -1,8 +1,15 @@
 import fs from "node:fs/promises";
 
-import type { DesktopUpdateNotice, DesktopUpdateNoticeDismissAction } from "@codeflowai/shared";
+import { formatDesktopVersion, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction } from "@codeflowai/shared";
 
 import { writeDurableJson } from "./durableFile.js";
+
+/** 提醒只使用明确壳与资源事实；缺失时保留未知，不借Web版本或其它设备代填。 */
+export function formatUpdateNoticeVersion(shellVersion: string | null | undefined, resourceVersion: string | null | undefined): string | null {
+  const shell = shellVersion?.trim(), resource = resourceVersion?.trim();
+  if (!shell || !resource || shell === "unknown" || resource === "unknown") return null;
+  return formatDesktopVersion(shell, resource);
+}
 
 /** 提醒节流状态；下载事实仍由 pendingRelease/preparedUpdate 持有，这里只记已提醒版本与时间。 */
 export type UpdateNoticeState = {
@@ -93,7 +100,11 @@ export function createUpdateNoticeController(input: {
   async function evaluate(prepared: PreparedUpdateNotice | null): Promise<DesktopUpdateNotice | null> {
     await loadState();
     if (!prepared) { pending = null; return null; }
-    if (pending?.releaseId === prepared.releaseId) return null;
+    if (pending?.releaseId === prepared.releaseId) {
+      // 同一发布的壳或当前资源事实可能更新；补查取最新快照，节流仍不重复推送。
+      pending = { ...prepared };
+      return null;
+    }
     if (!shouldNotifyUpdateNotice({ prepared, state, sessionDismissedReleaseId, now: now() })) return null;
     pending = { releaseId: prepared.releaseId, version: prepared.version,
       currentVersion: prepared.currentVersion, shellOnly: prepared.shellOnly };

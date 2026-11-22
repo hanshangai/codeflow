@@ -6,6 +6,9 @@ import { useApiContext } from "../../../composables/useApiContext";
 import { isCancelledRequestError, requestJson } from "../../../api/request";
 import { useConfigStore } from "../../../store/config";
 import { usePresenceStore } from "../../../store/presence";
+import { useWorkspacesStore } from "../../../store/workspaces";
+import { resolveWorkspaceClientInfo } from "../../../composables/useAppShell";
+import type { WorkspaceId } from "@codeflowai/shared";
 import { getClientLatest, getClientUpgradeStatus, upgradeClient, type ClientPackageTarget } from "../../../api/software";
 import { wsOriginToHttpOrigin } from "../../../api/request";
 import { isClientUpgradeTargetReached } from "../clientUpgradePolicy";
@@ -20,6 +23,7 @@ const CLIENT_UPGRADE_RECONNECT_TIMEOUT_MS = 360_000;
 
 const config = useConfigStore();
 const presence = usePresenceStore();
+const workspaces = useWorkspacesStore();
 const { ctx } = useApiContext();
 
 type UpgradePhase = "idle" | "upgrading" | "restarting" | "success" | "manual_restart";
@@ -32,10 +36,18 @@ const upgradeError = ref<string | null>(null);
 const copied = ref(false);
 const showManualCmd = ref(false);
 const activeUpgradeId = ref<string | null>(null);
+const confirmedVersion = ref<string | null>(null);
+let activeUpgradeTarget: {
+  workspaceId: string;
+  clientId: string;
+  version: string;
+  context: typeof ctx.value;
+} | null = null;
 
 let reconnectTimer: ReturnType<typeof setInterval> | null = null;
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
 let reconnectStatusPolling = false;
+let latestRequest = 0;
 
 const canClose = computed(() => phase.value !== "upgrading" && phase.value !== "restarting");
 const currentClientPlatform = computed(() => presence.clientForWorkspace(config.workspaceId)?.platform ?? "");
@@ -64,21 +76,28 @@ function startCommand(): string {
 
 /** 拉取当前 workspace client 平台优先的最新安装包。 */
 async function fetchLatest(): Promise<void> {
+  const request = ++latestRequest, workspaceId = config.workspaceId;
+  const context = { ...ctx.value };
+  /** 仅当前查询和账号范围可写回安装包版本、URL及加载状态。 */
+  const isCurrent = (): boolean => request === latestRequest && workspaceId === config.workspaceId
+    && context.serverWsOrigin === ctx.value.serverWsOrigin && context.sessionToken === ctx.value.sessionToken;
   loading.value = true;
+  latestVersion.value = null;
+  downloadUrl.value = null;
   try {
-    const res = await getClientLatest(ctx.value, resolveCurrentClientPackageTarget());
+    const res = await getClientLatest(context, resolveCurrentClientPackageTarget());
+    if (!isCurrent()) return;
     if (res.ok) {
       latestVersion.value = res.version;
       downloadUrl.value = res.url;
-    } else {
-      latestVersion.value = config.latestClientVersion;
-      downloadUrl.value = null;
-    }
-  } catch {
-    latestVersion.value = config.latestClientVersion;
+    } else throw new Error(res.message ?? "查询最新 Client 安装包失败");
+  } catch (error) {
+    if (!isCurrent()) return;
+    latestVersion.value = null;
     downloadUrl.value = null;
+    upgradeError.value = error instanceof Error ? error.message : String(error);
   } finally {
-    loading.value = false;
+    if (isCurrent()) loading.value = false;
   }
 }
 
@@ -91,6 +110,7 @@ function resolveCurrentClientPackageTarget(): ClientPackageTarget | null {
 
 /** 启动当前工作区 Client 升级，并进入重连等待。 */
 async function doUpgrade(): Promise<void> {
+  let target: typeof activeUpgradeTarget = null;
   phase.value = "upgrading";
   upgradeError.value = null;
   trackProductEvent("client_upgrade_start", {
@@ -99,7 +119,18 @@ async function doUpgrade(): Promise<void> {
   });
 
   try {
-    const res = await upgradeClient(ctx.value, config.workspaceId);
+    const workspaceId = config.workspaceId;
+    const workspace = workspaces.byId.get(workspaceId as WorkspaceId);
+    const client = resolveWorkspaceClientInfo({ workspaceId, ownerClientId: workspace?.ownerClientId,
+      hostClientId: workspace?.shared?.hostClientId,
+      hostWorkspaceId: workspace?.shared?.isHostOwner ? workspace.shared.hostLocalWorkspaceId : null,
+      clients: presence.availableClients });
+    if (!workspaceId || !client || !latestVersion.value) throw new Error("无法确认当前工作区的目标 Client 或升级版本，请刷新后重试");
+    activeUpgradeTarget = { workspaceId, clientId: client.clientId, version: latestVersion.value, context: { ...ctx.value } };
+    target = activeUpgradeTarget;
+    const res = await upgradeClient(target.context, workspaceId);
+    if (activeUpgradeTarget !== target) return;
+    assertUpgradeScope();
     if (!res.ok) {
       phase.value = "idle";
       upgradeError.value = res.message ?? "请求失败";
@@ -122,10 +153,12 @@ async function doUpgrade(): Promise<void> {
     }
 
     // 升级已下发或已完成，统一等待 client 重启后重连。
+    activeUpgradeTarget.version = res.targetVersion ?? res.toVersion ?? activeUpgradeTarget.version;
     activeUpgradeId.value = res.upgradeId ?? null;
     phase.value = "restarting";
     waitForReconnect();
   } catch (e) {
+    if (target && activeUpgradeTarget !== target) return;
     if (isCancelledRequestError(e)) {
       phase.value = "idle";
       return;
@@ -165,6 +198,7 @@ function waitForReconnect(): void {
 /** 使用 Server 返回的实际版本完成升级，禁止把目标版本直接写成当前版本。 */
 function onReconnected(clientVersion: string, latestClientVersion: string | null): void {
   clearTimers();
+  confirmedVersion.value = clientVersion;
   phase.value = "success";
   config.setClientVersionInfo({
     clientVersion,
@@ -177,34 +211,57 @@ function onReconnected(clientVersion: string, latestClientVersion: string | null
   });
 }
 
+/** 重连只确认原工作区的原 Client，聚合版本不能作为成功证据。 */
 async function pollReconnectStatus(): Promise<void> {
   if (reconnectStatusPolling || phase.value !== "restarting") return;
+  const target = activeUpgradeTarget;
   reconnectStatusPolling = true;
   try {
+    assertUpgradeScope();
     const upgradeFinished = await pollUpgradeInstallStatus();
+    if (activeUpgradeTarget !== target) return;
     if (upgradeFinished) return;
-    if (phase.value !== "restarting") return;
+    if (phase.value !== "restarting" || activeUpgradeTarget !== target) return;
     const res = await requestJson<{
-      clientConnected: boolean;
-      clientVersion: string | null;
       latestClientVersion: string | null;
-    }>(ctx.value, { method: "GET", path: "/api/status" });
-    if (phase.value !== "restarting") return;
-    if (!res.ok) return;
-    if (!res.clientConnected || !res.clientVersion || !latestVersion.value) return;
-    if (!isClientUpgradeTargetReached(res.clientVersion, latestVersion.value)) return;
-    onReconnected(res.clientVersion, res.latestClientVersion);
-  } catch {
-    // ignore transient reconnect failures
+      clients?: Array<{ clientId: string; version: string | null; workspaceIds: string[] }>;
+    }>(target!.context, { method: "GET", path: "/api/status" });
+    if (phase.value !== "restarting" || activeUpgradeTarget !== target) return;
+    assertUpgradeScope();
+    if (!res.ok) throw new Error(res.message ?? "查询 Client 重连状态失败");
+    const client = resolveWorkspaceClientInfo({ workspaceId: target!.workspaceId, ownerClientId: target!.clientId, clients: res.clients });
+    if (!client?.version || !isClientUpgradeTargetReached(client.version, target!.version)) return;
+    onReconnected(client.version, res.latestClientVersion);
+  } catch (error) {
+    if (activeUpgradeTarget !== target || phase.value !== "restarting") return;
+    clearTimers();
+    phase.value = "idle";
+    upgradeError.value = error instanceof Error ? error.message : String(error);
+    const failure = error as { code?: string; requestId?: string; details?: { requestId?: string } };
+    console.error("[CLIENT_UPGRADE_RECONNECT_FAILED]", { code: failure?.code ?? "CLIENT_UPGRADE_RECONNECT_FAILED",
+      requestId: failure?.requestId ?? failure?.details?.requestId ?? null, clientId: target?.clientId,
+      workspaceId: target?.workspaceId, upgradeId: activeUpgradeId.value, rootCause: upgradeError.value });
   } finally {
-    reconnectStatusPolling = false;
+    if (activeUpgradeTarget === target) reconnectStatusPolling = false;
+  }
+}
+
+/** 切换账号、Server 或工作区后停止原升级流程，避免跨作用域写回。 */
+function assertUpgradeScope(): void {
+  const target = activeUpgradeTarget;
+  if (!target || config.workspaceId !== target.workspaceId
+    || ctx.value.serverWsOrigin !== target.context.serverWsOrigin || ctx.value.sessionToken !== target.context.sessionToken) {
+    throw new Error("账号、服务器或工作区已变化，请返回原工作区确认 Client 升级结果");
   }
 }
 
 /** 查询后台升级安装结果；失败时退出等待并展示原因。 */
 async function pollUpgradeInstallStatus(): Promise<boolean> {
   if (!activeUpgradeId.value) return false;
-  const res = await getClientUpgradeStatus(ctx.value, activeUpgradeId.value);
+  const target = activeUpgradeTarget;
+  const res = await getClientUpgradeStatus(target!.context, activeUpgradeId.value);
+  if (phase.value !== "restarting" || activeUpgradeTarget !== target) return true;
+  assertUpgradeScope();
   if (!res.ok) {
     clearTimers();
     phase.value = "idle";
@@ -261,18 +318,32 @@ watch(
       phase.value = "idle";
       upgradeError.value = null;
       activeUpgradeId.value = null;
+      activeUpgradeTarget = null;
+      confirmedVersion.value = null;
       showManualCmd.value = false;
       reconnectStatusPolling = false;
       void fetchLatest();
     } else {
       clearTimers();
+      latestRequest++;
+      loading.value = false;
+      activeUpgradeTarget = null;
       reconnectStatusPolling = false;
     }
   },
   { immediate: true },
 );
 
-onUnmounted(clearTimers);
+/** 目标范围变化后作废安装包快照，打开状态重新读取，关闭状态不产生后台查询。 */
+watch([() => config.workspaceId, () => ctx.value.serverWsOrigin, () => ctx.value.sessionToken], () => {
+  latestRequest++;
+  latestVersion.value = null;
+  downloadUrl.value = null;
+  loading.value = false;
+  if (props.open && phase.value === "idle") void fetchLatest();
+}, { flush: "sync" });
+
+onUnmounted(() => { clearTimers(); activeUpgradeTarget = null; latestRequest++; });
 </script>
 
 <template>
@@ -342,7 +413,7 @@ onUnmounted(clearTimers);
       <!-- success：升级成功 -->
       <div v-if="phase === 'success'" class="upgrade-modal__result upgrade-modal__result--success">
         <div class="upgrade-modal__result-icon">✓</div>
-        <div>升级成功 v{{ latestVersion }}</div>
+        <div>升级成功 v{{ confirmedVersion }}</div>
       </div>
 
       <!-- manual_restart：超时未重连 -->

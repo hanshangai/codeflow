@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 
 import {
   resolveDesktopAppVersionLabel,
-  resolveDesktopClientVersionLabel,
   resolveDesktopRuntimeStatusHint,
   shouldShowDesktopLocalClientPopover,
 } from "../src/components/app-shell/desktopLocalClientStatus.ts";
@@ -30,16 +30,18 @@ test("runtime hint distinguishes transient startup/stop from real failure", () =
   assert.equal(resolveDesktopRuntimeStatusHint({ ready: false, status: null, error: null }), "本机运行环境未就绪，请稍后重试。");
 });
 
-test("desktop client version prefers runtime truth and falls back to server version", () => {
-  assert.equal(resolveDesktopClientVersionLabel("1.2.3", "2.0.0"), "1.2.3");
-  assert.equal(resolveDesktopClientVersionLabel("", "2.0.0"), "2.0.0");
-  assert.equal(resolveDesktopClientVersionLabel(null, null), "未知");
+test("desktop app display never borrows a local or remote Client version", () => {
+  const source = readFileSync(new URL("../src/components/app-shell/app-topbar.vue", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /resolveDesktopClientVersionLabel|desktopClientVersionLabel/u);
+  assert.match(source, /desktopAppVersionLabel\.value.*未知/u);
 });
 
 test("desktop app version matches the update panel and falls back when shell facts are missing", () => {
   const details = { current: { shellVersion: "1.0.0", bundle: { version: "2026.11.10.01" } } } as never;
   assert.equal(resolveDesktopAppVersionLabel(details), "1.0.1110");
   assert.equal(resolveDesktopAppVersionLabel({ current: { shellVersion: null, bundle: null } } as never), null);
+  assert.equal(resolveDesktopAppVersionLabel({ current: { shellVersion: "unknown", bundle: { version: "2026.11.21.01" } } } as never), null);
+  assert.equal(resolveDesktopAppVersionLabel({ current: { shellVersion: "1.12", bundle: { version: " unknown " } } } as never), null);
 });
 
 test("workspace title fallback stays distinguishable for unloaded local workspaces", () => {

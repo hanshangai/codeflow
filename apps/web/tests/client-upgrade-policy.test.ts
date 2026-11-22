@@ -35,7 +35,8 @@ test("升级弹窗只通过实际版本完成升级且手动命令不含废弃 d
     "utf8",
   );
 
-  assert.match(source, /isClientUpgradeTargetReached\(res\.clientVersion, latestVersion\.value\)/);
+  assert.match(source, /isClientUpgradeTargetReached\(client\.version, target!\.version\)/);
+  assert.doesNotMatch(source, /onReconnected\(res\.clientVersion/);
   assert.doesNotMatch(source, /seenOffline|presence\.isCurrentWorkspaceClientOnline/);
   assert.doesNotMatch(source, /--disturl/);
 });

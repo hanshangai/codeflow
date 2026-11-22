@@ -44,7 +44,7 @@ async function fixture(t: TestContext) {
 }
 
 /** 执行原完整 CLI；仅替换 builder 结果与进程平台，所有写入留在独占夹具。 */
-async function runScript(f: Fixture, output: string, extra: string[] = []) {
+async function runScript(f: Fixture, output: string, extra: string[] = [], baselineVersion = "2026.11.21.02") {
   const state: { argv: string[]; platform: string; arch: string; env: Record<string, string>; exitCode?: number } = {
     argv: [process.execPath, path.join(f.shell, "scripts/package-local-mac.mjs"), f.resources, output, ...extra],
     platform: "darwin", arch: "arm64", env: {},
@@ -55,7 +55,7 @@ async function runScript(f: Fixture, output: string, extra: string[] = []) {
     calls.push(options);
     const config = JSON.parse(await fs.readFile(options.config, "utf8"));
     if ((options.targets as unknown[])[0] === "dmg") {
-      const installer = path.join(config.directories.output, "CodeFlowAI-1.0.0-darwin-arm64.dmg");
+      const installer = path.join(config.directories.output, config.artifactName.replaceAll("${arch}", "arm64").replaceAll("${ext}", "dmg"));
       await fs.mkdir(path.dirname(installer), { recursive: true });
       await fs.writeFile(installer, "fixture", "utf8");
       return [installer];
@@ -74,7 +74,7 @@ async function runScript(f: Fixture, output: string, extra: string[] = []) {
   await execute(fs, { ...path, resolve: (...segments: string[]) => path.resolve(f.root, ...segments) }, crypto, createRequire,
     fileURLToPath, build, { MAC: { createTarget: (target: string, arch: number) => [target, arch] } }, { x64: 1, arm64: 2 }, state,
     { log: (line: string) => messages.push(JSON.parse(line)), error: (line: string) => messages.push(JSON.parse(line)) },
-    formatDesktopVersion, createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion, () => ({}), () => ({}),
+    formatDesktopVersion, createBuilderProject, removeBuilderProject, resolveElectronVersion, toBuilderVersion, () => ({}), () => ({ version: baselineVersion }),
     (options: Parameters<typeof readDesktopReleasePlan>[0]) => readDesktopReleasePlan({ ...options, root: fileURLToPath(new URL("../../..", import.meta.url)) }),
     () => readDesktopShellInputs(fileURLToPath(new URL("../../..", import.meta.url))));
   return { state, messages, calls };
@@ -136,10 +136,34 @@ test("macOS dmg 目标返回唯一安装包", async t => {
   const result = await runScript(f, output, ["--target", "dmg"]);
   assert.equal(result.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY");
   assert.equal(result.messages[0]?.target, "darwin-arm64-dmg");
-  assert.equal(result.messages[0]?.displayVersion, "1.0.0");
+  assert.equal(result.messages[0]?.displayVersion, "1.0");
   assert.equal(result.messages[0]?.adhocSigned, true);
-  assert.match(String(result.messages[0]?.installer), /CodeFlowAI-1\.0\.0-darwin-arm64\.dmg$/u);
+  assert.match(String(result.messages[0]?.installer), /CodeFlowAI-1\.0-darwin-arm64\.dmg$/u);
   const config = JSON.parse(await fs.readFile(result.calls[0]!.config, "utf8"));
-  assert.equal(config.artifactName, "CodeFlowAI-1.0.0-darwin-${arch}.${ext}");
-  assert.equal(config.dmg.title, "CodeFlow 1.0.0");
+  assert.equal(config.artifactName, "CodeFlowAI-1.0-darwin-${arch}.${ext}");
+  assert.equal(config.dmg.title, "CodeFlow");
+  assert.equal(config.mac.extendInfo.CFBundleGetInfoString, "CodeFlow 1.0");
+});
+
+test("macOS product version belongs in the filename and info text without becoming an invalid bundle version", async t => {
+  const f = await fixture(t), output = path.join(f.root, "baseline-dmg");
+  await fs.writeFile(path.join(f.resources, "baseline-release-manifest.json"), "{}", "utf8");
+  const result = await runScript(f, output, ["--target", "dmg"]);
+  assert.equal(result.messages[0]?.displayVersion, "1.0.1121.2");
+  const config = JSON.parse(await fs.readFile(result.calls[0]!.config, "utf8"));
+  assert.equal(config.artifactName, "CodeFlowAI-1.0.1121.2-darwin-${arch}.${ext}");
+  assert.equal(config.mac.extendInfo.CFBundleGetInfoString, "CodeFlow 1.0.1121.2");
+  assert.equal(config.extraMetadata.version, "1.0.0");
+  assert.equal(config.mac.bundleVersion, undefined);
+  assert.equal(config.mac.bundleShortVersion, undefined);
+  assert.equal(config.dmg.title, "CodeFlow");
+});
+
+test("macOS rejects resource versions containing a path before creating output", async t => {
+  const f = await fixture(t), output = path.join(f.root, "invalid-version");
+  await fs.writeFile(path.join(f.resources, "baseline-release-manifest.json"), "{}", "utf8");
+  const result = await runScript(f, output, [], "preview/bad");
+  assert.equal(result.messages[0]?.rootCause, "DESKTOP_PACKAGE_DISPLAY_VERSION_INVALID");
+  assert.equal(result.calls.length, 0);
+  await assert.rejects(fs.access(output), { code: "ENOENT" });
 });

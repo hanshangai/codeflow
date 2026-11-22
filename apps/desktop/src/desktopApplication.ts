@@ -26,7 +26,7 @@ import { createUpdateNetworkRetry, type UpdateNetworkRetry } from "./updateNetwo
 import { runShellUpdateOperation, type ShellUpdateHostFacts, type ShellUpdateOperationBoundary, type ShellUpdateHelperOwner } from "./shellUpdateOperation.js";
 import type { ShellDiscovery } from "./shellUpdateNetwork.js";
 import { retireShellUpdateAttempt } from "./shellHandoff.js";
-import { createUpdateNoticeController, type PreparedUpdateNotice } from "./updateNotice.js";
+import { createUpdateNoticeController, formatUpdateNoticeVersion, type PreparedUpdateNotice } from "./updateNotice.js";
 
 type ApplicationDownloadOptions = Omit<DownloadOptions, "transport" | "rootDir" | "trustedReleaseKeys" | "receivedReporter">;
 type ApplicationDiscoveryOptions = { requestId?: string; signal?: AbortSignal };
@@ -252,12 +252,14 @@ export function createDesktopApplication(input: {
   /** 当前可提醒的已下载候选；资源优先，macOS 壳按手动安装提示。 */
   const currentPreparedNotice = (): PreparedUpdateNotice | null => {
     if (preparedUpdate) {
-      return { releaseId: preparedUpdate.manifest.releaseId, version: preparedUpdate.manifest.version,
-        currentVersion: currentVersion === "unknown" ? null : currentVersion, shellOnly: false };
+      return { releaseId: preparedUpdate.manifest.releaseId,
+        version: formatUpdateNoticeVersion(input.shellVersion, preparedUpdate.manifest.version) ?? "未标记",
+        currentVersion: formatUpdateNoticeVersion(input.shellVersion, currentBundleVersion?.version), shellOnly: false };
     }
     if (shellDetails.result === "prepared" && shellDetails.target) {
-      return { releaseId: shellDetails.target.shellId, version: shellDetails.target.version,
-        currentVersion: input.shellVersion ?? null, shellOnly: process.platform === "darwin" };
+      return { releaseId: shellDetails.target.shellId,
+        version: formatUpdateNoticeVersion(shellDetails.target.version, currentBundleVersion?.version) ?? "未标记",
+        currentVersion: formatUpdateNoticeVersion(input.shellVersion, currentBundleVersion?.version), shellOnly: process.platform === "darwin" };
     }
     return null;
   };
@@ -1560,7 +1562,7 @@ export function createDesktopApplication(input: {
         if (pending) {
           await activatePendingAtStartup(pending, startupActiveRelease);
           if (bundleDetails.result === "healthy" && !updateCheckFailure) {
-            input.host.onUpdateApplied?.({ version: currentVersion });
+            input.host.onUpdateApplied?.({ version: formatUpdateNoticeVersion(input.shellVersion, currentBundleVersion?.version) ?? "未标记" });
           }
         }
         if (startupUpdateError) {

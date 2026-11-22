@@ -67,10 +67,11 @@ const hasAnyContent = computed(() => summaries.value.length > 0);
 
 /** 将后端发布范围转换为面向用户的组件名称，兼容没有范围元数据的历史日志。 */
 function releaseScopeLabel(scope: ReleaseNoteSummary["scope"]): string {
-  if (scope === "full") return "Server";
+  if (scope === "full") return "完整发布";
   if (scope === "server") return "Server";
   if (scope === "client") return "Client";
-  return "产品更新";
+  if (scope === "product") return "产品";
+  return "发布";
 }
 
 /** 拉取列表（仅元数据），失败给出 error 提示，不静默吞掉。 */
@@ -249,7 +250,7 @@ onUnmounted(() => {
             :ref="(el) => setCardRef(item.version, el as Element | null)"
           >
             <header class="upgrade-page__card-header">
-              <div class="upgrade-page__card-version">产品版本 v{{ item.version }}</div>
+              <div class="upgrade-page__card-version">{{ releaseScopeLabel(item.scope) }}版本 v{{ item.version }}</div>
               <div class="upgrade-page__card-meta">
                 <span class="upgrade-page__card-date">{{ item.releasedAt }}</span>
                 <span class="upgrade-page__card-scope">发布范围：{{ releaseScopeLabel(item.scope) }}</span>

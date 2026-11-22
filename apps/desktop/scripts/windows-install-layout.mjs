@@ -1,7 +1,26 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { buildShellLauncher } from "./build-shell-launcher.mjs";
+
+/** 仅修改未签名打包工件的展示字符串，保留 PE 固定数字版本。 */
+export async function writeWindowsDisplayVersion(executablePath, displayVersion) {
+  const requireBuilder = createRequire(createRequire(import.meta.url).resolve("electron-builder"));
+  const { NtExecutable, NtExecutableResource, Resource } = createRequire(requireBuilder.resolve("app-builder-lib"))("resedit");
+  const executable = NtExecutable.from(await fs.readFile(executablePath));
+  const resources = NtExecutableResource.from(executable);
+  const versions = Resource.VersionInfo.fromEntries(resources.entries);
+  if (versions.length === 0) throw new Error("DESKTOP_WINDOWS_VERSION_RESOURCE_MISSING");
+  for (const version of versions) {
+    const languages = version.getAllLanguagesForStringValues();
+    if (languages.length === 0) throw new Error("DESKTOP_WINDOWS_VERSION_LANGUAGE_MISSING");
+    for (const language of languages) version.setStringValues(language, { FileVersion: displayVersion, ProductVersion: displayVersion });
+    version.outputToResourceEntries(resources.entries);
+  }
+  resources.outputResource(executable);
+  await fs.writeFile(executablePath, Buffer.from(executable.generate()));
+}
 
 /** 打包输入只允许普通目录和文件，链接不能随布局移动进入安装包。 */
 async function assertPayloadTree(entry) {
@@ -45,15 +64,17 @@ export async function prepareWindowsInstallLayout({ appOutDir, launcherExecutabl
     "[shell]\r\nschema=1\r\nactive=installation\r\nprevious=\r\nbaseline=installation\r\n", { encoding: "ascii", flag: "wx" });
 }
 
-/** NSIS 资源编辑后、归档前复用固定启动器与共享工具缓存，不操作已安装应用。 */
+/** NSIS 归档前修正展示属性，再构建真实壳号启动器并转换新工件布局。 */
 export default async function afterSign(context) {
   if (context.electronPlatformName !== "win32") throw new Error("DESKTOP_WINDOWS_INSTALL_LAYOUT_PLATFORM_INVALID");
+  const metadata = context.packager.info.metadata;
+  if (metadata.desktopDisplayVersion) await writeWindowsDisplayVersion(path.join(context.appOutDir, "CodeFlowAI.exe"), metadata.desktopDisplayVersion);
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-install-launcher-"));
   let failure;
   try {
     const iconPath = await context.packager.getIconPath();
     const launcherExecutable = await buildShellLauncher({ outputDir: path.join(temporary, "launcher"),
-      version: context.packager.appInfo.version, ...(iconPath ? { iconPath } : {}) });
+      version: metadata.shellVersion ?? context.packager.appInfo.version, ...(iconPath ? { iconPath } : {}) });
     await prepareWindowsInstallLayout({ appOutDir: context.appOutDir, launcherExecutable });
     // NSIS 会在归档及收尾时写入根 resources/elevate.exe，保留其安装辅助目录。
     await fs.mkdir(path.join(context.appOutDir, "resources"));
