@@ -24,6 +24,8 @@ const capabilities = getDesktopUpdateCapabilities();
 const open = ref(false);
 const checking = ref(false);
 const restarting = ref(false);
+const restartDelayed = ref(false);
+const canClose = computed(() => !restarting.value || restartDelayed.value);
 const state = ref<DesktopUpdateState | null>(null);
 const details = ref<DesktopUpdateDetails | null>(null);
 const error = ref("");
@@ -36,6 +38,7 @@ let pollBusy = false;
 let run = 0;
 let snapshotRead = 0;
 let disposed = false;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
 const currentRows = computed(() => [
   { label: "当前版本", value: formatDesktopCurrentVersion(details.value?.current ?? null) },
@@ -91,12 +94,15 @@ const outcome = computed<DesktopUpdateOutcome>(() => {
 /** 展示直接派生自原检查、重启与错误事实，不维护另一套升级状态。 */
 const presentation = computed<DesktopUpdateOutcome>(() => {
   if (error.value || snapshotError.value) return outcome.value!;
+  if (restarting.value && restartDelayed.value) return { tone: "warning", title: "重启更新尚未完成",
+    detail: "暂未确认应用已重启。可以关闭此提示，原更新请求仍在处理中，请勿重复启动更新。" };
   if (restarting.value) return { tone: "info", title: "正在重启更新", detail: "应用将关闭并重新启动，请稍候。" };
   return outcome.value;
 });
 
 /** 每种结果只突出一个下一步；准备完成前不提供重启操作。 */
 const primaryAction = computed(() => {
+  if (restarting.value && restartDelayed.value) return { kind: "close" as const, label: "关闭提示", disabled: false };
   if (restarting.value) return { kind: "restart" as const, label: "正在重启…", disabled: true };
   if (error.value || snapshotError.value) {
     if (!snapshotError.value && prepared.value && capabilities.restart) return { kind: "restart" as const, label: "重启并更新", disabled: restartDisabled.value };
@@ -212,11 +218,13 @@ async function startCheck(): Promise<void> {
   }
 }
 
-/** 重启只由用户发起；失败保留 prepared，允许原因处理后再次请求。 */
+/** 等待过久只解锁提示，不取消宿主事务；失败后复查状态再允许重试。 */
 async function restart(): Promise<void> {
   if (disposed || restartDisabled.value) return;
   const owner = run;
   restarting.value = true;
+  restartDelayed.value = false;
+  restartTimer = setTimeout(() => { if (!disposed && owner === run) restartDelayed.value = true; }, 60_000);
   error.value = "";
   try { await restartDesktopForUpdate(); }
   catch (cause) {
@@ -233,8 +241,14 @@ async function restart(): Promise<void> {
             code: "DESKTOP_UPDATE_RESTART_FAILED", requestId: details.value?.shell.requestId ?? null, message }
         : { phase: "restart-client", target: "bundle", code: "DESKTOP_UPDATE_RESTART_FAILED",
             requestId: details.value?.bundle.requestId ?? null, releaseId: bundleTarget?.releaseId ?? null, message });
+      await refreshSnapshots(owner);
     }
-  } finally { restarting.value = false; }
+  } finally {
+    if (restartTimer) clearTimeout(restartTimer);
+    restartTimer = null;
+    restarting.value = false;
+    restartDelayed.value = false;
+  }
 }
 
 function close(): void {
@@ -292,6 +306,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   disposed = true;
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = null;
   ++run;
   stopPolling();
   unsubscribe?.();
@@ -303,7 +319,7 @@ onBeforeUnmount(() => {
 
 <template>
   <a-modal :open="open" title="软件更新" :footer="null" :width="520" centered
-    :closable="!restarting" :keyboard="!restarting" :mask-closable="false"
+    :closable="canClose" :keyboard="canClose" :mask-closable="false"
     :body-style="{ maxHeight: 'calc(100dvh - 160px)', overflowY: 'auto' }" @cancel="close">
     <div class="update-check">
       <section class="update-check__summary" :class="`update-check__summary--${presentation.tone}`" role="status" aria-live="polite">
@@ -338,14 +354,14 @@ onBeforeUnmount(() => {
       </section>
       <p v-if="prepared && !capabilities.restart" class="update-check__hint">当前版本不支持直接重启更新，请退出并重新启动应用。</p>
       <div class="update-check__actions">
-        <a-button type="link" :disabled="restarting" @click="openNotes">
+        <a-button type="link" :disabled="!canClose" @click="openNotes">
           <template #icon><ExportOutlined /></template>
           更新日志
         </a-button>
         <div class="update-check__action-buttons">
-          <a-button v-if="primaryAction.kind !== 'close'" :disabled="restarting" @click="close">{{ prepared ? '稍后' : '关闭' }}</a-button>
-          <a-button v-else-if="!updateInProgress && capabilities.check" type="text" @click="startCheck">重新检查</a-button>
-          <a-button :type="updateInProgress ? 'default' : 'primary'" :loading="restarting" :disabled="primaryAction.disabled" @click="performPrimaryAction">
+          <a-button v-if="primaryAction.kind !== 'close'" :disabled="!canClose" @click="close">{{ prepared ? '稍后' : '关闭' }}</a-button>
+          <a-button v-else-if="!updateInProgress && !restarting && capabilities.check" type="text" @click="startCheck">重新检查</a-button>
+          <a-button :type="updateInProgress ? 'default' : 'primary'" :loading="restarting && !restartDelayed" :disabled="primaryAction.disabled" @click="performPrimaryAction">
             {{ primaryAction.label }}
           </a-button>
         </div>

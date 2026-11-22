@@ -621,6 +621,73 @@ test("托盘重启只调用一次，失败保持明确错误并允许后续重�
   assert.equal(f.panel.error.value, "");
 });
 
+test("重启等待过久允许关闭提示但不重复派发，迟到结果仍由原请求收口", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = modalFixture(t);
+  let calls = 0, resolve!: () => void;
+  f.bridge.restartForUpdate = () => { calls++; return new Promise<void>(done => { resolve = done; }); };
+  await f.panel.startCheck();
+  const pending = f.panel.restart();
+  t.mock.timers.tick(60_000);
+  assert.equal(f.panel.presentation.value.title, "重启更新尚未完成");
+  assert.equal(f.panel.restartDelayed.value, true);
+  assert.equal(f.panel.canClose.value, true);
+  f.panel.close();
+  await f.panel.restart();
+  await f.panel.startCheck();
+  assert.equal(calls, 1);
+  assert.equal(f.checks(), 1);
+  resolve();
+  await pending;
+  assert.equal(f.panel.restartDelayed.value, false);
+  assert.equal(f.panel.restarting.value, false);
+});
+
+test("重启失败后重新读取宿主事实，禁止按旧 prepared 再次更新", async t => {
+  const f = modalFixture(t);
+  await f.panel.startCheck();
+  f.bridge.restartForUpdate = async () => {
+    f.state.shellOwned = true;
+    f.state.operation = "exiting";
+    throw new Error("RESTART_FAILED");
+  };
+  await f.panel.restart();
+  assert.equal(f.panel.state.value.shellOwned, true);
+  assert.equal(f.panel.restartDisabled.value, true);
+  assert.equal(f.panel.restarting.value, false);
+  assert.ok(f.panel.error.value);
+});
+
+test("上次重启计时器不能提前改变下一次重启提示", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = modalFixture(t);
+  await f.panel.startCheck();
+  await f.panel.restart();
+  t.mock.timers.tick(30_000);
+  let resolve!: () => void;
+  f.bridge.restartForUpdate = () => new Promise<void>(done => { resolve = done; });
+  const pending = f.panel.restart();
+  t.mock.timers.tick(30_000);
+  assert.equal(f.panel.restartDelayed.value, false);
+  assert.equal(f.panel.canClose.value, false);
+  t.mock.timers.tick(30_000);
+  assert.equal(f.panel.canClose.value, true);
+  resolve();
+  await pending;
+});
+
+test("重启失败后快照也失败时保留错误并阻止再次重启", async t => {
+  const f = modalFixture(t);
+  await f.panel.startCheck();
+  f.bridge.restartForUpdate = async () => { throw new Error("RESTART_FAILED"); };
+  f.bridge.getUpdateState = async () => { throw new Error("SNAPSHOT_FAILED"); };
+  await f.panel.restart();
+  assert.ok(f.panel.error.value);
+  assert.ok(f.panel.snapshotError.value);
+  assert.equal(f.panel.restartDisabled.value, true);
+  assert.equal(f.panel.canClose.value, true);
+});
+
 test("状态读取失败显式结束，不能继续发起更新检查", async t => {
   const f = modalFixture(t);
   f.bridge.getUpdateState = async () => { throw new Error("SNAPSHOT_FAILED"); };
