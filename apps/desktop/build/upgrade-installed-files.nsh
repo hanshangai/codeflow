@@ -10,6 +10,8 @@ Var d16UpgradeFailure
 Var d16UpgradeMode
 Var d16UpgradeRegisteredRoot
 Var d16UpgradeUninstallString
+Var d16UpgradeRegistryRoot
+Var d16UpgradeRootAbsent
 Var d16UpgradeExpectedType
 Var d16UpgradeFindBuffer
 Var d16UpgradeBase
@@ -463,40 +465,91 @@ Function D16FinishProgramReplacement
   upgrade_finish_done:
 FunctionEnd
 
-; Replace only a registered installation at this exact root; never invoke its old executable or uninstaller.
+; Inspect only the selected target. Other historical roots never grant cleanup authority or block a new install.
+Function D16InspectRegisteredRoot
+  StrCpy $d16UpgradeRootAbsent 0
+  System::Call 'kernel32::GetFileAttributesW(w "$d16UpgradeRegisteredRoot") i.r0 ?e'
+  Pop $d16InstallNativeError
+  ${If} $0 != -1
+    StrCpy $d16InstallNativeError 0
+    Return
+  ${EndIf}
+  ${If} $d16InstallNativeError != 2
+  ${AndIf} $d16InstallNativeError != 3
+    StrCpy $d16InstallCause LEGACY_INSTALL_ROOT_UNAVAILABLE
+    Goto registered_root_failed
+  ${EndIf}
+  ; User-approved: deleted programs may be reinstalled despite stale registry/uninstaller records.
+  ; Only this attempt ignores the record; successful normal registration replaces it. No old paths are deleted.
+  DetailPrint 'LEGACY_INSTALL_ROOT_ABSENT: requestId=$d16InstallRequestId registry=$d16UpgradeRegistryRoot old=$d16UpgradeRegisteredRoot target=$INSTDIR'
+  StrCpy $d16UpgradeRootAbsent 1
+  StrCpy $d16InstallNativeError 0
+  Return
+  registered_root_failed:
+    StrCpy $d16InstallStage program-files-upgrade
+    StrCpy $d16InstallErrorCode DESKTOP_INSTALL_PROGRAM_REPLACE_FAILED
+    StrCpy $d16InstallExitCode "null"
+    Call D16FailInstallation
+FunctionEnd
+
+; Retire only the other scope's same-root registration after the replacement has committed.
+!macro D16RetireInstallRegistration ROOT_KEY
+  ReadRegStr $R1 ${ROOT_KEY} "${INSTALL_REGISTRY_KEY}" InstallLocation
+  ${If} $R1 == $INSTDIR
+  ${AndIf} $R1 != ""
+    StrCpy $d16UpgradeRegistryRoot "${ROOT_KEY}"
+    StrCpy $d16UpgradeRegisteredRoot $R1
+    ReadRegStr $R2 ${ROOT_KEY} "${UNINSTALL_REGISTRY_KEY}" UninstallString
+    ClearErrors
+    StrCpy $R3 0
+    ${If} $R2 != ""
+      DeleteRegKey ${ROOT_KEY} "${UNINSTALL_REGISTRY_KEY}"
+      ${If} ${Errors}
+        StrCpy $R3 1
+      ${EndIf}
+    ${EndIf}
+    ${If} $R3 == 0
+      DeleteRegKey ${ROOT_KEY} "${INSTALL_REGISTRY_KEY}"
+      ${If} ${Errors}
+        StrCpy $R3 1
+      ${EndIf}
+    ${EndIf}
+    ${If} $R3 == 1
+      StrCpy $d16InstallStage installation-registration
+      StrCpy $d16InstallErrorCode DESKTOP_INSTALL_REGISTRATION_FAILED
+      StrCpy $d16InstallCause OTHER_SCOPE_REGISTRATION_RETIRE_FAILED
+      StrCpy $d16InstallExitCode "null"
+      StrCpy $d16InstallNativeError 0
+      Call D16FailInstallation
+    ${EndIf}
+    DetailPrint 'LEGACY_INSTALL_SCOPE_RETIRED: requestId=$d16InstallRequestId registry=$d16UpgradeRegistryRoot target=$INSTDIR'
+  ${EndIf}
+  ClearErrors
+!macroend
+
+; Upgrade the selected target only; other-root and unknown records do not block installation.
 !macro D16NativeUninstallOldVersion ROOT_KEY
       ; Keep upstream's function symbol referenced for warnings-as-errors builds; never call its code.
       GetFunctionAddress $R0 uninstallOldVersion
       ClearErrors
       StrCpy $R0 0
+      ${If} $d16InstallRequestId == ""
+        Call D16NewInstallRequestId
+      ${EndIf}
+      StrCpy $d16UpgradeRegistryRoot "${ROOT_KEY}"
+      StrCpy $d16UpgradeRootAbsent 0
       !insertmacro readReg $d16UpgradeRegisteredRoot "${ROOT_KEY}" "${INSTALL_REGISTRY_KEY}" InstallLocation
       !insertmacro readReg $d16UpgradeUninstallString "${ROOT_KEY}" "${UNINSTALL_REGISTRY_KEY}" UninstallString
-      ${If} $d16UpgradeRegisteredRoot == ""
-      ${AndIf} $d16UpgradeUninstallString != ""
-        StrCpy $d16InstallCause LEGACY_INSTALL_ROOT_UNKNOWN
-        StrCpy $d16InstallStage program-files-upgrade
-        StrCpy $d16InstallErrorCode DESKTOP_INSTALL_PROGRAM_REPLACE_FAILED
-        StrCpy $d16InstallExitCode "null"
-        Call D16FailInstallation
-      ${EndIf}
-      ${If} $d16UpgradeRegisteredRoot != ""
-        !if "${ROOT_KEY}" == "HKEY_CURRENT_USER"
-          ${If} $installMode == "all"
-            StrCpy $d16InstallCause LEGACY_INSTALL_SCOPE_CONFLICT
-            StrCpy $d16InstallStage program-files-upgrade
-            StrCpy $d16InstallErrorCode DESKTOP_INSTALL_PROGRAM_REPLACE_FAILED
-            StrCpy $d16InstallExitCode "null"
-            Call D16FailInstallation
-          ${EndIf}
-        !endif
-        ${If} $d16UpgradeRegisteredRoot != $INSTDIR
-          StrCpy $d16InstallCause LEGACY_INSTALL_ROOT_CONFLICT
-          StrCpy $d16InstallStage program-files-upgrade
-          StrCpy $d16InstallErrorCode DESKTOP_INSTALL_PROGRAM_REPLACE_FAILED
-          StrCpy $d16InstallExitCode "null"
-          Call D16FailInstallation
+      ${If} $d16UpgradeRegisteredRoot == $INSTDIR
+      ${AndIf} $d16UpgradeRegisteredRoot != ""
+        Call D16InspectRegisteredRoot
+        ${If} $d16UpgradeRootAbsent != 1
+          Call D16UpgradeSameRoot
         ${EndIf}
-        Call D16UpgradeSameRoot
+      ${ElseIf} $d16UpgradeRegisteredRoot != ""
+      ${OrIf} $d16UpgradeUninstallString != ""
+        ; User-approved: preserve unrelated/unknown old programs and let normal registration bind this target.
+        DetailPrint 'LEGACY_INSTALL_REGISTRATION_PRESERVED: requestId=$d16InstallRequestId registry=$d16UpgradeRegistryRoot old=$d16UpgradeRegisteredRoot target=$INSTDIR'
       ${EndIf}
       ClearErrors
       StrCpy $R0 0

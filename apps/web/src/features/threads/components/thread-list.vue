@@ -164,9 +164,15 @@ const filteredMoveGroups = computed(() => {
 const threadTabOptions = computed(() => [
   { title: "普通会话", payload: { name: "普通" }, value: "current" as ThreadFilterTab },
   { title: "流程会话", payload: { name: "流程" }, value: "orchestration" as ThreadFilterTab },
-  { title: "规格会话", payload: { name: "规格" }, value: "knowledge" as ThreadFilterTab },
   { title: "归档会话", payload: { name: "归档" }, value: "archived" as ThreadFilterTab },
 ]);
+
+/** 「规格」不再作为会话列表 tab；历史持久化选择静默回退到普通会话。 */
+watch(
+  () => ui.threadFilterTab,
+  (tab) => { if (tab === "knowledge") ui.threadFilterTab = "current"; },
+  { immediate: true },
+);
 
 const threadSortOptions: Array<{ label: string; value: ThreadListSort }> = [
   { label: "最近活动 新到旧", value: "activity_desc" },

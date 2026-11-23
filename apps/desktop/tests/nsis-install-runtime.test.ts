@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -49,6 +50,38 @@ function nsisPath(value: string): string {
   assert.doesNotMatch(value, /[\r\n\0]/u);
   return value.replaceAll("$", "$$").replaceAll('"', '$\\"');
 }
+
+test("安装诊断保留注册表中自带引号的旧目录值", { skip }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "nsis-diagnostic-"));
+  const source = path.join(root, "diagnostic.nsi"), executable = path.join(root, "diagnostic.exe");
+  const value = '"C:\\旧安装 💾\\with $ sign"';
+  await fs.writeFile(source, `Unicode true
+RequestExecutionLevel user
+SilentInstall silent
+AutoCloseWindow true
+Name "Diagnostic fixture"
+OutFile "${nsisPath(executable)}"
+!include "${nsisPath(hook)}"
+Section
+ FileOpen $1 "$EXEDIR\\diagnostic.json" w
+ FileWrite $1 '{"registeredInstallRoot":'
+ StrCpy $d16InstallDiagnosticValue "${nsisPath(value)}"
+ Call D16WriteDiagnosticString
+ IfErrors write_failed
+ FileWrite $1 '}'
+ FileClose $1
+ Goto done
+ write_failed:
+ FileClose $1
+ SetErrorLevel 1
+ done:
+SectionEnd
+`, "utf8");
+  const compiled = await execute(compiler!, ["/V2", "/INPUTCHARSET", "UTF8", source]);
+  assert.equal(compiled.code, 0, compiled.stdout + compiled.stderr);
+  const result = await execute(executable, []); assert.equal(result.code, 0, root);
+  assert.equal(JSON.parse(await fs.readFile(path.join(root, "diagnostic.json"), "utf8")).registeredInstallRoot, value);
+});
 
 /** 等待本次 spawn 的实际 close；超时仅终止其原始句柄并保留失败。 */
 async function execute(file: string, args: string[], env = process.env) {
@@ -173,9 +206,9 @@ FunctionEnd
   return { root, app, temporary, executable, env, child };
 }
 
-for (const variant of ["same-root", "junction", "wrong-type", "different-root", "different-scope"] as const) {
+for (const variant of ["same-root", "junction", "wrong-type", "different-root", "different-root-unicode", "different-scope", "unknown-root", "unknown-root-with-uninstaller", "deleted-root", "deleted-root-with-uninstaller", "deleted-root-all-users", "deleted-root-reparse", "root-access-denied", "repeated-registry-check"] as const) {
   test(`native legacy replacement ${variant} never invokes the old uninstaller`, { skip }, async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "nsis-legacy-replace-")), app = path.join(root, "app");
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), variant === "wrong-type" ? "nsis-旧安装-💾-$-" : "nsis-legacy-replace-")), app = path.join(root, "app");
     await fs.mkdir(path.join(app, "resources"), { recursive: true });
     await fs.mkdir(path.join(app, "shells/old"), { recursive: true });
     await fs.writeFile(path.join(app, "unknown-user.txt"), "账号、身份、任务原样保留", "utf8");
@@ -187,6 +220,27 @@ for (const variant of ["same-root", "junction", "wrong-type", "different-root", 
       await fs.writeFile(path.join(root, "external/user.txt"), "external", "ascii");
       await fs.symlink(path.join(root, "external"), path.join(app, "resources/alias"), "junction");
     }
+    const deleted = variant.startsWith("deleted-root"), success = !["junction", "wrong-type", "root-access-denied"].includes(variant);
+    const differentRoot = variant.startsWith("different-root");
+    const registeredRoot = path.join(root, variant === "different-root-unicode" ? "旧安装 💾 $" : differentRoot ? "other" : deleted ? "deleted-parent/old-app" : "app");
+    if (differentRoot) await fs.mkdir(registeredRoot);
+    if (variant === "deleted-root-reparse") {
+      await fs.mkdir(path.join(root, "external"));
+      await fs.symlink(path.join(root, "external"), path.join(root, "deleted-parent"), "junction");
+    }
+    const originalHook = await fs.readFile(hook, "utf8");
+    const diagnostic = 'GetTempFileName $d16InstallLog';
+    assert.equal(originalHook.split(diagnostic).length, 2);
+    const includedHook = path.join(root, "fixture-installer.nsh");
+    await fs.writeFile(includedHook, originalHook.replace(diagnostic, 'StrCpy $d16InstallLog "$EXEDIR\\failure.json"'), "utf8");
+    let upgradeInclude = fileURLToPath(new URL("../build/upgrade-installed-files.nsh", import.meta.url));
+    if (variant === "root-access-denied") {
+      const original = await fs.readFile(upgradeInclude, "utf8");
+      const anchor = `System::Call 'kernel32::GetFileAttributesW(w "$d16UpgradeRegisteredRoot") i.r0 ?e'`;
+      assert.equal(original.split(anchor).length, 2, "故障注入必须命中旧目录的真实属性读取");
+      upgradeInclude = path.join(root, "denied-upgrade.nsh");
+      await fs.writeFile(upgradeInclude, original.replace(anchor, 'StrCpy $0 -1\nPush 5'), "utf8");
+    }
     const source = path.join(root, "upgrade.nsi"), executable = path.join(root, "upgrade.exe");
     await fs.writeFile(source, `Unicode true
 RequestExecutionLevel user
@@ -194,15 +248,19 @@ SilentInstall silent
 AutoCloseWindow true
 Name "Legacy replacement fixture"
 OutFile "${nsisPath(executable)}"
-!include "${nsisPath(hook)}"
+!define CODEFLOW_UPGRADE_INSTALLED_INCLUDE "${nsisPath(upgradeInclude)}"
+!define CODEFLOW_STOP_INSTALLED_INCLUDE "${nsisPath(fileURLToPath(new URL("../build/stop-installed-processes.nsh", import.meta.url)))}"
+!include "${nsisPath(includedHook)}"
 !define INSTALL_REGISTRY_KEY "fixture-install"
 !define UNINSTALL_REGISTRY_KEY "fixture-uninstall"
 Var installMode
 !macro readReg OUTPUT ROOT KEY NAME
   !if "\${NAME}" == "InstallLocation"
-    StrCpy \${OUTPUT} "$EXEDIR\\${variant === "different-root" ? "other" : "app"}"
+    ${variant === "repeated-registry-check" ? '!if "${ROOT}" == "SHELL_CONTEXT"\n    StrCpy ${OUTPUT} "$EXEDIR\\deleted-old"\n    !else' : ''}
+    StrCpy \${OUTPUT} "${variant.startsWith("unknown-root") ? "" : nsisPath(registeredRoot)}"
+    ${variant === "repeated-registry-check" ? '!endif' : ''}
   !else
-    StrCpy \${OUTPUT} "old-uninstaller.exe"
+    StrCpy \${OUTPUT} "${deleted && variant !== "deleted-root-with-uninstaller" || variant === "unknown-root" ? "" : "old-uninstaller.exe"}"
   !endif
 !macroend
 Function uninstallOldVersion
@@ -215,9 +273,10 @@ FunctionEnd
 !macroend
 Section
   StrCpy $INSTDIR "$EXEDIR\\app"
-  StrCpy $installMode ${variant === "different-scope" ? "all" : "CurrentUser"}
+  StrCpy $installMode ${variant === "different-scope" || variant === "deleted-root-all-users" ? "all" : "CurrentUser"}
   !insertmacro customCheckAppRunning
-  !insertmacro uninstallOldVersion ${variant === "different-scope" ? "HKEY_CURRENT_USER" : "SHELL_CONTEXT"}
+  !insertmacro uninstallOldVersion ${variant === "different-scope" || variant === "deleted-root-all-users" ? "HKEY_CURRENT_USER" : "SHELL_CONTEXT"}
+  ${variant === "repeated-registry-check" ? '!insertmacro uninstallOldVersion HKEY_CURRENT_USER' : ''}
   FileOpen $0 "$EXEDIR\\continued.txt" w
   FileWrite $0 "continued"
   FileClose $0
@@ -231,20 +290,193 @@ FunctionEnd
     const compiled = await execute(compiler!, ["/V2", "/INPUTCHARSET", "UTF8", source]);
     assert.equal(compiled.code, 0, compiled.stdout + compiled.stderr);
     const result = await execute(executable, []);
-    assert.equal(result.code, variant === "same-root" ? 0 : 1, root);
+    assert.equal(result.code, success ? 0 : 1, root);
     await assert.rejects(fs.access(path.join(root, "legacy-ran.txt")), { code: "ENOENT" });
     assert.equal(await fs.readFile(path.join(app, "unknown-user.txt"), "utf8"), "账号、身份、任务原样保留");
-    if (variant === "same-root") {
+    if (success) {
+      assert.equal(await fs.readFile(path.join(root, "continued.txt"), "ascii"), "continued");
       assert.equal(await fs.readFile(path.join(app, "CodeFlowAI.exe"), "ascii"), "old executable", "preflight must preserve the complete old program until the new payload is ready");
       assert.equal(await fs.readFile(path.join(app, "shells/old/obsolete.txt"), "ascii"), "old shell");
     } else {
       assert.equal(await fs.readFile(path.join(app, "shells/old/obsolete.txt"), "ascii"), "old shell", "read-only preflight must reject before deleting any program file");
-      assert.equal(await fs.readFile(path.join(root, "failure.txt"), "ascii"), variant === "junction" ? "PROGRAM_PATH_REPARSE"
-        : variant === "wrong-type" ? "PROGRAM_PATH_TYPE_INVALID" : variant === "different-root" ? "LEGACY_INSTALL_ROOT_CONFLICT" : "LEGACY_INSTALL_SCOPE_CONFLICT");
+      const expected = variant === "junction" ? "PROGRAM_PATH_REPARSE" : variant === "wrong-type" ? "PROGRAM_PATH_TYPE_INVALID" : "LEGACY_INSTALL_ROOT_UNAVAILABLE";
+      assert.equal(await fs.readFile(path.join(root, "failure.txt"), "ascii"), expected);
+      const details = JSON.parse(await fs.readFile(path.join(root, "failure.json"), "utf8"));
+      assert.equal(details.registeredInstallRoot, registeredRoot);
+      assert.equal(details.targetInstallRoot, app);
+      assert.equal(details.registryRoot, variant === "different-scope" ? "HKEY_CURRENT_USER" : "SHELL_CONTEXT");
+      if (variant === "root-access-denied") assert.equal(details.win32Error, 5);
       if (variant === "junction") assert.equal(await fs.readFile(path.join(root, "external/user.txt"), "ascii"), "external");
     }
   });
 }
+
+for (const scenario of ["deleted-target", "empty-target", "partial-target", "changed-root", "uninstaller-only"] as const)
+test(`原生安装完整写入程序和完成标记，不被历史登记阻断：${scenario}`, { skip }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "nsis-fresh-install-"));
+  const app = path.join(root, "app"), previous = path.join(root, "previous"), payload = path.join(root, "payload");
+  await fs.mkdir(path.join(payload, "resources"), { recursive: true });
+  await fs.writeFile(path.join(payload, "CodeFlowAI.exe"), "new launcher", "ascii");
+  await fs.writeFile(path.join(payload, "resources/new.txt"), "new resources", "ascii");
+  const uninstaller = path.join(root, "uninstaller.exe");
+  await fs.writeFile(uninstaller, "independent uninstaller", "ascii");
+  if (scenario === "changed-root") {
+    await fs.mkdir(previous); await fs.writeFile(path.join(previous, "old-program.txt"), "preserve old installation", "ascii");
+  }
+  if (scenario === "empty-target" || scenario === "partial-target") await fs.mkdir(app);
+  if (scenario === "partial-target") {
+    await fs.writeFile(path.join(app, "CodeFlowAI.exe"), "broken old launcher", "ascii");
+    await fs.writeFile(path.join(app, "user-data.txt"), "preserve user data", "ascii");
+  }
+  const source = path.join(root, "install.nsi"), executable = path.join(root, "install.exe");
+  await fs.writeFile(source, `Unicode true
+RequestExecutionLevel user
+SilentInstall silent
+AutoCloseWindow true
+Name "Fresh installation fixture"
+OutFile "${nsisPath(executable)}"
+!define APP_BUILD_DIR "${nsisPath(payload)}"
+!define UNINSTALL_FILENAME "Uninstall CodeFlowAI.exe"
+!define UNINSTALLER_OUT_FILE "${nsisPath(uninstaller)}"
+!include "${nsisPath(hook)}"
+!define INSTALL_REGISTRY_KEY "fixture-install"
+!define UNINSTALL_REGISTRY_KEY "fixture-uninstall"
+Var installMode
+!macro readReg OUTPUT ROOT KEY NAME
+ !if "\${NAME}" == "InstallLocation"
+  StrCpy \${OUTPUT} "${scenario === "uninstaller-only" ? "" : nsisPath(scenario === "changed-root" ? previous : app)}"
+ !else
+  StrCpy \${OUTPUT} "missing-old-uninstaller.exe"
+ !endif
+!macroend
+Function uninstallOldVersion
+ Abort "old uninstaller must not execute"
+FunctionEnd
+!macro uninstallOldVersion ROOT
+ Call uninstallOldVersion
+!macroend
+!macro installApplicationFiles
+ File /r "${nsisPath(payload)}\\*.*"
+!macroend
+Section
+ InitPluginsDir
+ StrCpy $INSTDIR "$EXEDIR\\app"
+ StrCpy $installMode all
+ !insertmacro customCheckAppRunning
+ !insertmacro uninstallOldVersion SHELL_CONTEXT
+ !insertmacro uninstallOldVersion HKEY_CURRENT_USER
+ SetOutPath $INSTDIR
+ !insertmacro installApplicationFiles
+ !insertmacro customInstall
+SectionEnd
+`, "utf8");
+  const compiled = await execute(compiler!, ["/V2", "/INPUTCHARSET", "UTF8", source]);
+  assert.equal(compiled.code, 0, compiled.stdout + compiled.stderr);
+  const result = await execute(executable, []); assert.equal(result.code, 0, root);
+  assert.equal(await fs.readFile(path.join(app, "CodeFlowAI.exe"), "ascii"), "new launcher");
+  assert.equal(await fs.readFile(path.join(app, "resources/new.txt"), "ascii"), "new resources");
+  assert.equal(await fs.readFile(path.join(app, "Uninstall CodeFlowAI.exe"), "ascii"), "independent uninstaller");
+  assert.match(await fs.readFile(path.join(app, "installation-completed.ini"), "ascii"), /requestId=nsis-install-/u);
+  if (scenario === "changed-root") assert.equal(await fs.readFile(path.join(previous, "old-program.txt"), "ascii"), "preserve old installation");
+  if (scenario === "partial-target") assert.equal(await fs.readFile(path.join(app, "user-data.txt"), "ascii"), "preserve user data");
+});
+
+for (const scenario of ["to-all-users", "to-current-user", "other-directory", "missing-new-registration", "missing-new-uninstaller", "retire-denied"] as const)
+test(`成功切换范围只保留当前目录的一个卸载登记：${scenario}`, { skip }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "nsis-registration-")), app = path.join(root, "app");
+  await fs.mkdir(app);
+  const key = `Software\\CodeFlowInstallerTests\\${path.basename(root)}`;
+  const requireBuilder = createRequire(await fs.realpath(fileURLToPath(new URL("../node_modules/electron-builder/package.json", import.meta.url))));
+  const builderRoot = path.dirname(requireBuilder.resolve("app-builder-lib/package.json"));
+  const upstream = await fs.readFile(path.join(builderRoot, "templates/nsis/include/installer.nsh"), "utf8");
+  const registryMacro = upstream.match(/^!macro registryAddInstallInfo\r?\n[\s\S]*?^!macroend/mu)?.[0];
+  assert.ok(registryMacro, "使用真实builder登记宏验证安装范围切换");
+  const source = path.join(root, "registry.nsi"), executable = path.join(root, "registry.exe");
+  const allUsers = scenario !== "to-current-user";
+  let includedHook = hook;
+  if (scenario === "retire-denied") {
+    const original = await fs.readFile(new URL("../build/upgrade-installed-files.nsh", import.meta.url), "utf8");
+    const anchor = 'DeleteRegKey ${ROOT_KEY} "${UNINSTALL_REGISTRY_KEY}"';
+    assert.equal(original.split(anchor).length, 2);
+    const faulty = path.join(root, "denied-retirement.nsh");
+    await fs.writeFile(faulty, original.replace(anchor, 'SetErrors'), "utf8");
+    includedHook = path.join(root, "denied-installer.nsh");
+    await fs.writeFile(includedHook, await fs.readFile(hook, "utf8"), "utf8");
+  }
+  await fs.writeFile(source, `Unicode true
+RequestExecutionLevel user
+SilentInstall silent
+AutoCloseWindow true
+Name "Registration fixture"
+OutFile "${nsisPath(executable)}"
+${scenario === "retire-denied" ? `!define CODEFLOW_UPGRADE_INSTALLED_INCLUDE "${nsisPath(path.join(root, "denied-retirement.nsh"))}"\n!define CODEFLOW_STOP_INSTALLED_INCLUDE "${nsisPath(fileURLToPath(new URL("../build/stop-installed-processes.nsh", import.meta.url)))}"` : ''}
+!include "${nsisPath(includedHook)}"
+!define INSTALL_REGISTRY_KEY "${key}\\Install"
+!define UNINSTALL_REGISTRY_KEY "${key}\\Uninstall"
+!define SHORTCUT_NAME "CodeFlow test"
+!define UNINSTALL_DISPLAY_NAME "CodeFlow test"
+!define UNINSTALL_FILENAME "Uninstall CodeFlowAI.exe"
+!define VERSION "1.0.0"
+!define ESTIMATED_SIZE 1
+Var installMode
+Var appExe
+Var mappedRegistry
+${registryMacro}
+Section
+  ; Map HKLM into this process's private HKCU subtree; no elevation or real machine registration is touched.
+  System::Call 'advapi32::RegCreateKeyExW(p 0x80000001, w "${key}\\Machine", i 0, p 0, i 0, i 0xF003F, p 0, *p .r0, p 0) i.r1'
+  IntCmp $1 0 +2
+    Abort "private registry create failed"
+  StrCpy $mappedRegistry $0
+  System::Call 'advapi32::RegOverridePredefKey(p 0x80000002, p $mappedRegistry) i.r1'
+  IntCmp $1 0 +2
+    Abort "private registry mapping failed"
+  StrCpy $INSTDIR "$EXEDIR\\app"
+  StrCpy $appExe "$INSTDIR\\CodeFlowAI.exe"
+  SetShellVarContext ${allUsers ? "all" : "current"}
+  StrCpy $installMode ${allUsers ? "all" : "CurrentUser"}
+  WriteRegStr ${allUsers ? "HKCU" : "HKLM"} "\${INSTALL_REGISTRY_KEY}" InstallLocation "${scenario === "other-directory" ? '$EXEDIR\\other' : '$INSTDIR'}"
+  WriteRegStr ${allUsers ? "HKCU" : "HKLM"} "\${UNINSTALL_REGISTRY_KEY}" UninstallString "old-uninstaller"
+  ${scenario === "missing-new-registration" ? '' : '!insertmacro registryAddInstallInfo'}
+  ${scenario === "missing-new-uninstaller" ? 'DeleteRegValue SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" UninstallString' : ''}
+  !insertmacro customInstall
+  Call RecordRegistryState
+SectionEnd
+Function .onInstFailed
+  FileOpen $1 "$EXEDIR\\failed.txt" w
+  FileWrite $1 $d16InstallCause
+  FileClose $1
+  Call RecordRegistryState
+FunctionEnd
+Function RecordRegistryState
+  ClearErrors
+  ReadRegStr $0 ${allUsers ? "HKCU" : "HKLM"} "\${INSTALL_REGISTRY_KEY}" InstallLocation
+  FileOpen $1 "$EXEDIR\\old-root.txt" w
+  FileWrite $1 $0
+  FileClose $1
+  ReadRegStr $0 ${allUsers ? "HKCU" : "HKLM"} "\${UNINSTALL_REGISTRY_KEY}" UninstallString
+  FileOpen $1 "$EXEDIR\\old-uninstall.txt" w
+  FileWrite $1 $0
+  FileClose $1
+  ReadRegStr $0 SHELL_CONTEXT "\${INSTALL_REGISTRY_KEY}" InstallLocation
+  FileOpen $1 "$EXEDIR\\new-root.txt" w
+  FileWrite $1 $0
+  FileClose $1
+  System::Call 'advapi32::RegOverridePredefKey(p 0x80000002, p 0) i.r0'
+  System::Call 'advapi32::RegCloseKey(p $mappedRegistry) i.r0'
+  DeleteRegKey HKCU "${key}"
+FunctionEnd
+`, "utf8");
+  const compiled = await execute(compiler!, ["/V2", "/INPUTCHARSET", "UTF8", source]);
+  assert.equal(compiled.code, 0, compiled.stdout + compiled.stderr);
+  const failed = scenario.startsWith("missing-new-") || scenario === "retire-denied";
+  const result = await execute(executable, []); assert.equal(result.code, failed ? 1 : 0, root);
+  assert.equal(await fs.readFile(path.join(root, "new-root.txt"), "utf8"), scenario === "missing-new-registration" ? "" : app);
+  assert.equal(await fs.readFile(path.join(root, "old-root.txt"), "utf8"), scenario === "other-directory" ? path.join(root, "other") : failed ? app : "");
+  assert.equal(await fs.readFile(path.join(root, "old-uninstall.txt"), "utf8"), scenario === "other-directory" || failed ? "old-uninstaller" : "");
+  if (failed) assert.equal(await fs.readFile(path.join(root, "failed.txt"), "utf8"), scenario.startsWith("missing-new-")
+    ? "CURRENT_SCOPE_REGISTRATION_NOT_CONFIRMED" : "OTHER_SCOPE_REGISTRATION_RETIRE_FAILED");
+});
 
 for (const interruption of ["copy-failure", "commit-interrupted", "snapshot-interrupted"] as const) {
   test(`real NSIS replacement preserves a runnable and uninstallable old program after ${interruption}`, { skip }, async t => {

@@ -151,6 +151,7 @@ Var d16InstallErrorCode
 Var d16InstallNativeError
 Var d16InstallMarkerHandle
 Var d16InstallMarkerTemporary
+Var d16InstallDiagnosticValue
 
 !ifndef CODEFLOW_UPGRADE_INSTALLED_INCLUDE
   !define CODEFLOW_UPGRADE_INSTALLED_INCLUDE "${__FILEDIR__}\upgrade-installed-files.nsh"
@@ -163,7 +164,48 @@ Function D16NewInstallRequestId
   StrCpy $d16InstallRequestId "nsis-install-$0-$2"
 FunctionEnd
 
-; Persist only bounded NSIS diagnostics; a logging failure is a distinct failed install.
+; Emit UTF-16 code units as JSON escapes so paths remain exact across Windows code pages and quotes.
+Function D16WriteDiagnosticString
+  Push $0
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  FileWrite $1 '$\"'
+  IfErrors diagnostic_string_failed
+  StrCpy $0 $d16InstallDiagnosticValue
+  System::Call '*(&w${NSIS_MAX_STRLEN} r0) p.r2'
+  ${If} $2 == 0
+    Goto diagnostic_string_failed
+  ${EndIf}
+  StrCpy $4 $2
+  StrLen $3 $d16InstallDiagnosticValue
+  diagnostic_string_next:
+    IntCmp $3 0 diagnostic_string_done
+    System::Call '*$4(&i2 .r5)'
+    IntFmt $5 '\u%04x' $5
+    FileWrite $1 $5
+    IfErrors diagnostic_string_free_failed
+    IntOp $4 $4 + 2
+    IntOp $3 $3 - 1
+    Goto diagnostic_string_next
+  diagnostic_string_done:
+    System::Free $2
+    FileWrite $1 '$\"'
+    Goto diagnostic_string_return
+  diagnostic_string_free_failed:
+    System::Free $2
+  diagnostic_string_failed:
+    SetErrors
+  diagnostic_string_return:
+    Pop $5
+    Pop $4
+    Pop $3
+    Pop $2
+  Pop $0
+FunctionEnd
+
+; Persist bounded NSIS diagnostics and exact conflicting roots; logging failure is a distinct failed install.
 Function D16FailInstallation
   StrCpy $d16UpgradeSavedCause $d16InstallCause
   Call D16RestoreUpgrade
@@ -181,7 +223,22 @@ Function D16FailInstallation
   IfErrors diagnostic_failed
   FileOpen $1 "$d16InstallLog" w
   IfErrors diagnostic_failed
-  FileWrite $1 '{"errorCode":"$d16InstallErrorCode","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","recoveryRootCause":"$d16UpgradeFailure","exitCode":$d16InstallExitCode,"win32Error":$d16InstallNativeError}$\r$\n'
+  FileWrite $1 '{"errorCode":"$d16InstallErrorCode","requestId":"$d16InstallRequestId","appId":"ai.codeflow.codeflowai","stage":"$d16InstallStage","rootCause":"$d16InstallCause","recoveryRootCause":"$d16UpgradeFailure","exitCode":$d16InstallExitCode,"win32Error":$d16InstallNativeError,"registryRoot":'
+  IfErrors diagnostic_close_failed
+  StrCpy $d16InstallDiagnosticValue $d16UpgradeRegistryRoot
+  Call D16WriteDiagnosticString
+  IfErrors diagnostic_close_failed
+  FileWrite $1 ',"registeredInstallRoot":'
+  IfErrors diagnostic_close_failed
+  StrCpy $d16InstallDiagnosticValue $d16UpgradeRegisteredRoot
+  Call D16WriteDiagnosticString
+  IfErrors diagnostic_close_failed
+  FileWrite $1 ',"targetInstallRoot":'
+  IfErrors diagnostic_close_failed
+  StrCpy $d16InstallDiagnosticValue $INSTDIR
+  Call D16WriteDiagnosticString
+  IfErrors diagnostic_close_failed
+  FileWrite $1 '}$\r$\n'
   IfErrors diagnostic_close_failed
   System::Call 'kernel32::FlushFileBuffers(p r1) i.r2'
   ${If} $2 == 0
@@ -281,7 +338,7 @@ Function D16RecordInstallation
     Call D16FailInstallation
 FunctionEnd
 
-; Record completed program files without starting Electron or touching any profile.
+; Commit program files, then retire same-root registration in the other scope; profiles are never opened.
 !macro customInstall
   Call D16RecordInstallation
   ; The template registers builder semver first; retain the exact planned shell display version.
@@ -296,6 +353,30 @@ FunctionEnd
     ${EndIf}
   !endif
   Call D16FinishProgramReplacement
+  !ifmacrodef registryAddInstallInfo
+    ; The builder has registered this scope before customInstall. Never retire the old entry without that fact.
+    ReadRegStr $R1 SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" InstallLocation
+    ReadRegStr $R2 SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}" UninstallString
+    ${If} $installMode == "all"
+      StrCpy $R3 '$\"$INSTDIR\${UNINSTALL_FILENAME}$\" /allusers'
+    ${Else}
+      StrCpy $R3 '$\"$INSTDIR\${UNINSTALL_FILENAME}$\" /currentuser'
+    ${EndIf}
+    ${If} $R1 != $INSTDIR
+    ${OrIf} $R2 != $R3
+      StrCpy $d16InstallStage installation-registration
+      StrCpy $d16InstallErrorCode DESKTOP_INSTALL_REGISTRATION_FAILED
+      StrCpy $d16InstallCause CURRENT_SCOPE_REGISTRATION_NOT_CONFIRMED
+      StrCpy $d16InstallExitCode "null"
+      StrCpy $d16InstallNativeError 0
+      Call D16FailInstallation
+    ${EndIf}
+    ${If} $installMode == "all"
+      !insertmacro D16RetireInstallRegistration HKCU
+    ${Else}
+      !insertmacro D16RetireInstallRegistration HKLM
+    ${EndIf}
+  !endif
 !macroend
 !endif
 
