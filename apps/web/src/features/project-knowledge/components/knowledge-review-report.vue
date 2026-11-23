@@ -9,6 +9,9 @@ const restartDisabled = computed(() => props.restartBusy ?? props.busy);
 const selectedReportId = ref("");
 const ordered = computed(() => [...props.reports].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
 const report = computed(() => ordered.value.find(item => item.id === selectedReportId.value) ?? ordered.value[0] ?? null);
+/** 就近解释一键修复的现有禁用条件，旧报告只用于查阅。 */
+const issueRepairDisabledReason = computed(() => !props.canWrite ? "需要维护权限才能修复" : report.value?.stale
+  ? props.canReviewVersion ? "报告已失效，请重新复检" : "报告已失效，请复检最新版本" : null);
 const blockingIssues = computed(() => report.value?.issues.filter(issue => issue.severity === "error") ?? []);
 /** 阻断项优先展示，同级问题保留报告原顺序，编号仅用于阅读。 */
 const issues = computed(() => [...(report.value?.issues ?? [])].sort((a, b) => Number(b.severity === "error") - Number(a.severity === "error")));
@@ -28,7 +31,7 @@ const category = { factual: "事实不符", coverage: "覆盖缺失", unsupporte
     <a-alert v-if="report && failure" type="error" show-icon :message="failure" />
     <p v-if="canStartTask && !canReviewVersion" class="review-note">已有更新的待采用版本。请在待确认更新中选择最新版本复检；当前报告仅对应正在查看的版本。</p>
     <template v-if="report">
-      <p v-if="report.stale" class="review-stale" role="status">文档、生成要求或来源已经变化，请重新复检。{{ report.staleReasons.join('；') }}</p>
+      <p v-if="report.stale" class="review-stale" role="status">文档、生成要求或来源已经变化，已停用一键修复，避免按旧报告重复修改。{{ canReviewVersion ? '请重新复检后再修复。' : '请在待确认更新中选择最新版本，完成复检后再修复。' }}{{ report.staleReasons.join('；') }}</p>
       <template v-if="issues.length">
         <p class="review-counts">共 {{ issues.length }} 项问题：<strong>{{ blockingIssues.length }} 项需修复</strong><span> · {{ issues.length - blockingIssues.length }} 项提醒</span></p>
         <ol :key="report.id" class="review-issues" aria-label="复检问题条目">
@@ -38,7 +41,7 @@ const category = { factual: "事实不符", coverage: "覆盖缺失", unsupporte
               <p class="issue-location">{{ category[issue.category] }} · 正文第 {{ issue.documentStartLine }}{{ issue.documentEndLine !== issue.documentStartLine ? `–${issue.documentEndLine}` : '' }} 行</p>
               <div class="issue-description"><strong>问题说明</strong><p>{{ issue.detail }}</p></div>
               <div class="issue-suggestion">
-                <div class="issue-suggestion-head"><strong>修复建议</strong><a-button size="small" type="link" :disabled="!canWrite || report.stale" @click="emit('repairIssue', report, issue)">一键修复</a-button></div>
+                <div class="issue-suggestion-head"><strong>修复建议</strong><a-space wrap :size="6" :title="issueRepairDisabledReason ?? undefined"><span v-if="issueRepairDisabledReason" class="repair-disabled-reason">{{ issueRepairDisabledReason }}</span><a-button size="small" type="link" :disabled="!canWrite || report.stale" @click="emit('repairIssue', report, issue)">一键修复</a-button></a-space></div>
                 <p>{{ issue.suggestion }}</p>
               </div>
               <details v-if="issue.sources.length" class="issue-sources">
@@ -81,7 +84,8 @@ const category = { factual: "事实不符", coverage: "覆盖缺失", unsupporte
 .issue-description { margin-top: 10px; }
 .issue-description > strong, .issue-suggestion > strong { font-size: 12px; }
 .issue-suggestion { margin-top: 10px; padding: 8px 10px; border-left: 2px solid var(--app-accent); background: color-mix(in srgb, var(--app-accent) 5%, var(--app-bg)); }
-.issue-suggestion-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.issue-suggestion-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.repair-disabled-reason { color: var(--app-muted); font-size: 12px; }
 .issue-suggestion-head :deep(.ant-btn) { height: auto; padding: 0; font-size: 12px; }
 .issue-suggestion p { margin-bottom: 0; }
 .issue-sources, .review-explanation { margin-top: 10px; font-size: 12px; }
