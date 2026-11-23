@@ -7,11 +7,13 @@ import type { ConversationEventEnvelope, ConversationItem, ConversationStateSnap
 import type { SqliteDb } from "./sqliteTypes.js";
 
 const PRESENTATION_SCHEMA_VERSION = 2;
+// 表结构保持旧Client可读；行内版本仅标识可重建的归并结果。
+const PRESENTATION_REDUCER_VERSION = 3;
 type ProjectionRow = { version: number; ready: number; state_json: string; schema_version: number; build_id: string };
 type ItemRow = { item_id: string; position: number; stub_json: string; updated_seq: number; process_id: string | null };
 export type ProcessReadOptions = { afterSeq?: number; cursor?: string; throughSeq?: number; limit?: number };
 
-/** 由既有 schema owner 原子补齐旧索引结构并失效缓存；读取入口绝不建表。 */
+/** 原子补齐旧索引结构；归并版本由行标记控制按需重建，不阻断旧Client打开库。 */
 export function createConversationPresentationTables(db: SqliteDb): void {
   const marker = db.prepare("SELECT value FROM meta WHERE key = 'conversation_presentation_schema_version'").get() as { value: string } | undefined;
   if (marker) {
@@ -55,16 +57,18 @@ export class ConversationPresentationStore {
   isReady(threadId: ThreadId): boolean {
     if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversation_presentations'").get()) return false;
     const row = this.db.prepare("SELECT ready, schema_version FROM conversation_presentations WHERE thread_id = ?").get(threadId) as Pick<ProjectionRow, "ready" | "schema_version"> | undefined;
-    return row?.ready === 1 && row.schema_version === PRESENTATION_SCHEMA_VERSION;
+    return row?.ready === 1 && row.schema_version === PRESENTATION_REDUCER_VERSION;
   }
 
-  /** 新会话立即增量维护；旧会话留给分批构建，乱序 ACK 显式使旧投影失效。 */
+  /** 新会话立即增量维护；旧归并版本和乱序ACK先失效，交由原始事件分批重建。 */
   append(event: ConversationEventEnvelope, supersededItemIds: readonly string[] = []): void {
     const row = this.getRow(event.threadId);
     if (!row) {
       const previous = this.db.prepare("SELECT 1 FROM conversation_events WHERE thread_id = ? AND seq <> ? LIMIT 1").get(event.threadId, event.seq);
       if (previous) return;
       this.initialize(event.threadId, true);
+    } else if (row.schema_version !== PRESENTATION_REDUCER_VERSION) {
+      this.invalidate(event.threadId); return;
     } else if (!row.ready) {
       if (event.seq <= row.version) this.invalidate(event.threadId);
       return;
@@ -113,7 +117,7 @@ export class ConversationPresentationStore {
   /** 首屏组合非过程正文与过程 stub，不查询 canonical 或过程正文。 */
   read(threadId: ThreadId): ThreadPresentation {
     const row = this.getRow(threadId);
-    if (!row?.ready || row.schema_version !== PRESENTATION_SCHEMA_VERSION) throw new Error("THREAD_PRESENTATION_NOT_READY");
+    if (!row?.ready || row.schema_version !== PRESENTATION_REDUCER_VERSION) throw new Error("THREAD_PRESENTATION_NOT_READY");
     const rows = this.db.prepare("SELECT item_id, stub_json, updated_seq FROM conversation_presentation_items WHERE thread_id = ? ORDER BY position")
       .all(threadId) as Array<Pick<ItemRow, "item_id" | "stub_json" | "updated_seq">>;
     const full = this.db.prepare("SELECT item_id, item_json FROM conversation_presentation_items WHERE thread_id = ? AND process_id IS NULL")
@@ -127,7 +131,7 @@ export class ConversationPresentationStore {
   /** 按可见消息窗口读取快照；窗口外消息由 beforePosition 向前增量读取。 */
   readPage(threadId: ThreadId, options: { messageLimit: number; beforePosition?: number | null }): ThreadPresentation {
     const row = this.getRow(threadId);
-    if (!row?.ready || row.schema_version !== PRESENTATION_SCHEMA_VERSION) throw new Error("THREAD_PRESENTATION_NOT_READY");
+    if (!row?.ready || row.schema_version !== PRESENTATION_REDUCER_VERSION) throw new Error("THREAD_PRESENTATION_NOT_READY");
     const messageLimit = Math.max(1, Math.min(200, Math.floor(Number(options.messageLimit))));
     const beforePosition = Number(options.beforePosition ?? 0);
     const hasBefore = Number.isFinite(beforePosition) && beforePosition > 0;
@@ -164,7 +168,7 @@ export class ConversationPresentationStore {
   /** 按稳定成员位置分页；已被并发更新的快照可重复返回，调用方按 ID 替换并用 afterSeq 追上。 */
   readProcess(threadId: ThreadId, processId: string, options: ProcessReadOptions = {}): ThreadProcessDetails {
     const row = this.getRow(threadId);
-    if (!row?.ready || row.schema_version !== PRESENTATION_SCHEMA_VERSION) throw new Error("THREAD_PRESENTATION_NOT_READY");
+    if (!row?.ready || row.schema_version !== PRESENTATION_REDUCER_VERSION) throw new Error("THREAD_PRESENTATION_NOT_READY");
     if (!processId.startsWith("process:") || !processId.slice(8)) throw new Error("THREAD_PROCESS_ID_INVALID");
     const afterSeq = options.afterSeq ?? 0, version = options.throughSeq ?? row.version;
     const limit = options.limit ?? 100;
@@ -205,7 +209,7 @@ export class ConversationPresentationStore {
     const deletions = this.db.prepare("SELECT item_id FROM conversation_message_deletions WHERE thread_id = ?").all(threadId) as Array<{ item_id: string }>;
     state.deletedMessageIds = new Set(deletions.map(row => row.item_id));
     this.db.prepare(`INSERT INTO conversation_presentations(thread_id, version, ready, schema_version, build_id, state_json, presentation_json)
-      VALUES (?, 0, ?, ?, ?, ?, ?)`).run(threadId, ready ? 1 : 0, PRESENTATION_SCHEMA_VERSION, randomUUID(),
+      VALUES (?, 0, ?, ?, ?, ?, ?)`).run(threadId, ready ? 1 : 0, PRESENTATION_REDUCER_VERSION, randomUUID(),
         JSON.stringify(snapshotConversationState(state)), "{}");
   }
 

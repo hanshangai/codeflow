@@ -95,6 +95,8 @@ const batchEffort = ref("");
 const batchConcurrency = ref(2);
 const MAX_BATCH_CONCURRENCY = 16;
 const batchError = ref<string | null>(null);
+const batchReviewLoading = ref(false);
+let reviewExecutionRequest = 0;
 const batchMode = ref<"batch" | "review">("batch");
 const batchReviewEnabled = ref(true), batchReviewAutoRepair = ref(true), batchReviewMaxRounds = ref(1);
 const buildStarting = ref(false);
@@ -109,7 +111,7 @@ const quickGenerateError = ref<string | null>(null);
 type PendingGeneration = { input: KnowledgeAssetInput<"generate">; runId: string | null };
 const pendingBuild = shallowRef<PendingGeneration | null>(null), pendingBatch = shallowRef<PendingGeneration | null>(null);
 const batchRevisionRunId = ref<string | null>(null);
-const batchLocked = computed(() => busy.value || !buildSettingsMode.value && Boolean(pendingBatch.value));
+const batchLocked = computed(() => busy.value || batchReviewLoading.value || !buildSettingsMode.value && Boolean(pendingBatch.value));
 const buildSettingsMode = ref(false);
 const pendingBuildIds = ref<string[] | null>(null);
 type KnowledgeBuildPrefs = { engine: EngineType; model: string | null; effort: string | null };
@@ -314,9 +316,21 @@ const displayedExecutionSession = computed(() => executionSession.value ?? docum
 const executionThreadRunning = computed(() => Boolean(chat.threadDisplayRunningStateForThread(displayedExecutionSession.value?.threadId ?? null)?.runningTurnId));
 /** 正文或实时引用就绪即结束文档加载展示，复检报告仍按原入口独立读取。 */
 const documentLoading = computed(() => !documentReadError.value && (nodeLoading.value || revisionLoading.value) && !previewDocument.value && !detail.value?.reference);
-const executionRunActive = computed(() => Boolean(displayedExecutionSession.value && taskList.value.some(run => run.active && run.items.some(item =>
+/** 文件会话的原任务仍持有整批执行锁，停止入口与发送限制使用同一归属。 */
+const executionActiveRun = computed(() => displayedExecutionSession.value ? taskList.value.find(run => run.active && run.items.some(item =>
   item.executionThreadId === displayedExecutionSession.value!.threadId || item.review?.executionThreadId === displayedExecutionSession.value!.threadId
-  || run.mode === "conversation" && run.threadId === displayedExecutionSession.value!.threadId))));
+  || run.mode === "conversation" && run.threadId === displayedExecutionSession.value!.threadId)) ?? null : null);
+const executionRunActive = computed(() => Boolean(executionActiveRun.value));
+/** 在会话输入区就近说明限制，草稿可写不代表获准发送或采用。 */
+const executionInputRestriction = computed(() => {
+  if (!canWrite.value) return "当前为只读状态，不能编辑或发送。";
+  if (executionActiveRun.value) {
+    const item = executionActiveRun.value.items.find(item => item.executionThreadId === displayedExecutionSession.value?.threadId || item.review?.executionThreadId === displayedExecutionSession.value?.threadId);
+    const activity = item ? knowledgeDocumentReviewActivity(taskList.value, item.nodeId, item.revisionId) : null;
+    return `${activity ?? '本批任务运行中。'}可先写草稿，任务结束后发送，或停止任务后继续。`;
+  }
+  return updatesBusy.value ? "正在处理采用结果，请稍候，原草稿已保留。" : busy.value ? "正在处理操作，请稍候，原草稿已保留。" : null;
+});
 /** 独立正文就绪即展示；任务候选仍沿原入口等待节点判定，避免闪现普通正文页。 */
 const readingPending = computed(() => nodeLoading.value && !detail.value?.current && !detail.value?.reference && (!previewDocument.value || currentUpdatesCount.value > 0)
   || (!selectedId.value || selectedNode.value?.contentMode === "directory") && (loading.value || resultsLoading.value || snapshot.value && !snapshotStatesReady.value && !snapshotStatesError.value));
@@ -457,7 +471,7 @@ const batchEffortOptions = computed(() => {
 });
 const batchCatalog = computed(() => engines.byWorkspaceId[workspaceId.value]);
 const batchIncludesProduct = computed(() => batchTargets.value.some(node => ancestors(node)[0]?.category === "product"));
-const batchReviewConfig = computed(() => ({ enabled: batchMode.value === "review" || batchReviewEnabled.value, model: batchModel.value.model, effort: batchModel.value.effort, autoRepair: batchReviewAutoRepair.value && !batchIncludesProduct.value, maxRounds: batchReviewMaxRounds.value }));
+const batchReviewConfig = computed(() => ({ enabled: batchMode.value === "review" || batchReviewEnabled.value, model: batchModel.value.model, effort: batchModel.value.effort, autoRepair: batchReviewAutoRepair.value && !batchIncludesProduct.value, maxRounds: batchMode.value === "review" && batchReviewAutoRepair.value && !batchIncludesProduct.value ? Math.max(2, batchReviewMaxRounds.value) : batchReviewMaxRounds.value }));
 watch([batchModelInfo, batchOpen], () => {
   if (!batchOpen.value || !batchModelInfo.value || !batchEffort.value) return;
   const info = batchModelInfo.value;
@@ -1931,10 +1945,62 @@ async function openBatch(ids = checkedIds.value.length ? checkedIds.value : snap
   batchModelId.value = (prefs?.model !== undefined ? prefs.model : knowledgeConversation.value?.model) ?? "";
   batchEffort.value = (prefs?.effort !== undefined ? prefs.effort : knowledgeConversation.value?.effort) ?? "";
   batchConcurrency.value = Math.max(1, Math.min(activeRun.value?.concurrency ?? activeRun.value?.scheduler?.limit ?? 5, MAX_BATCH_CONCURRENCY));
-  batchMode.value = mode; batchReviewEnabled.value = true; batchReviewAutoRepair.value = mode === "batch"; batchReviewMaxRounds.value = 1; batchRepairReports.value = [];
+  batchMode.value = mode; batchReviewEnabled.value = true; batchReviewAutoRepair.value = true; batchReviewMaxRounds.value = 1; batchRepairReports.value = [];
   batchSelectedIds.value = [...ids]; batchIncludeDescendants.value = includeDescendants; batchStrategy.value = "all"; batchPrompt.value = ""; batchError.value = null; batchOpen.value = true;
-  if (!batchEngineStatus.value && !batchCatalog.value?.loading) void refreshBatchModels();
+  if (mode === "review") {
+    await inheritReviewExecution();
+  } else if (!batchEngineStatus.value && !batchCatalog.value?.loading) void refreshBatchModels();
 }
+/** 按Client实际待检版本继承配置；显式来源任务不因其当前版本变化而失效。 */
+async function inheritReviewExecution(): Promise<boolean> {
+  const scope = workspaceId.value, epoch = scopeEpoch;
+  const request = ++reviewExecutionRequest;
+  const targets = [...batchTargets.value];
+  const targetKey = JSON.stringify(targets.map(item => item.id));
+  const current = () => request === reviewExecutionRequest && isCurrent(epoch, scope) && batchOpen.value && batchMode.value === "review" && JSON.stringify(batchTargets.value.map(item => item.id)) === targetKey;
+  batchError.value = null; batchReviewLoading.value = true;
+  try {
+    if (!targets.length) throw new Error("所选范围没有可复检的文档");
+    const configs = await Promise.all(targets.map(async target => {
+      if (target.contentMode === "reference") return { ...knowledgeModelPrefs.value };
+      const detail = unwrap(await requestKnowledgeAsset(ctx(), "node", { workspaceId: scope, nodeId: target.id }));
+      const revision = detail.drafts[0] ?? detail.current?.revision;
+      const source = revision?.origin === "manual" ? detail.sourceRevision : null;
+      const revisionId = source?.revisionId ?? revision?.id;
+      const runId = source?.runId ?? revision?.runId;
+      const owner = [...taskList.value].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .find(run => (runId ? run.id === runId : run.mode !== "review") && run.items.some(item => item.nodeId === target.id && (Boolean(runId) || item.revisionId === revisionId)));
+      const item = owner?.items.find(item => item.nodeId === target.id);
+      if (!owner || !item) throw new Error(`无法找到“${target.title}”当前版本的原生成配置，请先恢复原任务记录。`);
+      const config = item.revisionId === revisionId ? item.executionConfig ?? owner : owner;
+      return { engine: owner.engine, model: config.model, effort: config.effort };
+    }));
+    if (!current()) return false;
+    const first = configs[0]!;
+    if (configs.some(config => config.engine !== first.engine || config.model !== first.model || config.effort !== first.effort)) throw new Error("所选文档的原生成配置不同，请按相同引擎和模型分批复检。");
+    batchEngine.value = first.engine; batchModelId.value = first.model ?? ""; batchEffort.value = first.effort ?? "";
+    await engines.refresh(ctx(), scope, { shouldApply: current });
+    if (!current()) return false;
+    const readError = engines.byWorkspaceId[scope]?.lastError;
+    if (readError) throw new Error(readError);
+    const issue = buildEngineIssue(first.engine, first.model);
+    if (issue) throw new Error(`原生成引擎暂不可用：${issue}`);
+    return true;
+  } catch (error) {
+    if (current()) batchError.value = reportError(error, "KNOWLEDGE_REVIEW_EXECUTION_UNAVAILABLE");
+    return false;
+  } finally {
+    if (request === reviewExecutionRequest && isCurrent(epoch, scope)) batchReviewLoading.value = false;
+  }
+}
+/** 改变后代范围后重新读取继承配置，旧范围的错误不阻塞新范围。 */
+async function changeBatchDescendants(include: boolean): Promise<void> {
+  batchIncludeDescendants.value = include;
+  if (batchMode.value !== "review" || pendingBatch.value || batchRevisionRunId.value) return;
+  await inheritReviewExecution();
+}
+/** 关闭弹框立即撤销读取归属，旧响应不能影响重开的同工作区弹框。 */
+watch(batchOpen, open => { if (!open) { reviewExecutionRequest++; batchReviewLoading.value = false; } }, { flush: "sync" });
 /** 调整原任务尚未完成项的配置，保存时仍使用原任务和冻结选区。 */
 async function reviseBatch(run: KnowledgeGenerationRunView): Promise<void> {
   if (!summaryAdjustable.value || busy.value || updatesBusy.value) return;
@@ -2042,7 +2108,7 @@ function normalizeBatchConcurrency(): number | null {
 }
 /** 批量生成和复检后台创建项目会话，启动失败沿原请求重试。 */
 async function submitBatch(): Promise<void> {
-  if (!batchTargets.value.length || busy.value || !canWrite.value || threadRunning.value) return;
+  if (!batchTargets.value.length || busy.value || batchReviewLoading.value || !canWrite.value || threadRunning.value) return;
   // 复检只避开正被处理的知识；其他模式仍不允许与活动任务并行。
   const reviewTargetBusy = batchMode.value === "review" && batchTargets.value.some(node => activelyProcessedNodeIds.value.has(node.id));
   if (reviewTargetBusy || (batchMode.value !== "review" && activeRun.value?.active)) {
@@ -2051,6 +2117,9 @@ async function submitBatch(): Promise<void> {
   }
   const scope = workspaceId.value, epoch = scopeEpoch; busy.value = true; batchError.value = null;
   try {
+    if (batchMode.value === "review" && !pendingBatch.value && !batchRevisionRunId.value) {
+      if (!await inheritReviewExecution() || !isCurrent(epoch, scope)) return;
+    }
     const concurrency = normalizeBatchConcurrency();
     if (concurrency === null) return;
     let run: KnowledgeGenerationRunView;
@@ -2446,7 +2515,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           <section class="reading-document">
         <!-- 采用至结果定位完成前持续加载，保留组件执行请求和失败恢复。 -->
         <div v-if="showUpdates && updatesBusy" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
-        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesTarget?.scopeNodeId ?? (updatesTarget ? null : readingNodeId)" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @focus="rememberUpdateFocus" @preview="updatePreview = $event" @empty="handleUpdatesEmpty" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(activeRun?.active) || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
+        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesTarget?.scopeNodeId ?? (updatesTarget ? null : readingNodeId)" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @stop-run="stopGeneration($event)" @focus="rememberUpdateFocus" @preview="updatePreview = $event" @empty="handleUpdatesEmpty" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
         <KnowledgeOverview v-else-if="overviewOpen" :snapshot="snapshot" :runs="taskList" :changes="pendingChangeNodes" :loading="loading || Boolean(snapshot && !snapshotStatesReady && !snapshotStatesError)" :state-error="snapshotStatesError" :run-error="resultsLoadError" :can-write="canWrite" :busy="busy || updatesBusy || buildStarting || binding || conversationLoading || taskList.some(run => run.active)" @improve="openQuickGenerate" @discuss="openSpecificationConversation" @updates="openUpdates(null)" @select="selectTreeNode" @retry="retryOverview" @policy="policyOpen = true" />
         <!-- 尚未确定正式正文或候选预览时保持加载，避免先渲染普通正文页。 -->
         <div v-else-if="documentReadError" class="empty" role="alert"><h3>文档读取失败</h3><p>{{ documentReadError.message }}</p><a-button :disabled="busy || updatesBusy" @click="retryReadDocument">重新读取文档</a-button></div>
@@ -2550,7 +2619,11 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           <template v-if="fileConversationMode">
             <div v-if="executionSessionLoading || documentLoading || resultsLoading && !displayedExecutionSession" class="conversation-start conversation-start--loading"><a-spin size="small" /><span>正在加载文件会话…</span></div>
             <div v-else-if="executionSessionError" class="binding-error" role="alert"><span>{{ executionSessionError }}</span><a-button size="small" @click="hydrateExecutionSession">重试</a-button></div>
-            <ChatPanel v-else-if="displayedExecutionSession && hydratedExecutionThreadId === displayedExecutionSession.threadId" :key="displayedExecutionSession.threadId" :workspace-id="workspaceId" :thread-id="displayedExecutionSession.threadId as ThreadId" :interaction-active="assistantOpen" assistant-mode :allow-queue="false" :composer-disabled="!canWrite || executionRunActive || busy || updatesBusy" preserve-draft-on-disable />
+            <template v-else-if="displayedExecutionSession && hydratedExecutionThreadId === displayedExecutionSession.threadId">
+              <ChatPanel :key="displayedExecutionSession.threadId" :workspace-id="workspaceId" :thread-id="displayedExecutionSession.threadId as ThreadId" :interaction-active="assistantOpen" assistant-mode :allow-queue="false" :composer-disabled="!canWrite || executionRunActive || busy || updatesBusy" :allow-draft-when-disabled="canWrite && executionRunActive && !busy && !updatesBusy" preserve-draft-on-disable>
+                <template #composer-notice><a-alert v-if="executionInputRestriction" class="execution-input-restriction" type="info" show-icon :message="executionInputRestriction" data-testid="knowledge-session-restriction"><template v-if="executionActiveRun && canWrite" #action><a-button size="small" :loading="busy" :disabled="updatesBusy" @click="stopGeneration(executionActiveRun)">停止任务后继续</a-button></template></a-alert></template>
+              </ChatPanel>
+            </template>
             <div v-else class="conversation-start"><p>{{ showUpdates && !updatePreview ? '请选择一个候选版本，查看对应工作会话。' : '当前文件版本尚无可用的生成会话记录。' }}</p></div>
           </template>
           <ChatPanel v-else-if="assistantThreadId" ref="assistantPanel" :workspace-id="workspaceId" :thread-id="assistantThreadId" :interaction-active="assistantOpen" assistant-mode preserve-draft-on-disable :allow-queue="false" :composer-disabled="!canWrite || !bindingReady || binding" @model-prefs-change="rememberConversationPrefs">
@@ -2602,12 +2675,12 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         </div>
       </div>
     </a-modal>
-    <a-modal v-model:open="batchOpen" :title="buildSettingsMode ? '规格库构建设置' : batchMode === 'review' ? '复检已有文档' : batchRepairReports.length ? '根据报告生成修订版' : '确认批量生成'" :z-index="1100" :closable="!busy && !binding" :mask-closable="!busy && !binding" :keyboard="!busy && !binding" :footer="null" width="640px" :style="{ top: '24px' }">
-      <div class="batch-scroll">
+    <a-modal v-model:open="batchOpen" :title="buildSettingsMode ? '规格库构建设置' : batchMode === 'review' ? '复检已有文档' : batchRepairReports.length ? '根据报告生成修订版' : '确认批量生成'" :z-index="1100" :closable="!busy && !binding" :mask-closable="!busy && !binding" :keyboard="!busy && !binding" :footer="null" width="min(680px, calc(100vw - 24px))" :style="{ top: '24px' }">
+      <div class="batch-scroll" :aria-busy="batchReviewLoading">
       <p v-if="buildSettingsMode" class="batch-explanation">目标项目：{{ workspaceName }}</p>
       <p class="batch-explanation">{{ buildSettingsMode ? '保存后同步规格对话及后续构建配置；切换引擎会新建会话并保留草稿。已创建任务保留原配置。默认自动复检最多 1 轮，结果统一预览后采用。' : '本次任务在后台执行，无需打开或切换规格会话。' }}</p>
-      <details class="batch-advanced" :open="batchOpen"><summary>引擎、模型与复检设置</summary>
-      <section class="batch-model-settings" aria-label="本批次引擎配置">
+      <details class="batch-advanced" :open="batchOpen"><summary>{{ batchMode === 'review' && !buildSettingsMode ? '复检设置' : '引擎、模型与复检设置' }}</summary>
+      <section v-if="batchMode !== 'review' || buildSettingsMode" class="batch-model-settings" aria-label="本批次引擎配置">
         <div class="batch-model-heading"><strong>执行引擎</strong></div>
         <div class="batch-model-fields">
           <label><span>引擎</span><select v-model="batchEngine" aria-label="批量生成引擎" :disabled="batchLocked" @change="changeBatchEngineEvent">
@@ -2626,20 +2699,23 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         <p v-if="batchCatalog?.loading" class="batch-model-note" role="status">正在读取模型列表…</p>
         <p v-else-if="batchCatalog?.lastError" class="batch-model-note" role="alert">模型列表读取失败：{{ batchCatalog.lastError }} <a-button type="link" size="small" @click="refreshBatchModels">重试</a-button></p>
       </section>
+      <p v-if="batchMode === 'review' && !buildSettingsMode" class="batch-explanation">复检沿用原生成引擎和模型；原始资料使用项目配置。新结果仍需确认采用。</p>
+      <p v-if="batchReviewLoading" class="batch-model-note" role="status">正在读取原生成配置…</p>
       <section v-if="!buildSettingsMode" class="batch-model-settings" aria-label="本批次复检配置">
         <div class="batch-model-heading"><strong>{{ batchMode === 'review' ? '复检配置' : '生成后复检' }}</strong><a-switch v-if="batchMode === 'batch'" v-model:checked="batchReviewEnabled" aria-label="生成后复检" :disabled="batchLocked" /></div>
-        <label v-if="batchReviewEnabled || batchMode === 'review'" class="review-auto-repair"><span><strong>发现问题后自动修订</strong><small>{{ batchIncludesProduct ? '所选范围含产品文档，本次只复检并报告问题；请修改原始资料。' : '复检指出问题后，AI 会回到该规格会话修订，再继续复检，最多 1 轮。' }}</small></span><a-switch :checked="batchReviewAutoRepair && !batchIncludesProduct" aria-label="发现问题后自动修订" :disabled="batchLocked || batchIncludesProduct" @update:checked="batchReviewAutoRepair = $event" /></label>
+        <label v-if="batchReviewEnabled || batchMode === 'review'" class="review-auto-repair"><span><strong>发现问题后自动修订</strong><small>{{ batchIncludesProduct ? '所选范围含产品文档，本次只复检并报告问题；请修改原始资料。' : batchMode === 'review' ? '开启后，首次复检发现问题会自动修订并再次复检；最多进行 2 次复检，新版本仍需确认采用。' : '生成后复检 1 次，新版本仍需确认采用。' }}</small></span><a-switch :checked="batchReviewAutoRepair && !batchIncludesProduct" aria-label="发现问题后自动修订" :disabled="batchLocked || batchIncludesProduct" @update:checked="batchReviewAutoRepair = $event" /></label>
         <p class="batch-model-note">{{ batchMode === 'review' ? '在文件工作会话中运行复检子任务，优先检查最新待采用版本，其次为正式文档；空白知识跳过。' : batchReviewEnabled ? '文档生成后保存为待采用版本，在同一工作会话中由子任务独立核对代码与要求；确认后由你采用。' : '本批次跳过复检，生成内容仍可随后单独复检。' }}</p>
         <p v-if="batchMode === 'review' && batchCatalog?.lastError" class="batch-model-note" role="alert">模型列表读取失败：{{ batchCatalog.lastError }} <a-button type="link" size="small" @click="refreshBatchModels">重试</a-button></p>
       </section>
       <div v-if="!buildSettingsMode" class="batch-settings">
         <div class="batch-settings-grid">
-          <label><span>包含所选目录的后代</span><a-switch v-model:checked="batchIncludeDescendants" :disabled="batchLocked" aria-label="包含所选目录的后代" /></label>
+          <label><span>包含所选目录的后代</span><a-switch :checked="batchIncludeDescendants" :disabled="batchLocked" aria-label="包含所选目录的后代" @update:checked="changeBatchDescendants" /></label>
           <label><span>同时处理知识</span><input v-model.number="batchConcurrency" type="number" min="1" :max="MAX_BATCH_CONCURRENCY" step="1" inputmode="numeric" aria-label="批次并发数" :disabled="batchLocked" @change="normalizeBatchConcurrency" /></label>
         </div>
         <a-radio-group v-if="batchMode === 'batch' && !batchRepairReports.length" v-model:value="batchStrategy" :disabled="batchLocked"><a-radio value="all">按要求处理选中知识</a-radio><a-radio value="missing">只补齐空白</a-radio></a-radio-group>
       </div>
       </details>
+      <h3 v-if="!buildSettingsMode" class="batch-section-title">本次范围 · {{ batchTargets.length }} 项</h3>
       <div v-if="!buildSettingsMode" class="batch-preview">
         <div v-for="item in batchTargets" :key="item.id">{{ pathTitle(item) }}</div>
       </div>
@@ -2647,15 +2723,17 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       <p v-if="batchError" class="page-error" role="alert">{{ batchError }}</p>
       <p v-if="pendingBatch" class="batch-model-note">重试沿用原请求；需要调整时可放弃本次恢复，已有任务与产物保留在任务记录中。<a-button size="small" :disabled="busy" @click="resetPendingGeneration('batch')">重新配置</a-button></p>
       </div>
-      <div class="batch-submit"><a-button :disabled="busy || binding" @click="batchOpen = false">取消</a-button><a-button v-if="buildSettingsMode" type="primary" :loading="binding" :disabled="modelSettingsBlocked || batchCatalog?.loading" @click="saveBuildSettings">{{ pendingBuildIds ? '保存并开始生成' : '保存构建设置' }}</a-button><a-button v-else type="primary" :loading="busy" :disabled="!batchTargets.length || !canWrite || threadRunning || Boolean(activeRun?.active) || batchCatalog?.loading" @click="submitBatch">{{ pendingBatch ? '重试原任务' : batchMode === 'review' ? '开始复检' : batchRepairReports.length ? '开始生成修订版' : '开始生成' }}</a-button></div>
+      <div class="batch-submit"><a-button :disabled="busy || binding" @click="batchOpen = false">取消</a-button><a-button v-if="buildSettingsMode" type="primary" :loading="binding" :disabled="modelSettingsBlocked || batchCatalog?.loading" @click="saveBuildSettings">{{ pendingBuildIds ? '保存并开始生成' : '保存构建设置' }}</a-button><a-button v-else type="primary" :loading="busy" :disabled="!batchTargets.length || !canWrite || threadRunning || (batchMode !== 'review' && Boolean(activeRun?.active)) || batchCatalog?.loading || batchReviewLoading || (batchMode === 'review' && Boolean(batchError))" @click="submitBatch">{{ pendingBatch ? '重试原任务' : batchMode === 'review' ? '开始复检' : batchRepairReports.length ? '开始生成修订版' : '开始生成' }}</a-button></div>
     </a-modal>
 
-    <a-drawer v-model:open="changeHistoryOpen" title="修改建议记录" width="min(1100px, 96vw)" :body-style="{ padding: 0, display: 'flex', minHeight: 0 }">
+    <a-modal v-model:open="changeHistoryOpen" title="修改建议记录" width="min(1100px, calc(100vw - 24px))" :style="{ top: '24px' }" :body-style="{ height: 'min(680px, calc(100dvh - 180px))', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }"><p class="batch-explanation">查看会话提出的修改、审批结果和历史依据，按状态筛选后核对具体差异。</p>
       <KnowledgeChangeInbox v-if="changeHistoryOpen" :workspace-id="workspaceId" :context="ctx()" :can-write="canWrite" @recheck="changeHistoryOpen = false; recheckKnowledgeChange($event)" @changed="historyChangeReviewed" />
-    </a-drawer>
+      <template #footer><a-button @click="changeHistoryOpen = false">关闭</a-button></template>
+    </a-modal>
     <KnowledgeManagementPolicy v-model:open="policyOpen" />
     <a-modal :open="Boolean(pendingEditDecision)" title="这份文档还有未保存修改" :footer="null" @cancel="pendingEditDecision?.('stay')"><p>保存后继续、放弃修改，或留在当前文档继续编辑。</p><div class="quick-actions"><a-button @click="pendingEditDecision?.('stay')">继续编辑</a-button><a-button danger @click="pendingEditDecision?.('discard')">放弃修改</a-button><a-button type="primary" @click="pendingEditDecision?.('save')">保存并继续</a-button></div></a-modal>
     <a-modal v-model:open="importOpen" title="选择项目文档导入" wrap-class-name="knowledge-import-modal" :closable="!busy" :mask-closable="!busy" :keyboard="!busy" width="min(880px, calc(100vw - 32px))" :style="{ top: '24px' }" :body-style="{ paddingTop: '12px' }">
+      <p class="batch-explanation">选择来源与分类后导入，保留原文并按章节检索；不会自动改写原始资料。</p>
       <div class="import-layout">
         <aside class="import-settings" aria-label="导入归类设置">
           <div>
@@ -2802,6 +2880,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .progress-row > span { flex: 0 0 auto; font-size: 10px; color: var(--app-muted); }
 .run-progress { flex: 1; min-width: 0; height: 3px; border-radius: 4px; background: var(--app-border); overflow: hidden; }
 .run-progress i { display: block; height: 100%; background: var(--app-accent); transition: width .2s ease; }
+.execution-input-restriction { margin-bottom: 8px; }
 .assistant-body { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 .assistant-body :deep(.chat-panel), .assistant-body :deep(.chat-panel__body), .assistant-body :deep(.chat-panel__messages), .assistant-body :deep(.chat-panel__composer) { min-width: 0; }
 .assistant-body :deep(.chat-panel__messages) { padding-inline: 14px; }
@@ -2818,7 +2897,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .quick-generate__error { margin: 0; color: var(--app-danger); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .batch-explanation { color: var(--app-muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .batch-advanced > summary { cursor: pointer; color: var(--app-muted); font-size: 12px; padding-block: 8px; }
-.batch-scroll { max-height: calc(100dvh - 180px); min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 3px; }
+.batch-scroll { max-height: calc(100dvh - 220px); min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 3px; }
 .batch-model-settings { padding-block: 6px; border-block: 1px solid var(--app-divider); margin-block: 6px; }
 .batch-model-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; font-size: 13px; color: var(--app-text); }
 .batch-model-heading > span { color: var(--app-muted); font-size: 12px; }
@@ -2838,7 +2917,8 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .batch-settings select, .batch-settings input[type="number"] { box-sizing: border-box; min-width: 92px; width: 112px; height: 30px; padding: 4px 8px; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-bg); color: var(--app-text); font: inherit; font-size: 12px; }
 .batch-settings input[type="number"]:focus-visible { outline: 2px solid var(--app-accent); outline-offset: 2px; }
 .batch-settings input[type="number"]:disabled { opacity: .6; cursor: not-allowed; }
-.batch-preview { height: 140px; overflow: auto; border: 1px solid var(--app-divider); border-radius: 6px; padding: 8px; margin-bottom: 10px; }
+.batch-section-title { font-size: 13px; margin: 14px 0 8px; }
+.batch-preview { max-height: 140px; min-height: 44px; overflow: auto; border: 1px solid var(--app-divider); border-radius: 6px; padding: 8px; margin-bottom: 10px; }
 .batch-preview > div, .batch-preview > label { display: flex; align-items: flex-start; gap: 8px; padding: 4px; overflow-wrap: anywhere; font-size: 12px; }
 .batch-submit { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .conversation-start { flex: 1; min-height: 0; min-width: 0; overflow: auto; padding: 24px; display: flex; flex-direction: column; }
@@ -2865,7 +2945,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .conversation-connect > .ant-btn { flex: 1; }
 .conversation-welcome .read-only-note { margin: 0; }
 .read-only-note { font-size: 12px; line-height: 1.8; color: var(--app-muted); }
-.import-layout { height: min(560px, calc(100dvh - 184px)); display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; min-height: 0; }
+.import-layout { height: min(560px, calc(100dvh - 256px)); display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; min-height: 0; }
 .import-settings { display: flex; flex-direction: column; gap: 20px; overflow: auto; min-height: 0; padding-right: 20px; border-right: 1px solid var(--app-divider); }
 .import-layout h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; }
 .import-categories { display: flex; flex-direction: column; gap: 12px; }

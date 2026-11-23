@@ -87,3 +87,18 @@ test("隐藏容器激活后也不自动弹框", async t => {
   await vue.nextTick();
   assert.equal(f.state.dialogOpen.value, false);
 });
+
+test("问题提交事件关闭残留表单，同编号的新问题不继承旧弹框", async t => {
+  const f = fixture(t);
+  f.state.dialogOpen.value = true;
+  f.props.item = { ...f.props.item, state: "submitted" };
+  await vue.nextTick();
+  assert.equal(f.state.dialogOpen.value, false, "其他卡片或页面提交后应关闭待填写弹框");
+  f.state.dialogOpen.value = true;
+  f.props.item = { ...f.props.item };
+  await vue.nextTick();
+  assert.equal(f.state.dialogOpen.value, true, "用户仍可主动查看已提交答案");
+  f.props.item = { ...f.props.item, id: "new-question", state: "pending" };
+  await vue.nextTick();
+  assert.equal(f.state.dialogOpen.value, false, "原生请求编号复用时也不能保留上一题弹框");
+});

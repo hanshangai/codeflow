@@ -55,6 +55,8 @@ type Props = {
   /** 受控写入会话需要在停止后重新授权下一条消息。 */
   allowQueue?: boolean;
   preserveDraftOnDisable?: boolean;
+  /** 暂缓发送时允许编写草稿，真实只读、失效和维护状态仍禁止编辑。 */
+  allowDraftWhenDisabled?: boolean;
   /** 嵌入页已展示上下文只读提示时，隐藏通用共享会话只读横幅。 */
   hideThreadReadOnlyNotice?: boolean;
   /** H5 仅改变会话呈现密度与输入栏，不改变消息和发送逻辑。 */
@@ -67,6 +69,7 @@ const props = withDefaults(defineProps<Props>(), {
   surface: "default",
   allowQueue: true,
   preserveDraftOnDisable: false,
+  allowDraftWhenDisabled: false,
   interactionActive: undefined,
 });
 const slots = useSlots();
@@ -1812,6 +1815,7 @@ defineExpose({ locateMessage, prepareThreadSwitch });
             <PendingInteractionStack :workspace-id="props.workspaceId" :items="pendingInteractionItems" :active="props.interactionActive" />
           </div>
           <div class="chat-panel__composer-inner">
+            <slot name="composer-notice" />
             <ChatComposer
               ref="composerRef"
               :workspace-id="props.workspaceId"
@@ -1824,6 +1828,7 @@ defineExpose({ locateMessage, prepareThreadSwitch });
               :surface="props.surface"
               :allow-queue="primaryKnowledgeThread ? false : props.allowQueue"
               :preserve-draft-on-disable="(props.preserveDraftOnDisable || primaryKnowledgeThread) && !threadReadOnly && !conversation?.invalidated"
+              :allow-draft-when-disabled="props.allowDraftWhenDisabled && !threadReadOnly && !conversation?.invalidated && !maintenanceBusy && !catalogSyncIssue && (!primaryKnowledgeThread || knowledgeReady.threadId === activeThreadId && knowledgeReady.canContinue)"
               @model-prefs-change="emit('modelPrefsChange', $event)"
             >
               <template v-if="slots['toolbar-before-model']" #toolbar-before-model="slotProps"><slot name="toolbar-before-model" v-bind="slotProps" /></template>

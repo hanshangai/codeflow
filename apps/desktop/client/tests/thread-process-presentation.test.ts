@@ -558,6 +558,59 @@ for (const terminal of ["turn.completed", "turn.error"]) test(`${terminal} 使�
   assertExpired();
 });
 
+test("展示版本2的错误回答缓存失效重建，编号复用后保留各问题答案", async t => {
+  const f = fixture(t);
+  for (const [id, question, answer] of [["old", "scope", "旧答案"], ["current", "modal_scope", "新答案"]]) {
+    f.append("userInput.requested", { request: { requestId: 0, params: { workspaceId: "workspace", threadId: f.threadId,
+      turnId: "turn", itemId: id, questions: [{ id: question, header: "范围", question: "选择范围" }] } } });
+    f.append("userInput.resolved", { response: { requestId: 0, answers: { [question!]: { answers: [answer] } } } });
+  }
+  const canonical = f.db.db.prepare("SELECT * FROM conversation_events ORDER BY seq").all();
+  // 模拟旧版本已持久化的错误快照，原始事件保持正确。
+  const records = f.db.db.prepare("SELECT item_id, item_json FROM conversation_presentation_items WHERE item_id IN ('old', 'current')").all() as any[];
+  for (const row of records) {
+    const item = JSON.parse(row.item_json);
+    item.state = row.item_id === "current" ? "pending" : "submitted";
+    item.submittedAnswers = row.item_id === "current" ? undefined : { modal_scope: { answers: ["新答案"] } };
+    f.db.db.prepare("UPDATE conversation_presentation_items SET item_json = ?, stub_json = ? WHERE item_id = ?")
+      .run(JSON.stringify(item), JSON.stringify(item), row.item_id);
+  }
+  f.db.db.prepare("UPDATE meta SET value = '2' WHERE key = 'conversation_presentation_schema_version'").run();
+  f.db.db.prepare("UPDATE conversation_presentations SET schema_version = 2, ready = 1").run();
+  createConversationPresentationTables(f.db.db);
+  assert.equal(f.db.conversationEvents.isPresentationReady(f.threadId), false);
+  await f.db.conversationEvents.ensurePresentation(f.threadId);
+  const items = f.db.conversationEvents.readPresentation(f.threadId).items.filter(item => item.kind === "userInputRequest");
+  assert.equal(items.length, 2);
+  assert.ok(items.every(item => item.state === "submitted"));
+  assert.deepEqual(items.find(item => item.id === "old" as ItemId)?.submittedAnswers, { scope: { answers: ["旧答案"] } });
+  assert.deepEqual(items.find(item => item.id === "current" as ItemId)?.submittedAnswers, { modal_scope: { answers: ["新答案"] } });
+  assert.deepEqual(f.db.db.prepare("SELECT * FROM conversation_events ORDER BY seq").all(), canonical);
+  createConversationPresentationTables(f.db.db);
+  assert.equal(f.db.conversationEvents.isPresentationReady(f.threadId), true);
+});
+
+test("归并缓存升级保持旧Client的结构版本2，旧缓存增量先失效再按原事件重建", async t => {
+  const f = fixture(t);
+  f.append("item.agentMessage.delta", { itemId: "answer", delta: "升级前" });
+  const storageVersion = () => (f.db.db.prepare("SELECT value FROM meta WHERE key='conversation_presentation_schema_version'").get() as any).value;
+  assert.equal(storageVersion(), "2", "只更新可重建缓存，不能让同数据库结构版本的旧Client拒绝打开");
+  f.db.db.prepare("UPDATE conversation_presentations SET schema_version = 2, ready = 1").run();
+  const before = f.db.db.prepare("SELECT item_json FROM conversation_presentation_items WHERE item_id = 'answer'").get();
+  f.append("item.agentMessage.delta", { itemId: "answer", delta: "升级后" });
+  assert.equal(f.db.conversationEvents.isPresentationReady(f.threadId), false);
+  assert.equal((f.db.db.prepare("SELECT ready FROM conversation_presentations WHERE thread_id = ?").get(f.threadId) as any).ready, 0);
+  assert.deepEqual(f.db.db.prepare("SELECT item_json FROM conversation_presentation_items WHERE item_id = 'answer'").get(), before,
+    "旧归并结果不得继续接受增量，必须从原始事件重建");
+  await f.db.conversationEvents.ensurePresentation(f.threadId);
+  assert.equal((f.db.conversationEvents.readPresentation(f.threadId).items.find(item => item.id === "answer" as ItemId) as any).text, "升级前升级后");
+  assert.equal(storageVersion(), "2");
+  const cached = f.db.db.prepare("SELECT * FROM conversation_presentations WHERE thread_id = ?").get(f.threadId);
+  createConversationPresentationTables(f.db.db);
+  assert.deepEqual(f.db.db.prepare("SELECT * FROM conversation_presentations WHERE thread_id = ?").get(f.threadId), cached,
+    "结构版本2不能导致每次初始化都把新缓存失效");
+});
+
 test("展示快照按可见消息窗口分页，游标向前补齐不重复", async t => {
   const f = fixture(t);
   for (let i = 0; i < 5; i += 1) {

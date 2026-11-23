@@ -70,10 +70,12 @@ const pendingActionLabel = computed(() => props.compact ? "填写" : "回答");
 const submittedActionLabel = computed(() => "查看");
 const isMobileViewport = ref(false);
 
+/** 提交或换题时关闭旧表单；状态不变时保留用户主动打开的只读答案。 */
 watch(
-  () => [props.item.requestId, props.item.state] as const,
-  () => {
-    if (props.item.state !== "pending" && props.item.state !== "submitted") {
+  () => [props.item.id, props.item.requestId, props.item.state] as const,
+  (current, previous) => {
+    if (previous && (current[0] !== previous[0] || current[1] !== previous[1] || current[2] !== previous[2])
+      || props.item.state !== "pending" && props.item.state !== "submitted") {
       dialogOpen.value = false;
     }
   },

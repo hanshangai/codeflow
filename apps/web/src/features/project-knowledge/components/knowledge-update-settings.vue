@@ -129,13 +129,15 @@ onBeforeUnmount(release);
 </script>
 
 <template>
-  <a-drawer :open="open" title="定时更新规格库" width="min(560px, 100vw)" :header-style="{ padding: '8px 12px' }" :body-style="{ padding: '12px', overflowY: 'auto' }" :footer-style="{ textAlign: 'right', padding: '8px 12px' }" @close="emit('update:open', false)">
+  <a-modal :open="open" title="定时更新规格库" width="min(720px, calc(100vw - 24px))" :style="{ top: '24px' }" :body-style="{ maxHeight: 'calc(100dvh - 200px)', overflowY: 'auto' }" :closable="!saving && !checking" :mask-closable="!saving && !checking" :keyboard="!saving && !checking" @cancel="emit('update:open', false)">
     <div class="update-settings" data-testid="knowledge-update-settings">
+      <p class="update-note">设置检查时间与范围，来源或要求变化时生成更新草稿，确认采用后才生效。</p>
       <a-alert v-if="errorText" type="error" show-icon :message="errorText" />
       <a-spin v-if="loading && !view" />
       <template v-else>
         <div class="update-toggle"><span>启用定时更新</span><a-switch v-model:checked="form.enabled" aria-label="启用定时更新" /></div>
-        <a-form layout="vertical" size="small">
+        <a-form layout="vertical">
+          <h3>检查时间</h3>
           <div class="setting-row">
             <a-form-item class="setting-field" label="执行频率"><a-select v-model:value="form.frequency" aria-label="执行频率" :options="[{ value: 'daily', label: '每天' }, { value: 'weekly', label: '每周' }, { value: 'custom', label: '自定义 cron' }]" /></a-form-item>
             <a-form-item v-if="form.frequency !== 'custom'" class="setting-field" label="执行时间"><a-input v-model:value="form.time" type="time" aria-label="执行时间" /></a-form-item>
@@ -143,8 +145,10 @@ onBeforeUnmount(release);
           </div>
           <a-form-item v-if="form.frequency === 'custom'" label="cron（分 时 日 月 星期）"><a-input v-model:value="form.cronExpr" aria-label="更新 cron" /></a-form-item>
           <a-form-item label="时区"><a-input v-model:value="form.timezone" aria-label="更新时区" /></a-form-item>
+          <h3>更新范围</h3>
           <a-form-item label="更新范围" extra="留空表示整个项目；已有待采用版本的资产暂缓更新。"><a-tree-select v-model:value="form.selectedNodeIds" aria-label="定时更新范围" :tree-data="treeData" tree-data-simple-mode tree-checkable show-checked-strategy="SHOW_PARENT" allow-clear placeholder="整个项目" :max-tag-count="2" /></a-form-item>
           <a-form-item label="包含所选目录的后代"><a-switch v-model:checked="form.includeDescendants" aria-label="定时更新包含后代" /></a-form-item>
+          <h3>执行设置</h3>
           <div class="setting-row">
             <a-form-item class="setting-field" label="引擎"><a-select v-model:value="form.engine" aria-label="定时更新引擎" :options="[{ value: 'codex', label: 'Codex' }, { value: 'claude', label: 'Claude' }]" @change="changeEngine" /></a-form-item>
             <a-form-item class="setting-field" label="并发数"><a-input-number v-model:value="form.concurrency" aria-label="定时更新并发" :min="1" :max="16" :precision="0" /></a-form-item>
@@ -170,14 +174,15 @@ onBeforeUnmount(release);
       </template>
     </div>
     <template #footer>
-      <a-space wrap><a-button :disabled="saving || checking" :loading="loading" @click="load(false)">刷新状态</a-button><a-button :disabled="!view?.schedule || loading || busy || saving || !snapshot?.canWrite" :loading="checking" @click="checkNow">立即检查</a-button><a-button type="primary" :disabled="loading || !view || !snapshot?.canWrite" :loading="saving" @click="save">保存计划</a-button></a-space>
+      <a-space wrap><a-button :disabled="saving || checking" @click="emit('update:open', false)">关闭</a-button><a-button :disabled="saving || checking" :loading="loading" @click="load(false)">刷新状态</a-button><a-button :disabled="!view?.schedule || loading || busy || saving || !snapshot?.canWrite" :loading="checking" @click="checkNow">立即检查</a-button><a-button type="primary" :disabled="loading || !view || !snapshot?.canWrite" :loading="saving" @click="save">保存计划</a-button></a-space>
     </template>
-  </a-drawer>
+  </a-modal>
 </template>
 
 <style scoped>
 .update-settings { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .update-settings :deep(.ant-form-item) { margin-bottom: 12px; }
+.update-settings h3 { margin: 16px 0 12px; padding-top: 12px; border-top: 1px solid var(--app-divider); font-size: 14px; }
 .update-toggle { display: flex; align-items: center; justify-content: space-between; }
 .setting-row { display: flex; flex-wrap: wrap; gap: 12px; }
 .setting-field { flex: 1; min-width: 120px; }

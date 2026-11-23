@@ -140,6 +140,8 @@ type Props = {
   allowQueue?: boolean;
   /** 嵌入页临时校验绑定时保留同一会话尚未发送的输入。 */
   preserveDraftOnDisable?: boolean;
+  /** 有写权限但暂不能发送的嵌入会话，仅放行文本草稿编辑与保存。 */
+  allowDraftWhenDisabled?: boolean;
   /** 主动推荐开关的可见性，由会话面板按工作流面板同源条件下发；H5 不渲染该开关。 */
   workflowToggleVisible?: boolean;
   knowledgeToggleVisible?: boolean;
@@ -151,6 +153,7 @@ const props = withDefaults(defineProps<Props>(), {
   surface: "default",
   allowQueue: true,
   preserveDraftOnDisable: false,
+  allowDraftWhenDisabled: false,
   workflowToggleVisible: false,
   knowledgeToggleVisible: false,
 });
@@ -286,6 +289,11 @@ const composerWriteBlocked = computed(() => (
   || !modelCatalogLoaded.value
   || workspaceSwitchFlushInProgress.value
   || sending.value
+));
+/** 草稿编辑独立于发送锁，连接和运行环境限制仍然生效。 */
+const draftInputBlocked = computed(() => (
+  props.disabled && !props.allowDraftWhenDisabled
+  || !composerConnected.value || !modelCatalogLoaded.value || workspaceSwitchFlushInProgress.value || sending.value
 ));
 const composerWriteBlockedReason = computed(() => {
   if (props.disabled) return "当前会话为只读状态";
@@ -1237,7 +1245,7 @@ async function prepareThreadSwitch(): Promise<ThreadDraftPayload> {
 
 /** 尾随防抖保存草稿，连续输入时最多等待固定上限。 */
 function scheduleDraftSave(): void {
-  if (draftHydrating.value || props.disabled || !composerConnected.value) return;
+  if (draftHydrating.value || props.disabled && !props.allowDraftWhenDisabled || !composerConnected.value) return;
   clearDraftSaveTimer();
   const now = Date.now();
   if (!draftDirtySince) draftDirtySince = now;
@@ -1268,14 +1276,14 @@ function scheduleDraftSave(): void {
   }, delayMs);
 }
 
-/** 加载当前会话草稿；禁用态不触发远端草稿接口，避免只读 shared 会话误写链路。 */
+/** 只读会话不读写草稿；显式允许的暂缓发送状态仍恢复草稿。 */
 async function loadThreadDraft(
   workspaceId: WorkspaceId,
   threadId: ThreadId,
   token: number,
   opts?: { silent?: boolean; force?: boolean },
 ): Promise<void> {
-  if (props.disabled) {
+  if (props.disabled && !props.allowDraftWhenDisabled) {
     if (token !== draftLoadToken) return;
     currentDraftVersion.value = null;
     draftScopeHydrated.value = false;
@@ -1329,7 +1337,7 @@ function reconcileDraftVersionSignal(nextVersion: number | null): boolean {
     if (activation.threadId !== props.threadId) return false;
     if (activation.phase !== "settled" && activation.phase !== "invalidated") return false;
   }
-  if (props.disabled || !composerConnected.value) return false;
+  if (props.disabled && !props.allowDraftWhenDisabled || !composerConnected.value) return false;
   draftLoadToken += 1;
   void loadThreadDraft(props.workspaceId, props.threadId, draftLoadToken, { silent: true, force: true });
   return true;
@@ -1365,7 +1373,7 @@ watch(
     draftAuthorizationWorkspaceId = nextWorkspaceId;
     draftAuthorizationThreadId = nextThreadId;
     if (prevState) {
-      draftWriteAuthorized = !props.disabled && composerConnected.value;
+      draftWriteAuthorized = (!props.disabled || props.allowDraftWhenDisabled) && composerConnected.value;
     }
     draftScopeHydrated.value = false;
     draftVersionReloadDeferred = false;
@@ -1380,7 +1388,7 @@ watch(
     } else {
       applyDraft(null);
     }
-    if (!props.activationManaged && !props.disabled) {
+    if (!props.activationManaged && (!props.disabled || props.allowDraftWhenDisabled)) {
       draftLoadToken += 1;
       void loadThreadDraft(nextWorkspaceId, nextThreadId, draftLoadToken, { silent: true, force: true });
     }
@@ -1450,7 +1458,7 @@ watch(
     if (prefsTask) void prefsTask.catch((error) => reportThreadPrefsSaveFailure(captureThreadPrefsSaveScope(), error));
     const consumedDeferredReload = flushDeferredDraftVersionReload();
     if (!props.activationManaged) {
-      if (props.disabled) return;
+      if (props.disabled && !props.allowDraftWhenDisabled) return;
       if (consumedDeferredReload) return;
       draftLoadToken += 1;
       void loadThreadDraft(props.workspaceId, props.threadId, draftLoadToken, { silent: true, force: true });
@@ -1459,7 +1467,7 @@ watch(
 );
 
 watch(
-  () => props.disabled,
+  () => props.disabled && !props.allowDraftWhenDisabled,
   (disabled) => {
     cancelDraftSave();
     draftLoadToken += 1;
@@ -1499,6 +1507,7 @@ const isKnowledgeSession = computed(() => thread.value?.threadSubtype === "knowl
 const engine = computed<EngineType>(() => (thread.value?.engine ?? "codex") as EngineType);
 /** 按输入表面和会话引擎展示真实可用的命令入口；手机端无物理键盘，省略按键提示。 */
 const composerPlaceholder = computed(() => {
+  if (props.disabled && props.allowDraftWhenDisabled) return "可先编写修订草稿，任务结束后再发送";
   if (props.surface === "h5") return "输入消息";
   if (isKnowledgeSession.value) return "";
   const actionHint = engine.value === "claude" ? "/ 命令或技能" : "/ 命令, $ 技能";
@@ -2318,7 +2327,7 @@ const canSend = computed(() => {
 const sendButtonLabel = computed(() => {
   if (pendingReads.value) return "读取附件中";
   if (sending.value) return isNodeExecutionThread.value ? "发送中" : (sendingViaQueue.value ? "入队中" : "发送中");
-  if (props.disabled) return "不可发送";
+  if (props.disabled) return props.allowDraftWhenDisabled ? "待任务结束" : "不可发送";
   if (!composerConnected.value || (!localChatReady.value && !config.webSessionId)) return "未连接";
   if (currentComposerInputSubmission.value.mode !== "host-action" && engineCliMissing.value) return "CLI 未安装";
   if (currentComposerInputSubmission.value.mode !== "host-action" && localModelSetupActive.value) return "请配置 Key";
@@ -2333,7 +2342,7 @@ const sendButtonLabel = computed(() => {
 const sendButtonTitle = computed(() => {
   if (pendingReads.value) return "正在读取附件，请稍候";
   if (sending.value) return "正在发送";
-  if (props.disabled) return "当前状态下不可发送";
+  if (props.disabled) return props.allowDraftWhenDisabled ? "可先编写草稿，任务结束后再发送" : "当前状态下不可发送";
   if (!composerConnected.value || (!localChatReady.value && !config.webSessionId)) return "连接成功后才能发送";
   if (currentComposerInputSubmission.value.mode !== "host-action" && engineCliMissingIssue.value) return engineCliMissingIssue.value;
   if (currentComposerInputSubmission.value.mode !== "host-action" && localModelSetupActive.value) {
@@ -3707,6 +3716,7 @@ watch(
     () => props.threadId,
     () => config.workspaceId,
     () => props.disabled,
+    () => props.allowDraftWhenDisabled,
     () => composerConnected.value,
   ],
   () => {
@@ -3714,7 +3724,7 @@ watch(
       && props.threadId === draftAuthorizationThreadId
       && String(props.workspaceId) === String(config.workspaceId);
     if (!scopeMatches) return;
-    draftWriteAuthorized = !props.disabled && composerConnected.value;
+    draftWriteAuthorized = (!props.disabled || props.allowDraftWhenDisabled) && composerConnected.value;
   },
   { immediate: true, flush: "sync" },
 );
@@ -4216,7 +4226,7 @@ defineExpose({ prefill, appendText, attachTextFile, sendExternalText, canAcceptE
         ref="textareaRef"
         v-model:value="text"
         class="composer__textarea"
-        :disabled="composerWriteBlocked"
+        :disabled="draftInputBlocked"
         :bordered="false"
         :auto-size="{ minRows: isMobile ? 1 : 2, maxRows: 10 }"
         :placeholder="composerPlaceholder"

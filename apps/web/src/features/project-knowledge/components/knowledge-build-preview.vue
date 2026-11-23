@@ -12,7 +12,7 @@ import { knowledgeAdoptionSelection, knowledgeSelectedNodes, knowledgeTreeRows }
 import type { KnowledgeDocumentContext } from "../knowledgeWorkTreeModel";
 import { knowledgeDocumentReviewActivity, knowledgeItemNeedsReview } from "../knowledgeReviewModel";
 
-const props = withDefaults(defineProps<{ workspaceId: string; context: ApiRequestContext; run: KnowledgeGenerationRunView; runs?: KnowledgeGenerationRunView[]; nodes?: KnowledgeAssetNode[]; canWrite: boolean; actionsBusy?: boolean; canStartTask?: boolean; embedded?: boolean; recoveryOnly?: boolean; suppliedPreview?: KnowledgeGenerationPreview | null; allowAdoption?: boolean; scopeNodeId?: string | null; focus?: { nodeId: string; revisionId?: string | null; report: boolean; selectOnly?: boolean } | null }>(), { allowAdoption: true, canStartTask: true });
+const props = withDefaults(defineProps<{ workspaceId: string; context: ApiRequestContext; run: KnowledgeGenerationRunView; runs?: KnowledgeGenerationRunView[]; nodes?: KnowledgeAssetNode[]; canWrite: boolean; actionsBusy?: boolean; canStartTask?: boolean; embedded?: boolean; recoveryOnly?: boolean; suppliedPreview?: KnowledgeGenerationPreview | null; restrictionReason?: string | null; allowAdoption?: boolean; scopeNodeId?: string | null; focus?: { nodeId: string; revisionId?: string | null; report: boolean; selectOnly?: boolean } | null }>(), { allowAdoption: true, canStartTask: true });
 const emit = defineEmits<{ changed: [run: KnowledgeGenerationRunView]; busy: [value: boolean]; openFile: [path: string]; review: [nodeId: string]; resumeReview: [context: KnowledgeDocumentContext]; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView, runId: string]; error: [error: unknown, context: { runId: string; nodeId: string | null }] }>();
 const preview = shallowRef<KnowledgeGenerationPreview | null>(null);
 const selected = ref<string[]>([]), selectedId = ref<string | null>(null);
@@ -68,7 +68,7 @@ const canResumeReview = computed(() => ["build", "batch", "review"].includes(pro
 const canReviewVersion = computed(() => document.value?.revision.id === (detail.value?.drafts[0]?.id ?? detail.value?.current?.revision.id));
 /** 用简短状态指引当前候选的下一步，具体问题保留在复检报告。 */
 const reviewGuidance = computed(() => {
-  if (!document.value || !currentItem.value?.reason || currentItem.value.applied || currentItem.value.dismissed) return null;
+  if (!document.value || !(currentItem.value?.reason || props.restrictionReason) || currentItem.value?.applied || currentItem.value?.dismissed) return null;
   if (reportsLoading.value) return "正在读取复检结果…";
   if (reportsReadError.value) return "复检报告读取失败，请重新读取报告。";
   const report = latestReport.value;
@@ -471,11 +471,11 @@ defineExpose({ hasRecovery: () => Boolean(pendingApply.value || maintenancePendi
         <a-spin v-if="reading" class="preview-loading" />
         <template v-else-if="node">
           <div class="preview-toolbar"><h3 :title="node.title">{{ node.title }}</h3><p v-if="specificationPaths !== null" class="specification-scope" :title="specificationPaths.join('、')">规格适用范围：{{ specificationPaths.length ? specificationPaths.join('、') : '整个项目' }}</p><span v-if="currentItem?.applied">已采用</span></div>
-          <a-alert v-if="documentActivity || currentItem?.reason && !currentItem.applied" class="review-notice" :type="documentActivity ? 'info' : 'warning'" :role="documentActivity ? 'status' : 'alert'" :aria-busy="Boolean(documentActivity)" show-icon data-testid="knowledge-review-notice">
+          <a-alert v-if="documentActivity || (currentItem?.reason || restrictionReason) && !currentItem?.applied" class="review-notice" :type="documentActivity ? 'info' : 'warning'" :role="documentActivity ? 'status' : 'alert'" :aria-busy="Boolean(documentActivity)" show-icon data-testid="knowledge-review-notice">
             <template v-if="documentActivity" #icon><LoadingOutlined spin aria-hidden="true" /></template>
             <template #message>
               <div class="review-notice-row">
-                <span class="review-notice-text" :title="reportsReadError ?? executionItem?.review?.error?.message ?? currentItem?.reason ?? undefined">{{ documentActivity ?? reviewGuidance ?? currentItem?.reason }}</span>
+                <span class="review-notice-text" :title="reportsReadError ?? executionItem?.review?.error?.message ?? currentItem?.reason ?? undefined">{{ documentActivity ?? reviewGuidance ?? currentItem?.reason ?? restrictionReason }}</span>
                 <a-space v-if="!documentActivity && reviewGuidance" wrap :size="6">
                   <a-button v-if="canResumeReview && document" type="primary" size="small" :disabled="!canWrite || reviewBusy || reportsLoading || Boolean(reportsReadError)" @click="emit('resumeReview', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })">{{ executionItem?.review?.status === 'failed' ? '重试复检' : '继续复检' }}</a-button>
                   <a-button v-else-if="canStartTask && document" type="primary" size="small" :disabled="!canWrite || restartReviewBusy || reportsLoading || Boolean(reportsReadError) || !canReviewVersion" @click="emit('review', node.id)">重新复检</a-button>

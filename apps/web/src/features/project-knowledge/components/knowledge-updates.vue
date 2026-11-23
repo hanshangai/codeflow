@@ -11,7 +11,7 @@ import KnowledgeBuildPreview from "./knowledge-build-preview.vue";
 import KnowledgeChangeInbox from "./knowledge-change-inbox.vue";
 
 const props = defineProps<{ workspaceId: string; context: ApiRequestContext; nodes: KnowledgeAssetNode[]; formalNodes: KnowledgeAssetNode[]; runs: KnowledgeGenerationRunView[]; updates: KnowledgeLibraryUpdate[]; scopeNodeId: string | null; canWrite: boolean; actionsBusy?: boolean; indexLoading?: boolean; indexError?: string | null; changeId?: string | null; focusId?: string | null; focusReport?: boolean; recoveryRunId?: string; retryIndex: () => Promise<void>; afterApply: (context: KnowledgeDocumentContext, count: number) => Promise<boolean> }>();
-const emit = defineEmits<{ changed: [run?: KnowledgeGenerationRunView]; focus: [id: string]; preview: [context: KnowledgeDocumentContext | null]; empty: [value: boolean]; close: []; openFile: [path: string]; recheck: [change: KnowledgeChangeDetail]; review: [nodeId: string]; resumeReview: [context: KnowledgeDocumentContext]; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView, runId: string]; busy: [value: boolean]; error: [cause: unknown, context: Record<string, unknown>] }>();
+const emit = defineEmits<{ changed: [run?: KnowledgeGenerationRunView]; stopRun: [run: KnowledgeGenerationRunView]; focus: [id: string]; preview: [context: KnowledgeDocumentContext | null]; empty: [value: boolean]; close: []; openFile: [path: string]; recheck: [change: KnowledgeChangeDetail]; review: [nodeId: string]; resumeReview: [context: KnowledgeDocumentContext]; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView, runId: string]; busy: [value: boolean]; error: [cause: unknown, context: Record<string, unknown>] }>();
 type Row = { id: string; nodeId: string; title: string; body: boolean; structure: boolean; generating: boolean; runId: string | null; revisionId: string | null; changeId: string | null; source: string; createdAt: string; reason: string | null; canApply: boolean };
 const previews = shallowRef(new Map<string, KnowledgeGenerationPreview>());
 const changes = shallowRef<KnowledgeChangeSummary[]>([]);
@@ -40,9 +40,12 @@ const rows = computed<Row[]>(() => {
     const legacyPlan = run && ["tree", "conversation"].includes(run.mode) && Boolean(run.proposedTree);
     const pending = run?.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled);
     const reviewActivity = knowledgeDocumentReviewActivity(props.runs, update.nodeId, update.revisionId);
+    const generationItem = run?.items.find(candidate => candidate.nodeId === update.nodeId && candidate.revisionId === update.revisionId);
+    const review = (generationItem?.reviewConfig ?? run?.reviewConfig)?.enabled === false ? null : generationItem?.review;
+    const reviewReason = review?.stale ? "复检依据已变化，请重新复检。" : review?.status === "issues" ? "正文尚未通过复检，请查看报告并修订。" : review?.status === "failed" ? "复检失败，请查看报告并重试。" : review?.status === "pending" ? "正文已保存，尚待完成复检。" : null;
     return { ...update, id: `${update.id}:${update.revisionId ?? 'structure'}`, title: node?.title ?? update.nodeId,
       changeId: null, source: run?.maintenance ? "自动维护" : run?.mode === "conversation" ? "规格对话" : "生成修订", createdAt: run?.createdAt ? new Date(run.createdAt).toLocaleString() : "",
-      reason: pending ? "有未完成采用，请恢复原清单或终止" : reviewActivity ?? (run?.active ? update.generating ? "生成中" : "当前任务尚未完成" : legacyPlan ? "历史目录计划，请重新构建" : item?.applied ? update.structure ? "正文已采用，结构变化需要重新构建" : "已采用" : item?.dismissed ? "本次不采用" : item?.reason ?? (!preview ? "正在核对采用条件" : null)),
+      reason: pending ? "有未完成采用，请恢复原清单或终止" : reviewActivity ?? (run?.active ? update.generating ? "生成中" : `${reviewReason ?? ''}本批任务仍在运行，结束或停止后才可采用。` : legacyPlan ? "历史目录计划，请重新构建" : item?.applied ? update.structure ? "正文已采用，结构变化需要重新构建" : "已采用" : item?.dismissed ? "本次不采用" : item?.reason ?? reviewReason ?? (!preview ? "正在核对采用条件" : null)),
       canApply: Boolean(!pending && !legacyPlan && !run?.active && !reviewActivity && item?.canApply && !item.applied && !item.dismissed) };
   }).filter(row => row.reason !== "已采用" && row.reason !== "本次不采用");
   const proposals = changes.value.filter(change => !props.recoveryRunId && (!scopeIds.value || scopeIds.value.has(change.nodeId))).map(change => {
@@ -64,6 +67,17 @@ const documentCount = computed(() => new Set(rows.value.filter(row => row.body &
 const generatingCount = computed(() => new Set(rows.value.filter(row => row.body && row.generating).map(row => row.nodeId)).size);
 const structureCount = computed(() => new Set(rows.value.filter(row => row.structure && !row.generating).map(row => row.nodeId)).size);
 const multiple = computed(() => active.value && rows.value.filter(row => row.nodeId === active.value!.nodeId).length > 1);
+/** 单文件隐藏清单时也显示采用阻断原因；运行锁与复检资格分别说明。 */
+const adoptionRestriction = computed(() => {
+  if (!props.canWrite) return "当前为只读状态，需要维护权限才能采用。";
+  if (loading.value || props.indexLoading) return "正在读取并核对采用条件，请稍候。";
+  if (locked.value) return "正在处理当前操作，请稍候。";
+  if (active.value?.reason && !active.value.canApply) return active.value.reason;
+  if (props.actionsBusy) return "任务或会话仍在处理，完成后才能采用。";
+  if (scopeIsFile.value && !active.value) return "请选择一个候选版本后再采用。";
+  if (!scopeIsFile.value && !chosen.value.length) return "请勾选可采用的更新。";
+  return null;
+});
 /** 自动选中与显式切换均通知父页，右侧会话必须对应正在展示的确切候选。 */
 watch(() => JSON.stringify(active.value ? [active.value.nodeId, active.value.runId, active.value.revisionId] : null), () => {
   emit("preview", active.value ? { nodeId: active.value.nodeId, runId: active.value.runId, revisionId: active.value.revisionId } : null);
@@ -362,14 +376,17 @@ watch(() => !loading.value && !props.indexLoading && !props.indexError && !error
         <label v-for="row in rows" :key="row.id" class="update-row" :class="{ selected: activeId === row.id }"><input type="checkbox" :aria-label="`采用 ${row.title} · ${row.source} · ${row.createdAt}`" :checked="selected.includes(row.id)" :disabled="!canWrite || locked || !row.canApply" @change="toggle(row, ($event.target as HTMLInputElement).checked)"><button type="button" :disabled="locked" @click="selectRow(row)"><strong>{{ row.title }}</strong><small>{{ row.source }} · {{ row.createdAt }} · {{ row.generating ? '生成中' : row.structure ? row.body ? '正文与结构调整' : '结构调整' : '尚未采用' }}</small><span v-if="row.reason" class="row-reason" :class="{ generating: row.generating }">{{ row.reason }}</span></button></label>
       </aside>
       <div class="update-content">
-        <KnowledgeBuildPreview v-if="activeRun && (!activeRun.active || activeReviewActivity || active?.revisionId && !active.generating)" :key="active?.id ?? activeRun.id" ref="buildRef" embedded :recovery-only="!active" :workspace-id="workspaceId" :context="context" :run="activeRun" :runs="runs" :nodes="nodes" :supplied-preview="previews.get(activeRun.id)" :can-write="canWrite" :actions-busy="locked || actionsBusy" :can-start-task="formalNodes.some(node => node.id === active?.nodeId)" :scope-node-id="active?.nodeId" :focus="activeFocus" @busy="childLock" @changed="receiveRun" @open-file="emit('openFile', $event)" @review="emit('review', $event)" @resume-review="emit('resumeReview', $event)" @repair="emit('repair', $event)" @repair-issue="(report, issue) => emit('repairIssue', report, issue)" @return-to-generation="(report, runId) => emit('returnToGeneration', report, runId)" @error="(cause, context) => fail(cause, context)" />
+        <KnowledgeBuildPreview v-if="activeRun && (!activeRun.active || activeReviewActivity || active?.revisionId && !active.generating)" :key="active?.id ?? activeRun.id" ref="buildRef" embedded :recovery-only="!active" :workspace-id="workspaceId" :context="context" :run="activeRun" :runs="runs" :nodes="nodes" :supplied-preview="previews.get(activeRun.id)" :restriction-reason="active?.reason" :can-write="canWrite" :actions-busy="locked || actionsBusy" :can-start-task="formalNodes.some(node => node.id === active?.nodeId)" :scope-node-id="active?.nodeId" :focus="activeFocus" @busy="childLock" @changed="receiveRun" @open-file="emit('openFile', $event)" @review="emit('review', $event)" @resume-review="emit('resumeReview', $event)" @repair="emit('repair', $event)" @repair-issue="(report, issue) => emit('repairIssue', report, issue)" @return-to-generation="(report, runId) => emit('returnToGeneration', report, runId)" @error="(cause, context) => fail(cause, context)" />
         <KnowledgeChangeInbox v-else-if="active?.changeId" :key="active.changeId" ref="changeRef" embedded :workspace-id="workspaceId" :context="context" :can-write="canWrite" :change-id="active.changeId" @recheck="emit('recheck', $event)" @selected="validateChange" @changed="emit('changed')" />
         <div v-else-if="active && activeRun?.active" class="updates-processing" role="status" aria-live="polite" aria-busy="true"><a-spin size="large" aria-hidden="true" /><span>{{ active.reason }}</span></div>
         <div v-else-if="!rows.length && !errorText && !indexError" class="updates-empty"><h3>暂无待确认更新</h3><p>从项目整理或通过规格对话补充要求后，更新会出现在这里。</p></div>
         <p v-else-if="rows.length" class="updates-empty">{{ active?.reason || '选择具体更新查看内容与对比。多个版本不会自动取最新。' }}</p>
       </div>
     </div>
-    <footer v-if="rows.length"><span>已选 {{ chosen.length }} 项<span v-if="rows.some(row => row.reason)"> · 不可采用项已注明原因</span></span><div><a-button :disabled="!canWrite || !active || loading || locked" @click="dismiss">本次不采用</a-button><a-button v-if="scopeIsFile" type="primary" :disabled="!canWrite || !active?.canApply || loading || locked" @click="active && applyRows([active])">采用此版本</a-button><a-button v-else type="primary" :disabled="!canWrite || !chosen.length || loading || locked" :loading="saving" @click="applyRows(chosen)">采用所选内容</a-button></div></footer>
+    <footer v-if="rows.length">
+      <div class="adoption-status"><span>已选 {{ chosen.length }} 项</span><span v-if="adoptionRestriction" role="status" data-testid="knowledge-adoption-restriction">{{ adoptionRestriction }}</span></div>
+      <div><a-button v-if="activeRun?.active && canWrite" :disabled="locked" @click="emit('stopRun', activeRun)">停止任务后处理</a-button><a-button :disabled="!canWrite || !active || loading || locked || actionsBusy" @click="dismiss">本次不采用</a-button><a-button v-if="scopeIsFile" type="primary" :title="adoptionRestriction ?? undefined" :disabled="!canWrite || !active?.canApply || loading || locked || actionsBusy" @click="active && applyRows([active])">采用此版本</a-button><a-button v-else type="primary" :title="adoptionRestriction ?? undefined" :disabled="!canWrite || !chosen.length || loading || locked || actionsBusy" :loading="saving" @click="applyRows(chosen)">采用所选内容</a-button></div>
+    </footer>
   </section>
 </template>
 
@@ -392,6 +409,7 @@ watch(() => !loading.value && !props.indexLoading && !props.indexError && !error
 .updates-processing { display: flex; flex-direction: column; align-items: center; gap: 16px; margin: auto; padding: 24px; color: var(--app-text); font-size: 16px; font-weight: 500; line-height: 1.6; text-align: center; }
 .updates-empty { margin: auto; padding: 20px; color: var(--app-muted); font-size: 12px; line-height: 1.7; }.updates-loading { margin: auto; }
 .updates-empty h3 { color: var(--app-text); margin: 0 0 8px; font-size: 16px; }.updates-empty p { margin: 0; }
+.adoption-status { flex: 1; min-width: 0; flex-direction: column; align-items: flex-start; font-size: 12px; color: var(--app-muted); overflow-wrap: anywhere; }
 footer { justify-content: space-between; border-top: 1px solid var(--app-divider); border-bottom: 0; }footer > div { display: flex; flex-wrap: wrap; gap: 8px; }
 @media (max-width: 640px) { .updates-heading > div { flex-basis: 100%; gap: 4px 8px; }.updates-heading strong { white-space: nowrap; }.updates-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(100px, 30%) minmax(0, 1fr); }.updates-layout.single-file { grid-template-rows: minmax(0, 1fr); }.update-list { border-right: 0; border-bottom: 1px solid var(--app-divider); } }
 </style>

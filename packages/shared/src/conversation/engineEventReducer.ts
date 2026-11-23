@@ -554,10 +554,7 @@ export function applyEngineEventToConversation(
       return;
     case "userInput.resolved":
       {
-        // requestId 与 id(itemId) 不同，需按 requestId 线性查找（低频事件，不影响性能）
-        const existing = state.items.find(
-          (i) => i.kind === "userInputRequest" && i.requestId === event.payload.response.requestId,
-        ) as ConversationUserInputRequest | undefined;
+        const existing = findLatestUserInputRequest(state, event.payload.response.requestId, event.payload.response.answers);
         if (existing) {
           existing.state = "submitted";
           existing.submittedAnswers = event.payload.response.answers;
@@ -567,9 +564,7 @@ export function applyEngineEventToConversation(
     case "userInput.expired":
       {
         // Claude 内部超时或拒绝了 AskUserQuestion → 将卡片从 pending 标记为 expired
-        const existing = state.items.find(
-          (i) => i.kind === "userInputRequest" && i.requestId === event.payload.requestId,
-        ) as ConversationUserInputRequest | undefined;
+        const existing = findLatestUserInputRequest(state, event.payload.requestId);
         if (existing && existing.state === "pending") {
           existing.state = "expired";
         }
@@ -1236,6 +1231,25 @@ function messageCompletionSourcePriority(source: ConversationMessage["completion
  */
 function reorderCurrentGroup(state: ThreadConversationState): void {
   // 保留真实时间线，不再把同一 assistant group 的 item 按语义桶重排。
+}
+
+/** 复用编号时按完整问题集合消歧；唯一请求仍沿旧协议接纳部分回答。 */
+function findLatestUserInputRequest(
+  state: ThreadConversationState,
+  requestId: ConversationUserInputRequest["requestId"],
+  answers?: ConversationUserInputRequest["submittedAnswers"],
+): ConversationUserInputRequest | undefined {
+  const answerIds = answers ? Object.keys(answers) : [];
+  let latest: ConversationUserInputRequest | undefined;
+  let matches = 0;
+  for (let index = state.items.length - 1; index >= 0; index--) {
+    const item = state.items[index]!;
+    if (item.kind !== "userInputRequest" || item.requestId !== requestId) continue;
+    latest ??= item; matches++;
+    if (!answers || answerIds.length === item.questions.length
+      && answerIds.every(id => item.questions.some(question => question.id === id))) return item;
+  }
+  return matches === 1 ? latest : undefined;
 }
 
 /** summaryPartAdded：在 summary 段落间加一个空行，提升可读性。 */
