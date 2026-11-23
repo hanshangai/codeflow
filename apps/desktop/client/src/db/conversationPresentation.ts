@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import {
   applyEngineEventToConversation, buildThreadPresentation, createConversationItemStub, createConversationState,
   getConversationProcessGroups, restoreConversationState, snapshotConversationState,
@@ -9,6 +10,8 @@ import type { SqliteDb } from "./sqliteTypes.js";
 const PRESENTATION_SCHEMA_VERSION = 2;
 // 表结构保持旧Client可读；行内版本仅标识可重建的归并结果。
 const PRESENTATION_REDUCER_VERSION = 3;
+const REBUILD_SLICE_MS = 8;
+const PLACEHOLDER_INDEX = "idx_conversation_presentation_placeholder";
 type ProjectionRow = { version: number; ready: number; state_json: string; schema_version: number; build_id: string };
 type ItemRow = { item_id: string; position: number; stub_json: string; updated_seq: number; process_id: string | null };
 export type ProcessReadOptions = { afterSeq?: number; cursor?: string; throughSeq?: number; limit?: number };
@@ -27,7 +30,9 @@ export function createConversationPresentationTables(db: SqliteDb): void {
       }
       db.prepare("UPDATE conversation_presentations SET ready = 0, build_id = '', presentation_json = '{}'").run();
       db.prepare("UPDATE meta SET value = ? WHERE key = 'conversation_presentation_schema_version'").run(String(PRESENTATION_SCHEMA_VERSION));
+      ensurePlaceholderIndex(db);
     })();
+    ensurePlaceholderIndex(db);
     return;
   }
   db.transaction(() => {
@@ -45,7 +50,15 @@ export function createConversationPresentationTables(db: SqliteDb): void {
   CREATE INDEX IF NOT EXISTS idx_conversation_presentation_process
     ON conversation_presentation_items(thread_id, process_id, position);`);
     db.prepare("INSERT INTO meta(key, value) VALUES ('conversation_presentation_schema_version', ?)").run(String(PRESENTATION_SCHEMA_VERSION));
+    ensurePlaceholderIndex(db);
   })();
+}
+
+/** 精确索引占位条目；旧库只补索引，不失效已完成投影或提高归并版本。 */
+function ensurePlaceholderIndex(db: SqliteDb): void {
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(PLACEHOLDER_INDEX)) return;
+  db.exec(`CREATE INDEX IF NOT EXISTS ${PLACEHOLDER_INDEX} ON conversation_presentation_items(thread_id)
+    WHERE process_id IS NOT NULL AND json_extract(stub_json, '$.placeholder') = 1`);
 }
 
 /** canonical 的可重建展示投影；正文与摘要始终在所属事件事务内一起更新。 */
@@ -76,21 +89,35 @@ export class ConversationPresentationStore {
     this.apply(event, supersededItemIds);
   }
 
-  /** 首次构建分批提交并让出事件循环；失败保留未就绪状态，绝不返回空历史。 */
+  /** 按时间片提交并让出事件循环；同版本中断从提交水位续接，失效标记仍完整重建。 */
   async rebuild(threadId: ThreadId, hydrate: (event: ConversationEventEnvelope) => ConversationEventEnvelope | null,
     supersededItems: (event: ConversationEventEnvelope) => readonly string[], opts?: { withDatabase?: <T>(operation: () => T) => Promise<T> }): Promise<void> {
     /** 每次让出后重新申请同步写入许可，不把整个重建包进数据库锁。 */
     const write = <T>(operation: () => T): Promise<T> => opts?.withDatabase ? opts.withDatabase(operation) : Promise.resolve(operation());
     if (await write(() => this.isReady(threadId))) return;
-    const buildId = await write(() => this.db.transaction(() => { this.initialize(threadId, false); return this.getRow(threadId)!.build_id; })());
-    let cursor = 0;
+    const checkpoint = await write(() => this.db.transaction(() => {
+      const existing = this.getRow(threadId);
+      if (existing?.ready && existing.schema_version === PRESENTATION_REDUCER_VERSION) return existing;
+      if (existing && !existing.ready && existing.schema_version === PRESENTATION_REDUCER_VERSION && existing.build_id) {
+        const next = { ...existing, build_id: randomUUID() };
+        this.db.prepare("UPDATE conversation_presentations SET build_id = ? WHERE thread_id = ?").run(next.build_id, threadId);
+        return next;
+      }
+      this.initialize(threadId, false);
+      return this.getRow(threadId)!;
+    })());
+    if (checkpoint.ready) return;
+    const buildId = checkpoint.build_id;
+    let cursor = checkpoint.version;
     while (true) {
       const count = await write(() => this.db.transaction(() => {
+        const startedAt = performance.now();
         if (this.getRow(threadId)?.build_id !== buildId) throw new Error("THREAD_PRESENTATION_BUILD_INVALIDATED");
         const thread = this.db.prepare("SELECT workspace_id, engine FROM threads WHERE id = ?").get(threadId) as { workspace_id: string; engine: string } | undefined;
         if (!thread) throw new Error("THREAD_PRESENTATION_THREAD_NOT_FOUND");
         const rows = this.db.prepare("SELECT seq, workspace_id, engine, event_json FROM conversation_events WHERE thread_id = ? AND seq > ? ORDER BY seq LIMIT 256")
           .all(threadId, cursor) as Array<{ seq: number; workspace_id: string; engine: string; event_json: string }>;
+        let processed = 0;
         for (const row of rows) {
           const event = JSON.parse(row.event_json) as ConversationEventEnvelope;
           if (!event || event.schema !== 1 || event.threadId !== threadId || event.seq !== row.seq || !Number.isSafeInteger(event.seq)
@@ -102,12 +129,14 @@ export class ConversationPresentationStore {
           const hydrated = hydrate(event);
           if (hydrated) this.apply(hydrated, supersededItems(hydrated));
           cursor = event.seq;
+          processed++;
+          if (performance.now() - startedAt >= REBUILD_SLICE_MS) break;
         }
         if (rows.length && this.getRow(threadId)!.version < cursor) {
           this.db.prepare("UPDATE conversation_presentations SET version = ? WHERE thread_id = ?").run(cursor, threadId);
         }
         if (!rows.length) this.db.prepare("UPDATE conversation_presentations SET ready = 1 WHERE thread_id = ?").run(threadId);
-        return rows.length;
+        return processed;
       })());
       if (!count) return;
       await new Promise<void>(resolve => setImmediate(resolve));
@@ -293,8 +322,8 @@ export class ConversationPresentationStore {
           || (event.payload.toolName !== undefined && event.payload.toolName !== item.toolType)
           || !getConversationProcessGroups([item]).length) return false;
       } else if (stored.process_id !== null || previousStub.kind !== "message" || !previousStub.text) return false;
-      // 正文和工具增量都删除全局推理占位；存在占位时须完整重算归属。
-      if (this.db.prepare(`SELECT 1 FROM conversation_presentation_items
+      // 固定使用稀疏占位索引，避免规划器误选过程范围索引后逐增量扫描历史。
+      if (this.db.prepare(`SELECT 1 FROM conversation_presentation_items INDEXED BY ${PLACEHOLDER_INDEX}
         WHERE thread_id = ? AND process_id IS NOT NULL AND json_extract(stub_json, '$.placeholder') = 1 LIMIT 1`).get(event.threadId)) return false;
     }
     const state = restoreConversationState(JSON.parse(row.state_json) as ConversationStateSnapshot, [item]);

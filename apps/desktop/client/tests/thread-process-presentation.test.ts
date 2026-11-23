@@ -12,7 +12,7 @@ import { openClientDb } from "../src/db/clientDb.js";
 import { executeDesktopApiRequest } from "../src/app/executeDesktopApiRequest.js";
 import type { ApiHandlerContext } from "../src/app/handleApiRequest.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
-import { createConversationPresentationTables } from "../src/db/conversationPresentation.js";
+import { ConversationPresentationStore, createConversationPresentationTables } from "../src/db/conversationPresentation.js";
 
 /** 每个用例使用独立本地 SQLite，避免触碰用户工作区。 */
 function fixture(t: test.TestContext) {
@@ -113,6 +113,83 @@ test("旧会话分批重建，后续热读复用索引", async t => {
   await pending;
   assert.equal(yielded, true);
   assert.equal((f.db.conversationEvents.readProcess(f.threadId, "process:reason").items[0] as any).content, "x".repeat(270));
+});
+
+test("中断重建后从已提交水位续接，不删除已处理的投影", async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 600; i++) f.append("item.reasoning.delta", { itemId: "reason", delta: "x" });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  let batches = 0;
+  const interrupted = new Error("interrupted between batches");
+  await assert.rejects(f.db.conversationEvents.ensurePresentation(f.threadId, { withDatabase: async operation => {
+    if (++batches === 4) throw interrupted;
+    return operation();
+  } }), interrupted);
+  const checkpoint = f.db.db.prepare("SELECT version, ready FROM conversation_presentations WHERE thread_id = ?").get(f.threadId) as { version: number; ready: number };
+  assert.equal(checkpoint.ready, 0);
+  assert.ok(checkpoint.version > 0 && checkpoint.version < 602);
+  const restored: number[] = [];
+  await new ConversationPresentationStore(f.db.db).rebuild(f.threadId, event => { restored.push(event.seq); return event; }, () => []);
+  assert.equal(restored[0], checkpoint.version + 1);
+  assert.equal(restored.length, 602 - checkpoint.version);
+  assert.equal((f.db.conversationEvents.readProcess(f.threadId, "process:reason").items[0] as any).content, "x".repeat(600));
+  assertFullReducerProjection(f);
+});
+
+test("慢事件重建按时间让出，不能等满256条才释放事务", async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 270; i++) f.append("item.reasoning.delta", { itemId: "reason", delta: "x" });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  let clock = 0;
+  const timer = t.mock.method(performance, "now", () => clock);
+  const pending = new ConversationPresentationStore(f.db.db).rebuild(f.threadId, event => { clock += 2; return event; }, () => []);
+  const firstCheckpoint = await new Promise<number>(resolve => setImmediate(() => {
+    const row = f.db.db.prepare("SELECT version FROM conversation_presentations WHERE thread_id = ?").get(f.threadId) as { version: number };
+    resolve(row.version);
+  }));
+  await pending;
+  timer.mock.restore();
+  assert.ok(firstCheckpoint > 0 && firstCheckpoint <= 16, `首批已模拟消耗 ${firstCheckpoint * 2}ms，必须及时让出`);
+  assertFullReducerProjection(f);
+});
+
+test("两个重建实例不能重复归并同一提交水位之后的增量", async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 300; i++) f.append("item.reasoning.delta", { itemId: "reason", delta: "x" });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  let release!: () => void, claimed!: () => void, calls = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const ready = new Promise<void>(resolve => { claimed = resolve; });
+  const first = new ConversationPresentationStore(f.db.db).rebuild(f.threadId, event => event, () => [], { withDatabase: async operation => {
+    if (++calls === 3) { claimed(); await gate; }
+    return operation();
+  } });
+  const rejected = assert.rejects(first, /THREAD_PRESENTATION_BUILD_INVALIDATED/);
+  await ready;
+  try { await new ConversationPresentationStore(f.db.db).rebuild(f.threadId, event => event, () => []); }
+  finally { release(); }
+  await rejected;
+  assert.equal((f.db.conversationEvents.readProcess(f.threadId, "process:reason").items[0] as any).content, "x".repeat(300));
+  assertFullReducerProjection(f);
+});
+
+test("等待准入时另一实例已完成，直接复用投影而不再次重建", async t => {
+  const f = fixture(t);
+  f.append("item.reasoning.delta", { itemId: "reason", delta: "x" });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  let release!: () => void, waiting!: () => void, calls = 0, replayed = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const ready = new Promise<void>(resolve => { waiting = resolve; });
+  const first = new ConversationPresentationStore(f.db.db).rebuild(f.threadId, event => { replayed++; return event; }, () => [], { withDatabase: async operation => {
+    if (++calls === 2) { waiting(); await gate; }
+    return operation();
+  } });
+  await ready;
+  try { await new ConversationPresentationStore(f.db.db).rebuild(f.threadId, event => event, () => []); }
+  finally { release(); }
+  await first;
+  assert.equal(replayed, 0);
+  assertFullReducerProjection(f);
 });
 
 test("本机 lazy load 和展开 API 无需登录，热读不执行 Git、DDL 或过程正文读取", async t => {
@@ -535,6 +612,26 @@ test("旧展示索引升级失败原子回滚补列、标记和缓存，显式�
   fault.mock.restore();
   createConversationPresentationTables(f.db.db);
   assert.equal(f.db.conversationEvents.isPresentationReady(f.threadId), false);
+});
+
+test("旧结构补占位索引失败时仍原子回滚结构升级", t => {
+  const f = fixture(t);
+  f.db.db.exec("DROP INDEX idx_conversation_presentation_placeholder");
+  f.db.db.prepare("UPDATE meta SET value = '1' WHERE key = 'conversation_presentation_schema_version'").run();
+  f.db.db.exec("ALTER TABLE conversation_presentations DROP COLUMN build_id");
+  const before = f.db.db.prepare("SELECT * FROM conversation_presentations").all();
+  const exec = f.db.db.exec.bind(f.db.db), failure = new Error("legacy index creation failed");
+  const fault = t.mock.method(f.db.db, "exec", (sql: string) => {
+    if (/CREATE INDEX.*placeholder/.test(sql)) throw failure;
+    exec(sql);
+  });
+  assert.throws(() => createConversationPresentationTables(f.db.db), error => error === failure);
+  assert.equal((f.db.db.prepare("SELECT value FROM meta WHERE key = 'conversation_presentation_schema_version'").get() as any).value, "1");
+  assert.equal(f.db.db.prepare("PRAGMA table_info(conversation_presentations)").all().some((column: any) => column.name === "build_id"), false);
+  assert.deepEqual(f.db.db.prepare("SELECT * FROM conversation_presentations").all(), before);
+  fault.mock.restore();
+  createConversationPresentationTables(f.db.db);
+  assert.equal(f.db.db.prepare("PRAGMA table_info(conversation_presentations)").all().some((column: any) => column.name === "build_id"), true);
 });
 
 for (const terminal of ["turn.completed", "turn.error"]) test(`${terminal} 使待输入项过期，热读和重建都保留完整请求`, async t => {
