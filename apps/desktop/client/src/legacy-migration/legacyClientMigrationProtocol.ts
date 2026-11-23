@@ -7,7 +7,17 @@ export type LegacyClientMigrationRequest = {
   migrationId?: string;
 };
 
-export type LegacyClientMigrationProgress = { stage: string; completed: number; total: number | null; workspaceCount?: number };
+export type LegacyClientMigrationProgress = {
+  stage: string; completed: number; total: number | null; workspaceCount?: number;
+  phase?: string; table?: string; workspaceIndex?: number; threadIndex?: number; threadCount?: number;
+  processed?: number; elapsedMs?: number;
+};
+export type LegacyClientMigrationContext = {
+  requestId?: string; phase?: string; method?: string; endpoint?: string; status?: number; retryAfter?: string;
+  remoteCode?: string; transportCode?: string; serverRequestId?: string;
+  workspaceId?: string; threadId?: string; table?: string; recordId?: string; blobId?: string; expectedSize?: number; actualSize?: number;
+  storedSize?: number; reason?: string;
+};
 export type LegacyClientMigrationResult = {
   candidateId: string | null;
   workspaceCount: number;
@@ -21,7 +31,23 @@ export type LegacyClientMigrationResult = {
 export type LegacyClientMigrationMessage =
   | { type: 'progress'; progress: LegacyClientMigrationProgress }
   | { type: 'result'; result: LegacyClientMigrationResult }
-  | { type: 'error'; error: { code: string; message: string } };
+  | { type: 'error'; error: { code: string; message: string; context?: LegacyClientMigrationContext } };
+
+/** 错误只跨 IPC 传固定字段；拒绝正文、密钥和任意服务端扩展。 */
+export function legacyClientMigrationErrorContext(error: unknown): LegacyClientMigrationContext {
+  const source = (error as { context?: unknown } | null)?.context as Record<string, unknown> | undefined;
+  const result: Record<string, string | number> = {};
+  for (const key of ['requestId', 'phase', 'method', 'endpoint', 'retryAfter', 'remoteCode', 'transportCode', 'serverRequestId', 'workspaceId', 'threadId',
+    'table', 'recordId', 'blobId', 'reason'] as const) {
+    const value = source?.[key];
+    if (typeof value === 'string' && /^[A-Za-z0-9_:.\/-]{1,256}$/.test(value)) result[key] = value;
+  }
+  for (const key of ['status', 'expectedSize', 'actualSize', 'storedSize'] as const) {
+    const value = source?.[key];
+    if (Number.isSafeInteger(value)) result[key] = value as number;
+  }
+  return result;
+}
 
 /** 只接受宿主固定参数；页面不能通过 Worker 协议指定任意来源路径。 */
 export function parseLegacyClientMigrationRequest(value: unknown): LegacyClientMigrationRequest {

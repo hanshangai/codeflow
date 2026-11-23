@@ -417,6 +417,100 @@ test("迁移失败保留屏障，错误状态可见，同任务重试不生成�
   assert.equal(ids[0], ids[1]);
 });
 
+test("迁移进度保留表名和工作量，相同位置只记录一次日志", async t => {
+  const detail = { phase: "presentation", table: "conversation_events", workspaceIndex: 1,
+    threadIndex: 4, threadCount: 37, processed: 1_024, elapsedMs: 14_000 };
+  let snapshot: ReturnType<ReturnType<typeof createLegacyClientMigration>["snapshot"]> | undefined;
+  const f = await fixture(t, async (request, onProgress) => {
+    if (request.action === "discover") return { candidateId: "source-1", workspaceCount: 2 };
+    onProgress({ stage: "convert", completed: 0, total: 2, ...detail });
+    onProgress({ stage: "convert", completed: 0, total: 2, ...detail, elapsedMs: 14_001 });
+    snapshot = migration.snapshot();
+    return { candidateId: "source-1", workspaceCount: 2, migrationId: request.migrationId!, completed: true };
+  });
+  const migration = createLegacyClientMigration(f), waiting = migration.prepare();
+  await migration.whenDiscovered(); await migration.start("source-1"); await waiting;
+  assert.deepEqual(snapshot?.progress, { ...detail, elapsedMs: 14_001 });
+  const logs = (await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8"))
+    .trim().split("\n").map(line => JSON.parse(line)).filter(value => value.event?.outcome === "progress");
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].table, "conversation_events");
+  assert.equal(logs[0].processed, 1_024);
+  assert.equal(logs[0].migrationId, migration.snapshot().migrationId);
+});
+
+test("HTTP 网络诊断白名单穿过宿主 Worker IPC，记录 Server request ID 且丢弃正文", async t => {
+  const f = await fixture(t, async () => { assert.fail("use the real Worker owner"); });
+  const context = { requestId: "client-http-request", serverRequestId: "server-http-request", phase: "account_auth", method: "POST",
+    endpoint: "/api/account/auth/client-migration", status: 503, retryAfter: "5",
+    remoteCode: "CLIENT_MIGRATION_UNAVAILABLE", transportCode: "DESKTOP_UPDATE_HTTP_FAILED" };
+  const spawnWorker = () => {
+    const worker = Object.assign(new EventEmitter(), {
+      /** 按 IPC 的真实消息顺序交付 discover 和账号阶段失败。 */
+      send(request: { action: string }, done: (error: null) => void) {
+        done(null);
+        setImmediate(() => {
+          if (request.action === "discover") worker.emit("message", { type: "result", result: { candidateId: "source-1", workspaceCount: 1 } });
+          else {
+            worker.emit("message", { type: "progress", progress: { stage: "completed", completed: 2, total: 2 } });
+            worker.emit("message", { type: "error", error: { code: "CLIENT_MIGRATION_UNAVAILABLE", message: "request failed",
+              context: { ...context, responseBody: "PRIVATE_RESPONSE_BODY", apiKey: "PRIVATE_API_KEY" } } });
+          }
+          worker.emit("close", request.action === "discover" ? 0 : 1, null);
+        });
+      },
+    });
+    return worker;
+  };
+  const require = createRequire(import.meta.url);
+  const source = ts.transpileModule(readFileSync(new URL("../src/legacyClientMigration.ts", import.meta.url), "utf8"), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, esModuleInterop: true },
+  }).outputText;
+  const module = { exports: {} as typeof import("../src/legacyClientMigration.js") };
+  const load = (id: string): unknown => id === "node:child_process" ? { spawn: spawnWorker }
+    : id.startsWith("./") ? require("../src/" + id.slice(2)) : require(id);
+  new Function("require", "module", "exports", source)(load, module, module.exports);
+  const owner = module.exports.createLegacyClientMigration({ dataDir: f.dataDir, identity: f.identity, workerEntry: f.workerEntry });
+  const waiting = assert.rejects(owner.prepare(), /MIGRATION_STOPPED/u);
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  await assert.rejects(owner.start("source-1"), (error: any) => {
+    assert.equal(error.code, "CLIENT_MIGRATION_UNAVAILABLE"); assert.deepEqual(error.context, context); return true;
+  });
+  assert.equal(owner.snapshot().stage, "completed");
+  const logText = await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8");
+  const log = logText.trim().split("\n").map(line => JSON.parse(line)).find(value => value.errorCode === "CLIENT_MIGRATION_UNAVAILABLE");
+  assert.deepEqual(log.context, context);
+  assert.ok(log.requestId); assert.equal(log.migrationId, owner.snapshot().migrationId);
+  assert.doesNotMatch(logText, /PRIVATE_RESPONSE_BODY|PRIVATE_API_KEY/u);
+  await owner.stop(); await waiting;
+});
+
+test("账号恢复网络失败日志保留 HTTP 阶段与状态，不记录响应正文", async t => {
+  const f = await fixture(t, async request => request.action === "discover"
+    ? { candidateId: "source-1", workspaceCount: 1 }
+    : { candidateId: "source-1", workspaceCount: 1, migrationId: request.migrationId!, completed: true,
+      accountSource: { sourceClientId: "old", apiKey: "fixture-key", serverWs: "wss://example.test/ws/client" } });
+  const failure = Object.assign(new Error("DESKTOP_UPDATE_HTTP_FAILED"), { code: "DESKTOP_UPDATE_HTTP_FAILED", context: {
+    requestId: "registration-request-1", phase: "device_registration", method: "POST",
+    endpoint: "/api/software/desktop/devices/register", status: 503, retryAfter: "5", remoteCode: "DESKTOP_UPDATE_UNAVAILABLE",
+    responseBody: "PRIVATE_RESPONSE_BODY", apiKey: "PRIVATE_API_KEY",
+  } });
+  const migration = createLegacyClientMigration({ ...f, restoreAccount: async () => { throw failure; } });
+  const waiting = migration.prepare();
+  await migration.whenDiscovered();
+  await migration.start("source-1"); await waiting;
+  await migration.runtimeReady();
+  assert.equal(migration.snapshot().status, "ready");
+  assert.equal(migration.snapshot().account.errorCode, "DESKTOP_UPDATE_HTTP_FAILED");
+  const log = (await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8"))
+    .trim().split("\n").map(line => JSON.parse(line)).find(value => value.errorCode === "DESKTOP_UPDATE_HTTP_FAILED");
+  assert.equal(log.requestId, "registration-request-1");
+  assert.deepEqual(log.context, { requestId: "registration-request-1", phase: "device_registration", method: "POST",
+    endpoint: "/api/software/desktop/devices/register", status: 503, retryAfter: "5", remoteCode: "DESKTOP_UPDATE_UNAVAILABLE" });
+  assert.doesNotMatch(JSON.stringify(log), /PRIVATE_RESPONSE_BODY|PRIVATE_API_KEY|fixture-key/u);
+});
+
 test("主动退出账号后，即使重启也不再自动恢复旧账号", async t => {
   let attempts = 0;
   let migrated = false;
@@ -444,6 +538,8 @@ test("主动退出账号后，即使重启也不再自动恢复旧账号", async
 
 test("账号恢复向原Server登记安装并发送绑定Key的签名，重试只轮换账号", async t => {
   const requests: Array<{ path: string; body: Record<string, unknown>; authorization?: string }> = [];
+  let failRegistration = true;
+  let failAccountBusiness = false;
   const server = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -451,10 +547,14 @@ test("账号恢复向原Server登记安装并发送绑定Key的签名，重试�
     requests.push({ path: req.url!, body, authorization: req.headers.authorization });
     res.setHeader("content-type", "application/json");
     if (req.url === "/api/software/desktop/devices/register") {
+      if (failRegistration) { res.writeHead(503, { "retry-after": "5", "x-request-id": "server-registration-503" }); res.end(JSON.stringify({ ok: false, code: "DESKTOP_UPDATE_UNAVAILABLE" })); return; }
       const { desktopDevicePublicKeySha256 } = await import("@codeflowai/shared/desktop-device-auth");
       res.end(JSON.stringify({ ok: true, deviceId: body.deviceId, publicKeySha256: desktopDevicePublicKeySha256(body.publicKeyBase64) }));
+    } else if (failAccountBusiness) {
+      failAccountBusiness = false;
+      res.end(JSON.stringify({ ok: false, code: "MIGRATION_ACCOUNT_REJECTED" }));
     } else if (requests.filter(request => request.path === req.url).length === 1) {
-      res.writeHead(503); res.end(JSON.stringify({ ok: false, code: "CLIENT_MIGRATION_UNAVAILABLE" }));
+      res.writeHead(503, { "x-request-id": "server-account-503" }); res.end(JSON.stringify({ ok: false, code: "CLIENT_MIGRATION_UNAVAILABLE" }));
     } else res.end(JSON.stringify({ ok: true, sessionToken: "sess_real_fixture", sessionExpiresAt: Date.now() + 60_000,
       userSummary: { userId: "account-1" }, accountRole: "personal", accessContext: {} }));
   });
@@ -469,18 +569,43 @@ test("账号恢复向原Server登记安装并发送绑定Key的签名，重试�
   const waiting = migration.prepare(); await migration.whenDiscovered(); await migration.start("source-1"); await waiting;
   await migration.runtimeReady();
   assert.equal(migration.snapshot().account.status, "failed");
+  const registrationLog = (await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8"))
+    .trim().split("\n").map(line => JSON.parse(line)).find(value => value.context?.phase === "device_registration");
+  assert.equal(registrationLog.errorCode, "DESKTOP_UPDATE_UNAVAILABLE");
+  assert.equal(registrationLog.context.endpoint, "/api/software/desktop/devices/register");
+  assert.equal(registrationLog.context.status, 503); assert.equal(registrationLog.context.remoteCode, "DESKTOP_UPDATE_UNAVAILABLE");
+  assert.equal(registrationLog.context.serverRequestId, "server-registration-503");
+  assert.equal(registrationLog.context.retryAfter, "5"); assert.ok(registrationLog.context.requestId);
+  assert.doesNotMatch(JSON.stringify(registrationLog), /fixture-key|signature|sessionToken/u);
+  failRegistration = false;
+  await migration.retryAccount();
+  assert.equal(migration.snapshot().account.status, "failed");
+  const accountLog = (await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8"))
+    .trim().split("\n").map(line => JSON.parse(line)).find(value => value.context?.phase === "account_auth");
+  assert.equal(accountLog.context.endpoint, "/api/account/auth/client-migration");
+  assert.equal(accountLog.context.status, 503); assert.equal(accountLog.context.remoteCode, "CLIENT_MIGRATION_UNAVAILABLE");
+  assert.equal(accountLog.context.serverRequestId, "server-account-503");
+  assert.ok(accountLog.context.requestId); assert.equal(accountLog.migrationId, migration.snapshot().migrationId);
+  assert.doesNotMatch(JSON.stringify(accountLog), /fixture-key|signature|sessionToken/u);
+  failAccountBusiness = true;
+  await migration.retryAccount();
+  const businessLog = (await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8"))
+    .trim().split("\n").map(line => JSON.parse(line)).find(value => value.context?.remoteCode === "MIGRATION_ACCOUNT_REJECTED");
+  assert.equal(businessLog.context.status, 200);
+  assert.equal(businessLog.context.transportCode, undefined);
+  assert.equal(businessLog.migrationId, migration.snapshot().migrationId);
   await migration.retryAccount();
   assert.equal(imports, 1);
   assert.equal(migration.snapshot().account.status, "restored");
   const auth = requests.filter(request => request.path === "/api/account/auth/client-migration");
-  assert.equal(auth.length, 2);
+  assert.equal(auth.length, 3);
   for (const request of auth) {
     assert.equal(request.authorization, "Bearer fixture-key");
     assert.equal(request.body.apiKey, undefined);
     verifyClientMigrationRequest(request.body, "fixture-key", Date.now());
   }
-  assert.equal(auth[0]!.body.nonce, auth[1]!.body.nonce);
-  assert.equal(auth[0]!.body.migrationId, auth[1]!.body.migrationId);
+  assert.equal(auth[0]!.body.nonce, auth[2]!.body.nonce);
+  assert.equal(auth[0]!.body.migrationId, auth[2]!.body.migrationId);
   const restored = await migration.takeAccount();
   assert.equal(restored?.serverOrigin, origin);
   assert.equal(restored?.session.sessionToken, "sess_real_fixture");

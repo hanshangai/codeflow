@@ -92,7 +92,8 @@ export class ConversationPresentationStore {
 
   /** 顺序归并只读批次，定期原子保存检查点；不再逐事件读写整个投影。 */
   async rebuild(threadId: ThreadId, hydrate: (event: ConversationEventEnvelope) => ConversationEventEnvelope | null,
-    supersededItems: (event: ConversationEventEnvelope) => readonly string[], opts?: { withDatabase?: <T>(operation: () => T) => Promise<T> }): Promise<void> {
+    supersededItems: (event: ConversationEventEnvelope) => readonly string[],
+    opts?: { withDatabase?: <T>(operation: () => T) => Promise<T>; validateEvent?: (event: ConversationEventEnvelope) => void }): Promise<void> {
     /** 每次让出后重新申请同步写入许可，不把整个重建包进数据库锁。 */
     const write = <T>(operation: () => T): Promise<T> => opts?.withDatabase ? opts.withDatabase(operation) : Promise.resolve(operation());
     if (await write(() => this.isReady(threadId))) return;
@@ -132,6 +133,7 @@ export class ConversationPresentationStore {
             || typeof event.type !== "string" || !event.type || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) {
             throw new Error(`THREAD_PRESENTATION_EVENT_INVALID: threadId=${threadId}, seq=${row.seq}`);
           }
+          opts?.validateEvent?.(event);
           const hydrated = hydrate(event);
           if (hydrated) events.push(hydrated);
           cursor = event.seq;

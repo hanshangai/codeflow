@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import type { DesktopMigrationAccount, DesktopMigrationState } from "@codeflowai/shared";
+import type { DesktopMigrationAccount, DesktopMigrationProgress, DesktopMigrationState } from "@codeflowai/shared";
 import { signDevicePayload, type DeviceIdentity } from "./deviceIdentity.js";
 import { createDesktopUpdateTransport } from "./updateTransport.js";
 
@@ -15,7 +15,11 @@ export type LegacyMigrationResult = {
   candidateId: string | null; workspaceCount: number; migrationId?: string;
   completed?: boolean; resume?: boolean; canDefer?: boolean; deferred?: boolean; accountSource?: AccountSource;
 };
-type Progress = { stage: string; completed: number; total: number | null; workspaceCount?: number };
+type Progress = {
+  stage: string; completed: number; total: number | null; workspaceCount?: number;
+  phase?: string; table?: string; workspaceIndex?: number; threadIndex?: number; threadCount?: number;
+  processed?: number; elapsedMs?: number;
+};
 export type LegacyMigrationExecutor = (request: LegacyMigrationRequest, progress: (value: Progress) => void) => Promise<LegacyMigrationResult>;
 type AccountRecord = { schemaVersion: 1; targetClientId: string; migrationId: string | null; nonce: string; cancelled: boolean; delivered: boolean };
 export type LegacyClientMigration = ReturnType<typeof createLegacyClientMigration>;
@@ -50,6 +54,7 @@ export function createLegacyClientMigration(input: {
   let flight: Promise<void> | undefined;
   let accountFlight: Promise<void> | undefined;
   let source: AccountSource | undefined;
+  let lastProgressKey: string | undefined;
   let journalCanDefer = false, journalSeen = false, dataDeferred = false;
   let account: DesktopMigrationAccount | null = null;
   let generation = 0;
@@ -78,9 +83,12 @@ export function createLegacyClientMigration(input: {
     const redact = (text: string) => [source?.apiKey, account?.session.sessionToken].reduce<string>((value, secret) => secret ? value.split(secret).join("[REDACTED]") : value, text);
     const logDir = path.join(input.dataDir, "logs");
     fs.mkdirSync(logDir, { recursive: true });
+    const context = migrationDiagnosticFields((error as { context?: unknown } | null)?.context);
     fs.appendFileSync(path.join(logDir, "legacy-client-migration.jsonl"), JSON.stringify({ time: new Date().toISOString(),
-      errorCode: code, requestId: record.migrationId ?? "legacy-discovery", migrationId: record.migrationId,
+      errorCode: code, requestId: typeof context.requestId === "string" ? context.requestId : record.migrationId ?? "legacy-discovery",
+      migrationId: record.migrationId,
       sourceClientId: source?.sourceClientId ?? null, targetClientId: record.targetClientId, stage,
+      context,
       rootCause: redact(error instanceof Error ? error.message : String(error)).slice(0, 1000) }) + "\n", "utf8");
   };
   /** Worker 状态来自计数，任何无效计数均拒绝，不能制造完成百分比。 */
@@ -88,7 +96,23 @@ export function createLegacyClientMigration(input: {
     if (typeof value.stage !== "string" || !Number.isSafeInteger(value.completed) || value.completed < 0
       || value.total !== null && (!Number.isSafeInteger(value.total) || value.total < value.completed)) throw new Error("MIGRATION_PROGRESS_INVALID");
     state = { ...state, stage: value.stage, completed: value.completed, total: value.total,
-      ...(value.workspaceCount === undefined ? {} : { workspaceCount: value.workspaceCount }) };
+      ...(value.workspaceCount === undefined ? {} : { workspaceCount: value.workspaceCount }),
+      ...(value.phase ? { progress: migrationProgress(value) } : { progress: undefined }) };
+    if (value.phase) {
+      const detail = migrationProgress(value), { elapsedMs: _elapsedMs, ...position } = detail;
+      const progressKey = JSON.stringify([value.stage, value.completed, value.total, position]);
+      if (progressKey !== lastProgressKey) {
+        const logDir = path.join(input.dataDir, "logs");
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.appendFileSync(path.join(logDir, "legacy-client-migration.jsonl"), JSON.stringify({
+          time: new Date().toISOString(), requestId: record.migrationId ?? "legacy-discovery", migrationId: record.migrationId,
+          sourceClientId: source?.sourceClientId ?? null, targetClientId: record.targetClientId, stage: value.stage,
+          completed: value.completed, total: value.total, ...detail,
+          event: { category: "desktop", action: "legacy_client_migration", outcome: "progress" },
+        }) + "\n", "utf8");
+        lastProgressKey = progressKey;
+      }
+    } else lastProgressKey = undefined;
     publish();
   };
   /** 固定入口只执行一个命令；最终结果必须同时等到子进程正常退出才可信。 */
@@ -102,10 +126,13 @@ export function createLegacyClientMigration(input: {
     worker.on("message", (message: unknown) => {
       try {
         if (!message || typeof message !== "object") throw new Error("MIGRATION_WORKER_PROTOCOL_INVALID");
-        const value = message as { type?: unknown; progress?: Progress; result?: LegacyMigrationResult; error?: { code: string; message: string } };
+        const value = message as { type?: unknown; progress?: Progress; result?: LegacyMigrationResult;
+          error?: { code: string; message: string; context?: unknown } };
         if (value.type === "progress" && value.progress) onProgress(value.progress);
         else if (value.type === "result" && value.result && !result) result = value.result;
-        else if (value.type === "error" && value.error) failure = Object.assign(new Error(value.error.message), { code: value.error.code });
+        else if (value.type === "error" && value.error) failure = Object.assign(new Error(value.error.message), {
+          code: value.error.code, context: migrationDiagnosticFields(value.error.context),
+        });
         else throw new Error("MIGRATION_WORKER_PROTOCOL_INVALID");
       } catch (error) { failure = error; worker.kill(); }
     });
@@ -378,6 +405,28 @@ function errorCode(error: unknown, fallback: string): string {
   return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,79}$/u.test(code) ? code : fallback;
 }
 
+/** IPC 与日志只允许固定请求阶段、实体、状态和计数，不接收响应正文或凭据。 */
+function migrationDiagnosticFields(value: unknown): Record<string, string | number> {
+  const input = value as Record<string, unknown> | null;
+  const result: Record<string, string | number> = {};
+  for (const key of ["requestId", "phase", "method", "endpoint", "retryAfter", "remoteCode", "transportCode", "serverRequestId", "workspaceId", "threadId",
+    "table", "recordId", "blobId", "reason"]) {
+    const field = input?.[key];
+    if (typeof field === "string" && /^[A-Za-z0-9_:.\/-]{1,256}$/.test(field)) result[key] = field;
+  }
+  for (const key of ["status", "expectedSize", "actualSize", "storedSize", "processed", "elapsedMs", "workspaceIndex",
+    "threadIndex", "threadCount"]) {
+    const field = input?.[key];
+    if (typeof field === "number" && Number.isSafeInteger(field)) result[key] = field;
+  }
+  return result;
+}
+
+/** 状态桥只包含当前表、实体序号和工作量，过滤 Worker 的其他附加字段。 */
+function migrationProgress(value: Progress): DesktopMigrationProgress {
+  return { ...migrationDiagnosticFields(value), phase: value.phase ?? value.stage } as DesktopMigrationProgress;
+}
+
 /** Worker输出仍须满足宿主合同，缺字段不能被当成没有旧数据放行。 */
 function assertMigrationResult(value: LegacyMigrationResult): void {
   if (!value || typeof value !== "object" || !Number.isSafeInteger(value.workspaceCount) || value.workspaceCount < 0
@@ -403,22 +452,67 @@ async function restoreMigrationAccount(input: { dataDir: string; identity: Devic
   ws.protocol = ws.protocol === "wss:" ? "https:" : "http:";
   const serverOrigin = ws.origin;
   const signal = AbortSignal.timeout(30_000);
+  const registrationRequestId = crypto.randomUUID();
   // 迁移发生在运行时就绪前，没有可上报的资源版本；固定 unknown 以满足新登记协议。
-  await createDesktopUpdateTransport({ ...input, configuredServerOrigin: serverOrigin,
-    getVersions: () => ({ shellVersion: "unknown", webVersion: "unknown", clientVersion: "unknown", releaseId: "unknown" }) }).register({ signal });
+  await withMigrationAccountRequest("device_registration", "POST", "/api/software/desktop/devices/register", registrationRequestId, () =>
+    createDesktopUpdateTransport({ ...input, configuredServerOrigin: serverOrigin,
+      getVersions: () => ({ shellVersion: "unknown", webVersion: "unknown", clientVersion: "unknown", releaseId: "unknown" }) })
+      .register({ signal, requestId: registrationRequestId }));
   const unsigned = { schemaVersion: 1 as const, migrationId: record.migrationId!, sourceClientId: source.sourceClientId,
     targetClientId: record.targetClientId, deviceId: input.identity.deviceId, publicKey: input.identity.publicKeyBase64,
     timestamp: Date.now(), nonce: record.nonce };
   const signed = await signDevicePayload(input.dataDir, buildClientMigrationPayload(unsigned, source.apiKey));
   if (signed.deviceId !== unsigned.deviceId || signed.publicKeyBase64 !== unsigned.publicKey) throw new Error("MIGRATION_DEVICE_CHANGED");
-  const response = await fetch(new URL(CLIENT_MIGRATION_PATH, serverOrigin), { method: "POST", redirect: "error", credentials: "omit", signal,
-    headers: { "content-type": "application/json", authorization: `Bearer ${source.apiKey}` }, body: JSON.stringify({ ...unsigned, signature: signed.signature }) });
+  const accountRequestId = crypto.randomUUID();
+  const response = await withMigrationAccountRequest("account_auth", "POST", CLIENT_MIGRATION_PATH, accountRequestId, () =>
+    fetch(new URL(CLIENT_MIGRATION_PATH, serverOrigin), { method: "POST", redirect: "error", credentials: "omit", signal,
+      headers: { "content-type": "application/json", "x-request-id": accountRequestId, authorization: "Bearer " + source.apiKey },
+      body: JSON.stringify({ ...unsigned, signature: signed.signature }) }));
   let value: unknown;
   try { value = await response.json(); }
-  catch { throw new Error("MIGRATION_ACCOUNT_RESPONSE_INVALID"); }
+  catch (cause) { throw migrationAccountResponseFailure(accountRequestId, response.status, cause, response.headers.get("x-request-id") ?? undefined); }
   const body = value as DesktopMigrationAccount["session"] & { ok?: boolean; code?: unknown };
-  if (!response.ok || body?.ok !== true) throw Object.assign(new Error("MIGRATION_ACCOUNT_RESTORE_FAILED"), { code: errorCode(body, "MIGRATION_ACCOUNT_RESTORE_FAILED") });
+  if (!response.ok || body?.ok !== true) {
+    const remoteCode = errorCode(body, "MIGRATION_ACCOUNT_RESTORE_FAILED");
+    const serverRequestId = response.headers.get("x-request-id");
+    throw Object.assign(new Error("MIGRATION_ACCOUNT_RESTORE_FAILED"), { code: remoteCode, context: {
+      requestId: accountRequestId, phase: "account_auth", method: "POST", endpoint: CLIENT_MIGRATION_PATH, status: response.status, remoteCode,
+      ...(!response.ok ? { transportCode: "DESKTOP_UPDATE_HTTP_FAILED" } : {}),
+      ...(serverRequestId ? { serverRequestId } : {}),
+    } });
+  }
   if (typeof body.sessionToken !== "string" || !body.sessionToken.startsWith("sess_") || !Number.isSafeInteger(body.sessionExpiresAt)
     || body.sessionExpiresAt <= Date.now() || !body.userSummary?.userId || !body.accountRole || !body.accessContext) throw new Error("MIGRATION_ACCOUNT_RESPONSE_INVALID");
   return { serverOrigin, session: body };
+}
+
+/** 为网络边界异常补充白名单上下文后原样失败，定位设备登记或账号恢复阶段。 */
+async function withMigrationAccountRequest<T>(phase: string, method: string, endpoint: string, requestId: string,
+  operation: () => Promise<T>): Promise<T> {
+  try { return await operation(); }
+  catch (cause) {
+    const error = cause as { code?: unknown; transportCode?: unknown; requestId?: unknown; serverRequestId?: unknown;
+      status?: unknown; retryAfter?: unknown };
+    const context = {
+      phase, method, endpoint,
+      requestId: typeof error.requestId === "string" ? error.requestId : requestId,
+      ...(Number.isSafeInteger(error.status) ? { status: error.status as number } : {}),
+      ...(typeof error.retryAfter === "string" ? { retryAfter: error.retryAfter } : {}),
+      ...(typeof error.transportCode === "string" ? { transportCode: error.transportCode } : {}),
+      ...(typeof error.serverRequestId === "string" ? { serverRequestId: error.serverRequestId } : {}),
+      ...(typeof error.transportCode === "string" && typeof error.code === "string" ? { remoteCode: error.code } : {}),
+    };
+    throw Object.assign(new Error(cause instanceof Error ? cause.message : "MIGRATION_ACCOUNT_REQUEST_FAILED", { cause }),
+      { code: typeof error.code === "string" ? error.code : "DESKTOP_UPDATE_TRANSPORT_FAILED",
+        ...(typeof error.transportCode === "string" ? { transportCode: error.transportCode } : {}),
+        ...(typeof error.serverRequestId === "string" ? { serverRequestId: error.serverRequestId } : {}), context });
+  }
+}
+
+/** 响应体无法解析时仍保留 HTTP 状态和固定端点，不携带服务端正文。 */
+function migrationAccountResponseFailure(requestId: string, status: number, cause: unknown, serverRequestId?: string): Error & { code: string; context: Record<string, string | number> } {
+  return Object.assign(new Error("MIGRATION_ACCOUNT_RESPONSE_INVALID", { cause }), { code: "MIGRATION_ACCOUNT_RESPONSE_INVALID",
+    context: { requestId, phase: "account_auth", method: "POST", endpoint: "/api/account/auth/client-migration", status,
+      ...(status < 200 || status >= 300 ? { transportCode: "DESKTOP_UPDATE_HTTP_FAILED" } : {}),
+      ...(serverRequestId ? { serverRequestId } : {}) } });
 }

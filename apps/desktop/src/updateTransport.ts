@@ -67,13 +67,14 @@ export function createDesktopUpdateTransport(input: { dataDir: string; identity:
       catch (cause) {
         throw Object.assign(new Error("DESKTOP_UPDATE_HTTP_FAILED", { cause: cause instanceof SyntaxError ? new Error("DESKTOP_UPDATE_RESPONSE_INVALID")
           : preserveUpdateNetworkCancellation(cause, request.signal) }),
-          { code: "DESKTOP_UPDATE_HTTP_FAILED", requestId: metadata.requestId, status: response.status, retryAfter });
+          { code: "DESKTOP_UPDATE_HTTP_FAILED", requestId: metadata.requestId, status: response.status, retryAfter,
+            ...serverRequestId(response) });
       }
       finally { clearTimeout(timer); }
       const value = failure && typeof failure === "object" ? failure as Record<string, unknown> : {};
       throw Object.assign(new Error("DESKTOP_UPDATE_HTTP_FAILED"),
         { code: safeRemoteErrorCode(value.code, "DESKTOP_UPDATE_HTTP_FAILED"), transportCode: "DESKTOP_UPDATE_HTTP_FAILED",
-          requestId: metadata.requestId, status: response.status, retryAfter });
+          requestId: metadata.requestId, status: response.status, retryAfter, ...serverRequestId(response) });
     }
     return response;
   };
@@ -195,4 +196,10 @@ export function createDesktopUpdateTransport(input: { dataDir: string; identity:
 /** 仅接受短 ASCII 错误码，避免远端正文伪装为本地诊断字段。 */
 function safeRemoteErrorCode(value: unknown, fallback: string): string {
   return typeof value === "string" && REMOTE_ERROR_CODE.test(value) ? value : fallback;
+}
+
+/** 保留响应头里的短 Server request ID，敏感或异常格式一律不进入错误上下文。 */
+function serverRequestId(response: Response): { serverRequestId?: string } {
+  const value = response.headers.get("x-request-id");
+  return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? { serverRequestId: value } : {};
 }

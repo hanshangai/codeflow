@@ -253,6 +253,28 @@ test("等待准入时另一实例已完成，直接复用投影而不再次重�
   assertFullReducerProjection(f);
 });
 
+test("重建连续稳定增量与完整 reducer 保持一致", async t => {
+  const f = fixture(t);
+  for (let index = 0; index < 620; index++) f.append("item.reasoning.delta", { itemId: "reason", delta: String(index % 10) });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  await f.db.conversationEvents.ensurePresentation(f.threadId);
+  const content = (f.db.conversationEvents.readProcess(f.threadId, "process:reason").items[0] as any).content;
+  assert.equal(content, Array.from({ length: 620 }, (_, index) => String(index % 10)).join(""));
+  assertFullReducerProjection(f);
+});
+
+test("重建跨条目和终态事件保留原 reducer 顺序", async t => {
+  const f = fixture(t);
+  f.append("item.reasoning.delta", { itemId: "a", delta: "before" });
+  f.append("item.reasoning.delta", { itemId: "b", delta: "middle" });
+  f.append("item.reasoning.delta", { itemId: "a", delta: "after" });
+  f.append("turn.completed", { turnId: "turn" });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  await f.db.conversationEvents.ensurePresentation(f.threadId);
+  assertFullReducerProjection(f);
+  assert.equal((f.db.conversationEvents.readProcess(f.threadId, "process:a").items[0] as any).content, "beforeafter");
+});
+
 test("本机 lazy load 和展开 API 无需登录，热读不执行 Git、DDL 或过程正文读取", async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "thread-presentation-api-"));
   const root = path.join(directory, "workspace");

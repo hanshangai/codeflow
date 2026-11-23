@@ -188,7 +188,7 @@ test('真实Worker可检查并持久暂缓发布前journal，正常退出且日�
       child.once('error', reject); child.once('close', code => resolve({ code, messages, stderr }));
       child.send({ ...f.input, action: action === 'bundled-discover' ? 'discover' : action, migrationId });
     });
-    assert.equal(output.messages.length, 1);
+    assert.equal(output.messages.length, 1, `${action}: ${output.stderr}`);
     if (action === 'bundled-discover') {
       // 已有dist可能来自修复前：旧版本须显式拒绝，新版本只能返回已暂缓，均不得自动续迁。
       if (output.code === 0) assert.equal(output.messages[0].result.deferred, true);
@@ -779,6 +779,53 @@ test('损坏附件失败，不发布半套数据', async t => {
   await assert.rejects(migrateLegacyClientMigration({ ...f.input, candidateId: candidate.candidateId!, migrationId: crypto.randomUUID() }, f.dependencies), { code: 'SOURCE_BLOB_INVALID' });
   assert.equal(fs.existsSync(path.join(f.dataDir, 'codeflowai.db')), false);
 });
+
+test('旧图片Data URL按解码后二进制大小迁移，草稿和待发送附件均保留原内容', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration } = await service(); history(f.db);
+  const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const dataUrl = Buffer.from(`data:image/png;base64,${image.toString('base64')}`, 'utf8');
+  const blobId = crypto.createHash('sha256').update(dataUrl).digest('hex');
+  f.db.prepare("INSERT INTO file_blobs VALUES(?,?,'utf8',?,1)").run(blobId, dataUrl.length, dataUrl);
+  f.db.prepare("INSERT INTO thread_draft_attachments(thread_id,attachment_id,kind,order_index,name,size,blob_id) VALUES('thread','draft-image','image',1,'image.png',?,?)")
+    .run(image.length, blobId);
+  f.db.prepare("INSERT INTO thread_message_queue_attachments(id,queue_item_id,kind,order_index,name,display_name,mime,size,blob_id) VALUES('queued-image','queue','image',0,'image.png',NULL,'image/png',?,?)")
+    .run(image.length, blobId);
+
+  const candidate = await discoverLegacyClientMigration(f.input, f.dependencies);
+  const result = await migrateLegacyClientMigration({ ...f.input, candidateId: candidate.candidateId!, migrationId: crypto.randomUUID() }, f.dependencies);
+  assert.equal(result.completed, true);
+  const work = f.open(path.join(f.workspacePath, '.codeflow', 'workspace.db'));
+  const draft = work.prepare("SELECT a.size,b.byte_len,b.encoding,b.data FROM thread_draft_attachments a JOIN file_blobs b ON b.blob_id=a.blob_id WHERE a.attachment_id='draft-image'").get() as
+    { size: number; byte_len: number; encoding: string; data: Buffer };
+  const queued = work.prepare("SELECT a.size,b.byte_len,b.encoding,b.data FROM thread_message_queue_attachments a JOIN file_blobs b ON b.blob_id=a.blob_id WHERE a.id='queued-image'").get() as
+    { size: number; byte_len: number; encoding: string; data: Buffer };
+  for (const attachment of [draft, queued]) {
+    assert.equal(attachment.size, image.length);
+    assert.equal(attachment.byte_len, dataUrl.length);
+    assert.equal(attachment.encoding, 'utf8');
+    assert.deepEqual(attachment.data, dataUrl);
+  }
+});
+
+for (const defect of ['invalid-base64', 'wrong-size', 'invalid-encoding', 'missing-blob'] as const) {
+  test(`旧图片Data URL仍拒绝损坏附件：${defect}`, async t => {
+    const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration } = await service(); history(f.db);
+    const image = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const dataUrl = Buffer.from(defect === 'invalid-base64' ? 'data:image/png;base64,!' : `data:image/png;base64,${image.toString('base64')}`, 'utf8');
+    const blobId = defect === 'missing-blob' ? 'missing-image-blob' : crypto.createHash('sha256').update(dataUrl).digest('hex');
+    if (defect !== 'missing-blob') {
+      const encoding = defect === 'invalid-encoding' ? 'utf16' : 'utf8';
+      f.db.prepare('INSERT INTO file_blobs VALUES(?,?,?,?,1)').run(blobId, dataUrl.length, encoding, dataUrl);
+    }
+    const size = defect === 'wrong-size' ? dataUrl.length : image.length;
+    f.db.prepare("INSERT INTO thread_draft_attachments(thread_id,attachment_id,kind,order_index,name,size,blob_id) VALUES('thread','broken-image','image',1,'image.png',?,?)")
+      .run(size, blobId);
+    const candidate = await discoverLegacyClientMigration(f.input, f.dependencies);
+    await assert.rejects(migrateLegacyClientMigration({ ...f.input, candidateId: candidate.candidateId!, migrationId: crypto.randomUUID() }, f.dependencies),
+      (error: any) => error.code === 'SOURCE_BLOB_INVALID' && error.context?.table === 'thread_draft_attachments');
+    assert.equal(fs.existsSync(path.join(f.dataDir, 'codeflowai.db')), false);
+  });
+}
 
 test('未知表、高版本与metadata缺失必须保留原数据并显式失败', async t => {
   const f = fixture(t), { discoverLegacyClientMigration } = await service();
