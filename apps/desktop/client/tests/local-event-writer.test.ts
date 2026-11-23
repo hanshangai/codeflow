@@ -714,6 +714,35 @@ test("锁等待预算在唤醒前耗尽时，即使读锁刚释放也不能再�
   } finally { clearTimeout(release); if (!released) reader.exec("ROLLBACK"); reader.close(); }
 });
 
+test("锁等待日志包含协调器占用与排队快照，不包含事件正文", async t => {
+  const f = fixture(t), Writer = await writerClass();
+  const writer = new Writer({ dbPath: f.dbPath, db: f.db, lockTimeoutMs: 60, onFatalError(error) { throw error; } }); f.own(writer);
+  await writer.ready();
+  const reader = openSqliteDb(path.join(f.root, ".codeflowai", "workspace.db"), { readonly: true, busyTimeoutMs: 0 });
+  reader.exec("BEGIN"); reader.prepare("SELECT COUNT(*) FROM threads").get();
+  const diagnostics: Array<{ message: string; data: Record<string, unknown> }> = [];
+  const capture = (_module: string, message: string, data: Record<string, unknown>) => { diagnostics.push({ message, data }); };
+  t.mock.method(logger, "warn", capture);
+  t.mock.method(logger, "error", capture);
+  try {
+    await assert.rejects(writer.withExclusiveWorkspaceDatabase("lock-snapshot-test", f.workspaceId, () => undefined),
+      (error: any) => error.code === "CLIENT_DB_LOCK_TIMEOUT");
+  } finally { reader.exec("ROLLBACK"); reader.close(); }
+  const diagnostic = diagnostics.find(entry => entry.data.errorCode === "CLIENT_DB_LOCK_WAIT");
+  assert.ok(diagnostic);
+  assert.equal(diagnostic.data.requestId, "lock-snapshot-test");
+  assert.equal(diagnostic.data.workspaceId, f.workspaceId);
+  assert.equal(diagnostic.data.sqliteCode, 5);
+  assert.equal(typeof diagnostic.data.waitingMs, "number");
+  assert.equal(typeof diagnostic.data.coordinator, "object");
+  const timeoutDiagnostic = diagnostics.find(entry => entry.data.errorCode === "CLIENT_DB_LOCK_TIMEOUT");
+  assert.ok(timeoutDiagnostic);
+  assert.equal(timeoutDiagnostic.data.sqliteCode, 5);
+  assert.equal(typeof timeoutDiagnostic.data.waitingMs, "number");
+  assert.equal(typeof timeoutDiagnostic.data.coordinator, "object");
+  assert.equal(JSON.stringify(diagnostic).includes("事件 0"), false);
+});
+
 test("锁等待诊断失败保留原锁和日志双错，不执行后续副作用", async t => {
   const f = fixture(t), Writer = await writerClass();
   const writer = new Writer({ dbPath: f.dbPath, db: f.db, onFatalError(error) { throw error; } }); f.own(writer);

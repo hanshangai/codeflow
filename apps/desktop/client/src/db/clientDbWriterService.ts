@@ -232,9 +232,21 @@ export class ClientDbWriterService {
       while (true) {
         if (this.fatal) throw this.fatal;
         if (this.closed || this.terminating) throw new Error("CLIENT_DB_WRITER_CLOSED");
-        if (lastLock && Date.now() >= deadline) throw Object.assign(new Error("等待工作区数据库锁超时", { cause: lastLock.cause }), {
-          code: "CLIENT_DB_LOCK_TIMEOUT", requestId, workspaceId, phase: "exclusive-acquire", sqliteCode: lastLock.errcode,
-        });
+        if (lastLock && Date.now() >= deadline) {
+          const waitingMs = Math.max(0, Date.now() - (deadline - this.lockTimeoutMs));
+          try {
+            logger.error("event-writer", "workspace database lock wait timed out", {
+              errorCode: "CLIENT_DB_LOCK_TIMEOUT", requestId, workspaceId, phase: "exclusive-acquire",
+              sqliteCode: lastLock.errcode, waitingMs, timeoutMs: this.lockTimeoutMs,
+              coordinator: this.databaseCoordinatorSnapshot(workspaceId),
+            });
+          } catch (diagnosticError) {
+            throw new AggregateError([lastLock.cause, diagnosticError], "CLIENT_DB_LOCK_TIMEOUT_DIAGNOSTIC_FAILED", { cause: lastLock.cause });
+          }
+          throw Object.assign(new Error("等待工作区数据库锁超时", { cause: lastLock.cause }), {
+            code: "CLIENT_DB_LOCK_TIMEOUT", requestId, workspaceId, phase: "exclusive-acquire", sqliteCode: lastLock.errcode,
+          });
+        }
         const batch = batchId ? this.batches.get(batchId) : undefined;
         if (batchId && (!batch?.receipt || batch.batch.workspaceId !== workspaceId)) throw new Error("CLIENT_DB_WRITER_INDEX_OWNER_INVALID");
         let entered = false;
@@ -256,7 +268,9 @@ export class ClientDbWriterService {
             try {
               logger.warn("event-writer", "waiting for workspace lock before effects", {
                 errorCode: "CLIENT_DB_LOCK_WAIT", requestId, workspaceId, phase: "exclusive-acquire",
-                rootCause: { code: "ERR_SQLITE_ERROR", errcode: lock.errcode }, timeoutMs: this.lockTimeoutMs,
+                rootCause: { code: "ERR_SQLITE_ERROR", errcode: lock.errcode }, sqliteCode: lock.errcode,
+                waitingMs: Math.max(0, Date.now() - (deadline - this.lockTimeoutMs)), timeoutMs: this.lockTimeoutMs,
+                coordinator: this.databaseCoordinatorSnapshot(workspaceId),
               });
             } catch (diagnosticError) {
               throw new AggregateError([error, diagnosticError], "CLIENT_DB_LOCK_DIAGNOSTIC_FAILED", { cause: error });
@@ -323,6 +337,24 @@ export class ClientDbWriterService {
       if (value && (typeof value === "object" || typeof value === "function") && typeof (value as { then?: unknown }).then === "function") throw new Error("CLIENT_DB_LEGACY_CALLBACK_MUST_BE_SYNCHRONOUS");
       return value;
     } finally { this.permitDepth--; }
+  }
+
+  /** 不包含SQL或事件正文的工作区协调器现场快照。 */
+  private databaseCoordinatorSnapshot(workspaceId: WorkspaceId): Record<string, unknown> {
+    const active = this.active;
+    return {
+      active: active ? { lane: active.lane, workspaceId: active.workspaceId ?? null, batchId: active.batchId ?? null } : null,
+      queued: [...this.jobs].flatMap(([lane, jobs]) => {
+        const matching = jobs.filter(job => job.workspaceId === workspaceId || job.workspaceId == null);
+        return matching.length ? [{ lane, count: matching.length,
+          batchIds: matching.flatMap(job => job.batchId ? [job.batchId] : []) }] : [];
+      }),
+      pendingBatches: [...this.batches.values()]
+        .filter(state => state.batch.workspaceId === workspaceId)
+        .map(state => ({ batchId: state.batch.batchId, eventCount: state.batch.events.length, indexed: Boolean(state.receipt) })),
+      workspacePendingBatchId: this.workspacePending.get(workspaceId) ?? null,
+      workspaceFailed: this.workspaceFailures.has(workspaceId),
+    };
   }
 
   /** 队列只保存预算内的批次；回合队列每次移到尾部以避免持续输出独占。 */
