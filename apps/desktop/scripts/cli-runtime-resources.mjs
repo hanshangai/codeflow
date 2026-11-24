@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-/** 复制锁定的 npm 包；包名或版本不符时在写目标前失败。 */
+/** 复制锁定 npm 并实体化包内链接；拒绝链接指向包外文件。 */
 export async function copyNpmPackage({ npmPackageDir, targetDir, expectedVersion }) {
   let manifest;
   try {
@@ -25,5 +25,17 @@ export async function copyNpmPackage({ npmPackageDir, targetDir, expectedVersion
       code: "DESKTOP_NPM_PACKAGE_INVALID", cause: error,
     });
   }
-  await fs.cp(npmPackageDir, targetDir, { recursive: true, force: false, errorOnExist: true });
+  const sourceRoot = await fs.realpath(npmPackageDir);
+  await fs.cp(sourceRoot, targetDir, { recursive: true, force: false, errorOnExist: true, dereference: true,
+    /** 复制前核对链接归属，资源清单仍只接收普通文件。 */
+    filter: async source => {
+      if ((await fs.lstat(source)).isSymbolicLink()) {
+        const relative = path.relative(sourceRoot, await fs.realpath(source));
+        if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+          throw Object.assign(new Error("DESKTOP_NPM_LINK_OUTSIDE_PACKAGE"), { code: "DESKTOP_NPM_LINK_OUTSIDE_PACKAGE" });
+        }
+      }
+      return true;
+    },
+  });
 }
