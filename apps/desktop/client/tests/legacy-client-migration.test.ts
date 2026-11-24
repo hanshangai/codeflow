@@ -29,9 +29,9 @@ const targetDeviceId = '22222222-2222-4222-8222-222222222222';
 const namespace = 'acct_currentaccount';
 const apiKey = 'codeflowai_123456789012345678901234';
 
-/** 每例使用真实磁盘库；关闭连接后再清理，绝不访问用户旧目录。 */
+/** 使用物理临时路径，避免 macOS 路径别名影响真实磁盘迁移校验。 */
 function fixture(t: test.TestContext, initialize: (db: SqliteDb) => void = migrateClientDb) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-client-migration-'));
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-client-migration-')));
   const homeDir = path.join(root, 'home'), dataDir = path.join(root, 'desktop');
   const sourceDir = path.join(homeDir, '.codeflowai'), workspacePath = path.join(root, 'project');
   fs.mkdirSync(sourceDir, { recursive: true }); fs.mkdirSync(workspacePath); fs.mkdirSync(dataDir);

@@ -13,9 +13,9 @@ import { loadOrCreateDeviceIdentity } from "../src/deviceIdentity.js";
 import { createLegacyClientMigration, resolveLegacyClientMigrationWorker, type LegacyMigrationExecutor } from "../src/legacyClientMigration.js";
 import * as migrationModule from "../src/legacyClientMigration.js";
 
-/** 隔离真实持久记录，仅替换 Worker 和网络边界。 */
+/** 使用物理临时目录隔离持久记录，仅替换 Worker 和网络边界。 */
 async function fixture(t: test.TestContext, execute: LegacyMigrationExecutor) {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-legacy-"));
+  const dataDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "desktop-legacy-")));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
   const identity = await loadOrCreateDeviceIdentity(dataDir);
   return { dataDir, identity, workerEntry: path.join(dataDir, "worker.cjs"), execute };
