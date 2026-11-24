@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { performance } from "node:perf_hooks";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createConversationState, snapshotConversationState } from "@codeflowai/shared";
 import type { ConversationEventEnvelope, ThreadId, WorkspaceId } from "@codeflowai/shared";
 import { ConversationPresentationStore, createConversationPresentationTables } from "../src/db/conversationPresentation.js";
 import { openSqliteDb, type SqliteDb } from "../src/db/sqliteDb.js";
+import { openClientDb } from "../src/db/clientDb.js";
 
 const threadId = "performance-thread" as ThreadId, workspaceId = "performance-workspace" as WorkspaceId;
 
@@ -102,7 +106,7 @@ test("旧投影冷重建保持心跳可响应并完整恢复高密度增量", as
   t.diagnostic(JSON.stringify({ events: tools + deltas, elapsedMs: Math.round(elapsedMs), maxHeartbeatMs: Math.round(maxHeartbeatMs), heartbeats }));
   assert.ok(heartbeats > 0);
   assert.ok(maxHeartbeatMs < 250, `重建阻塞心跳${Math.round(maxHeartbeatMs)}ms`);
-  assert.ok(elapsedMs < (deltas > 4000 ? 60_000 : 3000), `冷重建耗时${Math.round(elapsedMs)}ms`);
+  assert.ok(elapsedMs < (deltas > 4000 ? 5000 : 3000), `冷重建耗时${Math.round(elapsedMs)}ms`);
   assert.equal(store.isReady(threadId), true);
   const restored = [];
   let cursor: string | undefined;
@@ -113,4 +117,64 @@ test("旧投影冷重建保持心跳可响应并完整恢复高密度增量", as
   } while (cursor);
   assert.equal(restored.length, tools);
   for (let i = 0; i < tools; i++) assert.equal((restored[i] as any).output.length, Math.ceil((deltas - i) / tools));
+});
+
+test("磁盘旧库混合diff与长输出冷加载不逐事件扫描历史或落盘", async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "thread-cold-mixed-"));
+  const client = openClientDb({ dbPath: path.join(directory, "client.db"), localCanonicalEvents: true });
+  t.after(() => { client.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  client.workspaces.upsert({ id: workspaceId, title: "合成性能库", path: directory });
+  client.threads.create({ id: threadId, workspaceId, engine: "codex", title: "mixed cold history" });
+  const large = process.env.CODEFLOWAI_PRESENTATION_PERF === "1";
+  const tools = large ? 2000 : 160, deltasPerTool = large ? 175 : 60;
+  let seq = 0;
+  const insert = client.db.prepare("INSERT INTO conversation_events(seq,thread_id,workspace_id,engine,type,event_json,ts) VALUES (?,?,?,?,?,?,?)");
+  /** 只构造无业务内容的canonical，模拟升级前没有投影的历史磁盘库。 */
+  const append = (type: string, payload: unknown): void => {
+    const next = event(++seq, type, payload);
+    insert.run(seq, threadId, workspaceId, "codex", type, JSON.stringify(next), seq);
+  };
+  client.db.transaction(() => {
+    for (let tool = 0; tool < tools; tool++) {
+      const turnId = `turn-${Math.floor(tool / 20)}`;
+      if (tool % 20 === 0) {
+        append("item.userMessage.created", { itemId: `user-${tool}`, text: `question-${tool}`, turnId });
+        append("turn.started", { turnId });
+        client.turns.insertStarted({ workspaceId, threadId, engine: "codex", turnId: turnId as any, startedAt: seq, startEventSeq: seq });
+      }
+      append("item.tool.started", { itemId: `tool-${tool}`, toolName: "shell", input: {} });
+      for (let delta = 0; delta < deltasPerTool; delta++) append("item.tool.outputDelta", { itemId: `tool-${tool}`, delta: "synthetic output ".repeat(4) });
+      append("item.tool.completed", { itemId: `tool-${tool}`, toolName: "shell", status: "success" });
+      append("item.diff.created", { itemId: `diff-${tool}`, turnId, title: "synthetic patch", diff: `patch-${tool}` });
+      if (tool % 20 === 19) {
+        append("item.agentMessage.delta", { itemId: `answer-${tool}`, turnId, delta: `answer-${tool}` });
+        append("turn.completed", { turnId });
+      }
+    }
+  })();
+  let historicalDiffScans = 0, projectionWrites = 0;
+  const prepare = client.db.prepare.bind(client.db);
+  t.mock.method(client.db, "prepare", (sql: string) => {
+    if (/FROM conversation_events/i.test(sql) && /json_extract\(event_json/i.test(sql)) historicalDiffScans++;
+    if (/^(?:INSERT|UPDATE|DELETE).*conversation_presentation/is.test(sql)) projectionWrites++;
+    return prepare(sql);
+  });
+  let heartbeats = 0, maximumGapMs = 0, previous = performance.now();
+  const timer = setInterval(() => { const now = performance.now(); maximumGapMs = Math.max(maximumGapMs, now - previous); previous = now; heartbeats++; }, 10);
+  const start = performance.now();
+  try { await client.conversationEvents.ensurePresentation(threadId); }
+  finally { clearInterval(timer); }
+  const presentation = client.conversationEvents.readPresentationPage(threadId, { messageLimit: 40 });
+  const elapsedMs = Math.round(performance.now() - start);
+  t.diagnostic(JSON.stringify({ events: seq, tools, elapsedMs, maximumGapMs: Math.round(maximumGapMs), historicalDiffScans, projectionWrites }));
+  assert.ok(historicalDiffScans <= 2, `历史diff元数据被反复扫描${historicalDiffScans}次`);
+  assert.ok(projectionWrites < seq / 4, `投影写入${projectionWrites}次，不应按每条delta落盘`);
+  assert.ok(elapsedMs < (large ? 5000 : 1800), `冷首屏${elapsedMs}ms，不能等待历史逐事件重建`);
+  assert.ok(heartbeats > 0 && maximumGapMs < 250, `事件循环阻塞${Math.round(maximumGapMs)}ms`);
+  assert.ok(presentation.items.some(item => item.kind === "message" && item.text === `answer-${tools - 1}`));
+  const first = client.conversationEvents.readProcess(threadId, "process:tool-0", { limit: 200 });
+  assert.equal(first.items.find(item => item.id === "tool-0")?.kind, "tool");
+  assert.equal((first.items[0] as any).output, "synthetic output ".repeat(4 * deltasPerTool));
+  assert.equal(first.items.filter(item => item.kind === "diff").length, 1);
+  assert.equal((first.items.find(item => item.kind === "diff") as any).diff, "patch-19");
 });

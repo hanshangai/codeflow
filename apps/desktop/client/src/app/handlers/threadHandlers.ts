@@ -541,21 +541,43 @@ export async function handleThreadsLoad(ctx: ApiHandlerContext, req: ApiRequestM
   }
 
   const historyStartedAt = performance.now();
+  let presentationPrepareMs = 0, presentationReadMs = 0, databaseWaitMs = 0;
+  let presentationPending = false;
+  /** 区分writer准入排队和同步数据库工作，避免将全部history耗时误判为锁等待。 */
+  const historyAccess = <T>(operation: () => T): Promise<T> => {
+    const queuedAt = performance.now();
+    return withThreadDatabase(ctx, req.id, () => { databaseWaitMs += performance.now() - queuedAt; return operation(); });
+  };
   let history;
   try {
     if ((req.body as { presentation?: unknown })?.presentation === "lazy") {
-      await ctx.db.ensureThreadPresentation(workspaceId, threadId, { withDatabase: operation => withThreadDatabase(ctx, req.id, operation) });
-      const presentation = await withThreadDatabase(ctx, req.id, () => presentationLimit
-        ? ctx.db.conversationEvents.readPresentationPage(threadId, { messageLimit: presentationLimit, beforePosition: presentationBeforePosition })
-        : ctx.db.conversationEvents.readPresentation(threadId));
-      history = { events: [], presentation, hasMore: false, oldestSeq: null, latestSeq: presentation.version, rawEventCount: 0 };
+      const ready = await historyAccess(() => ctx.db.conversationEvents.isPresentationReady(threadId));
+      if (ready) {
+        const readingAt = performance.now();
+        const presentation = await historyAccess(() => presentationLimit
+          ? ctx.db.conversationEvents.readPresentationPage(threadId, { messageLimit: presentationLimit, beforePosition: presentationBeforePosition })
+          : ctx.db.conversationEvents.readPresentation(threadId));
+        presentationReadMs = performance.now() - readingAt;
+        history = { events: [], presentation, hasMore: false, oldestSeq: null, latestSeq: presentation.version, rawEventCount: 0 };
+      } else {
+        presentationPending = true;
+        history = { ...await ctx.db.conversationEvents.listByThreadForReplay(threadId, {
+          ...(limit ? { limit } : {}), ...(beforeSeq != null ? { beforeSeq } : {}), withDatabase: historyAccess,
+        }), presentation: undefined };
+        logger.info("api", "cold thread presentation deferred", {
+          code: "THREAD_PRESENTATION_BUILD_DEFERRED", requestId: req.id, workspaceId, threadId,
+          replayEventCount: history.rawEventCount, latestSeq: history.latestSeq, databaseWaitMs,
+          elapsedMs: performance.now() - startedAt,
+        });
+      }
     } else {
       history = { ...await ctx.db.conversationEvents.listByThreadForReplay(threadId, { ...(limit ? { limit } : {}), ...(beforeSeq != null ? { beforeSeq } : {}),
-        withDatabase: operation => withThreadDatabase(ctx, req.id, operation) }), presentation: undefined };
+        withDatabase: historyAccess }), presentation: undefined };
     }
   } catch (error) {
     logger.error("api", "thread history load failed", {
       code: "THREAD_HISTORY_LOAD_FAILED", requestId: req.id, workspaceId, threadId, beforeSeq, limit,
+      presentationPrepareMs, presentationReadMs, databaseWaitMs,
       rootCause: error instanceof Error ? { message: error.message, cause: error.cause instanceof Error ? error.cause.message : error.cause } : String(error),
     });
     ctx.onApiFailureLogged?.();
@@ -575,6 +597,7 @@ export async function handleThreadsLoad(ctx: ApiHandlerContext, req: ApiRequestM
   if (completedAt - startedAt >= 500) logger.warn("api", "thread history load slow", {
     code: "THREAD_HISTORY_LOAD_SLOW", requestId: req.id, workspaceId, threadId, beforeSeq, limit,
     ms: completedAt - startedAt, historyMs: stateStartedAt - historyStartedAt, stateMs: completedAt - stateStartedAt,
+    presentationPending, presentationPrepareMs, presentationReadMs, databaseWaitMs,
     rawEventCount, eventCount: events.length,
   });
   ctx.send({
@@ -615,6 +638,7 @@ export async function handleThreadsLoad(ctx: ApiHandlerContext, req: ApiRequestM
       oldestSeq,
       latestSeq,
       rawEventCount,
+      ...(presentationPending ? { presentationPending: true } : {}),
       ...(history.presentation ? { presentation: history.presentation } : {}),
     },
   });
@@ -622,26 +646,45 @@ export async function handleThreadsLoad(ctx: ApiHandlerContext, req: ApiRequestM
 
 /** 展示与过程明细沿本机仓储读取；失败在请求边界带上下文记录并向上返回。 */
 export async function handleThreadsPresentation(ctx: ApiHandlerContext, req: ApiRequestMessage): Promise<void> {
+  const startedAt = performance.now();
+  let prepareMs = 0, readMs = 0, databaseWaitMs = 0;
+  /** 单独记录Writer准入等待，冷建、投影读取和锁排队不可混成一个历史时间。 */
+  const access = <T>(operation: () => T): Promise<T> => {
+    const queuedAt = performance.now();
+    return withThreadDatabase(ctx, req.id, () => { databaseWaitMs += performance.now() - queuedAt; return operation(); });
+  };
   const bodyScope = req.body as { workspaceId?: WorkspaceId; threadId?: ThreadId };
   if (bodyScope.workspaceId && bodyScope.threadId) await ctx.flushLocalEvents?.(bodyScope.workspaceId, bodyScope.threadId);
   const thread = await withThreadDatabase(ctx, req.id, () => requireWorkspaceThread(ctx, req));
   if (!thread) return;
   try {
-    await ctx.db.ensureThreadPresentation(thread.workspaceId, thread.id, { withDatabase: operation => withThreadDatabase(ctx, req.id, operation) });
+    const prepareStartedAt = performance.now();
+    await ctx.db.ensureThreadPresentation(thread.workspaceId, thread.id, { withDatabase: access });
+    prepareMs = performance.now() - prepareStartedAt;
     const body = req.body as { processId?: string; afterSeq?: number; cursor?: string; throughSeq?: number; limit?: number;
       presentationLimit?: number; presentationBeforePosition?: number };
     const presentationLimit = parsePresentationLimit(body.presentationLimit);
     const presentationBeforePosition = parseBeforeSeq(body.presentationBeforePosition);
-    const result = await withThreadDatabase(ctx, req.id, () => req.method === "threads.process"
+    const readStartedAt = performance.now();
+    const result = await access(() => req.method === "threads.process"
       ? ctx.db.conversationEvents.readProcess(thread.id, String(body.processId ?? ""), body)
       : { presentation: presentationLimit
           ? ctx.db.conversationEvents.readPresentationPage(thread.id, { messageLimit: presentationLimit, beforePosition: presentationBeforePosition })
           : ctx.db.conversationEvents.readPresentation(thread.id) });
+    readMs = performance.now() - readStartedAt;
+    const elapsedMs = performance.now() - startedAt;
+    if (elapsedMs >= 500) logger.warn("api", "thread presentation read slow", {
+      code: "THREAD_PRESENTATION_READ_SLOW", requestId: req.id, workspaceId: thread.workspaceId, threadId: thread.id,
+      method: req.method, elapsedMs, prepareMs, readMs, databaseWaitMs,
+      presentationLimit: presentationLimit ?? null,
+      itemCount: "presentation" in result ? result.presentation.items.length : result.items.length,
+    });
     ctx.send({ t: "api.res", id: req.id, status: 200, body: { ok: true, ...result } });
   } catch (error) {
     logger.error("api", "thread presentation read failed", {
       code: "THREAD_PRESENTATION_READ_FAILED", requestId: req.id, workspaceId: thread.workspaceId, threadId: thread.id,
-      processId: (req.body as { processId?: unknown })?.processId, method: req.method,
+      method: req.method, prepareMs, readMs, databaseWaitMs, elapsedMs: performance.now() - startedAt,
+      processId: (req.body as { processId?: unknown })?.processId,
       rootCause: error instanceof Error ? error.message : String(error),
     });
     ctx.onApiFailureLogged?.();

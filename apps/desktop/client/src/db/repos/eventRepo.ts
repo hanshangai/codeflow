@@ -228,11 +228,31 @@ export class ConversationEventRepo {
     return this.db.transaction(() => this.presentation.isReady(threadId))();
   }
 
-  /** 旧会话沿统一 reducer 分批建立索引；失败由 API 边界记录并显式上抛。 */
+  /** 冷构建复用一次diff保留快照，实时追加超过读取水位时才重新准备元数据。 */
   async ensurePresentation(threadId: ThreadId, opts?: { withDatabase?: <T>(operation: () => T) => Promise<T> }): Promise<void> {
     const pending = this.presentationBuilds.get(threadId);
     if (pending) return await pending;
-    const build = this.presentation.rebuild(threadId, event => this.hydratePresentationEvent(event), event => this.getSupersededPresentationDiffIds(event), opts);
+    let diffs: { throughSeq: number; retained: Set<number>; rows: Array<{ seq: number; item_id: string; turn_id: string | null; engine_turn_id: string | null }> } | undefined;
+    /** 所属构建事务内读取，复用已有turn规则；不跨请求缓存历史事实。 */
+    const diffSnapshot = (seq: number) => {
+      if (!diffs || seq > diffs.throughSeq) {
+        const latest = this.db.prepare("SELECT MAX(seq) AS seq FROM conversation_events WHERE thread_id = ?").get(threadId) as { seq: number };
+        const rows = this.db.prepare(`SELECT seq, json_extract(event_json, '$.payload.itemId') AS item_id,
+          json_extract(event_json, '$.payload.turnId') AS turn_id, json_extract(event_json, '$.payload.engineTurnId') AS engine_turn_id
+          FROM conversation_events WHERE thread_id = ? AND type = 'item.diff.created' ORDER BY seq`).all(threadId) as NonNullable<typeof diffs>["rows"];
+        diffs = { throughSeq: latest.seq, rows, retained: resolveRetainedReplayDiffSeqs(this.db, threadId, rows.map(row => ({ seq: row.seq, type: "item.diff.created" }))) };
+      }
+      return diffs;
+    };
+    const build = this.presentation.rebuild(threadId, event => {
+      return this.hydratePresentationEvent(event, event.type === "item.diff.created" ? diffSnapshot(event.seq).retained : undefined);
+    }, event => {
+      if (event.type !== "item.diff.created") return [];
+      const snapshot = diffSnapshot(event.seq), key = resolveConversationDiffKey(event.payload);
+      return [...new Set(snapshot.rows.filter(row => row.seq <= event.seq && row.item_id !== String(event.payload.itemId)
+        && (!snapshot.retained.has(row.seq) || key && resolveConversationDiffKey({ itemId: row.item_id, turnId: row.turn_id, engineTurnId: row.engine_turn_id } as any) === key))
+        .map(row => row.item_id))];
+    }, opts);
     this.presentationBuilds.set(threadId, build);
     try { await build; }
     finally { this.presentationBuilds.delete(threadId); }
@@ -254,8 +274,8 @@ export class ConversationEventRepo {
   }
 
   /** 旧 aggregate 正文可被后续快照替换；最新引用缺失或校验不符必须中止构建。 */
-  private hydratePresentationEvent(event: ConversationEventEnvelope): ConversationEventEnvelope | null {
-    if (event.type === "item.diff.created" && !resolveRetainedReplayDiffSeqs(this.db, event.threadId, [{ seq: event.seq, type: event.type }]).has(event.seq)) return null;
+  private hydratePresentationEvent(event: ConversationEventEnvelope, retainedDiffSeqs?: ReadonlySet<number>): ConversationEventEnvelope | null {
+    if (event.type === "item.diff.created" && !(retainedDiffSeqs ?? resolveRetainedReplayDiffSeqs(this.db, event.threadId, [{ seq: event.seq, type: event.type }])).has(event.seq)) return null;
     if (event.type === "item.diff.created" && event.payload.diffRef?.kind === "client_latest_snapshot") {
       const key = resolveConversationDiffKey(event.payload);
       const snapshot = this.db.prepare("SELECT event_seq FROM conversation_diff_snapshots WHERE thread_id = ? AND diff_key = ?")

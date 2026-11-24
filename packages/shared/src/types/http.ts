@@ -447,6 +447,8 @@ export type LoadThreadRequestBody = {
 };
 export type LoadThreadResponseBody = {
   presentation?: import("../conversation/presentation.js").ThreadPresentation;
+  /** 冷投影未就绪时用有界事件回放先显示历史，前端随后异步读取完整投影。 */
+  presentationPending?: boolean;
   /** 永久删除的消息 ID，与分页窗口无关，用于阻止缓存和迟到事件恢复正文。 */
   deletedMessageIds?: string[];
   thread: {

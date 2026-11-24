@@ -1,16 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import {
-  applyEngineEventToConversation, buildThreadPresentation, createConversationItemStub, createConversationState,
+  applyEngineEventToConversation, buildThreadPresentation, compressConversationEvents, createConversationItemStub, createConversationState,
   getConversationProcessGroups, restoreConversationState, snapshotConversationState,
 } from "@codeflowai/shared";
-import type { ConversationEventEnvelope, ConversationItem, ConversationStateSnapshot, ThreadId, ThreadPresentation, ThreadProcessDetails } from "@codeflowai/shared";
+import type { ConversationEventEnvelope, ConversationItem, ConversationStateSnapshot, ThreadConversationState, ThreadId, ThreadPresentation, ThreadProcessDetails } from "@codeflowai/shared";
 import type { SqliteDb } from "./sqliteTypes.js";
 
 const PRESENTATION_SCHEMA_VERSION = 2;
 // 表结构保持旧Client可读；行内版本仅标识可重建的归并结果。
 const PRESENTATION_REDUCER_VERSION = 3;
 const REBUILD_SLICE_MS = 8;
+const REBUILD_CHECKPOINT_MS = 100;
 const PLACEHOLDER_INDEX = "idx_conversation_presentation_placeholder";
 type ProjectionRow = { version: number; ready: number; state_json: string; schema_version: number; build_id: string };
 type ItemRow = { item_id: string; position: number; stub_json: string; updated_seq: number; process_id: string | null };
@@ -89,7 +90,7 @@ export class ConversationPresentationStore {
     this.apply(event, supersededItemIds);
   }
 
-  /** 按时间片提交并让出事件循环；同版本中断从提交水位续接，失效标记仍完整重建。 */
+  /** 顺序归并只读批次，定期原子保存检查点；不再逐事件读写整个投影。 */
   async rebuild(threadId: ThreadId, hydrate: (event: ConversationEventEnvelope) => ConversationEventEnvelope | null,
     supersededItems: (event: ConversationEventEnvelope) => readonly string[], opts?: { withDatabase?: <T>(operation: () => T) => Promise<T> }): Promise<void> {
     /** 每次让出后重新申请同步写入许可，不把整个重建包进数据库锁。 */
@@ -97,18 +98,22 @@ export class ConversationPresentationStore {
     if (await write(() => this.isReady(threadId))) return;
     const checkpoint = await write(() => this.db.transaction(() => {
       const existing = this.getRow(threadId);
-      if (existing?.ready && existing.schema_version === PRESENTATION_REDUCER_VERSION) return existing;
+      if (existing?.ready && existing.schema_version === PRESENTATION_REDUCER_VERSION) return { row: existing, stored: [] };
       if (existing && !existing.ready && existing.schema_version === PRESENTATION_REDUCER_VERSION && existing.build_id) {
-        const next = { ...existing, build_id: randomUUID() };
-        this.db.prepare("UPDATE conversation_presentations SET build_id = ? WHERE thread_id = ?").run(next.build_id, threadId);
-        return next;
-      }
-      this.initialize(threadId, false);
-      return this.getRow(threadId)!;
+        this.db.prepare("UPDATE conversation_presentations SET build_id = ? WHERE thread_id = ?").run(randomUUID(), threadId);
+      } else this.initialize(threadId, false);
+      const stored = this.db.prepare("SELECT item_id, item_json, stub_json, position, process_id, updated_seq FROM conversation_presentation_items WHERE thread_id = ? ORDER BY position")
+        .all(threadId) as Array<ItemRow & { item_json: string }>;
+      return { row: this.getRow(threadId)!, stored };
     })());
-    if (checkpoint.ready) return;
-    const buildId = checkpoint.build_id;
-    let cursor = checkpoint.version;
+    if (checkpoint.row.ready) return;
+    const buildId = checkpoint.row.build_id, stored = checkpoint.stored;
+    let cursor = checkpoint.row.version;
+    const state = restoreConversationState(JSON.parse(checkpoint.row.state_json) as ConversationStateSnapshot,
+      stored.map(row => JSON.parse(row.item_json) as ConversationItem));
+    const persisted = new Map(stored.map(row => [row.item_id, row]));
+    let lastCheckpointAt = -Infinity;
+    let hasPlaceholders = state.items.some(item => item.kind === "reasoning" && item.placeholder);
     while (true) {
       const count = await write(() => this.db.transaction(() => {
         const startedAt = performance.now();
@@ -118,6 +123,7 @@ export class ConversationPresentationStore {
         const rows = this.db.prepare("SELECT seq, workspace_id, engine, event_json FROM conversation_events WHERE thread_id = ? AND seq > ? ORDER BY seq LIMIT 256")
           .all(threadId, cursor) as Array<{ seq: number; workspace_id: string; engine: string; event_json: string }>;
         let processed = 0;
+        const events: ConversationEventEnvelope[] = [];
         for (const row of rows) {
           const event = JSON.parse(row.event_json) as ConversationEventEnvelope;
           if (!event || event.schema !== 1 || event.threadId !== threadId || event.seq !== row.seq || !Number.isSafeInteger(event.seq)
@@ -127,20 +133,98 @@ export class ConversationPresentationStore {
             throw new Error(`THREAD_PRESENTATION_EVENT_INVALID: threadId=${threadId}, seq=${row.seq}`);
           }
           const hydrated = hydrate(event);
-          if (hydrated) this.apply(hydrated, supersededItems(hydrated));
+          if (hydrated) events.push(hydrated);
           cursor = event.seq;
           processed++;
           if (performance.now() - startedAt >= REBUILD_SLICE_MS) break;
         }
-        if (rows.length && this.getRow(threadId)!.version < cursor) {
-          this.db.prepare("UPDATE conversation_presentations SET version = ? WHERE thread_id = ?").run(cursor, threadId);
+        for (const event of this.compactRebuildEvents(events)) {
+          const superseded = new Set(supersededItems(event));
+          if (superseded.size) {
+            state.items = state.items.filter(item => item.kind !== "diff" || !superseded.has(String(item.id)));
+            for (const id of superseded) state._indexById.delete(id);
+          }
+          if (hasPlaceholders || !this.applyRebuildDelta(state, event)) {
+            applyEngineEventToConversation(state, event);
+            hasPlaceholders = state.items.some(item => item.kind === "reasoning" && item.placeholder);
+          }
+          if (state._indexById.size !== state.items.length) state.items = state.items.filter(item => state._indexById.get(String(item.id)) === item);
         }
-        if (!rows.length) this.db.prepare("UPDATE conversation_presentations SET ready = 1 WHERE thread_id = ?").run(threadId);
+        if (!rows.length || performance.now() - lastCheckpointAt >= REBUILD_CHECKPOINT_MS) {
+          this.saveRebuildCheckpoint(threadId, state, cursor, persisted, !rows.length);
+          lastCheckpointAt = performance.now();
+        }
         return processed;
       })());
       if (!count) return;
       await new Promise<void>(resolve => setImmediate(resolve));
     }
+  }
+
+  /** 仅压缩元数据完全相同的相邻增量，保留最早时间戳和shared的replace语义。 */
+  private compactRebuildEvents(events: ConversationEventEnvelope[]): ConversationEventEnvelope[] {
+    const result: ConversationEventEnvelope[] = [];
+    let group: ConversationEventEnvelope[] = [], key = "";
+    /** 复用shared压缩，其他事件原样推进，避免跨生命周期或消息身份合并。 */
+    const flush = (): void => {
+      if (!group.length) return;
+      const compressed = compressConversationEvents(group, { subagentChildEvents: false });
+      result.push(...compressed.map(event => ({ ...event, ts: group.reduce((minimum, item) => Math.min(minimum, item.ts), event.ts) })));
+      group = [];
+    };
+    for (const event of events) {
+      const mergeable = ["item.agentMessage.delta", "item.reasoning.delta", "item.reasoning.summaryDelta", "item.tool.outputDelta"].includes(event.type);
+      const metadata = { ...event.payload } as Record<string, unknown>;
+      delete metadata.delta;
+      if (event.type === "item.tool.outputDelta") delete metadata.mode;
+      const nextKey = mergeable ? JSON.stringify([event.type, metadata]) : "";
+      if (!mergeable || key !== nextKey) flush();
+      if (!mergeable) result.push(event);
+      else { key = nextKey; group.push(event); }
+    }
+    flush();
+    return result;
+  }
+
+  /** 稳定增量仅作用于已有目标；无全局占位时避免shared reducer逐增量过滤全部历史。 */
+  private applyRebuildDelta(state: ThreadConversationState, event: ConversationEventEnvelope): boolean {
+    const itemId = String((event.payload as { itemId?: string }).itemId ?? "");
+    const target = state._indexById.get(itemId);
+    const reasoning = event.type === "item.reasoning.delta" || event.type === "item.reasoning.summaryDelta" || event.type === "item.reasoning.summaryBoundary";
+    const tool = event.type === "item.tool.outputDelta";
+    const message = event.type === "item.agentMessage.delta";
+    if (!target || !(reasoning && target.kind === "reasoning" || tool && target.kind === "tool" && !target.isTodolist
+      && !["update_plan", "todowrite"].includes(String((event.payload as { toolName?: string }).toolName ?? target.toolType).toLowerCase())
+      || message && target.kind === "message" && target.role === "assistant")) return false;
+    const items = state.items;
+    state.items = [target];
+    try { applyEngineEventToConversation(state, event); }
+    finally { state.items = items; }
+    return true;
+  }
+
+  /** 调用者持有同批事务与构建身份；正文、分组和水位同时提交，异常不留下半份检查点。 */
+  private saveRebuildCheckpoint(threadId: ThreadId, state: ThreadConversationState, version: number,
+    persisted: Map<string, ItemRow & { item_json: string }>, ready: boolean): void {
+    const groups = new Map(getConversationProcessGroups(state.items).flatMap(group => group.items.map(item => [String(item.id), group.processId] as const)));
+    const currentIds = new Set(state.items.map(item => String(item.id)));
+    for (const id of persisted.keys()) if (!currentIds.has(id)) {
+      this.db.prepare("DELETE FROM conversation_presentation_items WHERE thread_id = ? AND item_id = ?").run(threadId, id);
+      persisted.delete(id);
+    }
+    const save = this.db.prepare(`INSERT INTO conversation_presentation_items(thread_id,item_id,position,created_seq,updated_seq,process_id,stub_json,item_json)
+      VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(thread_id,item_id) DO UPDATE SET position=excluded.position,updated_seq=excluded.updated_seq,
+        process_id=excluded.process_id,stub_json=excluded.stub_json,item_json=excluded.item_json`);
+    for (const [position, item] of state.items.entries()) {
+      const id = String(item.id), old = persisted.get(id), processId = groups.get(id) ?? null;
+      const json = JSON.stringify(item), stubJson = JSON.stringify(this.createStoredStub(item));
+      if (!old || old.item_json !== json || old.stub_json !== stubJson || old.position !== position || old.process_id !== processId) {
+        save.run(threadId, id, position, version, version, processId, stubJson, json);
+        persisted.set(id, { item_id: id, item_json: json, stub_json: stubJson, position, process_id: processId, updated_seq: version });
+      }
+    }
+    this.db.prepare("UPDATE conversation_presentations SET version = ?, state_json = ?, ready = ? WHERE thread_id = ?")
+      .run(version, JSON.stringify(snapshotConversationState(state)), ready ? 1 : 0, threadId);
   }
 
   /** 首屏组合非过程正文与过程 stub，不查询 canonical 或过程正文。 */

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { createPinia, setActivePinia } from "pinia";
-import { buildThreadPresentation, createConversationState, type DesktopApiRequest, type ThreadId, type WorkspaceId } from "@codeflowai/shared";
+import { applyEngineEventToConversation, buildThreadPresentation, createConversationState, type DesktopApiRequest, type EngineEventEnvelope, type ThreadId, type WorkspaceId } from "@codeflowai/shared";
 import { useChatStore } from "../src/store/chat.ts";
 import { useConfigStore } from "../src/store/config.ts";
 import { createProcessDetailsLoader } from "../src/features/chat/processDetails.ts";
@@ -297,6 +297,88 @@ test("打开会话使用轻量快照，保留正文和过程摘要且不回放�
   assert.equal(requests[0]?.body?.presentation, "lazy");
   assert.equal(chat.threadLoadMetaByThreadId[threadId]?.hasMore, false);
   assert.equal(chat.threadReplayEventsByThreadId[threadId]?.length, 0);
+});
+
+test("冷投影先显示有界历史，后台补齐窗口快照而不阻塞首次加载", async t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const requests: DesktopApiRequest[] = [];
+  const turn = { workspaceId, threadId, engine: "codex" as const };
+  const user = { schema: 1 as const, seq: 1, ts: 1, ...turn, type: "item.userMessage.created", payload: { itemId: "user", text: "问题" } } as EngineEventEnvelope;
+  const answer = { schema: 1 as const, seq: 2, ts: 2, ...turn, type: "item.agentMessage.delta", payload: { itemId: "answer", delta: "有界历史先显示" } } as EngineEventEnvelope;
+  const complete = createConversationState(threadId);
+  complete.items.push({ kind: "message", id: "user", role: "user", text: "问题", createdAt: 1 },
+    { kind: "message", id: "answer", role: "assistant", text: "投影完成", createdAt: 2 });
+  let finishProjection!: (response: unknown) => void, presentationReads = 0;
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { codeflowDesktop: { getState: async () => ({ status: "ready" }),
+    request: async (request: DesktopApiRequest) => {
+      requests.push(request);
+      if (request.method === "threads.load") return { status: 200, body: { ok: true, presentationPending: true,
+        thread: { id: threadId, workspaceId, engine: "codex", title: "冷会话", createdAt: 1, updatedAt: 2, threadType: "chat", threadSubtype: null, sessionId: null },
+        events: [user, answer], rawEventCount: 2, oldestSeq: 1, latestSeq: 2, hasMore: true, deletedMessageIds: [], running: null,
+        hasRealTurnActivity: true, managedServices: null, draft: null } };
+      assert.equal(request.method, "threads.presentation");
+      assert.equal(request.body?.presentationLimit, 30, "后台补齐也只读取首屏窗口");
+      if (++presentationReads > 1) return { status: 200, body: { ok: true, presentation: buildThreadPresentation(complete, 3) } };
+      return new Promise(resolve => { finishProjection = resolve; });
+    },
+  } } });
+  t.after(() => original ? Object.defineProperty(globalThis, "window", original) : Reflect.deleteProperty(globalThis, "window"));
+  setActivePinia(createPinia());
+  useConfigStore().workspaceId = workspaceId;
+  const chat = useChatStore();
+  chat.setThreadPresentationSurface({}, { workspaceId, threadId });
+  const ctx = { serverWsOrigin: "ws://unused", sessionToken: null, webSessionId: null, desktopClientId: "desktop" };
+  await chat.loadThread(ctx, { workspaceId, threadId });
+  assert.equal(chat.conversations[threadId]?.items.find(item => item.id === "answer")?.kind === "message"
+    && (chat.conversations[threadId]?.items.find(item => item.id === "answer") as any).text, "有界历史先显示");
+  assert.equal(chat.loadedThreads[threadId], true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 2, "完整投影准备在首次加载结束后启动");
+  finishProjection({ status: 200, body: { ok: true, presentation: buildThreadPresentation(complete, 2) } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal((chat.conversations[threadId]?.items.find(item => item.id === "answer") as any).text, "投影完成");
+  assert.equal(chat.threadPresentationVersionByThreadId[threadId], 2);
+  assert.equal(chat.threadPresentationErrorByThreadId[threadId], undefined);
+  assert.equal(chat.threadLoadMetaByThreadId[threadId]?.presentationPaged, undefined, "历史翻页仍沿canonical seq游标");
+  chat.requireThreadPresentationVersion(threadId, 3);
+  await chat.refreshThreadPresentation(ctx, { workspaceId, threadId, version: 3 });
+  assert.equal(requests[2]?.body?.presentationLimit, 30, "后续事件刷新继续限制为首屏窗口");
+});
+
+test("冷建完成后旧投影快照保留canonical beforeSeq分页窗口", async t => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const requests: DesktopApiRequest[] = [];
+  const turn = { workspaceId, threadId, engine: "codex" as const };
+  const older = { schema: 1 as const, seq: 1, ts: 1, ...turn, type: "item.userMessage.created", payload: { itemId: "older", text: "更早" } } as EngineEventEnvelope;
+  const recent = { schema: 1 as const, seq: 2, ts: 2, ...turn, type: "item.userMessage.created", payload: { itemId: "recent", text: "最近" } } as EngineEventEnvelope;
+  const answer = { schema: 1 as const, seq: 3, ts: 3, ...turn, type: "item.agentMessage.delta", payload: { itemId: "answer", delta: "回答" } } as EngineEventEnvelope;
+  const complete = createConversationState(threadId);
+  for (const event of [older, recent, answer]) applyEngineEventToConversation(complete, event);
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { codeflowDesktop: { getState: async () => ({ status: "ready" }),
+    request: async (request: DesktopApiRequest) => {
+      requests.push(request);
+      if (request.method === "threads.load" && requests.length === 1) return { status: 200, body: { ok: true, presentationPending: true,
+        thread: { id: threadId, workspaceId, engine: "codex", title: "冷会话", createdAt: 1, updatedAt: 3, threadType: "chat", threadSubtype: null, sessionId: null },
+        events: [recent, answer], rawEventCount: 2, oldestSeq: 2, latestSeq: 3, hasMore: true, deletedMessageIds: [], running: null,
+        hasRealTurnActivity: true, managedServices: null, draft: null } };
+      if (request.method === "threads.presentation") return { status: 200, body: { ok: true, presentation: buildThreadPresentation(complete, 3) } };
+      assert.equal(request.method, "threads.load");
+      assert.equal(request.body?.beforeSeq, 2);
+      return { status: 200, body: { ok: true, thread: { id: threadId, workspaceId, engine: "codex", title: "冷会话", createdAt: 1, updatedAt: 3 },
+        events: [older], rawEventCount: 1, oldestSeq: 1, latestSeq: 3, hasMore: false, deletedMessageIds: [], running: null, managedServices: null } };
+    },
+  } } });
+  t.after(() => original ? Object.defineProperty(globalThis, "window", original) : Reflect.deleteProperty(globalThis, "window"));
+  setActivePinia(createPinia()); useConfigStore().workspaceId = workspaceId;
+  const chat = useChatStore(); chat.setThreadPresentationSurface({}, { workspaceId, threadId });
+  const ctx = { serverWsOrigin: "ws://unused", sessionToken: null, webSessionId: null, desktopClientId: "desktop" };
+  await chat.loadThread(ctx, { workspaceId, threadId });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(chat.threadPresentationVersionByThreadId[threadId], 3);
+  assert.equal(chat.threadLoadMetaByThreadId[threadId]?.presentationPaged, undefined, "继续沿最初canonical窗口游标分页");
+  await chat.loadThreadPage(ctx, { workspaceId, threadId });
+  assert.equal(requests[2]?.method, "threads.load");
+  assert.deepEqual(chat.conversations[threadId]?.items.filter(item => item.kind === "message").map(item => item.id), ["older", "recent", "answer"]);
 });
 
 test("折叠过程不读取；展开按固定版本分页并以快照替换，收起停止补读", async () => {

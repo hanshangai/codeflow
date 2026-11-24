@@ -136,6 +136,67 @@ test("中断重建后从已提交水位续接，不删除已处理的投影", as
   assertFullReducerProjection(f);
 });
 
+test("检查点写入失败原子回滚，重试从提交水位恢复完整正文", async t => {
+  const f = fixture(t);
+  for (let index = 0; index < 600; index++) f.append("item.tool.outputDelta", { itemId: "tool", toolName: "shell", delta: "x" });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  const prepare = f.db.db.prepare.bind(f.db.db), failure = new Error("checkpoint state write failed");
+  const fault = t.mock.method(f.db.db, "prepare", (sql: string) => {
+    if (/UPDATE conversation_presentations SET version = \?, state_json = \?, ready/i.test(sql)) throw failure;
+    return prepare(sql);
+  });
+  await assert.rejects(f.db.conversationEvents.ensurePresentation(f.threadId), error => error === failure);
+  fault.mock.restore();
+  const checkpoint = f.db.db.prepare("SELECT version,ready FROM conversation_presentations WHERE thread_id = ?").get(f.threadId) as { version: number; ready: number };
+  assert.deepEqual(checkpoint, { version: 0, ready: 0 });
+  assert.equal((f.db.db.prepare("SELECT count(*) AS n FROM conversation_presentation_items WHERE thread_id = ?").get(f.threadId) as { n: number }).n, 0);
+  await f.db.conversationEvents.ensurePresentation(f.threadId);
+  assert.equal((f.db.conversationEvents.readProcess(f.threadId, "process:tool").items[0] as any).output, "x".repeat(600));
+  assertFullReducerProjection(f);
+});
+
+test("冷归并合并增量仍保留首次时间戳、replace顺序与删除事实", async t => {
+  const f = fixture(t);
+  f.append("item.agentMessage.delta", { itemId: "answer", delta: "hello" });
+  f.append("item.agentMessage.delta", { itemId: "answer", delta: " world" });
+  f.append("item.tool.outputDelta", { itemId: "tool", toolName: "shell", delta: "discard" });
+  f.append("item.tool.outputDelta", { itemId: "tool", toolName: "shell", delta: "keep", mode: "replace" });
+  f.append("item.tool.outputDelta", { itemId: "tool", toolName: "shell", delta: " end" });
+  f.append("item.reasoning.started", { itemId: "placeholder" });
+  f.append("item.agentMessage.delta", { itemId: "after", delta: "shown" });
+  f.append("item.agentMessage.delta", { itemId: "after", delta: " latest" });
+  f.db.conversationEvents.deleteMessage(f.threadId, "answer");
+  f.append("item.message.deleted", { itemId: "answer" });
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  await f.db.conversationEvents.ensurePresentation(f.threadId);
+  const presentation = f.db.conversationEvents.readPresentation(f.threadId);
+  assert.ok(!presentation.items.some(item => item.id === "answer" as ItemId));
+  const message = presentation.items.find(item => item.id === "after" as ItemId) as any;
+  assert.equal(message.text, "shown latest");
+  assert.equal(message.createdAt, 9);
+  assert.equal((f.db.conversationEvents.readProcess(f.threadId, "process:tool").items[0] as any).output, "keep end");
+  assertFullReducerProjection(f);
+});
+
+test("冷归并不跨增量元数据变化压缩，乱序时间戳仍与逐条归并一致", async t => {
+  const f = fixture(t);
+  f.append("item.agentMessage.delta", { itemId: "answer", engineMessageId: "first", delta: "a" });
+  f.append("item.agentMessage.delta", { itemId: "answer", engineMessageId: "second", delta: "b" });
+  f.append("item.agentMessage.delta", { itemId: "answer", engineMessageId: "second", delta: "c" });
+  f.append("item.agentMessage.delta", { itemId: "timed", engineMessageId: "timed", delta: "d" });
+  f.append("item.agentMessage.delta", { itemId: "timed", engineMessageId: "timed", delta: "e" });
+  const row = f.db.db.prepare("SELECT event_json FROM conversation_events WHERE seq = 7").get() as { event_json: string };
+  const event = { ...JSON.parse(row.event_json), ts: 1 };
+  f.db.db.prepare("UPDATE conversation_events SET event_json = ?, ts = ? WHERE seq = 7").run(JSON.stringify(event), 1);
+  f.db.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  await f.db.conversationEvents.ensurePresentation(f.threadId);
+  assertFullReducerProjection(f);
+  const message = f.db.conversationEvents.readPresentation(f.threadId).items.find(item => item.id === "answer" as ItemId) as any;
+  assert.equal(message.text, "a");
+  assert.equal(message.engineMessageId, "first");
+  assert.equal((f.db.conversationEvents.readPresentation(f.threadId).items.find(item => item.id === "timed" as ItemId) as any).createdAt, 1);
+});
+
 test("慢事件重建按时间让出，不能等满256条才释放事务", async t => {
   const f = fixture(t);
   for (let i = 0; i < 270; i++) f.append("item.reasoning.delta", { itemId: "reason", delta: "x" });

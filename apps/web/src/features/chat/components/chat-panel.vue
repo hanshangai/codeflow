@@ -1649,6 +1649,12 @@ defineExpose({ locateMessage, prepareThreadSwitch });
               <span>正在加载历史...</span>
             </div>
             <a-alert
+              v-else-if="activeThreadId && chat.threadLoadMetaByThreadId[activeThreadId]?.presentationPending"
+              type="info"
+              message="会话历史已打开，正在准备完整索引；较早历史可继续分页读取。"
+              show-icon
+            />
+            <a-alert
               v-if="activeThreadId && chat.threadPresentationErrorByThreadId[activeThreadId]"
               type="error"
               message="会话摘要更新失败"

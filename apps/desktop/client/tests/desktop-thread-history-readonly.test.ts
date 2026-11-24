@@ -42,6 +42,26 @@ for (const method of ["threads.delete", "threads.clear"] as const) for (const fl
   } finally { await writer.close(); }
 });
 
+test("冷投影首次threads.load只回放有界历史并标记后台准备，不等待整库重建", async t => {
+  const f = fixture(t, 700);
+  f.writer.db.prepare("DELETE FROM conversation_presentations WHERE thread_id = ?").run(f.threadId);
+  let ensured = 0;
+  const original = f.db.ensureThreadPresentation;
+  f.db.ensureThreadPresentation = async (...args) => { ensured++; return original(...args); };
+  const startedAt = Date.now();
+  const response = await f.load({ presentation: "lazy", limit: 40 });
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  const body = response.body as any;
+  assert.equal(body.presentationPending, true);
+  assert.equal(body.presentation, undefined);
+  assert.ok(body.events.length > 0 && body.events.length <= 40);
+  assert.ok(Date.now() - startedAt < 3000, "冷建不能成为首次请求的等待条件");
+  assert.equal(ensured, 0, "首次有界读取不能同步初始化或重建完整投影");
+  f.db.ensureThreadPresentation = original;
+  await f.db.ensureThreadPresentation(f.workspaceId, f.threadId);
+  assert.equal(f.db.forWorkspace(f.workspaceId, { readonly: true }).conversationEvents.readPresentation(f.threadId).version, body.latestSeq);
+});
+
 /** 真实 Git/SQLite 夹具只写临时目录，读取经桌面或通用 API 入口。 */
 function fixture(t: test.TestContext, count = 600) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "thread-readonly-"));

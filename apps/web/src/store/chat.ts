@@ -512,10 +512,14 @@ export type ChatState = {
     oldestLoadedSeq: number | null;
     /** 首屏使用消息窗口投影时，更早历史按 presentation 位置游标加载。 */
     presentationPaged?: boolean;
+    /** 冷建期间以canonical首屏启动；后续轻量刷新仍限制窗口但分页游标继续用seq。 */
+    presentationReadLimited?: boolean;
     /** presentation 分页游标：已加载窗口最早消息的位置。 */
     oldestPresentationPosition?: number | null;
     /** 已加载的 presentation 消息窗口大小；实时刷新沿用同一窗口。 */
     presentationLoadedMessages?: number;
+    /** 冷建期间由canonical事件回放；投影后台就绪后仍保留此窗口用于beforeSeq分页。 */
+    presentationPending?: boolean;
     /** 正在加载更多历史（用于 UI 显示加载指示器和防止重复请求）。 */
     loadingMore: boolean;
   }>;
@@ -3288,7 +3292,7 @@ export const useChatStore = defineStore("chat", {
     /** 恢复轻量快照及实时尾部；自动展示读取仅服务仍可见的面板，不阻断终态事件。 */
     async refreshThreadPresentation(
       ctx: ApiRequestContext,
-      body: { workspaceId: WorkspaceId; threadId: ThreadId; version?: number; visibleOnly?: boolean },
+      body: { workspaceId: WorkspaceId; threadId: ThreadId; version?: number; visibleOnly?: boolean; presentationLimit?: number },
     ): Promise<void> {
       const key = String(body.threadId);
       this.requireThreadPresentationVersion(body.threadId, body.version ?? 0);
@@ -3304,8 +3308,9 @@ export const useChatStore = defineStore("chat", {
             const runningHintAtRequest = this.threadRunningHintByThreadId[key];
             const presentationMeta = this.threadLoadMetaByThreadId[key];
             const result = await getThreadPresentation(ctx, { workspaceId: body.workspaceId, threadId: body.threadId,
-              ...(presentationMeta?.presentationPaged
-                ? { presentationLimit: presentationMeta.presentationLoadedMessages ?? PRESENTATION_INITIAL_MESSAGES } : {}) }, { signal });
+              ...(body.presentationLimit != null ? { presentationLimit: body.presentationLimit }
+                : presentationMeta?.presentationPaged || presentationMeta?.presentationReadLimited
+                  ? { presentationLimit: presentationMeta.presentationLoadedMessages ?? PRESENTATION_INITIAL_MESSAGES } : {}) }, { signal });
             if (!result.ok) throw createApiResultError(result);
             assertThreadReadScope(scope, { history: true });
             if (body.visibleOnly && !this.isThreadPresentationVisible(body.workspaceId, body.threadId)) return;
@@ -3333,8 +3338,11 @@ export const useChatStore = defineStore("chat", {
               this.setThreadRunningHint(body.threadId, running);
             }
             reapplyPendingLocalUserMessage(current, this.pendingLocalUserMessageByThreadId[key] ?? null, key, this.pendingLocalUserMessageByThreadId);
-            this.threadReplayEventsByThreadId[key] = tail;
+            // 冷建期间先展示的canonical事件仍是beforeSeq分页基线，不能被投影refresh删掉。
+            this.threadReplayEventsByThreadId[key] = this.threadLoadMetaByThreadId[key]?.presentationPending
+              ? this.threadReplayEventsByThreadId[key] ?? [] : tail;
             this.threadPresentationVersionByThreadId[key] = presentation.version;
+            if (presentationMeta?.presentationPending) presentationMeta.presentationPending = false;
             delete this.threadPresentationErrorByThreadId[key];
           } while ((!body.visibleOnly || this.isThreadPresentationVisible(body.workspaceId, body.threadId))
             && (this.threadPresentationRequiredVersionByThreadId[key] ?? 0) > this.threadPresentationVersionByThreadId[key]);
@@ -3357,6 +3365,7 @@ export const useChatStore = defineStore("chat", {
       const prefsReadBase = copyDefinedThreadPrefs(this.threadPrefsByThreadId[key]);
       const prefsReadPending = copyDefinedThreadPrefs(this.pendingThreadPrefsByThreadId[key]);
       const basePrefsReadBase = copyDefinedThreadPrefs(this.threadBasePrefsByThreadId[key]);
+      let preparePresentationInBackground = false;
       try {
         await runScopedRead<void>("thread-load", key, serializeThreadHistoryScope(scope), async (signal) => {
           const nextLimit = clampInt(body.limit ?? this.threadLoadMetaByThreadId[key]?.limit ?? DEFAULT_THREAD_LOAD_LIMIT, DEFAULT_THREAD_LOAD_LIMIT, 1, MAX_THREAD_LOAD_LIMIT);
@@ -3372,6 +3381,7 @@ export const useChatStore = defineStore("chat", {
             const res = await loadThread(ctx, { workspaceId: body.workspaceId, threadId: body.threadId, limit: nextLimit,
               presentationLimit: PRESENTATION_INITIAL_MESSAGES, presentation: "lazy" }, { signal });
             if (!res.ok) throw new Error(res.message);
+            preparePresentationInBackground = res.presentationPending === true;
             assertThreadReadScope(scope, { history: true });
             if (res.presentation && res.presentation.version < (this.threadPresentationVersionByThreadId[key] ?? 0)) {
               throw new Error("会话快照版本落后于已接受的展示版本，请重试");
@@ -3459,6 +3469,7 @@ export const useChatStore = defineStore("chat", {
                 ? (keepLoadedPresentation ? previousPresentationMeta!.hasMore : Boolean(res.presentation.hasMoreOlder))
                 : Boolean(res.hasMore),
               oldestLoadedSeq: oldestSeq,
+              ...(preparePresentationInBackground ? { presentationPending: true } : {}),
               ...(res.presentation ? { presentationPaged: true,
                 oldestPresentationPosition: keepLoadedPresentation
                   ? previousPresentationMeta!.oldestPresentationPosition ?? null
@@ -3466,6 +3477,7 @@ export const useChatStore = defineStore("chat", {
                 presentationLoadedMessages: keepLoadedPresentation
                   ? previousPresentationMeta!.presentationLoadedMessages ?? PRESENTATION_INITIAL_MESSAGES
                   : PRESENTATION_INITIAL_MESSAGES } : {}),
+              ...(preparePresentationInBackground ? { presentationReadLimited: true } : {}),
               loadingMore: false,
             };
 
@@ -3505,6 +3517,11 @@ export const useChatStore = defineStore("chat", {
                 this.threadLoadMetaByThreadId[key].hasMore = Boolean(res.presentation.hasMoreOlder);
                 this.threadLoadMetaByThreadId[key].oldestPresentationPosition = res.presentation.oldestPosition ?? null;
               }
+            } else if (preparePresentationInBackground) {
+              const version = Math.max(replayed.maxSeq, normalizeSeq(res.latestSeq) ?? 0);
+              this.threadPresentationVersionByThreadId[key] = Math.max(this.threadPresentationVersionByThreadId[key] ?? 0, version);
+              this.requireThreadPresentationVersion(body.threadId, version);
+              delete this.threadPresentationErrorByThreadId[key];
             }
             applyLoadedEngineSessionId(state, res.thread.sessionId);
             reapplyPendingLocalUserMessage(state, this.pendingLocalUserMessageByThreadId[key] ?? null, key, this.pendingLocalUserMessageByThreadId);
@@ -3550,6 +3567,14 @@ export const useChatStore = defineStore("chat", {
             if (this.threadLoadingToken === token) this.threadLoading = null;
           }
         });
+        if (preparePresentationInBackground && isThreadReadScopeCurrent(scope, { history: true })) {
+          /** 有界历史已经展示；现有单航班投影读取在后台准备并更新完整会话。 */
+          void this.refreshThreadPresentation(ctx, { workspaceId: body.workspaceId, threadId: body.threadId,
+            presentationLimit: PRESENTATION_INITIAL_MESSAGES }).catch(error => {
+            console.error("[THREAD_PRESENTATION_BACKGROUND_BUILD_FAILED]", { code: "THREAD_PRESENTATION_BACKGROUND_BUILD_FAILED",
+              workspaceId: body.workspaceId, threadId: body.threadId, cause: error instanceof Error ? error.message : String(error) });
+          });
+        }
       } catch (error) {
         if (isCancelledRequestError(error)) return;
         throw error;
