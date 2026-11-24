@@ -228,7 +228,7 @@ export type KnowledgeGenerationMode = "tree" | "conversation" | "batch" | "revie
 export type KnowledgeGenerationSelection = { nodeId: string; revisionId: string | null };
 export type KnowledgeGenerationPreview = {
   runId: string; tree: KnowledgeAssetTree; treeHash: string | null; planHash: string;
-  items: Array<KnowledgeGenerationSelection & { canApply: boolean; reason: string | null; applied: boolean; dismissed?: boolean }>;
+  items: Array<KnowledgeGenerationSelection & { canApply: boolean; reason: string | null; reasonCode?: string; applied: boolean; dismissed?: boolean }>;
 };
 export type KnowledgeGenerationApplyInput = { requestId: string; treeHash: string | null; planHash: string; selections: KnowledgeGenerationSelection[] };
 /** 原任务中的采用清单先于正式写入保存，用于逐文件恢复。 */
@@ -255,7 +255,7 @@ export type KnowledgeGenerationItem = {
   reviewConfig?: KnowledgeReviewConfig;
   executionThreadId?: string | null;
   maintenanceFingerprint?: string;
-  /** 按报告修订时读取该待修订版本，不能误用另一份已采用正文。 */
+  /** 按报告修订或更新来源时读取确切旧版本，不能误用另一份已采用正文。 */
   repairRevisionId?: string;
   /** 自动复检闭环当前要求生成者处理的报告。 */
   repairReportId?: string;
@@ -299,6 +299,8 @@ export type KnowledgeGenerationRun = {
   concurrency?: number;
   reviewConfig?: KnowledgeReviewConfig;
   repairReports?: Array<{ nodeId: string; reportId: string }>;
+  /** 用户主动更新来源时冻结旧候选身份，不将执行提示当成用户要求。 */
+  sourceRevisions?: Array<{ nodeId: string; revisionId: string }>;
   treeHash: string | null;
   proposedTree: KnowledgeAssetTree | null;
   baseTree?: KnowledgeAssetTree;

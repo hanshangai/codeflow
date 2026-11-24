@@ -141,6 +141,11 @@ export class KnowledgeReviewStore {
     return this.store.files.withReadCache(() => this.readReports(nodeId));
   }
 
+  /** 同一确切版本只使用最新报告，不回退到更早的通过结论。 */
+  latest(nodeId: string, revisionId: string): KnowledgeReviewReportView | null {
+    return this.list(nodeId).find(report => report.revisionId === revisionId) ?? null;
+  }
+
   /** 读取并验证全部报告；损坏或越界文件继续向调用边界显式报错。 */
   private readReports(nodeId: string): KnowledgeReviewReportView[] {
     this.store.node(nodeId);
@@ -302,6 +307,11 @@ export class KnowledgeReviewStore {
   /** 要求变化由版本快照判断，只有文件证据需要重新读取内容指纹。 */
   private freshness(report: KnowledgeReviewReport): { stale: boolean; staleReasons: string[] } {
     const reasons: string[] = [];
+    if (this.store.files.exists(`${this.store.root}/runs/${report.runId}/plan.json`)) {
+      const owner = this.store.readRun(report.runId);
+      const item = owner.items.find(item => item.nodeId === report.nodeId && item.revisionId === report.revisionId);
+      if (!item?.review || item.review.reportId !== report.id || item.review.status === "pending" || item.review.status === "failed" || item.review.error) reasons.push("复检执行未完成，请重试复检");
+    }
     try {
       const target = this.targetRevisionId(report.nodeId);
       if (target !== report.revisionId) reasons.push("知识已有新的当前版本或待采用版本");

@@ -2486,10 +2486,15 @@ async function main(options?: { apiKeyOverride?: unknown }) {
   }
 
   if (desktopLifecycle) {
-    /** 远程控制只接受 Server 已授权的共享 Host envelope，不开放个人 RPC。 */
-    const assertDesktopHostCommand = (message: Extract<ServerToClientMessage, { t: "sharedWorkspace.command" }>): void => {
+    /** 复用现有Host授权范围，不以认证连接本身代替共享工作区授权。 */
+    const isDesktopHostCommandAuthorized = (message: Extract<ServerToClientMessage, { t: "sharedWorkspace.command" }>): boolean => {
       const envelope = message.envelope;
-      if (!desktopHostScopes.some(scope => scope.bindingId === envelope.hostBindingId && scope.workspaceId === envelope.localWorkspaceId && scope.sharedWorkspaceId === envelope.sharedWorkspaceId)) throw new Error("DESKTOP_CLOUD_HOST_SCOPE_REQUIRED");
+      return desktopHostScopes.some(scope => scope.bindingId === envelope.hostBindingId
+        && scope.workspaceId === envelope.localWorkspaceId && scope.sharedWorkspaceId === envelope.sharedWorkspaceId);
+    };
+    /** 远程控制只接受已在本机确认的共享Host范围；等待由原云连接owner统一管理。 */
+    const assertDesktopHostCommand = (message: Extract<ServerToClientMessage, { t: "sharedWorkspace.command" }>): void => {
+      if (!isDesktopHostCommandAuthorized(message)) throw new Error("DESKTOP_CLOUD_HOST_SCOPE_REQUIRED");
     };
     /** 在途事件先本地提交；远程响应及新准入保持原 owner，禁止串入新账号。 */
     const desktopHostContext = (owner: DesktopCloudAccountOwner): ApiHandlerContext => ({
@@ -2517,6 +2522,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
     desktopCloudAccount = createDesktopCloudAccount({
       clientId: config.clientId, deviceId: deviceIdentity.deviceId, clientVersion: selfVersion!, timeoutMs: config.timeoutPolicy.startupTimeoutMs,
       getWorkspaceIds: () => Array.from(workspaces.keys()),
+      isHostCommandAuthorized: isDesktopHostCommandAuthorized,
       onOwnerInvalidated: retireDesktopOwner,
       getCredentialCleanupErrorCode: () => retiredCredentialFailures.length ? "DESKTOP_CREDENTIAL_RELEASE_FAILED" : null,
       onRequestCancelled: context => logger.info("desktop-cloud", "old account request cancelled after owner revocation", { code: "DESKTOP_CLOUD_OWNER_CANCELLED", requestId: desktopRequestId, clientId: config.clientId, ...context }),

@@ -46,6 +46,7 @@ type Attempt = {
   promise: Promise<DesktopCloudAccountState>; resolve(state: DesktopCloudAccountState): void; reject(error: Error): void; settled: boolean;
   controller: AbortController; hostRpcSessionId: string | null;
   operations: Set<{ done: Promise<PromiseSettledResult<unknown>>; release?: () => Promise<void> }>;
+  hostScopeWaiters: Set<() => void>;
 };
 
 /** 只接受完整 HTTP origin，令牌始终留在当前进程内存。 */
@@ -74,6 +75,8 @@ export function createDesktopCloudAccount(input: {
   getCredentialCleanupErrorCode?: () => string | null;
   onLinked?: (owner: DesktopCloudAccountOwner) => Promise<void | { builtInRelayErrorCode: NonNullable<DesktopCloudAccountState["builtInRelayErrorCode"]> }>;
   executeHostTask?: (task: HostRpcHttpTask, owner: DesktopCloudAccountOwner) => Promise<HostRpcHttpResultMessage[]>;
+  /** 沿现有Host范围入口核验；HTTP命令可等待并发到达的WS授权，不另存授权状态。 */
+  isHostCommandAuthorized?: (message: Extract<ServerToClientMessage, { t: "sharedWorkspace.command" }>, owner: DesktopCloudAccountOwner) => boolean;
 }) {
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) throw new Error("DESKTOP_CLOUD_TIMEOUT_INVALID");
   const fence = new ServerMessageHelloReadyFence();
@@ -92,6 +95,28 @@ export function createDesktopCloudAccount(input: {
     if (!current?.owner || state.status !== "linked" || owner.generation !== current.generation
       || owner.serverOrigin !== current.owner.serverOrigin || owner.ownerUserId !== current.owner.ownerUserId
       || owner.accountSessionId !== current.owner.accountSessionId) throw new DesktopCloudOwnerCancelled(owner.generation);
+  };
+  /** 跨传输最多等待五秒；账号撤销立即取消，每次唤醒重验当前绑定。 */
+  const waitForHostScope = async (attempt: Attempt, message: Extract<ServerToClientMessage, { t: "sharedWorkspace.command" }>, owner: DesktopCloudAccountOwner): Promise<void> => {
+    assertOwner(owner);
+    if (!input.isHostCommandAuthorized || input.isHostCommandAuthorized(message, owner)) return;
+    await new Promise<void>((resolve, reject) => {
+      const signal = attempt.controller.signal;
+      /** 移除监听与超时，迟到授权不能重新结算已撤销任务。 */
+      const finish = (error?: unknown): void => {
+        clearTimeout(timer); attempt.hostScopeWaiters.delete(check); signal.removeEventListener("abort", cancel);
+        if (error) reject(error); else resolve();
+      };
+      const cancel = (): void => finish(signal.reason);
+      const check = (): void => {
+        try { assertOwner(owner); if (input.isHostCommandAuthorized!(message, owner)) finish(); }
+        catch (error) { finish(error); }
+      };
+      const timer = setTimeout(() => finish(cloudConnectionError("DESKTOP_CLOUD_HOST_SCOPE_REQUIRED")), Math.min(input.timeoutMs, 5_000));
+      attempt.hostScopeWaiters.add(check); signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel(); else check();
+    });
+    assertOwner(owner);
   };
   /** link 的结算与状态分别管理，迟到的旧连接不能改写当前状态。 */
   const settle = (attempt: Attempt, error?: Error): void => {
@@ -196,8 +221,15 @@ export function createDesktopCloudAccount(input: {
           if (message.capabilities.hostRpcHttpLongPoll) {
             if (!message.capabilities.hostRpcHttpSessionId || !input.executeHostTask) throw cloudConnectionError("DESKTOP_CLOUD_HOST_RPC_UNAVAILABLE");
             attempt.host = new HostRpcHttpTransport({ serverWsUrl: wsUrl, apiKey: attempt.input.sessionToken, clientId: input.clientId,
-              execute: async task => { assertOwner(owner); const result = await input.executeHostTask!(task, owner); assertOwner(owner); return result; },
+              execute: async task => {
+                assertOwner(owner);
+                if (task.message.t === "sharedWorkspace.command") await waitForHostScope(attempt, task.message, owner);
+                const result = await input.executeHostTask!(task, owner); assertOwner(owner); return result;
+              },
               events: {
+                onDiagnostic: (level, message, data) => logger[level]("desktop-cloud-host-rpc", message, {
+                  ...data, clientId: input.clientId, generation: attempt.generation, serverOrigin: attempt.input.serverOrigin,
+                }),
                 /** Host RPC已有脱敏响应元数据进入原云失败owner，不泄露响应正文。 */
                 onFatal: error => {
                   const metadata = (error as Error & { responseMetadata?: { status?: unknown; responseErrorCode?: unknown } }).responseMetadata;
@@ -224,7 +256,10 @@ export function createDesktopCloudAccount(input: {
           settle(attempt); return;
         }
         if (!await fence.waitUntilReady(attempt.fenceGeneration) || current !== attempt || !attempt.owner) return;
-        assertOwner(attempt.owner); await input.onMessage(message, attempt.owner);
+        assertOwner(attempt.owner);
+        if (message.t === "sharedWorkspace.command") await waitForHostScope(attempt, message, attempt.owner);
+        await input.onMessage(message, attempt.owner);
+        if (message.t === "conversation.event.relayScopes") for (const check of [...attempt.hostScopeWaiters]) check();
       },
     } });
     attempt.transport = transport;
@@ -354,7 +389,7 @@ export function createDesktopCloudAccount(input: {
       let resolve!: Attempt["resolve"]; let reject!: Attempt["reject"];
       const promise = new Promise<DesktopCloudAccountState>((yes, no) => { resolve = yes; reject = no; });
       const attempt: Attempt = { input: normalized, generation, owner: null, transport: null, host: null, fenceGeneration: 0, timer: null, promise, resolve, reject, settled: false,
-        controller: new AbortController(), hostRpcSessionId: null, operations: new Set() };
+        controller: new AbortController(), hostRpcSessionId: null, operations: new Set(), hostScopeWaiters: new Set() };
       current = attempt; state = { status: "linking", generation, serverOrigin: normalized.serverOrigin, userSummary: null, errorCode: null };
       if (old) { revoke(old); settle(old, new Error("DESKTOP_CLOUD_LINK_SUPERSEDED")); }
       const previousTransition = transitionTail;

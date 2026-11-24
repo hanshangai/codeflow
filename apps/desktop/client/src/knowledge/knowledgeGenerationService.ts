@@ -121,6 +121,7 @@ export type KnowledgeGenerateInput = {
   concurrency?: number;
   reviewConfig?: KnowledgeReviewConfig;
   repairReports?: Array<{ nodeId: string; reportId: string }>;
+  sourceRevisions?: Array<{ nodeId: string; revisionId: string }>;
   changePaths?: string[];
   maintenance?: boolean;
 };
@@ -152,19 +153,20 @@ export class KnowledgeGenerationService {
     return this.store.files.withReadCache(() => this.readView(id));
   }
 
-  /** 单次详情核验复用相同来源读取，不把检查结果保留到后续请求。 */
+  /** 单次详情核验使用确切版本最新报告；执行中的待检项仍展示其实际阶段。 */
   private readView(id: string): KnowledgeGenerationRunView {
     const run = this.store.readRun(id), activity = activities.get(this.key(id));
     const pendingStart = startReservations.get(this.key(id));
     const active = !!activity || !!pendingStart || this.store.isRunExecuting(id);
     const reports = new KnowledgeReviewStore(this.context(run));
     const items = run.items.map(item => {
-      if (!item.review?.reportId) return item;
+      if (!item.review || !item.revisionId || active && !item.review.reportId) return item;
       const key = `${this.store.files.root}\0${item.nodeId}`;
       try {
-        const report = reports.list(item.nodeId).find(report => report.id === item.review!.reportId);
+        const report = reports.latest(item.nodeId, item.revisionId);
         reviewReadErrors.delete(key);
-        return { ...item, review: { ...item.review, ...(report && !report.stale ? { status: report.outcome } : {}), stale: report?.stale ?? true, staleReasons: report?.staleReasons ?? ["复检报告缺失，请重新复检"] } };
+        if (!report && !item.review.reportId) return item;
+        return { ...item, review: { ...item.review, ...(report ? { reportId: report.id, ...(!report.stale ? { status: report.outcome, error: null } : {}) } : {}), stale: report?.stale ?? true, staleReasons: report?.staleReasons ?? ["复检报告缺失，请重新复检"] } };
       } catch (error) {
         const failure = this.failure(error, run.id);
         if (reviewReadErrors.get(key) !== failure.message) { this.log(error, run.id, item.id, "read_review_status"); reviewReadErrors.set(key, failure.message); }
@@ -228,6 +230,9 @@ export class KnowledgeGenerationService {
     const reviewConfig = this.reviewConfig(input.reviewConfig, { enabled: true, model, effort, ...(input.mode === "build" ? { autoRepair: true, maxRounds: 2 } : {}) });
     if (input.mode === "review" && !reviewConfig.enabled) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "复检任务必须启用复检", 400);
     const repairReports = this.repairReports(input.repairReports);
+    const sourceRevisions = this.sourceRevisions(input.sourceRevisions);
+    if (sourceRevisions.length && (input.mode !== "batch" || input.strategy !== "all" || input.includeDescendants || repairReports.length)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "更新来源须明确选择待更新候选，不能混用目录扩展或报告修订", 400);
+    if (sourceRevisions.length && !reviewConfig.enabled) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "更新来源必须启用复检", 400);
     if (repairReports.length && (input.mode !== "batch" || input.strategy !== "all")) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "按报告修订须选择更新知识", 400);
     const id = `run_${knowledgeHash(knowledgeId(input.requestId)).slice(0, 32)}`;
     const owner = this.assertOwner(ownerThreadId);
@@ -235,7 +240,7 @@ export class KnowledgeGenerationService {
     const changePaths = input.changePaths === undefined ? [] : input.changePaths;
     if (!Array.isArray(changePaths) || changePaths.length > 10000) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "变更路径清单无效", 400);
     const paths = [...new Set(changePaths.map(value => this.store.sourcePath(value)))].sort();
-    const requestHash = knowledgeHash(knowledgeJson({ mode: input.mode, ownerThreadId, prompt, strategy: input.strategy, includeDescendants: input.includeDescendants, selectedNodeIds, engine: input.engine, model, effort, concurrency, reviewConfig, repairReports }));
+    const requestHash = knowledgeHash(knowledgeJson({ mode: input.mode, ownerThreadId, prompt, strategy: input.strategy, includeDescendants: input.includeDescendants, selectedNodeIds, engine: input.engine, model, effort, concurrency, reviewConfig, repairReports, ...(sourceRevisions.length ? { sourceRevisions } : {}) }));
     if (this.store.files.exists(`${this.store.root}/runs/${id}/plan.json`)) {
       const previous = this.view(id);
       if (previous.requestHash ? previous.requestHash !== requestHash : previous.mode !== input.mode || previous.ownerThreadId !== ownerThreadId || previous.prompt !== prompt || previous.strategy !== input.strategy || previous.includeDescendants !== input.includeDescendants || knowledgeJson(previous.selectedNodeIds) !== knowledgeJson(selectedNodeIds) || previous.engine !== input.engine || previous.model !== model || previous.effort !== effort || (previous.concurrency ?? 1) !== concurrency || knowledgeJson(previous.reviewConfig) !== knowledgeJson(reviewConfig) || knowledgeJson(previous.repairReports ?? []) !== knowledgeJson(repairReports)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", "同一生成请求 ID 已用于不同要求");
@@ -252,11 +257,12 @@ export class KnowledgeGenerationService {
       for (const node of input.includeDescendants ? this.store.scope(id, tree) : [this.store.node(id, tree)]) ids.add(node.id);
     }
     const nodes = tree.nodes.filter(n => ids.has(n.id) && n.contentMode !== "directory" && n.contentMode !== "reference" && (input.mode === "review" || this.store.category(n.id, tree) !== "product") && (input.mode === "review" ? this.reviewTarget(n.id) !== null : input.strategy === "all" || this.reviewTarget(n.id) === null));
+    if (sourceRevisions.some(source => !nodes.some(node => node.id === source.nodeId)) || sourceRevisions.length && nodes.length !== sourceRevisions.length) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_SCOPE_INVALID", "更新来源只能处理明确绑定候选的文档");
     if (!nodes.length && input.mode !== "build") throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", input.mode === "review" ? "所选范围没有可复检的文档" : "所选范围没有待生成知识", 400);
     const run: KnowledgeGenerationRun = {
       schemaVersion: 1, id, createdAt: new Date().toISOString(), mode: input.mode, nodeId: null,
       ownerThreadId, selectedNodeIds, includeDescendants: input.includeDescendants, strategy: input.strategy,
-      prompt, engine: input.engine, model, effort, concurrency, reviewConfig, repairReports, requestHash, treeHash: hash, proposedTree: null,
+      prompt, engine: input.engine, model, effort, concurrency, reviewConfig, repairReports, ...(sourceRevisions.length ? { sourceRevisions } : {}), requestHash, treeHash: hash, proposedTree: null,
       rationale: input.mode === "build" ? "已固定构建范围，待检查已有资料并确定需要生成的内容。" : `已固定 ${nodes.length} 个知识，${input.mode === "review" ? "复检已有文档" : input.strategy === "missing" ? "仅补齐空白文档" : "按当前要求处理已有或空白知识"}；新增目录不会自动加入本任务。`,
       gaps: [], items: [], phase: "planned", error: null,
       baseTree: tree,
@@ -355,11 +361,12 @@ export class KnowledgeGenerationService {
         || (!!revisionId && current.tree.nodes.some(node => node.id === nodeId) && this.store.currentRevisionId(nodeId) === revisionId);
       const dismissed = !isApplied && (revisionId ? dismissedRevisions.has(`${nodeId}:${revisionId}`) : !!run.dismissals?.some(receipt => receipt.nodeId === nodeId && receipt.revisionId === null));
       let reason = outdatedStructure ? "知识库已完成归类，此旧结构候选已失效；请不采用后重新构建" : reasons.get(nodeId) ?? null;
+      let reasonCode: string | undefined;
       if (!isApplied && !dismissed && !reason) {
         try { this.validateSelection(run, nodeId, revisionId, tree, false, scoped); }
-        catch (error) { reason = this.failure(error, id).message; this.log(error, id, item?.id ?? nodeId, "preview_validation"); }
+        catch (error) { const failure = this.failure(error, id); reason = failure.message; reasonCode = failure.code; this.log(error, id, item?.id ?? nodeId, "preview_validation"); }
       }
-      return { nodeId, revisionId, applied: isApplied, dismissed, canApply: !isApplied && !dismissed && !reason, reason };
+      return { nodeId, revisionId, applied: isApplied, dismissed, canApply: !isApplied && !dismissed && !reason, reason, ...(reasonCode ? { reasonCode } : {}) };
     });
     const byId = new Map(items.map(item => [item.nodeId, item]));
     // 新目录只承载待处理内容；后代草稿均不采用时，不留下空目录阻塞后续维护。
@@ -379,7 +386,7 @@ export class KnowledgeGenerationService {
     return { runId: id, treeHash: current.hash, tree, planHash, items };
   }
 
-  /** 校验确切交付版本、来源、有效要求和复检，供预览及持锁采用共用。 */
+  /** 采用前重验基线与生成证据；复检不能替换旧来源，同版本结论使用最新报告。 */
   private validateSelection(run: KnowledgeGenerationRun, nodeId: string, revisionId: string | null, tree: KnowledgeAssetTree, recovering = false, scoped = this.store.forRun(run.id, tree)): void {
     const node = this.store.node(nodeId, tree);
     const item = run.items.find(item => item.nodeId === nodeId);
@@ -416,10 +423,18 @@ export class KnowledgeGenerationService {
       const actualScopes = this.store.ancestry(nodeId, tree).map(node => ({ id: node.id, sourceScope: node.sourceScope }));
       if (knowledgeJson(generatedScopes) !== knowledgeJson(actualScopes)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", "来源范围已变化，请重新生成或复检");
     }
-    scoped.parseSources(document.sources, true);
+    try { scoped.parseSources(document.sources, true); }
+    catch (error) {
+      if (error instanceof KnowledgeAssetError && error.code === "KNOWLEDGE_ASSET_SOURCE_CHANGED") {
+        throw new KnowledgeAssetError(error.code, `${error.message}；请更新候选并复检，单独复检不会更新此版本的生成来源`);
+      }
+      throw error;
+    }
     if ((item.reviewConfig ?? run.reviewConfig)?.enabled) {
-      const report = new KnowledgeReviewStore(scoped).list(nodeId).find(report => report.id === item.review?.reportId && report.revisionId === revisionId);
-      if (!report || report.stale || !["passed", "passed_with_warnings"].includes(report.outcome)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", "正文尚未通过有效复检");
+      const report = new KnowledgeReviewStore(scoped).latest(nodeId, revisionId);
+      if (!report) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", "文档尚未复检，请完成复检后采用");
+      if (report.stale) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", `复检已失效：${report.staleReasons.join('；')}；请重新复检`);
+      if (report.outcome === "issues") throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", "最新复检存在阻断问题，请修订后再采用");
     }
   }
 
@@ -858,6 +873,15 @@ export class KnowledgeGenerationService {
     if (new Set(result.map(item => item.nodeId)).size !== result.length) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "同一知识只能选择一份修订报告", 400);
     return result;
   }
+  /** 解析确切旧候选列表；节点去重，文档存在和选区由创建任务入口验证。 */
+  private sourceRevisions(raw: unknown): Array<{ nodeId: string; revisionId: string }> {
+    if (raw === undefined) return [];
+    if (!Array.isArray(raw) || raw.length > 200) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "待更新候选列表无效", 400);
+    const result = raw.map(value => { const item = knowledgeRecord(value); return { nodeId: knowledgeId(item.nodeId), revisionId: knowledgeId(item.revisionId) }; }).sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+    if (new Set(result.map(item => item.nodeId)).size !== result.length) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "每个文件只能更新一个候选版本", 400);
+    return result;
+  }
+
   private reviewTarget(nodeId: string, store = this.store): string | null {
     const detail = store.detail(nodeId);
     return detail.drafts[0]?.id ?? detail.current?.revision.id ?? null;
@@ -973,12 +997,15 @@ export class KnowledgeGenerationService {
       activities.delete(key);
     });
   }
-  /** 冻结逐项执行目标及有效复检策略，产品资料始终只报告问题。 */
+  /** 冻结生成范围和要求；来源更新只继承旧候选可追溯的用户要求及身份。 */
   private makeItems(run: KnowledgeGenerationRun, nodes: KnowledgeAssetNode[], tree: KnowledgeAssetTree): KnowledgeGenerationItem[] {
     return nodes.map(n => {
       const inheritedInstructions = this.store.effectiveInstructions(n.id, tree);
+      const source = run.sourceRevisions?.find(source => source.nodeId === n.id);
+      const requirements = source ? this.store.revisionRequirementTexts(this.store.readRevision(n.id, source.revisionId)) : [];
       return { id: `item_${crypto.randomUUID()}`, nodeId: n.id, title: n.title, expectedHash: this.store.currentHash(n.id), inheritedInstructions,
-        instructions: [inheritedInstructions, run.prompt].filter(Boolean).join("\n\n"), status: run.mode === "review" ? "completed" as const : "pending" as const,
+        instructions: [inheritedInstructions, run.prompt, ...requirements.filter(text => !inheritedInstructions.includes(text) && text !== run.prompt)].filter(Boolean).join("\n\n"), status: run.mode === "review" ? "completed" as const : "pending" as const,
+        ...(source ? { repairRevisionId: source.revisionId } : {}),
         revisionId: run.mode === "review" ? this.reviewTarget(n.id) : null, executionThreadId: null, error: null,
         ...(run.reviewConfig && this.store.category(n.id, tree) === "product" ? { reviewConfig: { ...run.reviewConfig, autoRepair: false } } : {}),
         ...(run.reviewConfig?.enabled ? { review: { status: "pending" as const, reportId: null, round: 0, maxRounds: run.reviewConfig.maxRounds ?? KNOWLEDGE_MAX_REVIEW_ROUNDS, error: null } } : {}) };
@@ -996,11 +1023,11 @@ export class KnowledgeGenerationService {
     }
     if ((item.reviewConfig ?? run.reviewConfig)?.enabled) {
       const reports = new KnowledgeReviewStore(this.context(run));
-      // 旧任务可能把只有 warning 的报告记录成 issues；每次恢复时以项目报告的归一化结论校正任务状态。
-      const report = item.review?.reportId
-        ? reports.list(item.nodeId).find(candidate => candidate.id === item.review!.reportId && candidate.runId === run.id && candidate.revisionId === item.revisionId && !candidate.stale)
-        : reports.list(item.nodeId).find(candidate => candidate.runId === run.id && candidate.revisionId === item.revisionId && !candidate.stale);
-      if (report) item.review = { ...item.review, status: report.outcome, reportId: report.id, round: Math.max(item.review?.round ?? 0, 1), maxRounds: item.review?.maxRounds ?? KNOWLEDGE_MAX_REVIEW_ROUNDS, error: null };
+      // 独立复检与原任务共享确切版本的最新结论，失效报告不能被较早通过覆盖。
+      const latest = item.revisionId ? reports.latest(item.nodeId, item.revisionId) : null;
+      // 新发起的独立复检必须实际执行，不能被其他任务的旧报告直接收口。
+      const report = latest && (run.mode !== "review" || item.review?.reportId || latest.runId === run.id) ? latest : null;
+      if (report && !report.stale) item.review = { ...item.review, status: report.outcome, reportId: report.id, round: Math.max(item.review?.round ?? 0, 1), maxRounds: item.review?.maxRounds ?? KNOWLEDGE_MAX_REVIEW_ROUNDS, error: null, stale: false, staleReasons: [] };
       else if (!item.review || !["issues", "failed"].includes(item.review.status)) item.review = { ...item.review, status: "pending", reportId: null, executionThreadId: null, maxRounds: item.review?.maxRounds ?? KNOWLEDGE_MAX_REVIEW_ROUNDS, error: null, stale: false, staleReasons: [] };
     }
     return item.status === "completed";

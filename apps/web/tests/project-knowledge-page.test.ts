@@ -86,15 +86,6 @@ test("批量生成允许独立选择执行引擎，并在切换时清理模型�
   assert.match(pageSource, /v-if="buildSettingsMode && batchHasGeneration"><span>思考强度/u);
 });
 
-test("复检固定 1 轮并沿用生成模型和自动修订", () => {
-  assert.doesNotMatch(pageSource, /aria-label="最大复检轮次"/u);
-  assert.match(pageSource, /aria-label="发现问题后自动修订"/u);
-  assert.match(pageSource, /maxRounds: 1/u);
-  assert.match(pageSource, /model: batchModel\.value\.model, effort: batchModel\.value\.effort/u);
-  assert.doesNotMatch(pageSource, /batchReviewModelId/u);
-  assert.match(pageSource, /autoRepair: batchReviewAutoRepair\.value/u);
-});
-
 test("知识会话摘要进入主会话列表，页面恢复期间不会把目录状态写成空值", () => {
   assert.match(pageSource, /upsertKnowledgeThreadSummary/u);
   assert.match(pageSource, /hydratingPageState = true/u);

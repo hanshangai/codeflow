@@ -72,7 +72,7 @@ const detail = ref<KnowledgeAssetDetail | null>(null);
 const selectedId = ref<string | null>(null);
 const overviewOpen = ref(true);
 const changeHistoryOpen = ref(false);
-type KnowledgeUpdateTarget = { scopeNodeId: string | null; changeId?: string | null; focusId?: string | null; report?: boolean; recoveryRunId?: string };
+type KnowledgeUpdateTarget = { scopeNodeId: string | null; changeId?: string | null; focusId?: string | null; focusRunId?: string; report?: boolean; recoveryRunId?: string };
 const updatesTarget = shallowRef<KnowledgeUpdateTarget | null>(null);
 const updatesBusy = ref(false);
 const approvalRouteNodeId = ref<string | null>(null);
@@ -111,6 +111,7 @@ const quickGenerateError = ref<string | null>(null);
 type PendingGeneration = { input: KnowledgeAssetInput<"generate">; runId: string | null };
 const pendingBuild = shallowRef<PendingGeneration | null>(null), pendingBatch = shallowRef<PendingGeneration | null>(null);
 const batchRevisionRunId = ref<string | null>(null);
+const batchSourceContext = shallowRef<KnowledgeDocumentContext | null>(null);
 const batchLocked = computed(() => busy.value || batchReviewLoading.value || !buildSettingsMode.value && Boolean(pendingBatch.value));
 const buildSettingsMode = ref(false);
 const pendingBuildIds = ref<string[] | null>(null);
@@ -303,6 +304,8 @@ const visibleTreeCount = computed(() => visibleTreeNodes.value.length);
 const currentUpdatesCount = computed(() => readingNodeId.value ? visibleWorkTree.value.updates.filter(update => update.nodeId === readingNodeId.value).length + (pendingChangeNodes.value.find(item => item.nodeId === readingNodeId.value)?.count ?? 0) : 0);
 const autoPreview = computed(() => Boolean(!editing.value && !documentReadError.value && node.value && node.value.contentMode !== "directory" && !detail.value?.reference && !nodeLoading.value && !detail.value?.current && currentUpdatesCount.value && suppressAutoPreview.value !== readingNodeId.value));
 const showUpdates = computed(() => Boolean(updatesTarget.value) || autoPreview.value);
+/** 自动预览与显式候选共用实际范围，保存首次选择不会被误判为切换范围。 */
+const updatesScopeNodeId = computed(() => updatesTarget.value ? updatesTarget.value.scopeNodeId : readingNodeId.value);
 const fileConversationMode = computed(() => !showProjectConversation.value && Boolean(executionSession.value || showUpdates.value || node.value && node.value.contentMode !== "directory"));
 const documentSession = computed(() => {
   if (showUpdates.value) return updatePreview.value?.runId ? knowledgeDocumentSession(taskList.value, updatePreview.value) : null;
@@ -471,7 +474,8 @@ const batchEffortOptions = computed(() => {
 });
 const batchCatalog = computed(() => engines.byWorkspaceId[workspaceId.value]);
 const batchIncludesProduct = computed(() => batchTargets.value.some(node => ancestors(node)[0]?.category === "product"));
-const batchReviewConfig = computed(() => ({ enabled: batchMode.value === "review" || batchReviewEnabled.value, model: batchModel.value.model, effort: batchModel.value.effort, autoRepair: batchReviewAutoRepair.value && !batchIncludesProduct.value, maxRounds: batchMode.value === "review" && batchReviewAutoRepair.value && !batchIncludesProduct.value ? Math.max(2, batchReviewMaxRounds.value) : batchReviewMaxRounds.value }));
+/** 自动修订至少预留首次检查和修订后再检两次预算，关闭时沿用原检查配置。 */
+const batchReviewConfig = computed(() => ({ enabled: batchMode.value === "review" || batchReviewEnabled.value, model: batchModel.value.model, effort: batchModel.value.effort, autoRepair: batchReviewAutoRepair.value && !batchIncludesProduct.value, maxRounds: batchReviewAutoRepair.value && !batchIncludesProduct.value ? Math.max(2, batchReviewMaxRounds.value) : batchReviewMaxRounds.value }));
 watch([batchModelInfo, batchOpen], () => {
   if (!batchOpen.value || !batchModelInfo.value || !batchEffort.value) return;
   const info = batchModelInfo.value;
@@ -804,7 +808,7 @@ function restorePageState(): KnowledgePageState | null {
       directoryPreviewId: typeof value.directoryPreviewId === "string" ? value.directoryPreviewId : null,
       viewTab, overviewOpen: value.overviewOpen === true, assistantOpen: value.assistantOpen === true,
       selectedChangeId: typeof value.selectedChangeId === "string" ? value.selectedChangeId : null,
-      updatesTarget: target ? { scopeNodeId: typeof target.scopeNodeId === "string" ? target.scopeNodeId : null, changeId: typeof target.changeId === "string" ? target.changeId : null, focusId: typeof target.focusId === "string" ? target.focusId : null, report: target.report === true, recoveryRunId: typeof target.recoveryRunId === "string" ? target.recoveryRunId : undefined }
+      updatesTarget: target ? { scopeNodeId: typeof target.scopeNodeId === "string" ? target.scopeNodeId : null, changeId: typeof target.changeId === "string" ? target.changeId : null, focusId: typeof target.focusId === "string" ? target.focusId : null, focusRunId: typeof target.focusRunId === "string" ? target.focusRunId : undefined, report: target.report === true, recoveryRunId: typeof target.recoveryRunId === "string" ? target.recoveryRunId : undefined }
         : value.updatesOpen === true || value.pageView === "results" || value.pageView === "approvals" ? { scopeNodeId: typeof legacyNode === "string" ? legacyNode : null } : null };
   } catch (error) { reportError(error, "KNOWLEDGE_PAGE_STATE_RESTORE_FAILED"); return null; }
 }
@@ -1139,7 +1143,7 @@ async function rememberUpdateFocus(focusId: string): Promise<void> {
   }
   if (!isCurrent(epoch, scope)) return;
   selectedChangeId.value = null;
-  const next = { ...target, focusId, report: false }; delete next.changeId;
+  const next = { ...target, focusId, report: false }; delete next.changeId; delete next.focusRunId;
   updatesTarget.value = next;
 }
 /** 讨论进度按原会话归属恢复；后台构建进度由独立构建卡展示。 */
@@ -1462,6 +1466,7 @@ async function load(): Promise<void> {
   readController?.abort(); stopPoll(); if (snapshotStatesTimer) clearTimeout(snapshotStatesTimer); snapshotStatesTimer = null; runRequestVersion += 1; pollInFlight = false; nodeEpoch += 1; revisionEpoch += 1; importEpoch += 1;
   snapshot.value = null; snapshotStatesError.value = null; detail.value = null; selectedId.value = null; activeRun.value = null;
   executionSessionEpoch++; executionSession.value = null; executionSessionLoading.value = false; executionSessionError.value = null; hydratedExecutionThreadId.value = null; updatePreview.value = null; showProjectConversation.value = false;
+  batchSourceContext.value = null;
   previewDocument.value = null; previewRevisionId.value = null; documentReadError.value = null; nodeReports.value = []; reportsReadError.value = null; revisionLoading.value = false; reportsLoading.value = false;
   assistantThreadId.value = null; bindingReady.value = false; boundNodeId.value = null; bindingError.value = null;
   conversationLoading.value = false;
@@ -1861,7 +1866,7 @@ async function startBuild(ids: string[] = [], executionOverride?: KnowledgeBuild
     upsertKnowledgeThreadSummary(owner);
     pendingBuild.value = { runId: null, input: { workspaceId: scope, requestId: crypto.randomUUID(), mode: "build", ownerThreadId: owner.threadId,
       selectedNodeIds, includeDescendants: true, strategy: "all", prompt: "", treeHash, engine, ...prefs,
-      reviewConfig: { enabled: true, autoRepair: true, maxRounds: 1, model: prefs.model, effort: prefs.effort } } };
+      reviewConfig: { enabled: true, autoRepair: true, maxRounds: 2, model: prefs.model, effort: prefs.effort } } };
     const started = await startPreparedGeneration(pendingBuild.value, epoch, scope);
     if (!started) return;
     pendingBuild.value = null;
@@ -1920,6 +1925,7 @@ async function disconnectConversation(): Promise<void> {
 /** 全局入口按勾选或全项目初始化，文件入口显式传入范围；确认前不切换会话。 */
 async function openBatch(ids = checkedIds.value.length ? checkedIds.value : snapshot.value?.tree.nodes.filter(n => n.parentId === null && !n.archived).map(n => n.id) ?? [], includeDescendants = true, mode: "batch" | "review" = "batch"): Promise<void> {
   if (updatesBusy.value || executionThreadRunning.value) return;
+  batchSourceContext.value = null;
   batchRevisionRunId.value = null;
   if (pendingBatch.value) {
     const input = pendingBatch.value.input, review = input.reviewConfig as typeof batchReviewConfig.value;
@@ -1930,6 +1936,8 @@ async function openBatch(ids = checkedIds.value.length ? checkedIds.value : snap
     batchReviewEnabled.value = review.enabled;
     batchReviewAutoRepair.value = review.autoRepair ?? true; batchReviewMaxRounds.value = review.maxRounds ?? 1;
     batchRepairReports.value = (input.repairReports as typeof batchRepairReports.value | undefined)?.map(report => ({ ...report })) ?? [];
+    const source = (input.sourceRevisions as Array<{ nodeId: string; revisionId: string }> | undefined)?.[0];
+    if (source) batchSourceContext.value = { ...source, runId: null };
     buildSettingsMode.value = false; batchOpen.value = true;
     return;
   }
@@ -1999,8 +2007,8 @@ async function changeBatchDescendants(include: boolean): Promise<void> {
   if (batchMode.value !== "review" || pendingBatch.value || batchRevisionRunId.value) return;
   await inheritReviewExecution();
 }
-/** 关闭弹框立即撤销读取归属，旧响应不能影响重开的同工作区弹框。 */
-watch(batchOpen, open => { if (!open) { reviewExecutionRequest++; batchReviewLoading.value = false; } }, { flush: "sync" });
+/** 关闭确认框取消准备资格，避免来源更新身份污染下一次任务。 */
+watch(batchOpen, open => { if (!open) { reviewExecutionRequest++; batchReviewLoading.value = false; batchSourceContext.value = null; } }, { flush: "sync" });
 /** 调整原任务尚未完成项的配置，保存时仍使用原任务和冻结选区。 */
 async function reviseBatch(run: KnowledgeGenerationRunView): Promise<void> {
   if (!summaryAdjustable.value || busy.value || updatesBusy.value) return;
@@ -2034,6 +2042,24 @@ function changeBatchEngineEvent(event: Event): void {
 }
 /** 复用现有确认面板，复检范围与所选知识一致。 */
 async function openReview(ids?: string[], includeDescendants = true): Promise<void> { await openBatch(ids, includeDescendants, "review"); }
+/** 以用户正在查看的确切候选更新证据，复用单文件生成确认和自动复检。 */
+async function refreshCandidateSources(context: KnowledgeDocumentContext): Promise<void> {
+  if (!canWrite.value || busy.value || updatesBusy.value || executionThreadRunning.value || pendingBatch.value || !context.runId || !context.revisionId || activelyProcessedNodeIds.value.has(context.nodeId)) return;
+  const scope = workspaceId.value, epoch = scopeEpoch;
+  const owner = taskList.value.find(run => run.id === context.runId);
+  const item = owner?.items.find(item => item.nodeId === context.nodeId && item.revisionId === context.revisionId);
+  try {
+    if (!owner || !item) throw new Error("候选版本已变化，请重新选择需要更新的版本");
+    await openBatch([context.nodeId], false);
+    if (!isCurrent(epoch, scope) || !batchOpen.value) return;
+    const execution = item.executionConfig ?? owner;
+    batchSourceContext.value = { ...context };
+    batchEngine.value = owner.engine; batchModelId.value = execution.model ?? ""; batchEffort.value = execution.effort ?? "";
+    batchReviewEnabled.value = true; batchReviewAutoRepair.value = true; batchReviewMaxRounds.value = 2;
+    batchPrompt.value = "根据最新项目来源更新所选候选，保留仍然正确的内容，只修订受变化影响的部分。新版本复检通过后仍由用户确认采用。";
+    if (!await refreshBatchModels()) return;
+  } catch (error) { if (isCurrent(epoch, scope)) errorText.value = reportError(error, "KNOWLEDGE_SOURCE_REFRESH_PREPARE_FAILED", { ...context }); }
+}
 /** 修订绑定报告版本，活动任务或恢复中的原请求不能被新修订覆盖。 */
 async function repairReport(report: KnowledgeReviewReportView): Promise<void> {
   if (report.stale || !report.issues.length || !canWrite.value || busy.value || updatesBusy.value || threadRunning.value || executionThreadRunning.value || activeRun.value?.active || pendingBatch.value) return;
@@ -2109,6 +2135,7 @@ function normalizeBatchConcurrency(): number | null {
 /** 批量生成和复检后台创建项目会话，启动失败沿原请求重试。 */
 async function submitBatch(): Promise<void> {
   if (!batchTargets.value.length || busy.value || batchReviewLoading.value || !canWrite.value || threadRunning.value) return;
+  if (batchSourceContext.value && !pendingBatch.value && (batchError.value || batchCatalog.value?.loading)) return;
   // 复检只避开正被处理的知识；其他模式仍不允许与活动任务并行。
   const reviewTargetBusy = batchMode.value === "review" && batchTargets.value.some(node => activelyProcessedNodeIds.value.has(node.id));
   if (reviewTargetBusy || (batchMode.value !== "review" && activeRun.value?.active)) {
@@ -2133,7 +2160,7 @@ async function submitBatch(): Promise<void> {
         ...(batchHasGeneration.value ? { prompt: batchPrompt.value, model: batchModel.value.model, effort: batchModel.value.effort } : {}),
         reviewConfig: batchReviewConfig.value }, { method: "POST" }));
     } else {
-      const frozen = { workspaceId: scope, requestId: crypto.randomUUID(), mode: batchMode.value, selectedNodeIds: [...batchSelectedIds.value], includeDescendants: batchIncludeDescendants.value, strategy: batchMode.value === "review" ? "all" : batchStrategy.value, prompt: batchPrompt.value, treeHash: snapshot.value?.treeHash ?? null, concurrency, ...batchModel.value, reviewConfig: { ...batchReviewConfig.value }, ...(batchRepairReports.value.length ? { repairReports: batchRepairReports.value.map(report => ({ ...report })) } : {}) };
+      const frozen = { workspaceId: scope, requestId: crypto.randomUUID(), mode: batchMode.value, selectedNodeIds: [...batchSelectedIds.value], includeDescendants: batchIncludeDescendants.value, strategy: batchMode.value === "review" ? "all" : batchStrategy.value, prompt: batchPrompt.value, treeHash: snapshot.value?.treeHash ?? null, concurrency, ...batchModel.value, reviewConfig: { ...batchReviewConfig.value }, ...(batchRepairReports.value.length ? { repairReports: batchRepairReports.value.map(report => ({ ...report })) } : {}), ...(batchSourceContext.value ? { sourceRevisions: [{ nodeId: batchSourceContext.value.nodeId, revisionId: batchSourceContext.value.revisionId! }] } : {}) };
       const owner = await createTaskConversation(batchEngine.value, frozen.model, frozen.effort, scope);
       if (!isCurrent(epoch, scope)) return;
       pendingBatch.value = { runId: null, input: { ...frozen, ownerThreadId: owner.threadId } };
@@ -2142,7 +2169,13 @@ async function submitBatch(): Promise<void> {
       run = started; pendingBatch.value = null;
     }
     if (!isCurrent(epoch, scope)) return;
+    const sourceContext = batchSourceContext.value;
     receiveRun(run); batchOpen.value = false; batchRevisionRunId.value = null; poll(); await refreshRuns();
+    if (sourceContext && isCurrent(epoch, scope)) {
+      await openUpdateResult(run);
+      if (isCurrent(epoch, scope) && updatesTarget.value) updatesTarget.value = { scopeNodeId: sourceContext.nodeId, focusRunId: run.id };
+      batchSourceContext.value = null;
+    }
     if (isCurrent(epoch, scope)) message.success("任务已开始，完成后可在主页面查看结果");
   } catch (error) { if (isCurrent(epoch, scope)) batchError.value = reportError(error, "KNOWLEDGE_BATCH_START_FAILED"); }
   finally { if (isCurrent(epoch, scope)) busy.value = false; }
@@ -2382,7 +2415,7 @@ watch([readingNodeId, () => updatePreview.value?.runId, () => updatePreview.valu
   if (!requestedThreadId.value) showProjectConversation.value = false;
 }, { flush: "sync" });
 /** 候选范围改变时立即清除旧预览身份，等待子组件报告实际选中的版本。 */
-watch([showUpdates, () => updatesTarget.value?.scopeNodeId, readingNodeId], () => { updatePreview.value = null; }, { flush: "sync" });
+watch([showUpdates, updatesScopeNodeId, readingNodeId], () => { updatePreview.value = null; }, { flush: "sync" });
 watch([() => displayedExecutionSession.value?.threadId, assistantOpen, fileConversationMode], () => { void hydrateExecutionSession(); }, { flush: "sync" });
 watch(() => [route.query.view, route.query.changeId], ([view, changeId], previous) => {
   if (typeof changeId === "string") { selectedChangeId.value = changeId; updatesTarget.value = { scopeNodeId: null, changeId }; }
@@ -2515,7 +2548,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           <section class="reading-document">
         <!-- 采用至结果定位完成前持续加载，保留组件执行请求和失败恢复。 -->
         <div v-if="showUpdates && updatesBusy" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
-        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesTarget?.scopeNodeId ?? (updatesTarget ? null : readingNodeId)" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @stop-run="stopGeneration($event)" @focus="rememberUpdateFocus" @preview="updatePreview = $event" @empty="handleUpdatesEmpty" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
+        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesScopeNodeId" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-run-id="updatesTarget?.focusRunId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @stop-run="stopGeneration($event)" @focus="rememberUpdateFocus" @preview="updatePreview = $event" @empty="handleUpdatesEmpty" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @refresh-sources="refreshCandidateSources" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
         <KnowledgeOverview v-else-if="overviewOpen" :snapshot="snapshot" :runs="taskList" :changes="pendingChangeNodes" :loading="loading || Boolean(snapshot && !snapshotStatesReady && !snapshotStatesError)" :state-error="snapshotStatesError" :run-error="resultsLoadError" :can-write="canWrite" :busy="busy || updatesBusy || buildStarting || binding || conversationLoading || taskList.some(run => run.active)" @improve="openQuickGenerate" @discuss="openSpecificationConversation" @updates="openUpdates(null)" @select="selectTreeNode" @retry="retryOverview" @policy="policyOpen = true" />
         <!-- 尚未确定正式正文或候选预览时保持加载，避免先渲染普通正文页。 -->
         <div v-else-if="documentReadError" class="empty" role="alert"><h3>文档读取失败</h3><p>{{ documentReadError.message }}</p><a-button :disabled="busy || updatesBusy" @click="retryReadDocument">重新读取文档</a-button></div>
@@ -2658,7 +2691,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
     <KnowledgeUpdateSettings v-model:open="updateSettingsOpen" :workspace-id="workspaceId" :context="ctx()" :snapshot="snapshot" :selected-node-ids="checkedIds" :initial-engine="knowledgeModelPrefs.engine" :initial-model="knowledgeModelPrefs.model" :initial-effort="knowledgeModelPrefs.effort" @view-run="openUpdateResult" />
     <a-modal v-model:open="quickGenerateOpen" title="一键生成规格" :width="480" :footer="null" :closable="!quickSubmitting" :mask-closable="!quickSubmitting" :keyboard="!quickSubmitting">
       <div class="quick-generate">
-        <p class="batch-explanation">本次范围：{{ quickScopeLabel }}。生成后自动复检 1 次，其余使用默认配置。</p>
+        <p class="batch-explanation">本次范围：{{ quickScopeLabel }}。生成后自动复检；发现阻断问题时修订一次并再检，通过后由你确认采用。</p>
         <div class="batch-model-fields">
           <label><span>模型</span><select v-model="quickModelKey" aria-label="一键生成模型" :disabled="quickModelLoading || quickSubmitting">
             <option value="">请选择模型</option>
@@ -2675,11 +2708,12 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         </div>
       </div>
     </a-modal>
-    <a-modal v-model:open="batchOpen" :title="buildSettingsMode ? '规格库构建设置' : batchMode === 'review' ? '复检已有文档' : batchRepairReports.length ? '根据报告生成修订版' : '确认批量生成'" :z-index="1100" :closable="!busy && !binding" :mask-closable="!busy && !binding" :keyboard="!busy && !binding" :footer="null" width="min(680px, calc(100vw - 24px))" :style="{ top: '24px' }">
+    <a-modal v-model:open="batchOpen" :title="buildSettingsMode ? '规格库构建设置' : batchSourceContext ? '更新候选并复检' : batchMode === 'review' ? '复检已有文档' : batchRepairReports.length ? '根据报告生成修订版' : '确认批量生成'" :z-index="1100" :closable="!busy && !binding" :mask-closable="!busy && !binding" :keyboard="!busy && !binding" :footer="null" width="min(680px, calc(100vw - 24px))" :style="{ top: '24px' }">
       <div class="batch-scroll" :aria-busy="batchReviewLoading">
       <p v-if="buildSettingsMode" class="batch-explanation">目标项目：{{ workspaceName }}</p>
-      <p class="batch-explanation">{{ buildSettingsMode ? '保存后同步规格对话及后续构建配置；切换引擎会新建会话并保留草稿。已创建任务保留原配置。默认自动复检最多 1 轮，结果统一预览后采用。' : '本次任务在后台执行，无需打开或切换规格会话。' }}</p>
-      <details class="batch-advanced" :open="batchOpen"><summary>{{ batchMode === 'review' && !buildSettingsMode ? '复检设置' : '引擎、模型与复检设置' }}</summary>
+      <p class="batch-explanation">{{ buildSettingsMode ? '保存后同步规格对话及后续构建配置；切换引擎会新建会话并保留草稿。已创建任务保留原配置。默认复检，发现阻断问题时修订一次并再检，结果由你确认采用。' : '本次任务在后台执行，无需打开或切换规格会话。' }}</p>
+      <p v-if="batchSourceContext" class="batch-explanation">只更新当前文件：读取所选候选和最新来源，保留正确内容，提交新版本后自动复检。旧版本保留，新结果仍需你确认采用。</p>
+      <details class="batch-advanced" :open="batchOpen && !batchSourceContext"><summary>{{ batchMode === 'review' && !buildSettingsMode ? '复检设置' : '引擎、模型与复检设置' }}</summary>
       <section v-if="batchMode !== 'review' || buildSettingsMode" class="batch-model-settings" aria-label="本批次引擎配置">
         <div class="batch-model-heading"><strong>执行引擎</strong></div>
         <div class="batch-model-fields">
@@ -2702,28 +2736,28 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       <p v-if="batchMode === 'review' && !buildSettingsMode" class="batch-explanation">复检沿用原生成引擎和模型；原始资料使用项目配置。新结果仍需确认采用。</p>
       <p v-if="batchReviewLoading" class="batch-model-note" role="status">正在读取原生成配置…</p>
       <section v-if="!buildSettingsMode" class="batch-model-settings" aria-label="本批次复检配置">
-        <div class="batch-model-heading"><strong>{{ batchMode === 'review' ? '复检配置' : '生成后复检' }}</strong><a-switch v-if="batchMode === 'batch'" v-model:checked="batchReviewEnabled" aria-label="生成后复检" :disabled="batchLocked" /></div>
-        <label v-if="batchReviewEnabled || batchMode === 'review'" class="review-auto-repair"><span><strong>发现问题后自动修订</strong><small>{{ batchIncludesProduct ? '所选范围含产品文档，本次只复检并报告问题；请修改原始资料。' : batchMode === 'review' ? '开启后，首次复检发现问题会自动修订并再次复检；最多进行 2 次复检，新版本仍需确认采用。' : '生成后复检 1 次，新版本仍需确认采用。' }}</small></span><a-switch :checked="batchReviewAutoRepair && !batchIncludesProduct" aria-label="发现问题后自动修订" :disabled="batchLocked || batchIncludesProduct" @update:checked="batchReviewAutoRepair = $event" /></label>
+        <div class="batch-model-heading"><strong>{{ batchMode === 'review' ? '复检配置' : '生成后复检' }}</strong><a-switch v-if="batchMode === 'batch'" v-model:checked="batchReviewEnabled" aria-label="生成后复检" :disabled="batchLocked || Boolean(batchSourceContext)" /></div>
+        <label v-if="batchReviewEnabled || batchMode === 'review'" class="review-auto-repair"><span><strong>发现问题后自动修订</strong><small>{{ batchIncludesProduct ? '所选范围含产品文档，本次只复检并报告问题；请修改原始资料。' : '开启后，首次复检发现阻断问题时修订一次并再检；仅提醒不触发修订，新版本仍需确认采用。' }}</small></span><a-switch :checked="batchReviewAutoRepair && !batchIncludesProduct" aria-label="发现问题后自动修订" :disabled="batchLocked || batchIncludesProduct" @update:checked="batchReviewAutoRepair = $event" /></label>
         <p class="batch-model-note">{{ batchMode === 'review' ? '在文件工作会话中运行复检子任务，优先检查最新待采用版本，其次为正式文档；空白知识跳过。' : batchReviewEnabled ? '文档生成后保存为待采用版本，在同一工作会话中由子任务独立核对代码与要求；确认后由你采用。' : '本批次跳过复检，生成内容仍可随后单独复检。' }}</p>
         <p v-if="batchMode === 'review' && batchCatalog?.lastError" class="batch-model-note" role="alert">模型列表读取失败：{{ batchCatalog.lastError }} <a-button type="link" size="small" @click="refreshBatchModels">重试</a-button></p>
       </section>
       <div v-if="!buildSettingsMode" class="batch-settings">
         <div class="batch-settings-grid">
-          <label><span>包含所选目录的后代</span><a-switch :checked="batchIncludeDescendants" :disabled="batchLocked" aria-label="包含所选目录的后代" @update:checked="changeBatchDescendants" /></label>
+          <label><span>包含所选目录的后代</span><a-switch :checked="batchIncludeDescendants" :disabled="batchLocked || Boolean(batchSourceContext)" aria-label="包含所选目录的后代" @update:checked="changeBatchDescendants" /></label>
           <label><span>同时处理知识</span><input v-model.number="batchConcurrency" type="number" min="1" :max="MAX_BATCH_CONCURRENCY" step="1" inputmode="numeric" aria-label="批次并发数" :disabled="batchLocked" @change="normalizeBatchConcurrency" /></label>
         </div>
-        <a-radio-group v-if="batchMode === 'batch' && !batchRepairReports.length" v-model:value="batchStrategy" :disabled="batchLocked"><a-radio value="all">按要求处理选中知识</a-radio><a-radio value="missing">只补齐空白</a-radio></a-radio-group>
+        <a-radio-group v-if="batchMode === 'batch' && !batchRepairReports.length && !batchSourceContext" v-model:value="batchStrategy" :disabled="batchLocked"><a-radio value="all">按要求处理选中知识</a-radio><a-radio value="missing">只补齐空白</a-radio></a-radio-group>
       </div>
       </details>
       <h3 v-if="!buildSettingsMode" class="batch-section-title">本次范围 · {{ batchTargets.length }} 项</h3>
       <div v-if="!buildSettingsMode" class="batch-preview">
         <div v-for="item in batchTargets" :key="item.id">{{ pathTitle(item) }}</div>
       </div>
-      <a-textarea v-if="!buildSettingsMode && !(batchRevisionRunId && batchMode === 'review')" v-model:value="batchPrompt" :disabled="batchLocked" :rows="3" :placeholder="batchMode === 'review' ? '本次复检重点；自动对照项目和目录要求' : '告诉 AI 目标即可：已有知识会修改补充，没有知识会生成；目录调整会先形成计划'" aria-label="批量生成要求" />
-      <p v-if="batchError" class="page-error" role="alert">{{ batchError }}</p>
+      <a-textarea v-if="!buildSettingsMode && !batchSourceContext && !(batchRevisionRunId && batchMode === 'review')" v-model:value="batchPrompt" :disabled="batchLocked" :rows="3" :placeholder="batchMode === 'review' ? '本次复检重点；自动对照项目和目录要求' : '告诉 AI 目标即可：已有知识会修改补充，没有知识会生成；目录调整会先形成计划'" aria-label="批量生成要求" />
+      <p v-if="batchError" class="page-error" role="alert">{{ batchError }}<a-button v-if="batchSourceContext && !pendingBatch" type="link" size="small" @click="refreshBatchModels">重新读取模型</a-button></p>
       <p v-if="pendingBatch" class="batch-model-note">重试沿用原请求；需要调整时可放弃本次恢复，已有任务与产物保留在任务记录中。<a-button size="small" :disabled="busy" @click="resetPendingGeneration('batch')">重新配置</a-button></p>
       </div>
-      <div class="batch-submit"><a-button :disabled="busy || binding" @click="batchOpen = false">取消</a-button><a-button v-if="buildSettingsMode" type="primary" :loading="binding" :disabled="modelSettingsBlocked || batchCatalog?.loading" @click="saveBuildSettings">{{ pendingBuildIds ? '保存并开始生成' : '保存构建设置' }}</a-button><a-button v-else type="primary" :loading="busy" :disabled="!batchTargets.length || !canWrite || threadRunning || (batchMode !== 'review' && Boolean(activeRun?.active)) || batchCatalog?.loading || batchReviewLoading || (batchMode === 'review' && Boolean(batchError))" @click="submitBatch">{{ pendingBatch ? '重试原任务' : batchMode === 'review' ? '开始复检' : batchRepairReports.length ? '开始生成修订版' : '开始生成' }}</a-button></div>
+      <div class="batch-submit"><a-button :disabled="busy || binding" @click="batchOpen = false">取消</a-button><a-button v-if="buildSettingsMode" type="primary" :loading="binding" :disabled="modelSettingsBlocked || batchCatalog?.loading" @click="saveBuildSettings">{{ pendingBuildIds ? '保存并开始生成' : '保存构建设置' }}</a-button><a-button v-else type="primary" :loading="busy" :disabled="!batchTargets.length || !canWrite || threadRunning || (batchMode !== 'review' && Boolean(activeRun?.active)) || batchCatalog?.loading || batchReviewLoading || (batchMode === 'review' || batchSourceContext && !pendingBatch) && Boolean(batchError)" @click="submitBatch">{{ pendingBatch ? '重试原任务' : batchSourceContext ? '更新候选并复检' : batchMode === 'review' ? '开始复检' : batchRepairReports.length ? '开始生成修订版' : '开始生成' }}</a-button></div>
     </a-modal>
 
     <a-modal v-model:open="changeHistoryOpen" title="修改建议记录" width="min(1100px, calc(100vw - 24px))" :style="{ top: '24px' }" :body-style="{ height: 'min(680px, calc(100dvh - 180px))', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }"><p class="batch-explanation">查看会话提出的修改、审批结果和历史依据，按状态筛选后核对具体差异。</p>

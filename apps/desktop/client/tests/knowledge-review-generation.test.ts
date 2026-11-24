@@ -95,6 +95,153 @@ async function review(input: KnowledgeGenerationEngineInput, outcome: "passed" |
   return accepted<{ reportId: string }>(input, "knowledge.review.submit", reportInput(source, outcome));
 }
 
+for (const outcome of ["passed_with_warnings", "issues"] as const) test(`同版本独立最新报告统一原任务展示和采用，不沿用旧通过：${outcome}`, async t => {
+  const { service, begin, store, reviews, source } = fixture(t, async input => {
+    input.onThreadCreated(`thread-${crypto.randomUUID()}`);
+    if (input.purpose === "review") await review(input);
+    else await generate(input);
+  });
+  const run = begin(); service.start(run.id);
+  const finished = await settled(service, run.id), revisionId = finished.items[0]!.revisionId!;
+  const previous = reviews.list("permissions")[0]!;
+  store.files.write(`${store.root}/assets/permissions/reviews/${previous.id}.json`, JSON.stringify({ ...previous, createdAt: "2020-01-01T00:00:00.000Z" }));
+  const latest = reviews.save(reviews.snapshot("permissions", revisionId), {
+    runId: "independent-review", engine: "codex", model: "gpt-5.6-sol", effort: "xhigh", outcome,
+    summary: "独立复检的最新结论", sources: [source], issues: [{ ...issue(source), severity: outcome === "issues" ? "error" : "warning" }],
+  });
+  const visible = service.view(run.id);
+  assert.equal(visible.items[0]!.review?.reportId, latest.id);
+  assert.equal(visible.items[0]!.review?.status, outcome);
+  const preview = service.preview(run.id);
+  assert.equal(preview.items[0]!.canApply, outcome !== "issues");
+  const apply = () => service.apply(run.id, { requestId: crypto.randomUUID(), treeHash: preview.treeHash, planHash: preview.planHash, selections: [{ nodeId: "permissions", revisionId }] });
+  if (outcome === "issues") { assert.throws(apply, /复检|阻断/); assert.equal(store.detail("permissions").current, null); }
+  else { apply(); assert.equal(store.detail("permissions").current?.revision.id, revisionId); }
+});
+
+test("来源变化后复检通过仍明确要求更新候选，新候选自动复检后可以采用", async t => {
+  const { service, begin, store, root } = fixture(t, async input => {
+    input.onThreadCreated(`thread-${crypto.randomUUID()}`);
+    if (input.purpose === "review") await review(input);
+    else await generate(input);
+  });
+  const original = begin(); service.start(original.id);
+  const first = await settled(service, original.id), oldRevision = first.items[0]!.revisionId!;
+  fs.appendFileSync(path.join(root, "src/permissions.ts"), "// 仅新增说明，权限行为不变\n", "utf8");
+  const recheck = begin({ mode: "review" }); service.start(recheck.id);
+  assert.equal((await settled(service, recheck.id)).items[0]!.review?.status, "passed");
+  const blocked = service.preview(original.id).items[0]!;
+  assert.equal(blocked.canApply, false);
+  assert.equal((blocked as typeof blocked & { reasonCode?: string }).reasonCode, "KNOWLEDGE_ASSET_SOURCE_CHANGED");
+  assert.match(blocked.reason!, /更新候选/);
+  const updated = begin({ strategy: "all", prompt: `更新来源并复检，以候选 ${oldRevision} 为基础保留正确正文。` });
+  service.start(updated.id);
+  const result = await settled(service, updated.id), revisionId = result.items[0]!.revisionId!;
+  assert.notEqual(revisionId, oldRevision);
+  assert.equal(result.items[0]!.review?.status, "passed");
+  const preview = service.preview(updated.id);
+  assert.equal(preview.items[0]!.canApply, true);
+  service.apply(updated.id, { requestId: crypto.randomUUID(), treeHash: preview.treeHash, planHash: preview.planHash, selections: [{ nodeId: "permissions", revisionId }] });
+  assert.equal(store.detail("permissions").current?.revision.id, revisionId);
+  assert.equal(store.readRevision("permissions", oldRevision).sources[0]!.contentHash === store.readSource("src/permissions.ts").contentHash, false, "旧版本来源不可被静默改写");
+});
+
+test("通过后预览与采用之间来源再变，采用显式失败且不切换正式正文", async t => {
+  const { service, begin, store, root } = fixture(t, async input => {
+    input.onThreadCreated(`thread-${crypto.randomUUID()}`);
+    if (input.purpose === "review") await review(input);
+    else await generate(input);
+  });
+  const run = begin(); service.start(run.id);
+  const result = await settled(service, run.id), preview = service.preview(run.id);
+  assert.equal(preview.items[0]!.canApply, true);
+  fs.appendFileSync(path.join(root, "src/permissions.ts"), "// adopted evidence changed\n", "utf8");
+  assert.throws(() => service.apply(run.id, { requestId: crypto.randomUUID(), treeHash: preview.treeHash, planHash: preview.planHash,
+    selections: [{ nodeId: "permissions", revisionId: result.items[0]!.revisionId }] }), /来源|预览/);
+  assert.equal(store.detail("permissions").current, null);
+});
+
+test("独立复检提交报告后尚未收尾或最终失败，原候选不能提前采用", async t => {
+  let hold = false, reviewCalls = 0;
+  const submitted = deferred(), release = deferred();
+  const { service, begin, store, reviews } = fixture(t, async input => {
+    input.onThreadCreated(`thread-${crypto.randomUUID()}`);
+    if (input.purpose !== "review") { await generate(input); return; }
+    reviewCalls++;
+    await review(input);
+    if (hold) { submitted.resolve(); await release.promise; throw new Error("独立复检收尾失败"); }
+  });
+  const original = begin(); service.start(original.id);
+  await settled(service, original.id);
+  hold = true;
+  const checking = begin({ mode: "review" }); service.start(checking.id);
+  try {
+    await waitUntil(() => service.view(checking.id).items[0]?.review?.status === "pending" && reviews.list("permissions").some(report => report.runId === checking.id), "独立复检应实际执行并提交报告，不能复用旧通过结果跳过");
+    await submitted.promise;
+    assert.equal(service.view(checking.id).active, true);
+    assert.equal(reviews.list("permissions").find(report => report.runId === checking.id)?.stale, true);
+    const preview = service.preview(original.id);
+    assert.equal(preview.items[0]!.canApply, false);
+    assert.throws(() => service.apply(original.id, { requestId: crypto.randomUUID(), treeHash: preview.treeHash, planHash: preview.planHash,
+      selections: [{ nodeId: "permissions", revisionId: preview.items[0]!.revisionId }] }), /复检/);
+  } finally { release.resolve(); }
+  await settled(service, checking.id);
+  assert.equal(service.preview(original.id).items[0]!.canApply, false);
+  assert.equal(store.detail("permissions").current, null);
+  hold = false;
+  service.start(checking.id, { retryFailed: true });
+  assert.equal((await settled(service, checking.id)).items[0]!.review?.status, "passed");
+  assert.equal(reviewCalls, 3, "显式重试必须再次执行复检，不得复活未完成报告");
+  assert.equal(service.preview(original.id).items[0]!.canApply, true);
+});
+
+test("来源更新绑定确切旧候选，继承真实用户要求而不复制系统修订说明", async t => {
+  let generated = 0, sourceRevision: string | null = null;
+  const { service, begin, store, root } = fixture(t, async input => {
+    input.onThreadCreated(`thread-${crypto.randomUUID()}`);
+    if (input.purpose === "review") { await review(input, generated === 1 ? "issues" : "passed"); return; }
+    generated++;
+    if (sourceRevision) {
+      assert.ok(input.prompt.includes(`knowledge.revision.read 读取待修订版本 ${sourceRevision}`));
+      assert.ok(input.prompt.includes("保留用户指定的角色边界"));
+    }
+    const repair = /按复检报告 ([a-zA-Z0-9_-]+)/.exec(input.prompt);
+    if (repair) await accepted(input, "knowledge.review.report.read", { nodeId: "permissions", reportId: repair[1], offset: 0 });
+    await generate(input);
+  });
+  const tree = store.readTree();
+  store.saveTree({ schemaVersion: 3, instructions: tree.tree.instructions, nodes: [...knowledgeCategoryNodes(), { ...tree.tree.nodes[0]!, parentId: "knowledge-specifications" }] }, tree.hash);
+  const original = begin({ prompt: "保留用户指定的角色边界", reviewConfig: { enabled: true, model: null, effort: null, autoRepair: true, maxRounds: 2 } });
+  service.start(original.id);
+  const first = await settled(service, original.id);
+  assert.equal(first.phase, "completed", JSON.stringify(first.items));
+  assert.equal(generated, 2, JSON.stringify(first.items));
+  sourceRevision = first.items[0]!.revisionId!;
+  assert.ok(store.readRevision("permissions", sourceRevision).revision.instructions.includes("按复检报告"));
+  fs.appendFileSync(path.join(root, "src/permissions.ts"), "// 角色行为不变\n", "utf8");
+  const updated = begin({ strategy: "all", prompt: "更新当前候选的来源，保留正确内容", ...{ sourceRevisions: [{ nodeId: "permissions", revisionId: sourceRevision }] } });
+  service.start(updated.id);
+  const finished = await settled(service, updated.id);
+  assert.equal(finished.phase, "completed", JSON.stringify(finished.items[0]!.error));
+  const texts = store.revisionRequirementTexts(store.readRevision("permissions", finished.items[0]!.revisionId!)).join("\n");
+  assert.ok(texts.includes("保留用户指定的角色边界"));
+  assert.ok(!texts.includes("按复检报告"));
+  assert.ok(!texts.includes("knowledge.revision.read"));
+  assert.equal(generated, 3);
+});
+
+test("更新来源拒绝越界候选、重复节点和关闭复检，不产生新任务", t => {
+  const { begin, store } = fixture(t, async () => { throw new Error("非法输入不应启动引擎"); });
+  const revision = store.saveDocument({ nodeId: "permissions", content: "权限正文", sources: [], expectedHash: null, origin: "manual" });
+  const before = store.listRuns().length;
+  const sources = [{ nodeId: "permissions", revisionId: revision.id }];
+  assert.throws(() => begin({ strategy: "all", sourceRevisions: sources, reviewConfig: { enabled: false, model: null, effort: null } }), /复检/);
+  assert.throws(() => begin({ strategy: "all", sourceRevisions: [...sources, ...sources] }), /每个文件/);
+  assert.throws(() => begin({ strategy: "all", sourceRevisions: [{ nodeId: "outside", revisionId: revision.id }] }), /绑定候选/);
+  assert.throws(() => begin({ strategy: "all", sourceRevisions: [{ nodeId: "permissions", revisionId: "missing" }] }), /不存在|无法读取|ENOENT/);
+  assert.equal(store.listRuns().length, before);
+});
+
 test("单独复检可从AGENTS候选来源之外补读代码和文档", async t => {
   const { root, store, service, begin, reviews } = fixture(t, async input => {
     if (input.purpose !== "review") { await generate(input); return; }

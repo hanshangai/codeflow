@@ -57,6 +57,8 @@ async function fixture(t: test.TestContext) {
   let credentialCleanupFailed = false;
   let linkedHandler: ((owner: any) => Promise<any>) | undefined;
   let handler: ((message: any, owner: any) => Promise<void>) | undefined;
+  let hostHandler: ((task: any, owner: any) => Promise<any[]>) | undefined;
+  let hostAuthorized: ((message: any) => boolean) | undefined;
   const runtime = createDesktopCloudAccount({ clientId: "local-device", deviceId: "device-id", clientVersion: "1.0.0", timeoutMs: 500, getWorkspaceIds: () => [],
     onHello: async () => {}, onMessage: async (message, owner) => { delivered.push({ message, owner }); await handler?.(message, owner); },
     onOwnerInvalidated: owner => { invalidated.push(owner); },
@@ -64,7 +66,8 @@ async function fixture(t: test.TestContext) {
     onFailure(error, context) { failures.push(error); failureReports.push({ error, context }); },
     getCredentialCleanupErrorCode: () => credentialCleanupFailed ? "DESKTOP_CREDENTIAL_RELEASE_FAILED" : null,
     onLinked: async owner => await linkedHandler?.(owner),
-    executeHostTask: async () => [],
+    isHostCommandAuthorized: message => hostAuthorized?.(message) ?? true,
+    executeHostTask: async (task, owner) => await hostHandler?.(task, owner) ?? [],
   });
   t.after(async () => {
     try {
@@ -95,6 +98,8 @@ async function fixture(t: test.TestContext) {
   const ack = (socket: WebSocket, id: string, hostRpc = false) => socket.send(JSON.stringify({ t: "client.helloAck", keyHash: `key-${id}`, serverNow: Date.now(), userSummary: user(id), accountSessionId: `session-${id}`, capabilities: { desktopLocalRuntimeV1: true,
     ...(hostRpc ? { hostRpcHttpLongPoll: true, hostRpcHttpSessionId: "host-session" } : {}) } }));
   return { runtime, origin, hellos, delivered, failures, failureReports, httpRequests, invalidated, waitHello, ack, setHandler(value: typeof handler) { handler = value; },
+    /** 精确控制当前scope授权及真实HTTP任务执行边界。 */
+    setHostHandler(check: NonNullable<typeof hostAuthorized>, execute: NonNullable<typeof hostHandler>) { hostAuthorized = check; hostHandler = execute; },
     /** 仅在此隔离服务控制真实 HTTP 正文和完成顺序。 */
     setHttpHandler(value: typeof httpHandler) { httpHandler = value; },
     /** 控制真实 hello 后自动 Key 的完成顺序及显式结果。 */
@@ -109,6 +114,80 @@ async function fixture(t: test.TestContext) {
     setMalformedHttpBody(status: number, rawBody: string) { httpFailure = { status, rawBody }; },
   };
 }
+
+test("HTTP共享回填先到时等待WS当前授权，授权应用完成前不执行且保持云连接", { timeout: 3_000 }, async t => {
+  const f = await fixture(t);
+  let authorized = false, executed = 0, polls = 0, entered!: () => void, applied!: () => void;
+  const checked = new Promise<void>(resolve => { entered = resolve; });
+  const applying = new Promise<void>(resolve => { applied = resolve; });
+  const envelope = { hostBindingId: "binding", hostScopeEpoch: 7, localWorkspaceId: "workspace", sharedWorkspaceId: "shared",
+    routeEventId: "route", operationId: "operation", operationKey: "context.list" };
+  f.setHostHandler(() => { entered(); return authorized; }, async () => {
+    executed++; return [{ t: "sharedWorkspace.route.result", message: { routeEventId: "route", operationId: "operation", status: "succeeded", completedAt: Date.now(), result: {} } }];
+  });
+  let posted!: () => void;
+  const resultPosted = new Promise<void>(resolve => { posted = resolve; });
+  f.setHttpHandler((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.method === "POST") { req.resume(); res.end('{}'); posted(); return; }
+    if (++polls === 1) res.end(JSON.stringify({ operationId: "http-operation", message: { t: "sharedWorkspace.command", envelope } }));
+    else { res.writeHead(204); res.end(); }
+  });
+  f.setHandler(async message => { if (message.t === "conversation.event.relayScopes") { await applying; authorized = true; } });
+  const pending = f.runtime.link({ serverOrigin: f.origin, sessionToken: "token-A" });
+  const socket = await f.waitHello("token-A"); f.ack(socket, "A", true); await pending;
+  await Promise.race([checked, resultPosted]);
+  assert.equal(executed, 0); assert.equal(f.runtime.snapshot().status, "linked");
+  socket.send(JSON.stringify({ t: "conversation.event.relayScopes", scopes: [] }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(executed, 0);
+  applied(); await resultPosted;
+  assert.equal(executed, 1); assert.deepEqual(f.failures, []); assert.equal(f.runtime.snapshot().status, "linked");
+});
+
+test("WS共享命令等待授权期间退出账号，迟到范围不能执行旧命令", { timeout: 3_000 }, async t => {
+  const f = await fixture(t);
+  let checked!: () => void, authorized = false;
+  const waiting = new Promise<void>(resolve => { checked = resolve; });
+  f.setHostHandler(() => { checked(); return authorized; }, async () => []);
+  const pending = f.runtime.link({ serverOrigin: f.origin, sessionToken: "token-A" });
+  const socket = await f.waitHello("token-A"); f.ack(socket, "A"); await pending;
+  socket.send(JSON.stringify({ t: "sharedWorkspace.command", envelope: { hostBindingId: "old", localWorkspaceId: "workspace" } }));
+  await waiting;
+  await f.runtime.unlink(); authorized = true;
+  assert.equal(f.delivered.some(value => value.message.t === "sharedWorkspace.command"), false);
+  assert.equal(f.runtime.snapshot().status, "unlinked");
+});
+
+test("HTTP共享命令等待授权期间退出不污染排空，旧命令不执行不提交", { timeout: 3_000 }, async t => {
+  const f = await fixture(t);
+  let checked!: () => void, polls = 0, executed = 0, posts = 0;
+  const waiting = new Promise<void>(resolve => { checked = resolve; });
+  f.setHostHandler(() => { checked(); return false; }, async () => { executed++; return []; });
+  f.setHttpHandler((req, res) => {
+    if (req.method === "POST") { posts++; req.resume(); res.end('{}'); return; }
+    if (++polls === 1) res.end(JSON.stringify({ operationId: "cancelled-http", message: { t: "sharedWorkspace.command", envelope: { hostBindingId: "old", localWorkspaceId: "workspace" } } }));
+    else { res.writeHead(204); res.end(); }
+  });
+  const pending = f.runtime.link({ serverOrigin: f.origin, sessionToken: "token-A" });
+  const socket = await f.waitHello("token-A"); f.ack(socket, "A", true); await pending; await waiting;
+  await f.runtime.unlink();
+  assert.equal(executed, 0); assert.equal(posts, 0); assert.equal(f.runtime.snapshot().status, "unlinked");
+});
+
+test("共享范围从未确认时有界失败，不执行命令或返回成功", { timeout: 3_000 }, async t => {
+  const f = await fixture(t);
+  f.setHostHandler(() => false, async () => { assert.fail("未授权不得执行"); });
+  const pending = f.runtime.link({ serverOrigin: f.origin, sessionToken: "token-A" });
+  const socket = await f.waitHello("token-A"); f.ack(socket, "A"); await pending;
+  socket.send(JSON.stringify({ t: "sharedWorkspace.command", envelope: { hostBindingId: "missing", localWorkspaceId: "workspace" } }));
+  const deadline = Date.now() + 2_000;
+  while (!f.failures.length) { assert.ok(Date.now() < deadline); await new Promise(resolve => setTimeout(resolve, 5)); }
+  assert.equal(f.runtime.snapshot().status, "failed");
+  assert.equal((f.failures[0] as Error & { code: string }).code, "DESKTOP_CLOUD_HOST_SCOPE_REQUIRED");
+  assert.equal(f.delivered.some(value => value.message.t === "sharedWorkspace.command"), false);
+  f.expectFailedDrain();
+});
 
 test("桌面归因仅在显式调用时上传，旧账号 transport 不能借用新会话", async t => {
   const f = await fixture(t);

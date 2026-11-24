@@ -2,12 +2,12 @@
 import type { KnowledgeReviewIssue, KnowledgeReviewReportView } from "@codeflowai/shared";
 import { computed, ref } from "vue";
 
-const props = withDefaults(defineProps<{ reports: KnowledgeReviewReportView[]; loading: boolean; busy: boolean; restartBusy?: boolean; canWrite: boolean; canStartTask?: boolean; canReviewVersion?: boolean; canRepair?: boolean; pending?: boolean; failure?: string | null; generationThreadId?: string | null; generationTitle?: string | null }>(), { canStartTask: true, canReviewVersion: true, canRepair: true });
-const emit = defineEmits<{ review: []; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView] }>();
+const props = withDefaults(defineProps<{ reports: KnowledgeReviewReportView[]; loading: boolean; busy: boolean; restartBusy?: boolean; canWrite: boolean; canStartTask?: boolean; canReviewVersion?: boolean; canRepair?: boolean; sourceRefreshRequired?: boolean; pending?: boolean; failure?: string | null; generationThreadId?: string | null; generationTitle?: string | null }>(), { canStartTask: true, canReviewVersion: true, canRepair: true });
+const emit = defineEmits<{ review: []; refreshSources: []; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView] }>();
 /** 重新复检只看文档是否被占用；其他操作仍以 busy 为准。 */
 const restartDisabled = computed(() => props.restartBusy ?? props.busy);
 const selectedReportId = ref("");
-const ordered = computed(() => [...props.reports].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+const ordered = computed(() => [...props.reports].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)));
 const report = computed(() => ordered.value.find(item => item.id === selectedReportId.value) ?? ordered.value[0] ?? null);
 /** 就近解释一键修复的现有禁用条件，旧报告只用于查阅。 */
 const issueRepairDisabledReason = computed(() => !props.canWrite ? "需要维护权限才能修复" : report.value?.stale
@@ -24,14 +24,15 @@ const category = { factual: "事实不符", coverage: "覆盖缺失", unsupporte
     <header class="review-heading">
       <div><h3>复检报告</h3><span :title="report ? `${report.engine} / ${report.model || '引擎默认'} · ${report.effort || '默认思考强度'} · ${report.createdAt.replace('T', ' ').slice(0, 19)}` : undefined" :class="['review-status', { passed: (report?.outcome === 'passed' || report?.outcome === 'passed_with_warnings') && !report.stale, issues: report?.outcome === 'issues' || report?.stale }]">{{ status }}</span></div>
       <select v-if="ordered.length > 1" v-model="selectedReportId" aria-label="选择复检记录"><option v-for="item in ordered" :key="item.id" :value="item.id">{{ item.createdAt.replace('T', ' ').slice(0, 19) }} · {{ item.stale ? '已失效' : item.outcome === 'passed' ? '通过' : item.outcome === 'passed_with_warnings' ? '通过（有提醒）' : '发现问题' }}</option></select>
-      <a-button v-if="canStartTask" size="small" :disabled="!canWrite || restartDisabled || pending || !canReviewVersion" @click="emit('review')">{{ report ? '重新复检' : '复检这份文档' }}</a-button>
+      <a-button v-if="canStartTask && sourceRefreshRequired" size="small" :disabled="!canWrite || restartDisabled" @click="emit('refreshSources')">更新候选并复检</a-button>
+      <a-button v-else-if="canStartTask" size="small" :disabled="!canWrite || restartDisabled || pending || !canReviewVersion" @click="emit('review')">{{ report ? '重新复检' : '复检这份文档' }}</a-button>
     </header>
     <a-spin v-if="loading" />
     <p v-else-if="!report" class="review-note">{{ failure || (pending ? '文档已保存，等待复检；继续任务会从复检阶段接着处理。' : '复检会对照项目证据检查事实、覆盖范围与内容一致性。') }}</p>
     <a-alert v-if="report && failure" type="error" show-icon :message="failure" />
     <p v-if="canStartTask && !canReviewVersion" class="review-note">已有更新的待采用版本。请在待确认更新中选择最新版本复检；当前报告仅对应正在查看的版本。</p>
     <template v-if="report">
-      <p v-if="report.stale" class="review-stale" role="status">文档、生成要求或来源已经变化，已停用一键修复，避免按旧报告重复修改。{{ canReviewVersion ? '请重新复检后再修复。' : '请在待确认更新中选择最新版本，完成复检后再修复。' }}{{ report.staleReasons.join('；') }}</p>
+      <p v-if="sourceRefreshRequired || report.stale" class="review-stale" role="status">{{ sourceRefreshRequired ? '生成时引用的来源已变化。请更新候选并复检，原版本与报告会保留；单独复检不会更新旧版本的来源。' : '文档、生成要求或来源已经变化，已停用一键修复，避免按旧报告重复修改。' + (canReviewVersion ? '请重新复检后再修复。' : '请在待确认更新中选择最新版本，完成复检后再修复。') }}{{ report.staleReasons.join('；') }}</p>
       <template v-if="issues.length">
         <p class="review-counts">共 {{ issues.length }} 项问题：<strong>{{ blockingIssues.length }} 项需修复</strong><span> · {{ issues.length - blockingIssues.length }} 项提醒</span></p>
         <ol :key="report.id" class="review-issues" aria-label="复检问题条目">
