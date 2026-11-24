@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import http from "node:http";
+import { DatabaseSync } from "node:sqlite";
 import { DESKTOP_STARTUP_CAPABILITY_PATH, type DesktopBridgeApi, type DesktopEvent } from "@codeflowai/shared";
 
 import { createDesktopApplication, DesktopStartupCleanupError, type DesktopHost } from "../src/desktopApplication.js";
@@ -272,17 +273,20 @@ test("壳启动页加载失败显式失败并清理，不继续启动Client", as
   assert.equal(f.actions.filter(action => action === "window-destroy").length, 1);
 });
 
-test("普通启动使用核心核验，held 启动仍拒绝库存变化", async t => {
+test("普通与held启动均不重哈希资源正文", async t => {
   const f = await heldApplicationFixture(t);
-  await fs.mkdir(path.join(f.baseline, "client/node_modules"));
-  await fs.writeFile(path.join(f.baseline, "client/node_modules/extra.js"), "extra", "utf8");
+  await fs.appendFile(path.join(f.baseline, "client/dist/index.cjs"), "changed client bytes", "utf8");
+  await fs.appendFile(path.join(f.baseline, "web/index.html"), "changed web bytes", "utf8");
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
     host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
   await app.start(); await app.exit();
+  let authorized = false;
   const held = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline,
     host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime,
-    startupContinuation: { continuationId: "candidate-1", async authorizeReady() { assert.fail("invalid inventory"); } } });
-  await assert.rejects(held.start(), /Client payload SHA-256/u);
+    startupContinuation: { continuationId: "candidate-1", async authorizeReady() { authorized = true; } } });
+  await held.start();
+  assert.equal(authorized, true, "签名、固定入口类型和held marker仍通过而普通正文无需重哈希");
+  await held.exit();
 });
 
 test("壳交接启动同样先检查数据库迁移围栏，不启动不兼容旧Client", async t => {
@@ -736,7 +740,7 @@ for (const scenario of [
   await app.exit();
 });
 
-for (const corruption of ["signature", "payload", "missing-payload"] as const) test(`完整安装存在active仍拒绝损坏基线：${corruption}`, async t => {
+for (const corruption of ["signature", "missing-payload"] as const) test(`完整安装存在active仍拒绝损坏基线：${corruption}`, async t => {
   const f = await heldApplicationFixture(t, { version: "2.0.0" });
   await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1" });
   await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
@@ -750,6 +754,19 @@ for (const corruption of ["signature", "payload", "missing-payload"] as const) t
   assert.equal(f.actions.includes("start"), false);
   assert.equal(f.actions.includes("load-web"), false);
   assert.equal(await readActivePointer(f.dataDir), "active-1");
+});
+
+test("完整安装用更新基线接管active时不重哈希资源正文", async t => {
+  const f = await heldApplicationFixture(t, { version: "2.0.0" });
+  await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1", version: "1.0.0" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
+  await fs.appendFile(path.join(f.baseline, "client", "dist", "index.cjs"), "changed signed payload", "utf8");
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
+  await app.start();
+  assert.equal(f.actions.includes("start"), true);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  await app.exit();
 });
 
 for (const invalid of ["baseline", "active"] as const) test(`完整安装不把非数字${invalid}资源版本当作可比较版本`, async t => {
@@ -873,7 +890,7 @@ for (const hasActive of [false, true]) test(`held artifact gate passes trusted $
   await app.exit();
 });
 
-for (const phase of ["frame", "authorize"] as const) for (const change of ["baseline-manifest", "baseline-payload", "active-manifest", "active-pointer", "active-removed", "active-added", "active-payload"] as const) {
+for (const phase of ["frame", "authorize"] as const) for (const change of ["baseline-manifest", "active-manifest", "active-pointer", "active-removed", "active-added"] as const) {
   test(`held artifact gate detects ${change} drift during ${phase} before continuing`, async t => {
     const f = await heldApplicationFixture(t), active = path.join(f.dataDir, "releases", "active-1");
     await createHeldRelease(active, { releaseId: "active-1" }); await createHeldRelease(path.join(f.dataDir, "releases", "active-2"), { releaseId: "active-2" });
@@ -1223,6 +1240,20 @@ test("resource activation releases business startup without a shell discovery or
   await f.app.exit();
 });
 
+test("prepared resources cold-start only the new Client and load its Web once", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates();
+  const loaded: string[] = [], load = f.host.loadWeb;
+  f.host.loadWeb = async (window, directory, options) => { loaded.push(directory); await load(window, directory, options); };
+  f.actions.length = 0;
+  await f.restart();
+  assert.equal(f.actions.filter(action => action === "start").length, 1);
+  assert.deepEqual(loaded, [path.join(f.dataDir, "releases", "hot-release")]);
+  assert.equal(await readActivePointer(f.dataDir), "hot-release");
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  await f.app.exit();
+});
+
 test("resource update releases tasks without waiting for an absent shell update", async t => {
   const f = await shellApplicationFixture(t, true); f.control.available = false;
   await f.app.checkForUpdates();
@@ -1261,12 +1292,88 @@ test("完整安装接管后较新pending失败只恢复当前基线", async t =>
     if (directory === path.join(f.dataDir, "releases", "hot-release")) throw new Error("PENDING_WEB_FAILED");
   };
   await f.restart();
-  assert.deepEqual(loaded, [baseline, path.join(f.dataDir, "releases", "hot-release"), baseline]);
+  assert.deepEqual(loaded, [path.join(f.dataDir, "releases", "hot-release"), baseline]);
+  assert.equal(f.actions.filter(action => action === "start").length, 2, "候选冷启动失败后仅恢复一次完整安装基线");
   assert.equal(await readActivePointer(f.dataDir), null);
   assert.equal(await readPendingRelease(f.dataDir), null);
   assert.equal((await f.app.getUpdateDetails()).bundle.result, "restored");
   assert.equal((await f.app.getUpdateDetails()).current.bundle?.releaseId, "baseline");
+  assert.equal(f.runtime.snapshot().releaseId, "baseline", "回退启动继续按签名基线校验Client版本");
   assert.ok(f.app.updateCheckFailure);
+  await f.app.exit();
+});
+
+test("候选高于较新安装基线时冷启动候选并只启动一次Client", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates();
+  const baseline = path.join(f.dataDir, "installation", "shells", "baseline", "resources");
+  await createHeldRelease(baseline, { baseline: true, version: "1.5.0" });
+  await createHeldRelease(path.join(f.dataDir, "releases", "old-active"), { releaseId: "old-active", version: "1.0.0" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "old-active" }), "utf8");
+  const loaded: string[] = [];
+  f.host.loadWeb = async (_window, directory) => { loaded.push(directory); };
+  f.actions.length = 0;
+  await f.restart();
+  assert.equal(f.actions.filter(action => action === "start").length, 1);
+  assert.deepEqual(loaded, [path.join(f.dataDir, "releases", "hot-release")]);
+  assert.equal(await readActivePointer(f.dataDir), "hot-release");
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  await f.app.exit();
+});
+
+test("低于较新安装基线的pending不启动候选Client", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates();
+  const baseline = path.join(f.dataDir, "installation", "shells", "baseline", "resources");
+  await createHeldRelease(baseline, { baseline: true, version: "3.0.0" });
+  await createHeldRelease(path.join(f.dataDir, "releases", "old-active"), { releaseId: "old-active", version: "1.0.0" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "old-active" }), "utf8");
+  const loaded: string[] = [];
+  f.host.loadWeb = async (_window, directory) => { loaded.push(directory); };
+  f.actions.length = 0;
+  await f.restart();
+  assert.equal(f.actions.filter(action => action === "start").length, 1);
+  assert.deepEqual(loaded, [baseline]);
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal((await f.app.getUpdateDetails()).current.bundle?.version, "3.0.0");
+  await f.app.exit();
+});
+
+test("实际数据库版本高于恢复基线时不启动不兼容pending或基线Client", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates();
+  const baseline = path.join(f.dataDir, "installation", "shells", "baseline", "resources");
+  await createHeldRelease(baseline, { baseline: true, version: "3.0.0", dbSchemaVersion: 88 });
+  await createHeldRelease(path.join(f.dataDir, "releases", "old-active"), { releaseId: "old-active", version: "1.0.0", dbSchemaVersion: 88 });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "old-active" }), "utf8");
+  const database = new DatabaseSync(path.join(f.dataDir, "codeflowai.db"));
+  try { database.exec("PRAGMA user_version = 90"); } finally { database.close(); }
+  const snapshot = f.runtime.snapshot;
+  f.runtime.snapshot = () => ({ ...snapshot(), status: "stopped", health: null, pid: null });
+  f.actions.length = 0;
+  await assert.rejects(f.restart(), /DESKTOP_DB_SCHEMA_FORWARD_ONLY/u);
+  assert.equal(f.actions.includes("start"), false);
+  assert.equal(await readActivePointer(f.dataDir), "old-active");
+  await fs.access(path.join(f.dataDir, "pending-release.json"));
+  await f.app.exit();
+});
+
+test("冷启动无法读取SQLite结构时不启动候选或恢复基线", async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates();
+  const baseline = path.join(f.dataDir, "installation", "shells", "baseline", "resources");
+  await createHeldRelease(baseline, { baseline: true, version: "1.5.0" });
+  await createHeldRelease(path.join(f.dataDir, "releases", "old-active"), { releaseId: "old-active", version: "1.0.0" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "old-active" }), "utf8");
+  await fs.writeFile(path.join(f.dataDir, "codeflowai.db"), "invalid sqlite bytes", "utf8");
+  const snapshot = f.runtime.snapshot;
+  f.runtime.snapshot = () => ({ ...snapshot(), status: "stopped", health: null, pid: null });
+  f.actions.length = 0;
+  await assert.rejects(f.restart());
+  assert.equal(f.actions.includes("start"), false);
+  assert.equal(await readActivePointer(f.dataDir), "old-active");
+  await fs.access(path.join(f.dataDir, "pending-release.json"));
   await f.app.exit();
 });
 
@@ -1997,6 +2104,18 @@ test("initial Web load can request the already healthy local runtime", async (t)
   await app.exit();
 });
 
+test("startup reports measured phase durations under one diagnostic request id", async t => {
+  const f = await fixture(t), stages: Array<{ requestId: string; stage: string; durationMs: number }> = [];
+  f.host.onStartupStage = facts => stages.push(facts);
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host, createRuntime: () => f.runtime });
+  await app.start();
+  assert.ok(stages.length > 1);
+  assert.equal(new Set(stages.map(stage => stage.requestId)).size, 1);
+  assert.ok(stages.every(stage => stage.stage.length > 0 && Number.isInteger(stage.durationMs) && stage.durationMs >= 0));
+  assert.equal(stages.at(-1)?.stage, "正在加载工作台…");
+  await app.exit();
+});
+
 for (const fails of [false, true]) {
   test(`concurrent exits share one drain and its ${fails ? "failure" : "success"}`, async t => {
     const f = await fixture(t);
@@ -2129,7 +2248,7 @@ test("versioned shell restores the fixed original baseline after a binding healt
   await application.exit();
 });
 
-test("简化启动后的首次更新失败，回退前必须全量核验基线", async t => {
+test("简化启动后的首次更新失败，按轻量入口校验恢复基线", async t => {
   const f = await fixture(t), baseline = path.join(f.dataDir, "installation");
   await createHeldRelease(baseline, { baseline: true });
   await fs.mkdir(path.join(baseline, "client/node_modules"));
@@ -2141,12 +2260,8 @@ test("简化启动后的首次更新失败，回退前必须全量核验基线",
       return expected?.releaseId === "new-release" ? { ...f.runtime, waitReady: async () => { throw new Error("CANDIDATE_FAILED"); } } : f.runtime;
     } });
   await app.start();
-  await assert.rejects(app.applyRelease(await createUpdatePackage(f.dataDir)), error => {
-    assert.ok(error instanceof AggregateError);
-    assert.ok(error.errors.some(cause => cause instanceof Error && /Client payload SHA-256/u.test(cause.message)));
-    return true;
-  });
-  assert.equal(baselineStarts, 1);
+  await assert.rejects(app.applyRelease(await createUpdatePackage(f.dataDir)), /CANDIDATE_FAILED/u);
+  assert.equal(baselineStarts, 2, "初始基线和同结构失败后的恢复各启动一次");
   await app.exit();
 });
 

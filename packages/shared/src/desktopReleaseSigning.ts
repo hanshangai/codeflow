@@ -34,11 +34,11 @@ export function verifyReleaseBundleSignature(input: unknown, trustedKeys: Truste
   return manifest;
 }
 
-/** 默认及新包核完整库存；已安装资源可显式复核核心，held 仍校验入口绑定能力。 */
+/** 默认核完整库存；运行时 installed 只核入口类型和 held 绑定，期限门禁独立生效。 */
 export async function verifyReleaseBundlePayload(input: {
   directory: string; manifest: unknown; trustedKeys: TrustedReleaseKeys; platform?: string; arch?: string;
   now?: () => number; requireFresh?: boolean; requireHeldStartup?: boolean;
-  verification?: "full" | "startup";
+  verification?: "full" | "startup" | "installed";
 }): Promise<ReleaseBundleManifest> {
   const manifest = verifyReleaseBundleSignature(input.manifest, input.trustedKeys, input);
   let startupEntry: string | undefined;
@@ -46,6 +46,10 @@ export async function verifyReleaseBundlePayload(input: {
     const marker = manifest.files.find(file => file.path === DESKTOP_STARTUP_CAPABILITY_PATH);
     startupEntry = manifest.files.find(file => file.path === "client/dist/index.cjs")?.sha256;
     if (!marker || marker.size > 1024 || !startupEntry) throw new Error("DESKTOP_STARTUP_CAPABILITY_REQUIRED");
+  }
+  if (input.verification === "installed") {
+    await verifyInstalledFiles(input.directory, manifest, startupEntry);
+    return manifest;
   }
   if (input.verification === "startup" && !input.requireFresh) {
     await verifyStartupFiles(input.directory, manifest, startupEntry);
@@ -60,7 +64,34 @@ export async function verifyReleaseBundlePayload(input: {
   return manifest;
 }
 
-/** 核对入口、worker、配置及可选 held 能力；完整依赖由安装和切换前全量核验负责。 */
+/** 仅 lstat 固定入口及清单声明的核心文件；不枚举目录、不读取入口或依赖正文。 */
+async function verifyInstalledFiles(directory: string, manifest: ReleaseBundleManifest, heldStartupEntrySha256?: string): Promise<void> {
+  const core = new Set(["client/dist/index.cjs", "web/index.html", ...manifest.files
+    .filter(file => file.path.startsWith("client/dist/") || file.path.startsWith("client/") && file.path.split("/").length === 2)
+    .map(file => file.path)]);
+  const checkedDirectories = new Set<string>();
+  for (const relative of core) {
+    const parts = relative.split("/");
+    for (let depth = 0; depth < parts.length; depth++) {
+      const ancestor = parts.slice(0, depth).join("/");
+      if (checkedDirectories.has(ancestor)) continue;
+      const stat = await fs.lstat(path.join(directory, ancestor));
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`DESKTOP_RELEASE_FILE_TYPE_INVALID: ${ancestor}`);
+      checkedDirectories.add(ancestor);
+    }
+    const target = path.join(directory, relative), stat = await fs.lstat(target);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`DESKTOP_RELEASE_FILE_TYPE_INVALID: ${relative}`);
+    if (relative === DESKTOP_STARTUP_CAPABILITY_PATH && heldStartupEntrySha256 !== undefined) {
+      const marker = manifest.files.find(file => file.path === relative)!;
+      const content = await readStartupCapability(target, stat, heldStartupEntrySha256);
+      if (content.length !== marker.size || crypto.createHash("sha256").update(content).digest("hex") !== marker.sha256) {
+        throw new Error(`DESKTOP_RELEASE_STARTUP_FILE_MISMATCH: ${relative}`);
+      }
+    }
+  }
+}
+
+/** 保留旧 startup 语义：枚举并核入口、worker、配置摘要及可选 held 能力。 */
 async function verifyStartupFiles(directory: string, manifest: ReleaseBundleManifest, heldStartupEntrySha256?: string): Promise<void> {
   const checkedDirectories = new Set<string>();
   const core = manifest.files.filter(file => file.path.startsWith("client/dist/")

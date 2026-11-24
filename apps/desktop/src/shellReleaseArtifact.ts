@@ -19,13 +19,15 @@ class ArtifactError extends Error {
   }
 }
 
-/** 先验签，再只读校验独立安装器和候选目录全部物理普通文件；不安装或激活。 */
+/** 安装器始终验签和整体摘要；发布默认完整库存，已安装运行时只查固定入口形态。 */
 export async function verifyShellReleaseArtifact(input: {
   manifest: unknown; trustedKeys: TrustedReleaseKeys; installerPath: string; candidateDirectory: string;
+  verification?: "full" | "installed";
 }): Promise<ShellReleaseManifest> {
   const { manifest, installerPath, installer, view } = await verifyInstaller(input);
   let phase: VerificationPhase = "candidate", artifactPath: string | undefined;
   try {
+    if (input.verification !== undefined && input.verification !== "full" && input.verification !== "installed") throw new ArtifactError("VERIFICATION_INVALID");
     artifactPath = input.candidateDirectory;
     const candidate = await view.promises.realpath(path.resolve(input.candidateDirectory));
     artifactPath = candidate;
@@ -35,7 +37,8 @@ export async function verifyShellReleaseArtifact(input: {
       throw new ArtifactError("PATH_OVERLAP");
     }
     if (!sameMetadata(installer, await view.promises.lstat(installerPath, { bigint: true }))) throw new ArtifactError("FILE_CHANGED");
-    await verifyCandidate(candidate, manifest, installer, view);
+    if (input.verification === "installed") await verifyInstalledEntries(path.resolve(input.candidateDirectory), installer, view);
+    else await verifyCandidate(candidate, manifest, installer, view);
     phase = "installer";
     artifactPath = installerPath;
     if (!sameMetadata(installer, await view.promises.lstat(installerPath, { bigint: true }))) throw new ArtifactError("FILE_CHANGED");
@@ -43,6 +46,31 @@ export async function verifyShellReleaseArtifact(input: {
   } catch (cause) {
     const error = cause instanceof ArtifactError ? cause : new ArtifactError("IO_FAILED", cause);
     throw Object.assign(error, { phase, shellId: manifest.shellId, artifactPath });
+  }
+}
+
+/** 包级摘要承担运行时内容完整性；固定入口及目录祖先不得是链接，不读取候选内容或清单库存。 */
+async function verifyInstalledEntries(root: string, installer: BigIntStats, view: typeof fs): Promise<void> {
+  let directory = path.parse(root).root;
+  const directories: { target: string; stat: BigIntStats }[] = [], files: { target: string; stat: BigIntStats }[] = [];
+  for (const segment of ["", ...path.relative(directory, root).split(path.sep).filter(Boolean), "resources"]) {
+    directory = path.join(directory, segment);
+    const stat = await view.promises.lstat(directory, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ArtifactError("PATH_INVALID");
+    directories.push({ target: directory, stat });
+  }
+  for (const relative of ["CodeFlowAI.exe", "resources/app.asar", "resources/release-trust.json"]) {
+    const target = path.join(root, relative), stat = await view.promises.lstat(target, { bigint: true });
+    assertRegular(stat);
+    if (stat.dev === installer.dev && stat.ino === installer.ino) throw new ArtifactError("PATH_OVERLAP");
+    files.push({ target, stat });
+  }
+  for (const { target, stat } of files) {
+    if (!sameMetadata(stat, await view.promises.lstat(target, { bigint: true }))) throw new ArtifactError("FILE_CHANGED");
+  }
+  for (const { target, stat } of directories) {
+    const current = await view.promises.lstat(target, { bigint: true });
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== stat.dev || current.ino !== stat.ino || current.mode !== stat.mode) throw new ArtifactError("DIRECTORY_CHANGED");
   }
 }
 

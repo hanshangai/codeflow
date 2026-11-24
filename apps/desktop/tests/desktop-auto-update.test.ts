@@ -660,10 +660,14 @@ test('升级直接使用现有数据库，不创建快照或因快照写入失�
     if (String(args[0]).includes('update-database-backup.json')) throw new Error('SNAPSHOT_DISK_FAILED');
     return await write(...args);
   });
+  f.actions.length = 0;
+  const registrationCount = f.requests.filter(request => request.path.endsWith('/devices/register')).length;
   await f.restart();
   assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
   assert.equal(f.app.updateCheckFailure, null);
-  assert.equal(f.actions.filter(action => action === 'start').length, 3);
+  assert.equal(f.actions.filter(action => action === 'start').length, 1, '启动时直接启动候选 Client');
+  assert.equal(f.runtimeFacts.at(-1)?.versions.releaseId, f.manifest.releaseId, '崩溃上下文跟随已提交候选');
+  assert.ok(f.requests.filter(request => request.path.endsWith('/devices/register')).length > registrationCount, '提交候选后刷新设备版本心跳');
   assert.equal(f.actions.filter(action => action === 'runtime.startup.continue').length, 1);
   await assert.rejects(fs.access(path.join(f.dataDir, 'update-database-backups')), { code: 'ENOENT' });
 });
@@ -779,8 +783,11 @@ test('同结构新页面失败只回退资源，保留候选已经写入的原�
     try { current.exec('UPDATE version SET v=2'); } finally { current.close(); }
   };
   f.control.rejectLoadWeb = true;
+  const runtimeFactCount = f.runtimeFacts.length;
   await f.app.checkForUpdates(); await f.restart();
   assert.equal((await f.app.getUpdateDetails()).bundle.result, 'restored');
+  assert.ok(f.runtimeFacts.length > runtimeFactCount, '资源回滚后重新发布实际恢复版本事实');
+  assert.equal(f.runtimeFacts.at(-1)?.versions.releaseId, 'baseline-release');
   assert.equal(await readActivePointer(f.dataDir), null);
   const current = new DatabaseSync(database);
   try { assert.equal(current.prepare('SELECT v FROM version').get()?.v, 2); } finally { current.close(); }

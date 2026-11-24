@@ -6,7 +6,6 @@ import { verifyShellReleaseSignature } from '@codeflowai/shared/desktop-shell-re
 import { createDesktopUpdateTransport } from './updateTransport.js';
 import { downloadShellInstaller } from './shellInstallerDownload.js';
 import { installShellCandidate } from './shellInstallerProcess.js';
-import { verifyShellReleaseArtifact } from './shellReleaseArtifact.js';
 import { readShellLaunchState, serializeShellLaunchState } from './shellLaunchState.js';
 import { startAfterExitShellSwitch, testShellProcess } from './shellSwitchProcess.js';
 import { processSnapshot, sameIdentity, type ProcessIdentity } from './windowsProcessIdentity.js';
@@ -20,7 +19,7 @@ export type NativeShellUpdateBoundary = {
   snapshot?: typeof processSnapshot;
 };
 
-/** 壳文件准备与退出后切换独立于业务资源、数据库及历史交接尝试。 */
+/** 壳准备复用安装边界的已验结果；退出后切换独立于业务资源、数据库及历史交接尝试。 */
 export async function runNativeShellUpdate(input: ShellUpdateOperationInput, boundary: NativeShellUpdateBoundary = {}): Promise<ShellUpdateOperationResult> {
   const facts = structuredClone(input.facts), requestId = input.requestId;
   let phase: DesktopShellUpdatePhase = 'prepare', manifest: ShellReleaseManifest | undefined;
@@ -100,7 +99,6 @@ export async function runNativeShellUpdate(input: ShellUpdateOperationInput, bou
       requestId, signal: input.signal, timeoutMs: input.timeoutMs, temporaryParentDir: facts.temporaryParentDir }));
     const candidateDirectory = path.join(facts.installationDir, 'shells', manifest.shellId);
     if (installed.candidateDirectory !== candidateDirectory || JSON.stringify(installed.manifest) !== JSON.stringify(manifest)) fail('TARGET_CHANGED');
-    await checked(verifyShellReleaseArtifact({ manifest, trustedKeys: input.trustedKeys, installerPath: downloaded.installerPath, candidateDirectory }));
     observe('health');
     await checked((boundary.test ?? testShellProcess)({ executablePath: path.join(candidateDirectory, 'CodeFlowAI.exe'),
       temporaryParentDir: facts.temporaryParentDir, signal: input.signal, timeoutMs: input.timeoutMs }));

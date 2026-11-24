@@ -64,6 +64,32 @@ test("a complete installer is closed and physically verified before returning; c
   assert.equal(sends, 1);
 });
 
+test("publishing a verified installer reads its bytes once and keeps the final independent file", async t => {
+  const f = await fixture(), open = fs.open; let bytesRead = 0;
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args), read = file.read.bind(file);
+    t.mock.method(file, "read", async (...values: any[]) => {
+      const result = await (read as any)(...values); bytesRead += result.bytesRead; return result;
+    });
+    return file;
+  });
+  const transport = await server(t, (_request, response) => { headers(response, f); response.end(f.bytes); });
+  const result = await download.downloadShellInstaller({ ...f, transport });
+  assert.equal(bytesRead, f.bytes.length);
+  assert.equal((await fs.lstat(result.installerPath)).nlink, 1);
+  assert.deepEqual(await fs.readFile(result.installerPath), f.bytes);
+});
+
+test("changing a verified installer during publication fails instead of returning stale proof", async t => {
+  const f = await fixture(), unlink = fs.unlink;
+  t.mock.method(fs, "unlink", async (...args: Parameters<typeof fs.unlink>) => {
+    if (String(args[0]).endsWith(".part")) await fs.writeFile(args[0], Buffer.alloc(f.bytes.length - 1));
+    return await unlink(...args);
+  });
+  const transport = await server(t, (_request, response) => { headers(response, f); response.end(f.bytes); });
+  await assert.rejects(download.downloadShellInstaller({ ...f, transport }));
+});
+
 test("installed cache proof ignores expiry only with explicit installed context and retains physical verification", async t => {
   const f = await fixture(); let sends = 0;
   const transport = await server(t, (_request, response) => { sends++; headers(response, f); response.end(f.bytes); });

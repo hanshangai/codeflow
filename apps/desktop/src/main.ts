@@ -800,6 +800,8 @@ if (process.versions.electron) {
           updateStartupStatus: (window, status) => updateStartupWeb(window as BrowserWindow, status).catch(error => {
             logError(error, { errorCode: readDesktopErrorCode(error, "DESKTOP_STARTUP_STATUS_FAILED"), requestId: "startup-status" });
           }),
+          onStartupStage: facts => appendDesktopStartupDiagnostic(dataDir, `${JSON.stringify({ at: new Date().toISOString(),
+            event: "desktop_startup_stage", requestId: facts.requestId, stage: facts.stage, durationMs: facts.durationMs })}\n`),
           onMigrationError: error => showDesktopError(dataDir, "CodeFlow 退出失败", error,
             { errorCode: readDesktopErrorCode(error, "DESKTOP_EXIT_FAILED"), requestId: startupRequestId }),
           /** 先导航展示页面，已有本地启动任务与页面资源使用各自的等待预算。 */

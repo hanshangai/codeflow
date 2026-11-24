@@ -12,7 +12,7 @@ import { verifyShellReleaseArtifact as verifyArtifact, verifyShellInstallerArtif
 
 const evidence = await fs.mkdtemp(path.join(os.tmpdir(), "cf-d13-shell-artifact-"));
 after(() => { process.stdout.write(`D13 shell artifact evidence: ${evidence}\n`); });
-type ArtifactInput = { manifest: unknown; trustedKeys: { "test-key": crypto.KeyObject }; installerPath: string; candidateDirectory: string };
+type ArtifactInput = { manifest: unknown; trustedKeys: { "test-key": crypto.KeyObject }; installerPath: string; candidateDirectory: string; verification?: "full" | "installed" };
 
 /** 夹具只生成临时 Ed25519 材料与明确标记的合成安装器，不运行任何工件。 */
 async function fixture() {
@@ -64,6 +64,35 @@ test("a valid signed installer and complete physical candidate return an indepen
   assert.equal(JSON.stringify(f.manifest), before);
   assert.deepEqual(await fs.readFile(f.input.installerPath), f.installer);
   for (const [relative, bytes] of Object.entries(f.contents)) assert.deepEqual(await fs.readFile(path.join(f.input.candidateDirectory, relative)), bytes);
+});
+
+test("installed verification checks the installer and required entry shapes without reading candidate contents or inventory", async t => {
+  const f = await fixture(), open = fs.open; let installerBytes = 0;
+  await fs.unlink(path.join(f.input.candidateDirectory, "locales/zh-CN.pak"));
+  await fs.writeFile(path.join(f.input.candidateDirectory, "unexpected.txt"), "runtime package boundary");
+  await fs.writeFile(path.join(f.input.candidateDirectory, "resources/app.asar"), "runtime package boundary");
+  t.mock.method(fs, "readdir", async () => { throw new Error("installed verification must not enumerate inventory"); });
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    assert.equal(String(args[0]), f.input.installerPath);
+    const file = await open(...args), read = file.read.bind(file);
+    t.mock.method(file, "read", async (buffer: Buffer, offset: number, length: number, position: number) => {
+      const result = await read(buffer, offset, length, position); installerBytes += result.bytesRead; return result;
+    });
+    return file;
+  });
+  assert.deepEqual(await verifyArtifact({ ...f.input, verification: "installed" }), f.manifest);
+  assert.equal(installerBytes, f.installer.length);
+});
+
+for (const defect of ["missing", "file-link", "resources-link", "root-link"] as const) test(`installed entry validation rejects ${defect}`, async () => {
+  const f = await fixture(), target = path.join(f.input.candidateDirectory, "resources/app.asar");
+  if (defect === "missing") await fs.unlink(target);
+  else if (defect === "file-link") await fs.link(target, path.join(f.root, "alias.asar"));
+  else {
+    const source = defect === "root-link" ? f.input.candidateDirectory : path.join(f.input.candidateDirectory, "resources");
+    const retained = path.join(f.root, "retained"); await fs.rename(source, retained); await fs.symlink(retained, source, "junction");
+  }
+  await rejectsArtifact({ ...f.input, verification: "installed" }, "candidate");
 });
 
 test("an installed complete shell matching the signed inventory needs no installer download", async () => {

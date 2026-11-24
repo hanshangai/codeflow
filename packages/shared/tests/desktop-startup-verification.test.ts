@@ -9,6 +9,44 @@ import { signReleaseBundleManifest, readReleaseBundleFiles, computeReleaseDirect
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
 
+test("installed 新包只检查入口类型与 held 证明，不读取正文或枚举目录", async t => {
+  const f = await fixture(t, true);
+  await fs.writeFile(path.join(f.directory, "client/dist/index.cjs"), "changed", "utf8");
+  await fs.writeFile(path.join(f.directory, "client/node_modules/example/index.js"), "changed", "utf8");
+  t.mock.method(fs, "readFile", async () => { assert.fail("installed 不应读取文件正文"); });
+  t.mock.method(fs, "readdir", async () => { assert.fail("installed 不应枚举目录"); });
+  assert.deepEqual(await verifyReleaseBundlePayload({ ...f, verification: "installed", requireFresh: true, requireHeldStartup: true }), f.manifest);
+});
+
+for (const file of ["client/dist/index.cjs", "client/dist/migration-worker.cjs", "client/package.json", "web/index.html"]) {
+  test(`installed 拒绝缺失或非普通核心入口：${file}`, async t => {
+    const f = await fixture(t);
+    await fs.rm(path.join(f.directory, file));
+    await assert.rejects(verifyReleaseBundlePayload({ ...f, verification: "installed" }), /ENOENT/u);
+    await fs.mkdir(path.join(f.directory, file));
+    await assert.rejects(verifyReleaseBundlePayload({ ...f, verification: "installed" }), /FILE_TYPE_INVALID/u);
+  });
+}
+
+test("installed held 证明仍拒绝入口绑定错误和摘要变更", async t => {
+  const f = await fixture(t, true);
+  const marker = path.join(f.directory, "client/dist/desktop-startup-capability.json");
+  await fs.writeFile(marker, JSON.stringify({ schemaVersion: 1, heldStartupProtocol: 1, clientEntrySha256: "0".repeat(64) }));
+  await assert.rejects(verifyReleaseBundlePayload({ ...f, verification: "installed", requireHeldStartup: true }), /CAPABILITY_ENTRY_MISMATCH/u);
+  await fs.writeFile(marker, JSON.stringify({ schemaVersion: 1, heldStartupProtocol: 1,
+    clientEntrySha256: f.manifest.files.find(file => file.path === "client/dist/index.cjs")!.sha256 }) + " ");
+  await assert.rejects(verifyReleaseBundlePayload({ ...f, verification: "installed", requireHeldStartup: true }), /STARTUP_FILE_MISMATCH/u);
+});
+
+test("installed 拒绝核心入口祖先链接与错误签名", async t => {
+  const f = await fixture(t);
+  await assert.rejects(verifyReleaseBundlePayload({ ...f, verification: "installed", manifest: { ...f.manifest, version: "changed" } }), /SIGNATURE_INVALID/u);
+  const original = path.join(f.directory, "client/dist"), target = path.join(f.directory, "moved-dist");
+  await fs.rename(original, target);
+  await fs.symlink(target, original, process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(verifyReleaseBundlePayload({ ...f, verification: "installed" }), /FILE_TYPE_INVALID/u);
+});
+
 /** 临时签名资源同时包含启动入口、迁移 worker 与不在启动核验范围的依赖。 */
 async function fixture(t: test.TestContext, held = false) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cf-startup-verification-"));

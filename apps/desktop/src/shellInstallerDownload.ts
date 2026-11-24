@@ -22,7 +22,7 @@ class InstallerError extends Error {
   constructor(readonly code: string, readonly requestId: string, cause?: unknown) { super(code, { cause }); }
 }
 
-/** 单次完整安装器动作，不创建重试；完整流、同步、关闭及物理验签完成后才返回。 */
+/** 单次下载同步关闭后完整验一次；发布仅改变链接数，返回前仍核同一实体与内容元数据。 */
 export async function downloadShellInstaller(input: InstallerInput): Promise<DownloadedShellInstaller> {
   const { manifest, root, directory } = installerContext(input), key = root.toLowerCase();
   if (running.has(key)) throw new InstallerError("DESKTOP_SHELL_INSTALLER_BUSY", input.requestId);
@@ -72,13 +72,13 @@ export async function downloadShellInstaller(input: InstallerInput): Promise<Dow
     if (!sameMetadata(closed, await fs.lstat(partPath, { bigint: true }))) throw new Error("DESKTOP_SHELL_INSTALLER_FILE_CHANGED");
     input.signal?.throwIfAborted();
     assertCurrentManifest(manifest, input);
-    // link 排他发布，不能覆盖其他实体；成功后移除前缀名再完整复核。
+    // 排他发布同一已验证实体；link/unlink 只允许改变 ctime 和链接数。
     await fs.link(partPath, installerPath);
     const linked = await fs.lstat(installerPath, { bigint: true }), original = await fs.lstat(partPath, { bigint: true });
-    if (!sameIdentity(closed, linked) || !sameIdentity(closed, original) || linked.nlink !== 2n || original.nlink !== 2n) throw new Error("DESKTOP_SHELL_INSTALLER_FILE_CHANGED");
+    if (!sameContentMetadata(closed, linked) || !sameMetadata(linked, original) || linked.nlink !== 2n) throw new Error("DESKTOP_SHELL_INSTALLER_FILE_CHANGED");
     await assertDirectories(directories); await fs.unlink(partPath);
     const published = await fs.lstat(installerPath, { bigint: true }); assertRegular(published);
-    await verifyShellInstallerArtifact({ manifest, trustedKeys: input.trustedKeys, installerPath });
+    if (!sameContentMetadata(linked, published)) throw new Error("DESKTOP_SHELL_INSTALLER_FILE_CHANGED");
     await assertDirectories(directories); input.signal?.throwIfAborted();
     if (!sameMetadata(published, await fs.lstat(installerPath, { bigint: true }))) throw new Error("DESKTOP_SHELL_INSTALLER_FILE_CHANGED");
     assertCurrentManifest(manifest, input);
@@ -191,6 +191,9 @@ function assertRegular(stat: BigIntStats): void { if (!stat.isFile() || stat.isS
 
 /** 写入会改变时间与长度，身份比较只负责同一实体，读后核验另比完整元数据。 */
 function sameIdentity(a: BigIntStats, b: BigIntStats): boolean { return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode; }
+
+/** link/unlink 改变 ctime 和链接数，已验内容仍须绑定同一实体、大小与修改时间。 */
+function sameContentMetadata(a: BigIntStats, b: BigIntStats): boolean { return sameIdentity(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs; }
 
 /** 完成读写并关闭后的实体不得被替换、截断、改写或增加别名。 */
 function sameMetadata(a: BigIntStats, b: BigIntStats): boolean { return sameIdentity(a, b) && a.nlink === b.nlink && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs; }

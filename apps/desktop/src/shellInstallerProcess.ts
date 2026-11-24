@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { ShellReleaseManifest } from "@codeflowai/shared";
 import type { TrustedReleaseKeys } from "@codeflowai/shared/desktop-release-signing";
+import { verifyShellReleaseSignature } from "@codeflowai/shared/desktop-shell-release-signing";
 import { verifyShellInstallerArtifact, verifyShellReleaseArtifact } from "./shellReleaseArtifact.js";
 import { parseShellLaunchState, readShellLaunchState, serializeShellLaunchState, type ShellLaunchState } from "./shellLaunchState.js";
 import { processSnapshot, sameIdentity, stopIdentity, type ProcessIdentity } from "./windowsProcessIdentity.js";
@@ -30,7 +31,7 @@ class InstallerProcessError extends Error {
   constructor(code: string, cause?: unknown) { super(`DESKTOP_SHELL_INSTALLER_PROCESS_${code}`, { cause }); this.code = this.message; }
 }
 
-/** 仅安装或完整复验候选；不改 INI、不联网、不重试、不删除候选或继续业务。 */
+/** 已有候选只验一次安装器与入口；新装在执行前验安装器、执行后查入口，不改 INI。 */
 export async function installShellCandidate(input: InstallerInput): Promise<{ manifest: ShellReleaseManifest; candidateDirectory: string }> {
   let phase = "input", manifest: ShellReleaseManifest | undefined, installerRequestId: string | undefined, temporaryRoot: string | undefined;
   const details: ExecutionDetails = {};
@@ -42,7 +43,9 @@ export async function installShellCandidate(input: InstallerInput): Promise<{ ma
       || !path.isAbsolute(input.installerPath)) fail("INPUT_INVALID");
     const expected = parseShellLaunchState(Buffer.from(serializeShellLaunchState(input.expectedState), "ascii"));
     phase = "installer";
-    manifest = await verifyShellInstallerArtifact(input);
+    manifest = verifyShellReleaseSignature(input.manifest, input.trustedKeys);
+    const installerEntry = await fs.lstat(input.installerPath, { bigint: true });
+    if (!installerEntry.isFile() || installerEntry.isSymbolicLink() || installerEntry.nlink !== 1n) fail("INSTALLER_PATH_INVALID");
     const installationDir = await fs.realpath(input.installationDir), installerPath = await fs.realpath(input.installerPath);
     const directories = await snapshotDirectories(path.join(installationDir, "shells"));
     const candidateDirectory = path.join(installationDir, "shells", manifest.shellId);
@@ -51,7 +54,7 @@ export async function installShellCandidate(input: InstallerInput): Promise<{ ma
     phase = "candidate";
     if (await exists(candidateDirectory)) {
       await assertCandidateRoot(candidateDirectory);
-      const verified = await verifyShellReleaseArtifact({ ...input, manifest, installerPath, candidateDirectory });
+      const verified = await verifyShellReleaseArtifact({ ...input, manifest, installerPath, candidateDirectory, verification: "installed" });
       await assertDirectories(directories); await assertLaunch(installationDir, expected); input.signal?.throwIfAborted();
       return { manifest: verified, candidateDirectory };
     }
@@ -77,7 +80,7 @@ export async function installShellCandidate(input: InstallerInput): Promise<{ ma
       { cwd: installationDir, env, timeout, manifest, installerRequestId, details });
     phase = "candidate";
     await assertDirectories([...directories, ...temporaryDirectories]); await assertCandidateRoot(candidateDirectory);
-    const verified = await verifyShellReleaseArtifact({ ...input, manifest, installerPath, candidateDirectory });
+    const verified = await verifyShellReleaseArtifact({ ...input, manifest, installerPath, candidateDirectory, verification: "installed" });
     await assertDirectories(directories); await assertLaunch(installationDir, expected); input.signal?.throwIfAborted();
     return { manifest: verified, candidateDirectory };
   } catch (cause) {

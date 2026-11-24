@@ -14,7 +14,7 @@ import { writeDurableJson, flushDirectory } from "./durableFile.js";
 export { computeReleasePackageSha256 } from "@codeflowai/shared/desktop-release-signing";
 
 type ReleaseTrustOptions = { trustedReleaseKeys?: TrustedReleaseKeys; platform?: string; arch?: string; now?: () => number; requireHeldStartup?: boolean };
-type InstalledReleaseTrustOptions = ReleaseTrustOptions & { verification?: "full" | "startup" };
+type InstalledReleaseTrustOptions = ReleaseTrustOptions & { verification?: "full" | "startup" | "installed" };
 
 export type PreparedRelease = {
   requestId: string;
@@ -36,6 +36,8 @@ export type ReleaseSwitchHooks = {
   reloadWeb(releaseDir: string): Promise<void>;
   waitHealthy(releaseDir: string): Promise<boolean>;
   restoreInitialRelease(): Promise<void>;
+  /** 完整安装基线接管期间，候选回退必须恢复已验签的新基线而非旧活动包。 */
+  restoreInitialOnFailure?: boolean;
   /** 候选停止并恢复数据库后，才允许重新启动旧资源。 */
   beforeRestore?(): Promise<void>;
 };
@@ -71,7 +73,7 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
   };
 
   return {
-    /** 重新验签及核完整库存；与已验证安装同包只收口旧记录，其余候选仍须未过期。 */
+    /** 重新验签、检查入口及 held 证明；同包安装只收口旧记录，其余候选仍须未过期。 */
     async resume(pending, installed): Promise<PreparedRelease> {
       const directory = path.resolve(pending.stagingDir);
       if (path.dirname(directory) !== path.join(rootDir, ".staging")
@@ -207,7 +209,7 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
             }
             rollbackError = activationUncertain
               ? new Error("活动指针提交未确认，保留候选与数据库等待启动恢复", { cause: error })
-              : await restorePreviousRelease(rootDir, previousReleaseId, hooks, input);
+              : await restorePreviousRelease(rootDir, hooks.restoreInitialOnFailure ? null : previousReleaseId, hooks, input);
           } catch (cause) { rollbackError = cause instanceof Error ? cause : new Error(String(cause)); }
         }
         const localResult = activated ? "healthy" : !needsRestore ? "failure" : rollbackError ? "unavailable" : "restored";
@@ -266,7 +268,7 @@ export async function clearIncompatibleActiveRelease(rootDir: string, expectedRe
   await flushDirectory(root);
 }
 
-/** 活动版本默认全量核验；普通启动可显式选择核心核验。 */
+/** 活动版本默认只验签和检查入口；显式 full 保留完整核验。 */
 export async function resolveActiveRelease(rootDir: string, options: InstalledReleaseTrustOptions = {}): Promise<ActiveRelease | null> {
   const resolvedRoot = path.resolve(rootDir);
   const releaseId = await readActivePointer(resolvedRoot);
@@ -289,7 +291,7 @@ export async function resolveBaselineRelease(initialReleaseDir: string, options:
   }
   if (!root.isDirectory() || root.isSymbolicLink() || !entry.isFile() || entry.isSymbolicLink()) throw new Error("DESKTOP_RELEASE_BASELINE_INVALID");
   const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await fs.readFile(proof)));
-  return { releaseDir, manifest: await verifyReleaseBundlePayload({ ...options, directory: releaseDir, manifest,
+  return { releaseDir, manifest: await verifyReleaseBundlePayload({ verification: "installed", ...options, directory: releaseDir, manifest,
     trustedKeys: options.trustedReleaseKeys ?? {} }) };
 }
 
@@ -303,7 +305,7 @@ async function readPointer(rootDir: string, fileName: string): Promise<string | 
   }
 }
 
-/** 新包仍全量校验并受有效期约束；已安装普通启动可显式缩小文件读取范围。 */
+/** 运行时默认轻量检查；新包仍检查签名期限，保留归档时必须核整包摘要。 */
 async function verifyReleaseBundle(directory: string, options: InstalledReleaseTrustOptions, requireFresh = false,
   onManifest?: (manifest: ReleaseBundleManifest) => void): Promise<ReleaseBundleManifest> {
   for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
@@ -320,7 +322,7 @@ async function verifyReleaseBundle(directory: string, options: InstalledReleaseT
   return manifest;
 }
 
-/** 展开包与归档准备共用签名、平台和新包有效期门禁。 */
+/** 展开包与归档准备共用签名、平台和期限门禁；fresh 不改变轻量检查。 */
 async function verifyManifest(directory: string, options: InstalledReleaseTrustOptions, requireFresh: boolean,
   onManifest?: (manifest: ReleaseBundleManifest) => void, withPayload = false): Promise<ReleaseBundleManifest> {
   if (!(await fs.lstat(directory)).isDirectory()) throw new Error("DESKTOP_RELEASE_ROOT_INVALID");
@@ -328,7 +330,7 @@ async function verifyManifest(directory: string, options: InstalledReleaseTrustO
   if (!(await fs.lstat(manifestPath)).isFile()) throw new Error("DESKTOP_RELEASE_MANIFEST_INVALID");
   const manifest = assertReleaseBundleManifest(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await fs.readFile(manifestPath))));
   onManifest?.(manifest);
-  return withPayload ? await verifyReleaseBundlePayload({ ...options, directory, manifest, trustedKeys: options.trustedReleaseKeys ?? {}, requireFresh })
+  return withPayload ? await verifyReleaseBundlePayload({ verification: "installed", ...options, directory, manifest, trustedKeys: options.trustedReleaseKeys ?? {}, requireFresh })
     : verifyReleaseBundleSignature(manifest, options.trustedReleaseKeys ?? {}, { ...options, requireFresh });
 }
 

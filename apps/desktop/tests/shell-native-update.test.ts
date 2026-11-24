@@ -83,6 +83,31 @@ test('native shell update prepares and hands off without Client health, resource
   result.owner.release();
 });
 
+test('native shell reuses the install result without reopening verified candidate files', async t => {
+  const f = await fixture(t), open = fs.open; let candidateBytes = 0;
+  t.mock.method(fs, 'open', async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args);
+    if (String(args[0]).startsWith(`${f.candidateDirectory}${path.sep}`)) {
+      const read = file.read.bind(file);
+      t.mock.method(file, 'read', async (...values: any[]) => {
+        const result = await (read as any)(...values); candidateBytes += result.bytesRead; return result;
+      });
+    }
+    return file;
+  });
+  const result = await run(f.input, f.boundary);
+  assert.equal(candidateBytes, 0);
+  result.owner.release();
+});
+
+for (const mismatch of ['path', 'manifest']) test(`native shell rejects an install result with mismatched ${mismatch} before health or handoff`, async t => {
+  const f = await fixture(t);
+  const boundary = { ...f.boundary, async install() { return { candidateDirectory: mismatch === 'path' ? path.join(f.root, 'foreign') : f.candidateDirectory,
+    manifest: mismatch === 'manifest' ? { ...f.manifest, version: '9.0' } : f.manifest }; } };
+  await assert.rejects(run(f.input, boundary), { code: 'DESKTOP_SHELL_OPERATION_FAILED' });
+  assert.equal(f.actions.includes('self-test'), false); assert.equal(f.actions.includes('prepare'), false);
+});
+
 for (const version of ['1.0', '0.9']) test(`native shell version ${version} does not download or inspect candidate files`, async t => {
   const f = await fixture(t); f.setManifest({ version });
   await fs.rm(f.candidateDirectory, { recursive: true });
@@ -172,9 +197,9 @@ test('recovering after the application UI was destroyed never restarts Client', 
   assert.equal(f.actions.includes('cancel'), true); assert.equal(f.actions.includes('resume'), false);
 });
 
-test('candidate inventory mismatch fails the install phase without changing the active selection', async t => {
+test('a missing candidate entry fails the install phase without changing the active selection', async t => {
   const f = await fixture(t);
-  await fs.writeFile(path.join(f.candidateDirectory, 'unexpected.txt'), 'unsigned extra');
+  await fs.unlink(path.join(f.candidateDirectory, 'resources/app.asar'));
   await assert.rejects(run(f.input, f.boundary), (error: unknown) => {
     assert.equal((error as { failurePhase: string }).failurePhase, 'install'); return true;
   });

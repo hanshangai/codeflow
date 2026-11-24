@@ -398,15 +398,21 @@ for (const role of ["candidate", "original"] as const) test(`fully completed ${r
   assert.deepEqual(await fs.readFile(path.join(f.input.dataDir, "shell-update-attempt.json")), before);
 });
 
-for (const defect of ["helper-alive", "client-alive", "unknown-child", "pid-reused", "wrong-ini", "bad-proof"] as const)
+for (const defect of ["helper-alive", "client-alive", "unknown-child", "pid-reused", "wrong-ini"] as const)
 test(`terminal ordinary startup rejects ${defect} before creating application work`, async () => {
   const h = await api(), f = await terminalFixture("candidate");
   const extra = defect === "helper-alive" ? f.helper : defect === "client-alive" ? f.terminalClient
     : defect === "unknown-child" ? { ...f.terminalClient, pid: 299, parentPid: f.main.pid }
       : { ...f.helper, created: 9999, commandLine: "foreign reused pid" };
   if (defect === "wrong-ini") await fs.writeFile(path.join(f.selected.installationDir, "shell-launch.ini"), serializeShellLaunchState(f.selected.originalState));
-  if (defect === "bad-proof") await fs.writeFile(path.join(f.proof.directory, "web/index.html"), "tampered signed web");
-  await assert.rejects(h.readShellHandoffStartup({ ...f.ordinaryInput, snapshot: async () => [f.caller, ...(["wrong-ini", "bad-proof"].includes(defect) ? [] : [extra])] }));
+  await assert.rejects(h.readShellHandoffStartup({ ...f.ordinaryInput, snapshot: async () => [f.caller, ...(defect === "wrong-ini" ? [] : [extra])] }));
+});
+
+test("terminal ordinary startup checks signed installed entry points without rehashing Web payload files", async () => {
+  const h = await api(), f = await terminalFixture("candidate");
+  await fs.writeFile(path.join(f.proof.directory, "web/index.html"), "changed Web payload");
+  const startup = await h.readShellHandoffStartup({ ...f.ordinaryInput, snapshot: async () => [f.caller] });
+  assert.equal(startup.kind, "ordinary");
 });
 
 test("terminal ordinary startup validates current signed hot binding instead of permanently locking historical binding", async () => {

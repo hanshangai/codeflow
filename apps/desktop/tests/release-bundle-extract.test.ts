@@ -102,14 +102,41 @@ for (const bad of [
   });
 }
 
-test("archive rejects a missing signed file, wrong size and wrong content digest", async t => {
+test("archive rejects a missing signed file and wrong size", async t => {
   const f = await fixture(t);
-  for (const entries of [[f.entries[0]!], [{ ...f.entries[0]!, content: "wrong-size" }, f.entries[1]!],
-    [{ ...f.entries[0]!, content: "wrong!" }, f.entries[1]!]]) {
+  for (const entries of [[f.entries[0]!], [{ ...f.entries[0]!, content: "wrong-size" }, f.entries[1]!]]) {
     await f.replaceArchive(archive(entries));
     await assert.rejects(() => f.coordinator.prepare(f.incoming), /DESKTOP_RELEASE_|SHA-256/);
     assert.deepEqual(await fs.readdir(path.join(f.rootDir, ".staging")), []);
   }
+});
+
+test("archive uses its signed whole-package digest without hashing each extracted file", async t => {
+  const f = await fixture(t);
+  await f.replaceArchive(archive([{ ...f.entries[0]!, content: "wrong!" }, f.entries[1]!]));
+  const prepared = await f.coordinator.prepare(f.incoming);
+  assert.equal(await fs.readFile(path.join(prepared.stagingDir, "web/index.html"), "utf8"), "wrong!");
+});
+
+test("archive decoding hashes and reads the archive once", async t => {
+  const f = await fixture(t), open = fs.open.bind(fs);
+  let zeroReads = 0, bytesRead = 0;
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args);
+    if (String(args[0]) === path.join(f.incoming, "bundle.tar.gz")) {
+      const read = file.read.bind(file);
+      t.mock.method(file, "read", async (...readArgs: Parameters<typeof file.read>) => {
+        if ((readArgs as readonly unknown[])[3] === 0) zeroReads++;
+        const result = await read(...readArgs);
+        bytesRead += result.bytesRead;
+        return result;
+      });
+    }
+    return file;
+  });
+  await f.coordinator.prepare(f.incoming);
+  assert.equal(zeroReads, 1);
+  assert.equal(bytesRead, f.built.manifest.archiveSize);
 });
 
 test("archive length and digest are rechecked before any payload is prepared", async t => {
@@ -313,7 +340,7 @@ test("large rejected archives close all file operations before staging cleanup",
   t.mock.restoreAll();
 });
 
-test("archive bytes are hashed again during the actual decoding pass", async t => {
+test("archive bytes are hashed during the actual decoding pass", async t => {
   const f = await fixture(t);
   const open = fs.open.bind(fs);
   let changed = false;
@@ -323,7 +350,7 @@ test("archive bytes are hashed again during the actual decoding pass", async t =
       const read = file.read.bind(file);
       let firstBlocks = 0;
       t.mock.method(file, "read", async (...readArgs: Parameters<typeof file.read>) => {
-        if ((readArgs as readonly unknown[])[3] === 0 && ++firstBlocks === 2) {
+        if ((readArgs as readonly unknown[])[3] === 0 && ++firstBlocks === 1) {
           const bytes = await fs.readFile(path.join(f.incoming, "bundle.tar.gz"));
           bytes[4] = bytes[4]! ^ 1;
           await fs.writeFile(path.join(f.incoming, "bundle.tar.gz"), bytes);
@@ -350,6 +377,17 @@ function extractCauses(value: unknown): unknown[] {
   if (value instanceof AggregateError) return [value, ...value.errors.flatMap(extractCauses)];
   return value instanceof Error && Object.hasOwn(value, "cause") ? [value, ...extractCauses(value.cause)] : [value];
 }
+
+for (const original of [undefined, false]) test(`archive read preserves a lone primitive rejection: ${String(original)}`, async t => {
+  const f = await fixture(t), open = fs.open.bind(fs);
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args);
+    if (String(args[0]) === path.join(f.incoming, "bundle.tar.gz")) t.mock.method(file, "read", async () => { throw original; });
+    return file;
+  });
+  await assert.rejects(f.coordinator.prepare(f.incoming), failure => { assert.equal(failure, original); return true; });
+  assert.deepEqual(await fs.readdir(path.join(f.rootDir, ".staging")), []);
+});
 
 for (const stage of ["archive-read", "payload-write", "payload-sync"] as const)
 for (const original of [undefined, false, Object.freeze(new Error("extract operation failed"))])
@@ -563,7 +601,7 @@ test(`extract cancellation journal retains ${stage} and both closes when staging
   assert.deepEqual(receipts, ["verified", "prepared"]);
 });
 
-/** 第二遍真实归档读取结算时取消，核原因保留和纯取消分类。 */
+/** 真实解包读取结算时取消，核原因保留和纯取消分类。 */
 for (const outcome of ["cancel", "error", "undefined", "false", "aggregate", "read-only", "cleanup", "aggregate-cleanup"] as const)
 for (const closeFails of [false, true])
 test(`extract read cancellation retains ${outcome} with close=${closeFails} and permits explicit retry`, async t => {
@@ -590,7 +628,7 @@ test(`extract read cancellation retains ${outcome} with close=${closeFails} and 
       let zeroReads = 0;
       t.mock.method(file, "read", async (...readArgs: Parameters<typeof file.read>) => {
         const result = await read(...readArgs);
-        if ((readArgs as readonly unknown[])[3] === 0 && ++zeroReads === 2) {
+        if ((readArgs as readonly unknown[])[3] === 0 && ++zeroReads === 1) {
           injected = true;
           if (closeFails) rejectClosedFile(t, file, closing);
           if (hasCancellation) controller.abort(cancelled);
@@ -669,7 +707,7 @@ test(`extract read cancellation retains concurrent ${order} causes once in the j
       t.mock.method(file, "read", async (...readArgs: Parameters<typeof file.read>) => {
         const result = await read(...readArgs), position = (readArgs as readonly unknown[])[3];
         if (position === 0) zeroReads += 1;
-        if (zeroReads === 2 && position !== 0 && !injected) {
+        if (zeroReads === 1 && position !== 0 && !injected) {
           await syncing; injected = true; controller.abort(cancelled);
           if (order === "read-first") setImmediate(finishSync);
           else { finishSync(); await closed; await new Promise<void>(resolve => setImmediate(resolve)); }

@@ -102,7 +102,7 @@ function containsCause(value: unknown, expected: unknown): boolean {
     || value instanceof AggregateError && value.errors.some(cause => containsCause(cause, expected));
 }
 
-test("successful installation waits for close and verifies the complete candidate without changing S0", async () => {
+test("successful installation waits for close and verifies candidate entries without changing S0", async () => {
   const f = await fixture(); let release!: () => void, exited = false, settled = false;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const p = processBoundary(f, async child => { await f.materialize(); child.exit(0); exited = true; await gate; child.close(); });
@@ -117,6 +117,25 @@ test("successful installation waits for close and verifies the complete candidat
   assert.equal(path.dirname(env.TEMP!), f.input.temporaryParentDir); assert.equal(env.ELECTRON_RUN_AS_NODE, undefined);
   for (const [key, value] of Object.entries(process.env)) if (!["TEMP", "TMP", "TMPDIR", "ELECTRON_RUN_AS_NODE"].includes(key.toUpperCase())) assert.ok(env[key] === value, `environment key must remain unchanged: ${key}`);
   assert.equal(p.options[0].windowsHide, true); assert.deepEqual(p.options[0].stdio, ["ignore", "pipe", "pipe"]);
+});
+
+for (const existing of [false, true]) test(`${existing ? "existing" : "new"} candidate reads installer only at its required verification boundaries`, async t => {
+  const f = await fixture(), open = fs.open; let installerBytes = 0;
+  if (existing) await f.materialize();
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args);
+    if (String(args[0]) === f.input.installerPath) {
+      const read = file.read.bind(file);
+      t.mock.method(file, "read", async (...values: any[]) => {
+        const result = await (read as any)(...values); installerBytes += result.bytesRead; return result;
+      });
+    }
+    return file;
+  });
+  const p = processBoundary(f), result = await install({ ...f.input, boundary: p.boundary });
+  assert.equal(result.candidateDirectory, f.candidateDirectory);
+  assert.equal(installerBytes, f.installer.length * (existing ? 1 : 2));
+  assert.equal(p.calls(), existing ? 0 : 1);
 });
 
 for (const elapsed of [1_999, 2_000, 2_001])
@@ -214,6 +233,20 @@ test("bad signature rejects before executing any installer", async () => {
   assert.equal(p.calls(), 0); assert.equal(existsSync(f.candidateDirectory), false);
 });
 
+test("an installer file alias fails before executing its resolved target", async t => {
+  const f = await fixture(), p = processBoundary(f), retained = path.join(f.root, "retained-installer.exe"), realpath = fs.realpath, lstat = fs.lstat;
+  await fs.writeFile(retained, f.installer);
+  // Windows 无文件符号链接权限时仍按 OS 返回的别名元数据验证执行边界。
+  t.mock.method(fs, "realpath", async (...args: Parameters<typeof fs.realpath>) => args[0] === f.input.installerPath ? retained : await realpath(...args));
+  t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    const stat = await lstat(...args);
+    if (args[0] === f.input.installerPath) Object.assign(stat, { isSymbolicLink: () => true });
+    return stat;
+  });
+  await assert.rejects(install({ ...f.input, boundary: p.boundary }));
+  assert.equal(p.calls(), 0);
+});
+
 test("installer bytes changed during preflight are reverified immediately before spawn", async t => {
   const f = await fixture(), p = processBoundary(f), mkdtemp = fs.mkdtemp;
   t.mock.method(fs, "mkdtemp", async (...args: Parameters<typeof fs.mkdtemp>) => {
@@ -254,7 +287,7 @@ test("a temporary parent inside the installation is rejected before creating dir
   assert.deepEqual(await fs.readdir(f.input.installationDir), before); assert.equal(p.calls(), 0);
 });
 
-test("an existing candidate is reused only after complete verification and never starts the installer", async () => {
+test("an existing candidate is reused after installer and entry verification without starting the installer", async () => {
   const f = await fixture(), p = processBoundary(f); await f.materialize();
   assert.deepEqual(await install({ ...f.input, boundary: p.boundary }), { manifest: f.input.manifest, candidateDirectory: f.candidateDirectory });
   assert.equal(p.calls(), 0); assert.equal(p.samples(), 0); assert.deepEqual(await fs.readdir(f.input.temporaryParentDir), []);
@@ -269,9 +302,9 @@ test("a signed target already in previous is reused without adding another selec
   assert.equal(await fs.readFile(path.join(f.input.installationDir, "shell-launch.ini"), "utf8"), serializeShellLaunchState(expectedState));
 });
 
-for (const existing of [false, true]) for (const defect of ["missing", "extra"]) test(`${existing ? "existing" : "new"} candidate with ${defect} inventory explicitly fails and is retained`, async () => {
+for (const existing of [false, true]) test(`${existing ? "existing" : "new"} candidate with a missing entry explicitly fails and is retained`, async () => {
   const f = await fixture();
-  const corrupt = async () => { await f.materialize(); if (defect === "missing") await fs.unlink(path.join(f.candidateDirectory, "resources/app.asar")); else await fs.writeFile(path.join(f.candidateDirectory, "extra.txt"), "unsigned"); };
+  const corrupt = async () => { await f.materialize(); await fs.unlink(path.join(f.candidateDirectory, "resources/app.asar")); };
   if (existing) await corrupt();
   const p = processBoundary(f, async child => { await corrupt(); child.close(); });
   await assert.rejects(install({ ...f.input, boundary: p.boundary })); assert.equal(p.calls(), existing ? 0 : 1); assert.equal(existsSync(f.candidateDirectory), true);

@@ -401,8 +401,9 @@ async function dependencies(input: HelperInput, attempt: ShellUpdateHandoffAttem
 
 /** 固定baseline及原active共用现有完整签名门禁，换壳不换业务binding或DB schema。 */
 async function verifyBinding(attempt: ShellUpdateHandoffAttempt, keys: TrustedReleaseKeys) {
-  const baseline = await resolveBaselineRelease(path.join(attempt.installationDir, "shells", attempt.originalState.baselineShellId, "resources"), { trustedReleaseKeys: keys, requireHeldStartup: true });
-  const active = await resolveActiveRelease(attempt.dataDir, { trustedReleaseKeys: keys, requireHeldStartup: true });
+  const baseline = await resolveBaselineRelease(path.join(attempt.installationDir, "shells", attempt.originalState.baselineShellId, "resources"),
+    { trustedReleaseKeys: keys, requireHeldStartup: true, verification: "full" });
+  const active = await resolveActiveRelease(attempt.dataDir, { trustedReleaseKeys: keys, requireHeldStartup: true, verification: "full" });
   const health = attempt.binding.health, manifest = active?.manifest ?? baseline.manifest;
   if (attempt.binding.kind === "active" ? !active || active.releaseId !== attempt.binding.releaseId || active.manifest.packageSha256 !== attempt.binding.packageSha256 : active !== null) fail("BINDING_CHANGED");
   if (manifest.clientVersion !== health.clientVersion || manifest.protocolVersion !== health.protocolVersion || manifest.dbSchemaVersion !== health.dbSchemaVersion) fail("BINDING_CHANGED");

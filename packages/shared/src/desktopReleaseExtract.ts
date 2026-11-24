@@ -8,7 +8,7 @@ import { assertReleaseFilePath, type ReleaseBundleManifest } from "./desktopRele
 /** 仅标识本模块合成的操作组合，展平去重时保留外部I/O聚合的原实体。 */
 class ExtractOperationError extends AggregateError {}
 
-/** 仅向空staging写签名inventory；归档关闭合并自产包装，保原原因及日志深度。 */
+/** 仅向空 staging 安全解包并单遍核整包摘要；调用者须在失败后清理 staging。 */
 export async function extractReleaseBundle(input: {
   archivePath: string; stagingDir: string; manifest: ReleaseBundleManifest; signal?: AbortSignal;
 }): Promise<void> {
@@ -20,7 +20,7 @@ export async function extractReleaseBundle(input: {
   try {
     const opened = await file.stat();
     if (opened.dev !== stat.dev || opened.ino !== stat.ino || !opened.isFile() || opened.nlink !== 1) throw new Error("DESKTOP_RELEASE_ARCHIVE_INVALID");
-    await verifyArchive(file, input.manifest, input.signal);
+    if (opened.size !== input.manifest.archiveSize) throw new Error("DESKTOP_RELEASE_ARCHIVE_MISMATCH");
     await extractEntries(file, input);
   } catch (error) { failure = { cause: error }; throw error; }
   finally {
@@ -33,24 +33,7 @@ export async function extractReleaseBundle(input: {
   }
 }
 
-/** 同一只读句柄先流式核对长度和摘要，再从零读取给解析器。 */
-async function verifyArchive(file: FileHandle, manifest: ReleaseBundleManifest, signal?: AbortSignal): Promise<void> {
-  if ((await file.stat()).size !== manifest.archiveSize) throw new Error("DESKTOP_RELEASE_ARCHIVE_MISMATCH");
-  const digest = crypto.createHash("sha256");
-  const buffer = Buffer.allocUnsafe(64 * 1024);
-  let position = 0;
-  while (position < manifest.archiveSize) {
-    signal?.throwIfAborted();
-    const { bytesRead } = await file.read(buffer, 0, Math.min(buffer.length, manifest.archiveSize - position), position);
-    if (!bytesRead) throw new Error("DESKTOP_RELEASE_ARCHIVE_MISMATCH");
-    digest.update(buffer.subarray(0, bytesRead));
-    position += bytesRead;
-  }
-  signal?.throwIfAborted();
-  if (digest.digest("hex") !== manifest.archiveSha256 || (await file.stat()).size !== manifest.archiveSize) throw new Error("DESKTOP_RELEASE_ARCHIVE_MISMATCH");
-}
-
-/** Parser 仅解析；串行任务保留在途独立错误，等待文件关闭完成后才返回。 */
+/** 解包同一数据流时核摘要；串行任务保留在途错误，等待文件关闭后返回。 */
 async function extractEntries(file: FileHandle, input: {
   stagingDir: string; manifest: ReleaseBundleManifest; signal?: AbortSignal;
 }): Promise<void> {
@@ -69,7 +52,8 @@ async function extractEntries(file: FileHandle, input: {
 
   /** 显式失败并停止解析；操作结算合并独立原因，事件仍按首因收口。 */
   const fail = (cause: unknown, operation = false): void => {
-    const error = cause instanceof Error ? cause : new Error("DESKTOP_RELEASE_EXTRACT_FAILED", { cause });
+    const error = cause instanceof Error ? cause : operation
+      ? new ExtractOperationError([cause], "DESKTOP_RELEASE_EXTRACT_FAILED") : new Error("DESKTOP_RELEASE_EXTRACT_FAILED", { cause });
     if (error instanceof AggregateError && error.errors.includes(failure)) failure = error;
     else if (operation && failure && cause !== failure) {
       const previous = failure instanceof ExtractOperationError ? failure.errors : [failure];
@@ -184,7 +168,7 @@ async function extractEntries(file: FileHandle, input: {
     await tasks;
     input.signal?.removeEventListener("abort", onAbort);
   }
-  if (failure) throw failure;
+  if (failure) throw failure instanceof ExtractOperationError && failure.errors.length === 1 ? failure.errors[0] : failure;
   input.signal?.throwIfAborted();
   if (!eof) throw new Error("DESKTOP_RELEASE_ARCHIVE_TRUNCATED");
   if (input.manifest.files.some(entry => !seen.has(entry.path.toLowerCase()))) throw new Error("DESKTOP_RELEASE_ARCHIVE_FILES_MISMATCH");

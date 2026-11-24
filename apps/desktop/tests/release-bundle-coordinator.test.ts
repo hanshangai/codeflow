@@ -18,7 +18,7 @@ const trustedReleaseKeys = { fixture: publicKey };
 
 const failureContext = { deviceId: "868683b1-e79b-4509-9ca1-97b7786e5344", shellVersion: "1.0.0", currentReleaseId: "installation", webVersion: "1.0.0", clientVersion: "1.0.0" };
 
-test("活动与基线允许显式启动校验，默认仍核完整依赖", async t => {
+test("活动与基线默认只检查入口，显式 full 仍核完整依赖", async t => {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "cf-installed-startup-"));
   t.after(() => fs.rm(rootDir, { recursive: true, force: true }));
   const source = await createPackage(rootDir);
@@ -36,13 +36,36 @@ test("活动与基线允许显式启动校验，默认仍核完整依赖", async
   await fs.writeFile(extra, "changed", "utf8");
   const trust = { trustedReleaseKeys };
   assert.equal((await releaseCoordinator.resolveBaselineRelease(source, { ...trust, verification: "startup" })).manifest.releaseId, manifest.releaseId);
-  await assert.rejects(releaseCoordinator.resolveBaselineRelease(source, trust), /Client payload SHA-256/u);
+  assert.equal((await releaseCoordinator.resolveBaselineRelease(source, trust)).manifest.releaseId, manifest.releaseId);
+  await assert.rejects(releaseCoordinator.resolveBaselineRelease(source, { ...trust, verification: "full" }), /Client payload SHA-256/u);
   await fs.unlink(path.join(source, "baseline-release-manifest.json"));
   const releaseDir = path.join(rootDir, "releases", manifest.releaseId);
   await fs.mkdir(path.dirname(releaseDir)); await fs.rename(source, releaseDir);
   await fs.writeFile(path.join(rootDir, "active-release.json"), JSON.stringify({ releaseId: manifest.releaseId }), "utf8");
   assert.equal((await resolveActiveRelease(rootDir, { ...trust, verification: "startup" }))?.releaseId, manifest.releaseId);
-  await assert.rejects(resolveActiveRelease(rootDir, trust), /Client payload SHA-256/u);
+  assert.equal((await resolveActiveRelease(rootDir, trust))?.releaseId, manifest.releaseId);
+  await assert.rejects(resolveActiveRelease(rootDir, { ...trust, verification: "full" }), /Client payload SHA-256/u);
+});
+
+test("prepare resume switch 只读取签名清单与 held marker，fresh 不触发全量校验", async t => {
+  const f = await startupProofPackage(startupMarker());
+  t.after(() => fs.rm(f.root, { recursive: true, force: true }));
+  const { signature: _signature, ...payload } = f.manifest;
+  const manifest = signReleaseBundleManifest({ ...payload, expiresAt: "2099-01-01T00:00:00.000Z" }, privateKey);
+  await fs.writeFile(f.manifestFile, JSON.stringify(manifest), "utf8");
+  await fs.rm(path.join(f.directory, "baseline-release-manifest.json"));
+  await fs.writeFile(path.join(f.directory, "client/dist/index.cjs"), "changed", "utf8");
+  const readFile = fs.readFile.bind(fs);
+  t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    assert.ok(String(args[0]).endsWith(".json"), "运行时不应读取资源正文");
+    return await readFile(...args);
+  });
+  const coordinator = createCoordinator({ rootDir: f.root, trustedReleaseKeys, requireHeldStartup: true, getFailureContext: () => failureContext });
+  const prepared = await coordinator.prepare(f.directory);
+  const resumed = await coordinator.resume({ requestId: prepared.requestId, releaseId: manifest.releaseId, stagingDir: prepared.stagingDir });
+  const active = await coordinator.switch(resumed, { async checkCompatibility() {}, async drain() {}, async restartClient() {},
+    async reloadWeb() {}, async waitHealthy() { return true; }, async restoreInitialRelease() {} });
+  assert.equal((await resolveActiveRelease(f.root, { trustedReleaseKeys, requireHeldStartup: true }))?.releaseId, active.releaseId);
 });
 
 /** 更新测试固定可信身份和版本，不从现有安装目录读取设备数据。 */
@@ -109,15 +132,14 @@ async function createPackage(root: string, options: { wrongClientHash?: boolean;
   return packageDir;
 }
 
-test("does not activate a bundle when one payload hash is wrong", async () => {
+test("preparation trusts signed aggregate metadata without hashing expanded resources", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-desktop-release-"));
   try {
     const packageDir = await createPackage(tempDir, { wrongClientHash: true });
     const coordinator = createReleaseBundleCoordinator({ rootDir: tempDir });
-    await assert.rejects(() => coordinator.prepare(packageDir), /Client.*SHA-256/);
+    assert.equal((await coordinator.prepare(packageDir)).manifest.releaseId, "new-release");
     assert.equal(await readActivePointer(tempDir), null);
-    const failure = createUpdateFailureJournal(tempDir).pending(failureContext.deviceId)[0]!;
-    assert.equal(failure.errorCode, "DESKTOP_RELEASE_FAILED"); assert.equal(failure.releaseId, "new-release");
+    assert.equal(createUpdateFailureJournal(tempDir).pending(failureContext.deviceId).length, 0);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -179,7 +201,7 @@ test("does not commit the previous pointer before rollback health succeeds", asy
   }
 });
 
-test("loads only a complete and intact active release on restart", async () => {
+test("restart checks entry presence without reading resource hashes", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-desktop-release-"));
   try {
     const coordinator = createReleaseBundleCoordinator({ rootDir: tempDir });
@@ -194,7 +216,9 @@ test("loads only a complete and intact active release on restart", async () => {
     });
     assert.equal((await resolveActiveRelease(tempDir, { trustedReleaseKeys }))?.releaseDir, active.releaseDir);
     await fs.writeFile(path.join(active.releaseDir, "web", "index.html"), "tampered", "utf8");
-    await assert.rejects(() => resolveActiveRelease(tempDir, { trustedReleaseKeys }), /Web payload SHA-256/);
+    assert.equal((await resolveActiveRelease(tempDir, { trustedReleaseKeys }))?.releaseDir, active.releaseDir);
+    await fs.rm(path.join(active.releaseDir, "web", "index.html"));
+    await assert.rejects(() => resolveActiveRelease(tempDir, { trustedReleaseKeys }), /ENOENT/);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -221,13 +245,13 @@ test("restores the installation bundle when the first update fails", async () =>
   }
 });
 
-test("refuses a staged bundle that changes after preparation", async () => {
+test("refuses a staged bundle whose entry disappears after preparation", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-desktop-release-"));
   try {
     let drained = false;
     const coordinator = createReleaseBundleCoordinator({ rootDir: tempDir });
     const prepared = await coordinator.prepare(await createPackage(tempDir));
-    await fs.writeFile(path.join(prepared.stagingDir, "client", "dist", "index.cjs"), "changed", "utf8");
+    await fs.rm(path.join(prepared.stagingDir, "client", "dist", "index.cjs"));
     await assert.rejects(() => coordinator.switch(prepared, {
       checkCompatibility: async () => {},
       drain: async () => { drained = true; },
@@ -235,7 +259,7 @@ test("refuses a staged bundle that changes after preparation", async () => {
       reloadWeb: async () => {},
       waitHealthy: async () => true,
       restoreInitialRelease: async () => {},
-    }), /Client payload SHA-256/);
+    }), /ENOENT/);
     assert.equal(drained, false);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -422,7 +446,7 @@ test("new bundles enforce expiry and platform while a verified active bundle can
   await assert.rejects(() => timely.prepare(other), /PLATFORM_MISMATCH/);
 });
 
-test("signed inventory rejects extra, missing and wrong-size resources before drain", async t => {
+test("expanded resources skip inventory hashes while missing entries still fail", async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codeflow-desktop-files-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const packageDir = await createPackage(root);
@@ -432,10 +456,10 @@ test("signed inventory rejects extra, missing and wrong-size resources before dr
   payload.files[0].size += 1;
   await fs.writeFile(manifestPath, JSON.stringify(signReleaseBundleManifest(payload, privateKey)), "utf8");
   const coordinator = createReleaseBundleCoordinator({ rootDir: root });
-  await assert.rejects(() => coordinator.prepare(packageDir), /FILES_MISMATCH/);
+  await coordinator.prepare(packageDir);
   await fs.writeFile(manifestPath, JSON.stringify(original), "utf8");
   await fs.writeFile(path.join(packageDir, "web", "extra.js"), "extra", "utf8");
-  await assert.rejects(() => coordinator.prepare(packageDir), /Web payload SHA-256|FILES_MISMATCH/);
+  await coordinator.prepare(packageDir);
   await fs.rm(path.join(packageDir, "web", "extra.js"));
   await fs.rm(path.join(packageDir, "client", "dist", "index.cjs"));
   await assert.rejects(() => coordinator.prepare(packageDir), /ENOENT|Client payload SHA-256|FILES_MISMATCH/);
