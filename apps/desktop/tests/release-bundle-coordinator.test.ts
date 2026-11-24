@@ -68,6 +68,25 @@ test("prepare resume switch 只读取签名清单与 held marker，fresh 不触�
   assert.equal((await resolveActiveRelease(f.root, { trustedReleaseKeys, requireHeldStartup: true }))?.releaseId, active.releaseId);
 });
 
+test("coordinator阶段轨迹按requestId标注开始、耗时和失败码", async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cf-coordinator-trace-"));
+  const directory = await createPackage(root);
+  const manifest = JSON.parse(await fs.readFile(path.join(directory, "manifest.json"), "utf8"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const trace: Array<{ requestId: string; phase: string; outcome: string; durationMs?: number; errorCode?: string }> = [];
+  const coordinator = createCoordinator({ rootDir: root, trustedReleaseKeys, getFailureContext: () => failureContext,
+    onDiagnostic: event => trace.push(event) });
+  const prepared = await coordinator.prepare(directory);
+  await assert.rejects(coordinator.switch(prepared, { async checkCompatibility() {}, async drain() {},
+    async restartClient() { throw Object.assign(new Error("private detail"), { code: "FIXTURE_CLIENT_START_FAILED" }); },
+    async reloadWeb() {}, async waitHealthy() { return true; }, async restoreInitialRelease() {} }));
+  assert.ok(trace.some(event => event.phase === "prepare" && event.outcome === "success" && event.requestId === prepared.requestId));
+  assert.ok(trace.some(event => event.phase === "restart-client" && event.outcome === "failure"
+    && event.errorCode === "FIXTURE_CLIENT_START_FAILED" && event.requestId === prepared.requestId));
+  assert.ok(trace.every(event => event.durationMs === undefined || Number.isSafeInteger(event.durationMs) && event.durationMs >= 0));
+  assert.equal(JSON.stringify(trace).includes("private detail"), false);
+});
+
 /** 更新测试固定可信身份和版本，不从现有安装目录读取设备数据。 */
 function createReleaseBundleCoordinator(input: { rootDir: string; now?: () => number; reportReceipt?: (receipt: DesktopUpdateReceipt) => Promise<void> }) {
   return createCoordinator({ ...input, trustedReleaseKeys, getFailureContext: () => failureContext,

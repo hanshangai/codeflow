@@ -33,7 +33,7 @@ export type ReleaseSwitchHooks = {
   checkCompatibility(manifest: ReleaseBundleManifest): Promise<void>;
   drain(): Promise<void>;
   restartClient(releaseDir: string, manifest: ReleaseBundleManifest): Promise<void>;
-  reloadWeb(releaseDir: string): Promise<void>;
+  reloadWeb(releaseDir: string, manifest: ReleaseBundleManifest): Promise<void>;
   waitHealthy(releaseDir: string): Promise<boolean>;
   restoreInitialRelease(): Promise<void>;
   /** 完整安装基线接管期间，候选回退必须恢复已验签的新基线而非旧活动包。 */
@@ -57,6 +57,8 @@ type ReleaseBundleCoordinator = {
 
 /** following 是已观察到的下一阶段事实，持久 reporter 必须先一并落盘再联网。 */
 type ReleaseReceiptReporter = (receipt: DesktopUpdateReceipt, following?: DesktopUpdateReceipt) => Promise<void>;
+export type ReleaseBundleDiagnostic = { requestId: string; releaseId?: string; phase: string; outcome: "start" | "success" | "failure";
+  durationMs?: number; errorCode?: string; receivedBytes?: number; totalBytes?: number };
 
 const ACTIVE_POINTER = "active-release.json";
 const PREVIOUS_POINTER = "previous-release.json";
@@ -64,6 +66,7 @@ const PREVIOUS_POINTER = "previous-release.json";
 /** 创建绑定发布包协调器；包目录是 Server 完整包下载后的不可变本地副本。 */
 export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { rootDir: string; getFailureContext(): UpdateFailureContext;
   reportReceipt?: ReleaseReceiptReporter; isCancellation?: (error: unknown) => boolean;
+  onDiagnostic?: (event: ReleaseBundleDiagnostic) => void;
   onProgress?: (observation: { requestId: string; phase: DesktopBundleUpdatePhase; result?: DesktopUpdateResult; target?: DesktopBundleVersion }) => void }): ReleaseBundleCoordinator {
   const rootDir = path.resolve(input.rootDir);
   const journal = createUpdateFailureJournal(rootDir);
@@ -91,15 +94,26 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
       const requestId = options.requestId ?? crypto.randomUUID();
       let releaseId = "unknown";
       let stagingDir: string | undefined;
+      let prepareStartedAt = performance.now();
       try {
+        input.onDiagnostic?.({ requestId, phase: "prepare", outcome: "start" });
         input.onProgress?.({ requestId, phase: "prepare" });
         options.signal?.throwIfAborted();
         const sourceDir = path.resolve(packageDir);
         const entries = await fs.readdir(sourceDir);
         const archived = entries.length === 2 && entries.includes("manifest.json") && entries.includes("bundle.tar.gz");
-        const manifest = archived
-          ? await verifyManifest(sourceDir, input, true, manifest => { releaseId = manifest.releaseId; })
-          : await verifyReleaseBundle(sourceDir, input, true, manifest => { releaseId = manifest.releaseId; });
+        let verifyStartedAt = performance.now(), manifest: ReleaseBundleManifest;
+        input.onDiagnostic?.({ requestId, phase: "verify-source", outcome: "start" });
+        try {
+          manifest = archived
+            ? await verifyManifest(sourceDir, input, true, value => { releaseId = value.releaseId; })
+            : await verifyReleaseBundle(sourceDir, input, true, value => { releaseId = value.releaseId; });
+        } catch (error) {
+          input.onDiagnostic?.({ requestId, releaseId, phase: "verify-source", outcome: "failure",
+            durationMs: diagnosticDuration(verifyStartedAt), errorCode: diagnosticErrorCode(error) });
+          throw error;
+        }
+        input.onDiagnostic?.({ requestId, releaseId, phase: "verify-source", outcome: "success", durationMs: diagnosticDuration(verifyStartedAt) });
         input.onProgress?.({ requestId, phase: "prepare", target: versionOf(manifest) });
 
         const stagingRoot = path.join(rootDir, ".staging");
@@ -107,17 +121,39 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
         if (!(await fs.lstat(stagingRoot)).isDirectory()) throw new Error("DESKTOP_RELEASE_STAGING_INVALID");
         stagingDir = await fs.mkdtemp(path.join(stagingRoot, `${manifest.releaseId}-`));
         await fs.copyFile(path.join(sourceDir, "manifest.json"), path.join(stagingDir, "manifest.json"));
-        if (archived) await extractReleaseBundle({ archivePath: path.join(sourceDir, "bundle.tar.gz"), stagingDir, manifest, signal: options.signal });
-        else for (const root of ["web", "client"]) await fs.cp(path.join(sourceDir, root), path.join(stagingDir, root), { recursive: true, errorOnExist: true, force: false });
-        const staged = await verifyReleaseBundle(stagingDir, input, true);
+        const materializeStage = archived ? "extract" : "copy-resources", materializeStartedAt = performance.now();
+        input.onDiagnostic?.({ requestId, releaseId, phase: materializeStage, outcome: "start" });
+        try {
+          if (archived) await extractReleaseBundle({ archivePath: path.join(sourceDir, "bundle.tar.gz"), stagingDir, manifest, signal: options.signal });
+          else for (const root of ["web", "client"]) await fs.cp(path.join(sourceDir, root), path.join(stagingDir, root), { recursive: true, errorOnExist: true, force: false });
+        } catch (error) {
+          input.onDiagnostic?.({ requestId, releaseId, phase: materializeStage, outcome: "failure",
+            durationMs: diagnosticDuration(materializeStartedAt), errorCode: diagnosticErrorCode(error) });
+          throw error;
+        }
+        input.onDiagnostic?.({ requestId, releaseId, phase: materializeStage, outcome: "success", durationMs: diagnosticDuration(materializeStartedAt) });
+        verifyStartedAt = performance.now(); input.onDiagnostic?.({ requestId, releaseId, phase: "verify-staged", outcome: "start" });
+        let staged: ReleaseBundleManifest;
+        try { staged = await verifyReleaseBundle(stagingDir, input, true); }
+        catch (error) {
+          input.onDiagnostic?.({ requestId, releaseId, phase: "verify-staged", outcome: "failure",
+            durationMs: diagnosticDuration(verifyStartedAt), errorCode: diagnosticErrorCode(error) });
+          throw error;
+        }
+        input.onDiagnostic?.({ requestId, releaseId, phase: "verify-staged", outcome: "success", durationMs: diagnosticDuration(verifyStartedAt) });
         if (JSON.stringify(staged) !== JSON.stringify(manifest)) throw new Error("准备期间绑定包清单已变更");
         options.signal?.throwIfAborted();
         if (input.reportReceipt) {
           await input.reportReceipt(createReceipt(input.getFailureContext(), requestId, manifest, "verified"));
           await input.reportReceipt(createReceipt(input.getFailureContext(), requestId, manifest, "prepared"));
         }
+        input.onDiagnostic?.({ requestId, releaseId: manifest.releaseId, phase: "prepare", outcome: "success",
+          durationMs: diagnosticDuration(prepareStartedAt) });
         return { requestId, manifest, stagingDir };
       } catch (error) {
+        try { input.onDiagnostic?.({ requestId, releaseId, phase: "prepare", outcome: "failure",
+          durationMs: diagnosticDuration(prepareStartedAt), errorCode: diagnosticErrorCode(error) }); }
+        catch (diagnosticError) { error = new AggregateError([error, diagnosticError], "DESKTOP_RELEASE_DIAGNOSTIC_FAILED"); }
         let failure = error;
         if (stagingDir) {
           try {
@@ -140,12 +176,19 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
       let previousReleaseId: string | null = null;
       const releaseId = prepared.manifest.releaseId;
       const targetDir = path.join(rootDir, "releases", releaseId);
-      let phase = "read-active";
+      let phase = "";
+      let phaseStartedAt = performance.now();
       let needsRestore = false;
       let activated: ActiveRelease | undefined;
       let activationReceiptError: unknown;
       /** 与原局部 phase 同步，回调失败继续沿原切换异常边界处理。 */
-      const setPhase = (next: DesktopBundleUpdatePhase): void => { phase = next; input.onProgress?.({ requestId: prepared.requestId, phase: next }); };
+      const setPhase = (next: DesktopBundleUpdatePhase): void => {
+        if (phase) input.onDiagnostic?.({ requestId: prepared.requestId, releaseId, phase, outcome: "success",
+          durationMs: diagnosticDuration(phaseStartedAt) });
+        phase = next; phaseStartedAt = performance.now();
+        input.onDiagnostic?.({ requestId: prepared.requestId, releaseId, phase, outcome: "start" });
+        input.onProgress?.({ requestId: prepared.requestId, phase: next });
+      };
       try {
         setPhase("read-active");
         previousReleaseId = await readActivePointer(rootDir);
@@ -173,7 +216,7 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
         setPhase("restart-client");
         await hooks.restartClient(targetDir, verified);
         setPhase("reload-web");
-        await hooks.reloadWeb(targetDir);
+        await hooks.reloadWeb(targetDir, verified);
         setPhase("health");
         if (!await hooks.waitHealthy(targetDir)) throw new Error("绑定包健康检查失败");
         setPhase("activate");
@@ -189,8 +232,12 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
           try { await input.reportReceipt(healthy); }
           catch (reportError) { activationReceiptError = reportError; throw new Error("DESKTOP_RELEASE_RECEIPT_FAILED", { cause: reportError }); }
         }
+        input.onDiagnostic?.({ requestId: prepared.requestId, releaseId, phase, outcome: "success", durationMs: diagnosticDuration(phaseStartedAt) });
         return activated;
       } catch (error) {
+        try { input.onDiagnostic?.({ requestId: prepared.requestId, releaseId, phase, outcome: "failure",
+          durationMs: diagnosticDuration(phaseStartedAt), errorCode: diagnosticErrorCode(error) }); }
+        catch (diagnosticError) { error = new AggregateError([error, diagnosticError], "DESKTOP_RELEASE_DIAGNOSTIC_FAILED"); }
         if (phase === "drain" && !(error instanceof AggregateError)
           && (error instanceof DesktopUpdatePostponed || input.isCancellation?.(error))) throw error;
         let observationFailure: { cause: unknown } | undefined;
@@ -201,6 +248,9 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
         let rollbackError: Error | null = null;
         let activationUncertain = false;
         if (needsRestore && !activated) {
+          const rollbackStartedAt = performance.now();
+          try { input.onDiagnostic?.({ requestId: prepared.requestId, releaseId, phase: "rollback", outcome: "start" }); }
+          catch (cause) { observationFailure = { cause }; }
           try {
             // rename 后刷盘失败时，先核指针；候选已写入或读回失败均不能破坏配套数据库。
             if (phase === "activate") {
@@ -211,6 +261,10 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
               ? new Error("活动指针提交未确认，保留候选与数据库等待启动恢复", { cause: error })
               : await restorePreviousRelease(rootDir, hooks.restoreInitialOnFailure ? null : previousReleaseId, hooks, input);
           } catch (cause) { rollbackError = cause instanceof Error ? cause : new Error(String(cause)); }
+          try { input.onDiagnostic?.({ requestId: prepared.requestId, releaseId, phase: "rollback",
+            outcome: rollbackError ? "failure" : "success", durationMs: diagnosticDuration(rollbackStartedAt),
+            ...(rollbackError ? { errorCode: diagnosticErrorCode(rollbackError) } : {}) }); }
+          catch (cause) { observationFailure = { cause: observationFailure ? new AggregateError([observationFailure.cause, cause], "DESKTOP_UPDATE_DIAGNOSTIC_FAILED") : cause }; }
         }
         const localResult = activated ? "healthy" : !needsRestore ? "failure" : rollbackError ? "unavailable" : "restored";
         try { input.onProgress?.({ requestId: prepared.requestId, phase: needsRestore && !activated ? "rollback" : phase as DesktopBundleUpdatePhase, result: localResult }); }
@@ -243,6 +297,16 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
 function versionOf(manifest: ReleaseBundleManifest): DesktopBundleVersion {
   return { releaseId: manifest.releaseId, version: manifest.version, webVersion: manifest.webVersion, clientVersion: manifest.clientVersion };
 }
+
+/** 固定安全错误分类，诊断不序列化异常正文。 */
+function diagnosticErrorCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "DESKTOP_RELEASE_FAILED";
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^[A-Z0-9_:-]{1,96}$/u.test(code) ? code : "DESKTOP_RELEASE_FAILED";
+}
+
+/** 阶段只使用单调时钟，结果是整数毫秒。 */
+function diagnosticDuration(startedAt: number): number { return Math.max(0, Math.round(performance.now() - startedAt)); }
 
 /** 从可信本地上下文构造阶段事实；不存在记者时不联网、不产生回执。 */
 function createReceipt(context: UpdateFailureContext, requestId: string, manifest: ReleaseBundleManifest,
@@ -353,7 +417,7 @@ async function restorePreviousRelease(rootDir: string, previousReleaseId: string
     const manifest = await verifyReleaseBundle(releaseDir, options);
     if (manifest.releaseId !== previousReleaseId) throw new Error("回退绑定包版本标识不匹配");
     await hooks.restartClient(releaseDir, manifest);
-    await hooks.reloadWeb(releaseDir);
+    await hooks.reloadWeb(releaseDir, manifest);
     if (!await hooks.waitHealthy(releaseDir)) throw new Error("回退绑定包健康检查失败");
     await writePointer(rootDir, ACTIVE_POINTER, { releaseId: previousReleaseId });
     return null;

@@ -43,13 +43,10 @@ let restartTimer: ReturnType<typeof setTimeout> | null = null;
 const currentRows = computed(() => [
   { label: "当前版本", value: formatDesktopCurrentVersion(details.value?.current ?? null) },
 ]);
-/** 两通道完成前不展示临时组合号；完成后按有效目标合成，历史失败目标不参与。 */
+/** 只有检测到有效目标后才展示新版本；检查中不显示占位提示，历史失败目标不参与。 */
 const targetRows = computed(() => {
   const value = details.value;
   if (!value) return [];
-  if (updateInProgress.value && (value.bundle.result === "unknown" || value.shell.result === "unknown")) {
-    return [{ label: "新版本", value: "新版本检测中" }];
-  }
   // same/failure/restored 时宿主仍保留目标快照，不能当成待安装的新版本展示。
   const active = (result: string | null | undefined) => result === "prepared" || result === "unknown" && updateInProgress.value;
   const bundle = active(value.bundle.result) ? value.bundle.target : null;
@@ -335,7 +332,7 @@ onBeforeUnmount(() => {
           <p>{{ presentation.detail }}</p>
         </div>
       </section>
-      <section class="update-check__versions" aria-label="版本">
+      <section v-if="targetRows.length > 0" class="update-check__versions" aria-label="版本">
         <template v-for="(row, index) in versionRows" :key="row.label">
           <ArrowRightOutlined v-if="index > 0" class="update-check__version-arrow" aria-hidden="true" />
           <div class="update-check__version" :class="{ 'update-check__version--target': index > 0 }">

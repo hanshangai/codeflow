@@ -10,11 +10,11 @@ import { toUpdateDiagnosticCause, toShellUpdateDiagnosticCause } from "@codeflow
 
 import { loadOrCreateDeviceIdentity, type DeviceIdentity } from "./deviceIdentity.js";
 import type { LegacyClientMigration } from "./legacyClientMigration.js";
-import type { StartupStatus } from "./webLoader.js";
+import type { StartupStatus, WebLoadTrace } from "./webLoader.js";
 import { createClientRuntime, type ClientCliRuntime, type ClientRuntime, type ClientRuntimeExpectation, type ClientRuntimeSnapshot } from "./clientRuntime.js";
 import { createDesktopBridge } from "./preload.js";
 import type { DesktopBridgeApi } from "./contracts.js";
-import { createReleaseBundleCoordinator, DesktopUpdatePostponed, readActivePointer, resolveActiveRelease, resolveBaselineRelease, clearIncompatibleActiveRelease, type ActiveRelease, type PreparedRelease } from "./releaseBundleCoordinator.js";
+import { createReleaseBundleCoordinator, DesktopUpdatePostponed, readActivePointer, resolveActiveRelease, resolveBaselineRelease, clearIncompatibleActiveRelease, type ActiveRelease, type PreparedRelease, type ReleaseBundleDiagnostic } from "./releaseBundleCoordinator.js";
 import { createDesktopUpdateReceipt, type DesktopUpdateReceipt } from "@codeflowai/shared/desktop-update-receipt";
 import type { TrustedReleaseKeys } from "@codeflowai/shared/desktop-release-signing";
 import { createDesktopUpdateTransport } from "./updateTransport.js";
@@ -51,7 +51,10 @@ export type DesktopHost = {
   /** 可选壳内静态启动页；不能读取待验证资源或开放业务桥。 */
   loadStartup?(window: DesktopWindow): Promise<void>;
   /** 页面先导航展示，本地启动任务收口后再开始页面就绪预算。 */
-  loadWeb(window: DesktopWindow, releaseDir: string, options?: { beforeReady?: () => Promise<void> }): Promise<void>;
+  loadWeb(window: DesktopWindow, releaseDir: string, options?: { beforeReady?: () => Promise<void>; requestId?: string; releaseId?: string;
+    onTrace?: (event: WebLoadTrace) => void }): Promise<void>;
+  /** 升级专用脱敏诊断写入现有 Desktop 日志。 */
+  onUpgradeDiagnostic?(event: ReleaseBundleDiagnostic & { diagnostic?: Record<string, unknown> }): void;
   /** 启动页阶段进度；提示失败只记录，不改变启动或更新结果。 */
   updateStartupStatus?(window: DesktopWindow, status: StartupStatus): Promise<void> | void;
   /** 将已结束启动阶段的实测耗时写入本地诊断日志。 */
@@ -415,6 +418,7 @@ export function createDesktopApplication(input: {
   const coordinator = createReleaseBundleCoordinator({ rootDir: input.dataDir, trustedReleaseKeys: input.trustedReleaseKeys,
     reportReceipt: input.configuredServerOrigin || input.reportReceipt ? reportReceiptInternal : undefined,
     getFailureContext, isCancellation: isAutomaticStop,
+    onDiagnostic: event => input.host.onUpgradeDiagnostic?.(event),
     /** 原协调器只报告阶段及本地结果，不由展示观察决定后续动作。 */
     onProgress(observation) {
       if (bundleDetails.requestId !== observation.requestId) {
@@ -579,9 +583,24 @@ export function createDesktopApplication(input: {
     if (result.status === "postponed" && !allowRestart) shellDetails.result = "prepared";
   };
   /** 使用同一窗口切换 Web 资源根，可等待本地启动任务；失败向上传递。 */
-  const reloadWeb = async (releaseDir: string, options?: { beforeReady?: () => Promise<void> }): Promise<void> => {
+  const reloadWeb = async (releaseDir: string, options?: { beforeReady?: () => Promise<void>; requestId?: string; releaseId?: string }): Promise<void> => {
     if (!window) throw new Error("DESKTOP_WINDOW_NOT_READY");
-    await input.host.loadWeb(window, releaseDir, options);
+    const startedAt = performance.now(), requestId = options?.requestId ?? crypto.randomUUID();
+    const releaseId = options?.releaseId ?? path.basename(path.resolve(releaseDir));
+    input.host.onUpgradeDiagnostic?.({ requestId, releaseId, phase: "reload-web", outcome: "start" });
+    try {
+      await input.host.loadWeb(window, releaseDir, { ...options, requestId, releaseId,
+        onTrace: event => input.host.onUpgradeDiagnostic?.({ requestId, releaseId, phase: event.stage, outcome: event.outcome,
+          ...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
+          ...(event.errorCode ? { errorCode: event.errorCode } : {}),
+          diagnostic: { probeCount: event.probeCount, ready: event.ready, documentReadyState: event.documentReadyState,
+            htmlRootPresent: event.htmlRootPresent, appRootPresent: event.appRootPresent, bodyChildCount: event.bodyChildCount } }) });
+    } catch (error) {
+      input.host.onUpgradeDiagnostic?.({ requestId, releaseId, phase: "reload-web", outcome: "failure",
+        durationMs: elapsedSince(startedAt), errorCode: safeUpgradeErrorCode(error) });
+      throw error;
+    }
+    input.host.onUpgradeDiagnostic?.({ requestId, releaseId, phase: "reload-web", outcome: "success", durationMs: elapsedSince(startedAt) });
     if (operation === "starting") startupWebLoaded = true;
   };
   /** 启动取消后禁止迟到任务创建 Client、加载业务页或重显窗口。 */
@@ -708,13 +727,29 @@ export function createDesktopApplication(input: {
   }
 
   /** 两个下载入口复用同一落盘和 received 事实，不重复安装状态或回执副本。 */
-  const downloadReleaseInternal = async (options: ApplicationDownloadOptions) => {
-    return await downloadReleaseBundle({ ...options, rootDir: input.dataDir, transport: transport!, trustedReleaseKeys: input.trustedReleaseKeys ?? {},
+  const downloadReleaseInternal = async (options: ApplicationDownloadOptions, releaseIdHint?: string) => {
+    let diagnosticPhase: "download" | "verify" | undefined;
+    let diagnosticStartedAt = performance.now();
+    let downloadProgress: { receivedBytes: number; totalBytes: number } | undefined;
+    const requestId = options.requestId ?? "unknown";
+    try {
+      const downloaded = await downloadReleaseBundle({ ...options, rootDir: input.dataDir, transport: transport!, trustedReleaseKeys: input.trustedReleaseKeys ?? {},
       networkRetry: networkContext?.retry,
       /** 下载与摘要校验沿下载器真实边界，不能用 received 推测校验中。 */
-      onPhase(phase) { bundleDetails.requestId = options.requestId ?? null; bundleDetails.phase = phase; if (phase !== "download") input.host.onUpdateProgress?.(null); },
+      onPhase(phase) {
+        const releaseId = releaseIdHint ?? pendingUpdate?.manifest.releaseId ?? "unknown";
+        if (diagnosticPhase) input.host.onUpgradeDiagnostic?.({ requestId, releaseId, phase: diagnosticPhase, outcome: "success",
+          durationMs: elapsedSince(diagnosticStartedAt), ...(diagnosticPhase === "download" ? downloadProgress : {}) });
+        diagnosticPhase = phase; diagnosticStartedAt = performance.now();
+        bundleDetails.requestId = options.requestId ?? null; bundleDetails.phase = phase;
+        input.host.onUpgradeDiagnostic?.({ requestId, releaseId, phase, outcome: "start" });
+        if (phase !== "download") input.host.onUpdateProgress?.(null);
+      },
       /** 字节进度只供弹框展示，不改变下载、校验或重试判定。 */
-      onProgress(received, total) { input.host.onUpdateProgress?.({ received, total }); },
+      onProgress(received, total) {
+        downloadProgress = { receivedBytes: received, totalBytes: total };
+        input.host.onUpdateProgress?.({ received, total });
+      },
       receivedReporter: async received => {
         const existing = await receiptJournal!.find(identity!.deviceId, received.requestId, "received");
         if (existing && (existing.releaseId !== received.manifest.releaseId || existing.archiveSha256 !== received.manifest.archiveSha256)) {
@@ -725,6 +760,16 @@ export function createDesktopApplication(input: {
           at: new Date().toISOString(), errorCode: null, errorId: null }));
       },
     });
+      if (diagnosticPhase) input.host.onUpgradeDiagnostic?.({ requestId, releaseId: downloaded.manifest.releaseId,
+        phase: diagnosticPhase, outcome: "success", durationMs: elapsedSince(diagnosticStartedAt),
+        ...(diagnosticPhase === "download" ? downloadProgress : {}) });
+      return downloaded;
+    } catch (error) {
+      if (diagnosticPhase) input.host.onUpgradeDiagnostic?.({ requestId, releaseId: releaseIdHint ?? pendingUpdate?.manifest.releaseId ?? "unknown",
+        phase: diagnosticPhase, outcome: "failure", durationMs: elapsedSince(diagnosticStartedAt), errorCode: safeUpgradeErrorCode(error),
+        ...(diagnosticPhase === "download" ? downloadProgress : {}) });
+      throw error;
+    }
   };
 
   /** 同轮按真实尝试标识缓存组合响应；历史壳恢复使用原标识复查，绝不改写授权信封。 */
@@ -874,7 +919,7 @@ export function createDesktopApplication(input: {
         }
       }
       const downloaded = await downloadReleaseInternal({ manifestBytes, archivePath: `/api/software/desktop/releases/${manifest.releaseId}/archive`,
-        requestId, signal: options.signal });
+        requestId, signal: options.signal }, manifest.releaseId);
       if (operation === "checking" && pendingUpdate?.requestId === requestId) pendingUpdate.downloaded = downloaded;
       return downloaded;
     } catch (cause) {
@@ -927,12 +972,14 @@ export function createDesktopApplication(input: {
           // 交接开始后复用唯一关闭入口，避免重复停止会话及更新确认状态。
           if (operation === "checking") switchCommitted = true;
           await currentRuntime.drain(undefined, { force: true });
-        }, restartClient, reloadWeb,
+        },
+        restartClient,
+        reloadWeb: async (directory, manifest) => await reloadWeb(directory, { requestId: prepared.requestId, releaseId: manifest.releaseId }),
         waitHealthy: async () => runtime.snapshot().status === "ready",
         restoreInitialRelease: async () => {
-          if (input.requireBaseline) await resolveBaselineRelease(baselineReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys });
-          await restartClient(input.initialReleaseDir, initialExpectation);
-          await reloadWeb(input.initialReleaseDir);
+          const baseline = input.requireBaseline ? await resolveBaselineRelease(baselineReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys }) : null;
+          await restartClient(input.initialReleaseDir, baseline?.manifest ?? initialExpectation);
+          await reloadWeb(input.initialReleaseDir, { requestId: prepared.requestId, releaseId: baseline?.manifest.releaseId ?? "installation" });
         },
       });
       syncActiveRelease(active);
@@ -1061,7 +1108,7 @@ export function createDesktopApplication(input: {
         },
         /** 启动调用即可能迁移数据库；不能仅凭未收到 ready 推断原库未变。 */
         async restartClient(releaseDir, manifest) { candidateStarted = true; await restartClient(releaseDir, manifest); },
-        reloadWeb,
+        reloadWeb: (directory, manifest) => reloadWeb(directory, { requestId: pending.requestId, releaseId: manifest.releaseId }),
         /** 不能将下载或进程存在当健康；候选仍持有启动围栏。 */
         async waitHealthy() {
           const current = runtime.snapshot();
@@ -1079,7 +1126,8 @@ export function createDesktopApplication(input: {
           if (input.requireBaseline) await resolveBaselineRelease(baselineReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys });
           const restoreDirectory = baselineAtStartup?.releaseDir ?? input.initialReleaseDir;
           const expectedBaseline = baselineAtStartup?.manifest ?? initialExpectation;
-          await restartClient(restoreDirectory, expectedBaseline); await reloadWeb(restoreDirectory);
+          await restartClient(restoreDirectory, expectedBaseline);
+          await reloadWeb(restoreDirectory, { requestId: pending.requestId, releaseId: expectedBaseline?.releaseId });
         },
         restoreInitialOnFailure,
       });
@@ -1134,7 +1182,8 @@ export function createDesktopApplication(input: {
           { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY", requestId: pending.requestId, releaseId: pending.releaseId });
         const fallback = activeAtStartup ?? baselineAtStartup;
         await restartClient(fallback?.releaseDir ?? input.initialReleaseDir, fallback?.manifest ?? initialExpectation);
-        await reloadWeb(fallback?.releaseDir ?? input.initialReleaseDir);
+        await reloadWeb(fallback?.releaseDir ?? input.initialReleaseDir, { requestId: pending.requestId,
+          releaseId: fallback?.manifest.releaseId ?? "installation" });
         publishRuntimeFacts();
       }
     }
@@ -1797,6 +1846,16 @@ export function createDesktopApplication(input: {
 function snapshotBundleVersion(manifest: Pick<DownloadedRelease["manifest"], "releaseId" | "version" | "webVersion" | "clientVersion">): DesktopBundleVersion {
   return { releaseId: manifest.releaseId, version: manifest.version, webVersion: manifest.webVersion, clientVersion: manifest.clientVersion };
 }
+
+/** 诊断只暴露固定错误码，不序列化异常正文。 */
+function safeUpgradeErrorCode(error: unknown): string {
+  if (error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+    && /^[A-Z0-9_:-]{1,96}$/u.test((error as { code: string }).code)) return (error as { code: string }).code;
+  return "DESKTOP_UPGRADE_FAILED";
+}
+
+/** 使用单调时钟输出阶段耗时。 */
+function elapsedSince(startedAt: number): number { return Math.max(0, Math.round(performance.now() - startedAt)); }
 
 /** 冷激活时只读实际 SQLite 结构版本，缺失数据库按首次安装处理。 */
 async function readDatabaseSchemaVersion(dataDir: string): Promise<number> {

@@ -5,6 +5,19 @@ type WebWindow = {
   webContents?: { executeJavaScript(source: string): Promise<unknown> };
 };
 
+export type WebLoadTrace = {
+  stage: "navigation" | "before_ready" | "ready_probe";
+  outcome: "start" | "success" | "failure";
+  durationMs?: number;
+  errorCode?: string;
+  probeCount?: number;
+  ready?: boolean;
+  documentReadyState?: "loading" | "interactive" | "complete" | "unknown";
+  htmlRootPresent?: boolean;
+  appRootPresent?: boolean;
+  bodyChildCount?: number;
+};
+
 /** 启动阶段进度只用于壳内提示，不代表业务就绪。 */
 export type StartupStatus = { label: string; percent?: number };
 
@@ -53,25 +66,88 @@ export async function updateStartupWeb(window: WebWindow, status: StartupStatus)
 
 /** 导航后先等待已有本地启动任务，再限时确认应用挂载；导航成功本身不算健康。 */
 export async function loadWeb(window: WebWindow, entry: string, options: {
-  requireReady?: boolean; timeoutMs?: number; beforeReady?: () => Promise<void>;
+  requireReady?: boolean; timeoutMs?: number; beforeReady?: () => Promise<void>; onTrace?: (event: WebLoadTrace) => void;
 } = {}): Promise<void> {
-  await window.loadURL(entry);
+  const emit = (event: WebLoadTrace): void => { options.onTrace?.(event); };
+  let startedAt = performance.now();
+  emit({ stage: "navigation", outcome: "start" });
+  try { await window.loadURL(entry); }
+  catch (cause) {
+    try { emit({ stage: "navigation", outcome: "failure", durationMs: elapsed(startedAt), errorCode: safeWebErrorCode(cause) }); }
+    catch (logError) { throw new AggregateError([cause, logError], "DESKTOP_WEB_TRACE_FAILED"); }
+    throw cause;
+  }
+  emit({ stage: "navigation", outcome: "success", durationMs: elapsed(startedAt) });
   if (!options.requireReady) return;
   if (!window.webContents) throw new Error("DESKTOP_WEB_READY_UNAVAILABLE");
-  await options.beforeReady?.();
+  if (options.beforeReady) {
+    startedAt = performance.now(); emit({ stage: "before_ready", outcome: "start" });
+    try { await options.beforeReady(); }
+    catch (cause) {
+      try { emit({ stage: "before_ready", outcome: "failure", durationMs: elapsed(startedAt), errorCode: safeWebErrorCode(cause) }); }
+      catch (logError) { throw new AggregateError([cause, logError], "DESKTOP_WEB_TRACE_FAILED"); }
+      throw cause;
+    }
+    emit({ stage: "before_ready", outcome: "success", durationMs: elapsed(startedAt) });
+  }
   const timeoutMs = options.timeoutMs ?? 30_000, deadline = performance.now() + timeoutMs;
+  let probes = 0, lastState: WebLoadTrace | undefined;
+  startedAt = performance.now(); emit({ stage: "ready_probe", outcome: "start" });
   let timer: ReturnType<typeof setTimeout> | undefined;
   /** 只读取可信页面的固定启动协议；探测拒绝与超时均交更新恢复边界。 */
   const wait = async (): Promise<void> => {
     while (performance.now() < deadline) {
-      if (await window.webContents!.executeJavaScript('document.documentElement.dataset.codeflowReady === "1"') === true) return;
+      probes++;
+      const result = await window.webContents!.executeJavaScript(`(() => ({
+        ready: document.documentElement.dataset.codeflowReady === "1",
+        documentReadyState: document.readyState,
+        htmlRootPresent: Boolean(document.documentElement),
+        appRootPresent: Boolean(document.getElementById("app")),
+        bodyChildCount: document.body?.childElementCount ?? 0
+      }))()`);
+      if (result && typeof result === "object") {
+        const state = result as Record<string, unknown>;
+        lastState = {
+          stage: "ready_probe", outcome: "failure", ready: state.ready === true,
+          documentReadyState: ["loading", "interactive", "complete"].includes(String(state.documentReadyState))
+            ? state.documentReadyState as "loading" | "interactive" | "complete" : "unknown",
+          htmlRootPresent: state.htmlRootPresent === true,
+          appRootPresent: state.appRootPresent === true,
+          bodyChildCount: Number.isSafeInteger(state.bodyChildCount) && Number(state.bodyChildCount) >= 0
+            ? Number(state.bodyChildCount) : 0,
+        };
+        if (lastState.ready) return;
+      }
+      if (result === true) return;
       const remaining = deadline - performance.now();
       if (remaining <= 0) break;
       await new Promise<void>(resolve => setTimeout(resolve, Math.min(50, remaining)));
     }
-    throw new Error("DESKTOP_WEB_READY_TIMEOUT");
+    throw Object.assign(new Error("DESKTOP_WEB_READY_TIMEOUT"), { code: "DESKTOP_WEB_READY_TIMEOUT" });
   };
   try {
-    await Promise.race([wait(), new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("DESKTOP_WEB_READY_TIMEOUT")), timeoutMs); })]);
+    await Promise.race([wait(), new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(Object.assign(new Error("DESKTOP_WEB_READY_TIMEOUT"), { code: "DESKTOP_WEB_READY_TIMEOUT" })), timeoutMs);
+    })]);
+    emit({ stage: "ready_probe", outcome: "success", durationMs: elapsed(startedAt), probeCount: probes, ready: true,
+      ...(lastState ? { documentReadyState: lastState.documentReadyState, htmlRootPresent: lastState.htmlRootPresent,
+        appRootPresent: lastState.appRootPresent, bodyChildCount: lastState.bodyChildCount } : {}) });
+  } catch (cause) {
+    try { emit({ ...lastState, stage: "ready_probe", outcome: "failure", durationMs: elapsed(startedAt), probeCount: probes,
+      errorCode: safeWebErrorCode(cause) }); }
+    catch (logError) { throw new AggregateError([cause, logError], "DESKTOP_WEB_TRACE_FAILED"); }
+    throw cause;
   } finally { if (timer) clearTimeout(timer); }
 }
+
+/** 仅输出固定错误码/名称，避免异常正文夹带页面数据。 */
+function safeWebErrorCode(cause: unknown): string {
+  if (!cause || typeof cause !== "object") return "DESKTOP_WEB_LOAD_FAILED";
+  const code = (cause as { code?: unknown }).code;
+  if (typeof code === "string" && /^[A-Z0-9_:-]{1,96}$/u.test(code)) return code;
+  const name = (cause as { name?: unknown }).name;
+  return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,39}$/u.test(name) ? `WEB_${name.toUpperCase()}` : "DESKTOP_WEB_LOAD_FAILED";
+}
+
+/** 使用单调时钟记录阶段持续时间。 */
+function elapsed(startedAt: number): number { return Math.max(0, Math.round(performance.now() - startedAt)); }

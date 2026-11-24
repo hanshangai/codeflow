@@ -747,6 +747,8 @@ if (process.versions.electron) {
       crashCapture = capture;
       let webDir = path.join(initialReleaseDir, "web");
       let normalWindow: BrowserWindow | undefined, loadedFrame = false;
+      let webDiagnosticContext: { requestId: string; releaseId: string } = { requestId: startupRequestId, releaseId: "installation" };
+      let webConsoleErrorCount = 0;
       let pendingUpdateCheck = false;
       /** 下载进度推送节流时间戳；进度事件高频，避免每条数据块都做窗口与来源校验。 */
       let lastUpdateProgressAt = 0;
@@ -793,13 +795,51 @@ if (process.versions.electron) {
         shellUpdate: shellFacts ? { facts: shellFacts } : undefined,
         trustedReleaseKeys: readInstalledReleaseTrust(releaseResourcesDir),
         host: {
-          createWindow: () => { normalWindow = createDefaultWindow(webEntry, showError); return normalWindow; },
+          createWindow: () => {
+            normalWindow = createDefaultWindow(webEntry, showError);
+            const contents = normalWindow.webContents;
+            contents.on("did-start-navigation", (_event, url, _inPlace, isMainFrame) => {
+              if (isMainFrame) {
+                webConsoleErrorCount = 0;
+                appendDesktopStartupDiagnostic(dataDir, JSON.stringify({ at: new Date().toISOString(),
+                  event: "desktop_web_navigation", outcome: "start", ...webDiagnosticContext,
+                  trustedEntry: isTrustedDesktopUrl(url, webEntry) }) + "\n");
+              }
+            });
+            contents.on("did-finish-load", () => appendDesktopStartupDiagnostic(dataDir, JSON.stringify({ at: new Date().toISOString(),
+              event: "desktop_web_navigation", outcome: "finished", ...webDiagnosticContext }) + "\n"));
+            contents.on("did-fail-load", (_event, errorCode, _description, validatedUrl, isMainFrame) => {
+              if (isMainFrame) appendDesktopStartupDiagnostic(dataDir, JSON.stringify({ at: new Date().toISOString(),
+                event: "desktop_web_navigation", outcome: "failure", ...webDiagnosticContext,
+                errorCode: "WEB_NAVIGATION_FAILED", networkErrorCode: Number.isInteger(errorCode) ? errorCode : null,
+                trustedEntry: isTrustedDesktopUrl(validatedUrl, webEntry) }) + "\n");
+            });
+            contents.on("render-process-gone", (_event, details) => appendDesktopStartupDiagnostic(dataDir, JSON.stringify({
+              at: new Date().toISOString(), event: "desktop_web_renderer", outcome: "gone", ...webDiagnosticContext,
+              reason: ["clean-exit", "abnormal-exit", "killed", "crashed", "oom", "launch-failed"].includes(details.reason)
+                ? details.reason : "unknown", exitCode: Number.isInteger(details.exitCode) ? details.exitCode : null }) + "\n"));
+            contents.on("console-message", (_event, level, message, lineNumber, sourceId) => {
+              if (level < 3) return;
+              webConsoleErrorCount++;
+              if (webConsoleErrorCount <= 20) appendDesktopStartupDiagnostic(dataDir, JSON.stringify({ at: new Date().toISOString(),
+                event: "desktop_web_console_error", ...webDiagnosticContext, lineNumber: Number.isInteger(lineNumber) ? lineNumber : null,
+                messageSha256: crypto.createHash("sha256").update(String(message)).digest("hex"),
+                sourceSha256: crypto.createHash("sha256").update(String(sourceId)).digest("hex") }) + "\n");
+              else if (webConsoleErrorCount === 21) appendDesktopStartupDiagnostic(dataDir, JSON.stringify({ at: new Date().toISOString(),
+                event: "desktop_web_console_error_limit", ...webDiagnosticContext, limit: 20 }) + "\n");
+            });
+            return normalWindow;
+          },
           /** 内置启动页与已验证的 Web 复用同一沙箱窗口。 */
           loadStartup: window => loadStartupWeb(window as BrowserWindow),
           /** 启动页进度失败只记录，不阻断启动或更新。 */
           updateStartupStatus: (window, status) => updateStartupWeb(window as BrowserWindow, status).catch(error => {
             logError(error, { errorCode: readDesktopErrorCode(error, "DESKTOP_STARTUP_STATUS_FAILED"), requestId: "startup-status" });
           }),
+          onUpgradeDiagnostic: facts => appendDesktopStartupDiagnostic(dataDir, `${JSON.stringify({ at: new Date().toISOString(),
+            event: "desktop_upgrade_stage", requestId: facts.requestId, releaseId: facts.releaseId, phase: facts.phase,
+            outcome: facts.outcome, durationMs: facts.durationMs, errorCode: facts.errorCode,
+            receivedBytes: facts.receivedBytes, totalBytes: facts.totalBytes, diagnostic: facts.diagnostic })}\n`),
           onStartupStage: facts => appendDesktopStartupDiagnostic(dataDir, `${JSON.stringify({ at: new Date().toISOString(),
             event: "desktop_startup_stage", requestId: facts.requestId, stage: facts.stage, durationMs: facts.durationMs })}\n`),
           onMigrationError: error => showDesktopError(dataDir, "CodeFlow 退出失败", error,
@@ -808,6 +848,7 @@ if (process.versions.electron) {
           loadWeb: async (window, releaseDir, options) => {
             loadedFrame = false;
             webDir = path.join(releaseDir, "web");
+            if (options?.requestId && options.releaseId) webDiagnosticContext = { requestId: options.requestId, releaseId: options.releaseId };
             await loadWeb(window as BrowserWindow, resolveDesktopInitialEntry(webEntry), { requireReady: true, ...options });
             loadedFrame = true;
           },

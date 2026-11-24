@@ -2116,6 +2116,38 @@ test("startup reports measured phase durations under one diagnostic request id",
   await app.exit();
 });
 
+test("资源更新的阶段诊断关联原requestId和releaseId且不携带异常正文", async t => {
+  const f = await fixture(t), events: Array<Record<string, unknown>> = [];
+  f.host.onUpgradeDiagnostic = event => events.push(event);
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir,
+    trustedReleaseKeys, host: f.host, createRuntime: () => f.runtime });
+  await app.start();
+  await app.applyRelease(await createUpdatePackage(f.dataDir));
+  assert.ok(events.some(event => event.phase === "prepare" && event.outcome === "start" && event.requestId));
+  assert.ok(events.some(event => event.phase === "restart-client" && event.outcome === "success" && event.releaseId === "new-release"));
+  assert.ok(events.some(event => event.phase === "reload-web" && event.outcome === "success" && event.releaseId === "new-release"));
+  assert.ok(events.every(event => event.durationMs === undefined || Number.isSafeInteger(event.durationMs) && Number(event.durationMs) >= 0));
+  assert.equal(JSON.stringify(events).includes("console.log('client')"), false);
+  await app.exit();
+});
+
+test("更新失败轨迹同时记录候选失败与回退完成", async t => {
+  const f = await fixture(t), events: Array<Record<string, unknown>> = [];
+  f.host.onUpgradeDiagnostic = event => events.push(event);
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir,
+    trustedReleaseKeys, host: f.host, createRuntime: (_entry, expected) => expected?.releaseId === "new-release"
+      ? { ...f.runtime, waitReady: async () => { throw Object.assign(new Error("private failure text"), { code: "FIXTURE_CANDIDATE_HEALTH_FAILED" }); } }
+      : f.runtime });
+  await app.start();
+  await assert.rejects(app.applyRelease(await createUpdatePackage(f.dataDir)), error =>
+    (error as { code?: string }).code === "FIXTURE_CANDIDATE_HEALTH_FAILED");
+  assert.ok(events.some(event => event.phase === "restart-client" && event.outcome === "failure"
+    && event.errorCode === "FIXTURE_CANDIDATE_HEALTH_FAILED"));
+  assert.ok(events.some(event => event.phase === "rollback" && event.outcome === "success"));
+  assert.equal(JSON.stringify(events).includes("private failure text"), false);
+  await app.exit();
+});
+
 for (const fails of [false, true]) {
   test(`concurrent exits share one drain and its ${fails ? "failure" : "success"}`, async t => {
     const f = await fixture(t);

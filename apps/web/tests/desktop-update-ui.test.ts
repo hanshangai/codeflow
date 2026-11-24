@@ -302,18 +302,12 @@ for (const target of ["bundle", "shell", "both"] as const) test(`更新弹框${t
   }
   await f.panel.startCheck();
   const expected = target === "bundle" ? "1.0.1117.2" : target === "shell" ? "2.1.1117" : "2.1.1117.2";
-  if (target !== "shell") {
-    assert.deepEqual(f.panel.versionRows.value, [
-      { label: "当前版本", value: "1.0.1117" }, { label: "新版本", value: "新版本检测中" },
-    ]);
-    return;
-  }
   assert.deepEqual(f.panel.versionRows.value, [
     { label: "当前版本", value: "1.0.1117" }, { label: "新版本", value: expected },
   ]);
 });
 
-test("更新检测尚无任何目标时显示检测中", async t => {
+test("更新检测尚无任何目标时不展示新版本占位", async t => {
   const f = modalFixture(t);
   f.state.checking = true;
   f.details.bundle.target = null;
@@ -321,9 +315,8 @@ test("更新检测尚无任何目标时显示检测中", async t => {
   f.details.shell.target = null;
   f.details.shell.result = "unknown";
   await f.panel.startCheck();
-  assert.deepEqual(f.panel.versionRows.value, [
-    { label: "当前版本", value: "1.0.1108" }, { label: "新版本", value: "新版本检测中" },
-  ]);
+  assert.deepEqual(f.panel.targetRows.value, []);
+  assert.deepEqual(f.panel.versionRows.value, [{ label: "当前版本", value: "1.0.1108" }]);
 });
 
 test("更新弹框不把失败或已生效的历史目标显示为新版本", async t => {

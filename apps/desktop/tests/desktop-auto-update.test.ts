@@ -158,6 +158,18 @@ async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'd
     async restart() { await app.exit(); app = createDesktopApplication(options); await app.start(); } };
 }
 
+test('下载与验签阶段写入关联的升级诊断', async t => {
+  const f = await fixture(t), trace: Array<Record<string, unknown>> = [];
+  f.host.onUpgradeDiagnostic = event => trace.push(event);
+  await f.app.checkForUpdates();
+  assert.ok(trace.some(event => event.phase === 'download' && event.outcome === 'start' && event.releaseId === f.manifest.releaseId));
+  assert.ok(trace.some(event => event.phase === 'download' && event.outcome === 'success'
+    && event.receivedBytes === f.manifest.archiveSize && event.totalBytes === f.manifest.archiveSize));
+  assert.ok(trace.some(event => event.phase === 'verify' && event.outcome === 'success' && event.releaseId === f.manifest.releaseId));
+  assert.ok(trace.every(event => !Object.hasOwn(event, 'url') && !Object.hasOwn(event, 'body')));
+  await f.app.exit();
+});
+
 test('内置已安装发布与目标相同，不下载、不准备也不提示重启', async t => {
   const f = await fixture(t, 'same');
   assert.equal(f.runtimeFacts.at(-1)?.versions.releaseId, f.manifest.releaseId);

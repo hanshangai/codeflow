@@ -93,3 +93,33 @@ test("导航失败立即停止，不等待本地启动", async () => {
     { requireReady: true, beforeReady: async () => { assert.fail("failed navigation must not wait for startup"); } }), error => error === failure);
 });
 
+test("Web加载报告导航、本地屏障和ready探测阶段", async () => {
+  const trace: Array<Record<string, unknown>> = [];
+  let reads = 0;
+  await loadWeb({ loadURL: async () => {}, webContents: { executeJavaScript: async () => ({
+    ready: ++reads > 1, documentReadyState: "complete", htmlRootPresent: true, appRootPresent: true, bodyChildCount: 1,
+  }) } }, "codeflow://desktop/", { requireReady: true, timeoutMs: 1000,
+    beforeReady: async () => {}, onTrace: event => trace.push(event) });
+  assert.deepEqual(trace.map(item => [item.stage, item.outcome]), [
+    ["navigation", "start"], ["navigation", "success"], ["before_ready", "start"],
+    ["before_ready", "success"], ["ready_probe", "start"], ["ready_probe", "success"],
+  ]);
+  assert.equal(trace.at(-1)?.probeCount, 2);
+  assert.equal(trace.at(-1)?.documentReadyState, "complete");
+  assert.equal(trace.at(-1)?.appRootPresent, true);
+});
+
+test("Web就绪超时报告最后一次安全探测状态且保留原失败码", async () => {
+  const trace: Array<Record<string, unknown>> = [];
+  await assert.rejects(loadWeb({ loadURL: async () => {}, webContents: { executeJavaScript: async () => ({
+    ready: false, documentReadyState: "complete", htmlRootPresent: true, appRootPresent: false, bodyChildCount: 1,
+  }) } }, "codeflow://desktop/", { requireReady: true, timeoutMs: 25, onTrace: event => trace.push(event) }),
+  error => (error as { code?: string }).code === "DESKTOP_WEB_READY_TIMEOUT");
+  const timeout = trace.at(-1)!;
+  assert.deepEqual([timeout.stage, timeout.outcome, timeout.ready, timeout.documentReadyState,
+    timeout.htmlRootPresent, timeout.appRootPresent, timeout.bodyChildCount],
+  ["ready_probe", "failure", false, "complete", true, false, 1]);
+  assert.ok(Number(timeout.probeCount) > 0);
+  assert.equal(Object.hasOwn(timeout, "url"), false);
+});
+

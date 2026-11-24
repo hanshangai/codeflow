@@ -13,6 +13,30 @@ import { DesktopMaintenanceStartupError } from "../src/desktopMaintenanceRecord.
 
 const startupId = "startup:current", attemptId = "attempt:original", continuationId = "continuation-original";
 
+test("main upgrade diagnostic callback persists fixed correlated fields to the existing log", async () => {
+  const source = await fs.readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const ast = ts.createSourceFile("main.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  let callback: ts.Expression | undefined;
+  const visit = (node: ts.Node): void => {
+    if (ts.isPropertyAssignment(node) && node.name.getText(ast) === "onUpgradeDiagnostic") callback = node.initializer;
+    ts.forEachChild(node, visit);
+  };
+  visit(ast); assert.ok(callback);
+  const line: string[] = [];
+  const compiled = ts.transpileModule(`const callback = ${callback!.getText(ast)}; callback;`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  class FixedDate extends Date { toISOString() { return "2026-11-24T00:00:00.000Z"; } }
+  const handler = vm.runInNewContext(compiled, { appendDesktopStartupDiagnostic(_directory: string, value: string) { line.push(value); },
+    dataDir: "C:\\profile", Date: FixedDate }) as (event: unknown) => void;
+  handler({ requestId: "update:1", releaseId: "release-1", phase: "ready_probe", outcome: "failure", durationMs: 30000,
+    errorCode: "DESKTOP_WEB_READY_TIMEOUT", diagnostic: { probeCount: 30, appRootPresent: false } });
+  assert.equal(line.length, 1);
+  assert.deepEqual(JSON.parse(line[0]!), { at: "2026-11-24T00:00:00.000Z", event: "desktop_upgrade_stage",
+    requestId: "update:1", releaseId: "release-1", phase: "ready_probe", outcome: "failure", durationMs: 30000,
+    errorCode: "DESKTOP_WEB_READY_TIMEOUT", diagnostic: { probeCount: 30, appRootPresent: false } });
+  assert.doesNotMatch(line[0]!, /console message|token|codeflow:\/\//iu);
+});
+
 test("normal relaunch drops the completed shell handshake while preserving both profile arguments", async () => {
   const source = await fs.readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const ast = ts.createSourceFile("main.ts", source, ts.ScriptTarget.Latest, true);
