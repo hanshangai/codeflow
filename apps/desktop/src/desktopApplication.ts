@@ -1007,7 +1007,8 @@ export function createDesktopApplication(input: {
 
   /** 启动时独立提交资源候选；本地事实完成才清 pending，远端交付不延长本地事务。 */
   const activatePendingAtStartup = async (pending: PendingRelease, activeAtStartup: ActiveRelease | null,
-    baselineAtStartup: Awaited<ReturnType<typeof resolveBaselineRelease>> | null, restoreToBaseline = false): Promise<void> => {
+    baselineAtStartup: Awaited<ReturnType<typeof resolveBaselineRelease>> | null, restoreToBaseline = false,
+    beforeWebReady?: () => Promise<void>): Promise<void> => {
     let candidate: PreparedRelease | undefined;
     let databaseMigration = false, candidateStarted = false;
     let baselineCannotStart = false;
@@ -1108,7 +1109,7 @@ export function createDesktopApplication(input: {
         },
         /** 启动调用即可能迁移数据库；不能仅凭未收到 ready 推断原库未变。 */
         async restartClient(releaseDir, manifest) { candidateStarted = true; await restartClient(releaseDir, manifest); },
-        reloadWeb: (directory, manifest) => reloadWeb(directory, { requestId: pending.requestId, releaseId: manifest.releaseId }),
+        reloadWeb: (directory, manifest) => reloadWeb(directory, { requestId: pending.requestId, releaseId: manifest.releaseId, beforeReady: beforeWebReady }),
         /** 不能将下载或进程存在当健康；候选仍持有启动围栏。 */
         async waitHealthy() {
           const current = runtime.snapshot();
@@ -1127,7 +1128,7 @@ export function createDesktopApplication(input: {
           const restoreDirectory = baselineAtStartup?.releaseDir ?? input.initialReleaseDir;
           const expectedBaseline = baselineAtStartup?.manifest ?? initialExpectation;
           await restartClient(restoreDirectory, expectedBaseline);
-          await reloadWeb(restoreDirectory, { requestId: pending.requestId, releaseId: expectedBaseline?.releaseId });
+          await reloadWeb(restoreDirectory, { requestId: pending.requestId, releaseId: expectedBaseline?.releaseId, beforeReady: beforeWebReady });
         },
         restoreInitialOnFailure,
       });
@@ -1662,16 +1663,19 @@ export function createDesktopApplication(input: {
         } else if (migration) {
           window.show();
           const owner = migration;
+          let migrationRuntimeReady: Promise<void> | undefined;
+          /** 候选或回滚 Client 已就绪后释放 Web 启动门，避免迁移与资源切换互相等待。 */
+          const markMigrationRuntimeReady = (): Promise<void> => migrationRuntimeReady ??= owner.runtimeReady();
           /** 发现与页面互相提供进度；并行等待真实就绪，任一失败先停止迁移再收妥在途任务。 */
           const ready = (async () => {
             await owner.prepare();
             if (pending) {
               if (!runtimeStarted && startupActiveRelease?.releaseId === pending.releaseId) await startRuntime();
-              await activatePendingAtStartup(pending, startupActiveRelease, baselineRelease, newerBaseline);
+              await activatePendingAtStartup(pending, startupActiveRelease, baselineRelease, newerBaseline, markMigrationRuntimeReady);
               pendingActivated = true;
             }
             if (!runtimeStarted) await startRuntime();
-            await owner.runtimeReady();
+            await markMigrationRuntimeReady();
           })();
           const web = reloadWeb(releaseDir, {
             /** 选择与失败页可独立交互；自动启动等待迁移和账号恢复收口后再计时。 */

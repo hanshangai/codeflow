@@ -14,7 +14,7 @@ import { createDesktopApplication, DesktopStartupCleanupError, type DesktopHost 
 import type { ClientRuntime } from "../src/clientRuntime.js";
 import { createClientRuntime } from "../src/clientRuntime.js";
 import { readActivePointer } from "../src/releaseBundleCoordinator.js";
-import { readPendingRelease } from "../src/pendingRelease.js";
+import { readPendingRelease, savePendingRelease } from "../src/pendingRelease.js";
 import { loadOrCreateDeviceIdentity } from "../src/deviceIdentity.js";
 import { createLegacyClientMigration, type LegacyClientMigration } from "../src/legacyClientMigration.js";
 import { loadWeb } from "../src/webLoader.js";
@@ -497,6 +497,84 @@ test("迁移与标准页面就绪并行，页面可等待迁移及Client真正�
   await app.start();
   assert.ok(f.actions.includes("web-ready"));
   assert.ok(f.actions.includes("start"));
+  await app.exit();
+});
+
+for (const candidateFails of [false, true]) test(`启动迁移与待更新资源并行时就绪屏障不会互锁：候选失败=${candidateFails}`, { timeout: 5_000 }, async t => {
+  const f = await heldApplicationFixture(t);
+  const releaseId = "startup-resource";
+  const stagingDir = path.join(f.dataDir, ".staging", releaseId);
+  const candidate = await createHeldRelease(stagingDir, { releaseId, version: "2.0.0" });
+  await savePendingRelease(f.dataDir, { requestId: crypto.randomUUID(), releaseId, stagingDir });
+
+  const identity = await loadOrCreateDeviceIdentity(f.dataDir);
+  const serverErrors: unknown[] = [];
+  const server = http.createServer((request, response) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const metadata = readDesktopDeviceHeaders(request.rawHeaders);
+      response.setHeader("content-type", "application/json");
+      if (request.url === "/api/software/desktop/devices/register") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        response.end(JSON.stringify({ ok: true, deviceId: body.deviceId, publicKeySha256: desktopDevicePublicKeySha256(body.publicKeyBase64) }));
+        return;
+      }
+      assert.equal(request.url, `/api/software/desktop/releases/${releaseId}/switch-authorization`);
+      response.end(JSON.stringify({ ok: true, authorized: true, deviceId: identity.deviceId,
+        requestId: metadata.requestId, releaseId, archiveSha256: candidate.archiveSha256 }));
+    })().catch(error => { serverErrors.push(error); response.writeHead(500); response.end("{}"); });
+  });
+  server.on("error", error => { serverErrors.push(error); });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    assert.deepEqual(serverErrors, []);
+  });
+
+  const originalSnapshot = f.runtime.snapshot;
+  let runtimeReleaseId: string | null = null;
+  let heldId: string | undefined;
+  f.runtime.snapshot = () => {
+    const { startup: _startup, ...snapshot } = originalSnapshot();
+    return { ...snapshot, releaseId: runtimeReleaseId,
+      ...(heldId ? { startup: { continuationId: heldId, admission: "paused" as const } } : {}) };
+  };
+  f.runtime.request = async request => {
+    assert.equal(request.method, "runtime.startup.continue");
+    return { status: 200, body: { ok: true } };
+  };
+
+  let migration!: LegacyClientMigration;
+  const loaded: string[] = [];
+  f.host.loadWeb = async (_window, directory, options) => {
+    loaded.push(directory);
+    if (candidateFails && directory.endsWith(path.join("releases", releaseId))) throw new Error("CANDIDATE_WEB_NAVIGATION_FAILED");
+    await loadWeb({ loadURL: async () => {}, webContents: { executeJavaScript: async () => migration.snapshot().status === "ready" } },
+      "codeflow://desktop/", { requireReady: true, timeoutMs: 30, beforeReady: options?.beforeReady });
+  };
+
+  const address = server.address(); assert.ok(address && typeof address === "object");
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, configuredServerOrigin: `http://127.0.0.1:${address.port}`,
+    createRuntime: (_entry, expectation, startup) => {
+      runtimeReleaseId = expectation?.releaseId ?? null;
+      heldId = startup?.mode === "held" ? startup.continuationId : undefined;
+      return f.runtime;
+    },
+    createMigration: ({ identity }) => (migration = createLegacyClientMigration({ dataDir: f.dataDir, identity, workerEntry: "unused",
+      execute: async () => ({ candidateId: null, workspaceCount: 0 }) })) });
+
+  await app.start();
+  assert.equal(migration.snapshot().status, "ready");
+  assert.equal(await readActivePointer(f.dataDir), candidateFails ? null : releaseId,
+    JSON.stringify({ pending: await readPendingRelease(f.dataDir), details: await app.getUpdateDetails(), actions: f.actions }));
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.ok(loaded.some(directory => directory.endsWith(path.join("releases", releaseId))));
+  if (candidateFails) assert.ok(loaded.includes(f.baseline), "rollback Web receives the same migration ready barrier");
+  assert.equal((await app.getUpdateDetails()).bundle.result, candidateFails ? "restored" : "healthy");
+  assert.equal(f.actions.includes("runtime.startup.continue"), false);
   await app.exit();
 });
 
