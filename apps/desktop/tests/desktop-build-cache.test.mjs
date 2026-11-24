@@ -170,3 +170,41 @@ test("Windows cache keys stay stable when mixed-case names change their enumerat
     assert.equal(await key(canonical), await key(mixed));
   }
 });
+
+test("Windows cache publish retries transient rename failures", { skip: process.platform !== "win32" }, async t => {
+  const { materializeDesktopBuildCache } = await import("../scripts/desktop-build-cache.mjs");
+  const root = await fixture(t);
+  const rename = fs.rename.bind(fs);
+  let calls = 0;
+  t.mock.method(fs, "rename", async (...args) => {
+    calls++;
+    if (calls <= 2) throw Object.assign(new Error("busy"), { code: "EPERM" });
+    return rename(...args);
+  });
+  const result = await materializeDesktopBuildCache({ cacheDir: path.join(root, "cache"), namespace: "web", key: "e".repeat(64),
+    destination: path.join(root, "out"), build: async directory => {
+      await fs.mkdir(directory);
+      await fs.writeFile(path.join(directory, "index.html"), "ok");
+    } });
+  assert.equal(result.hit, false);
+  assert.ok(calls >= 3);
+  assert.equal(await fs.readFile(path.join(root, "out/index.html"), "utf8"), "ok");
+});
+
+test("Windows cache publish falls back to copy when rename stays busy", { skip: process.platform !== "win32" }, async t => {
+  const { materializeDesktopBuildCache } = await import("../scripts/desktop-build-cache.mjs");
+  const root = await fixture(t);
+  let calls = 0;
+  t.mock.method(fs, "rename", async () => { calls++; throw Object.assign(new Error("busy"), { code: "EPERM" }); });
+  const common = { cacheDir: path.join(root, "cache"), namespace: "web", key: "f".repeat(64) };
+  const first = await materializeDesktopBuildCache({ ...common, destination: path.join(root, "first"), build: async directory => {
+    await fs.mkdir(directory);
+    await fs.writeFile(path.join(directory, "index.html"), "ok");
+  } });
+  assert.equal(first.hit, false);
+  assert.ok(calls >= 6);
+  const second = await materializeDesktopBuildCache({ ...common, destination: path.join(root, "second"),
+    build: () => { throw new Error("must not rebuild"); } });
+  assert.equal(second.hit, true);
+  assert.equal(await fs.readFile(path.join(root, "second/index.html"), "utf8"), "ok");
+});

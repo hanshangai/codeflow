@@ -80,6 +80,29 @@ async function exists(file) {
   catch (error) { if (error.code === "ENOENT") return false; throw error; }
 }
 
+/** Windows 临时目录可能被杀软/索引器短暂占用；重试后以不覆盖复制兜底发布。 */
+async function publishCacheEntry(temporary, entry) {
+  let lastError;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try { await fs.rename(temporary, entry); return; }
+    catch (error) {
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code)) throw error;
+      lastError = error;
+      if (await exists(entry)) throw new Error("DESKTOP_BUILD_CACHE_CONFLICT", { cause: error });
+      await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
+  try { await fs.cp(temporary, entry, { recursive: true, errorOnExist: true, force: false }); }
+  catch (error) {
+    // 复制可能留下不完整目录；锁保证同键无其它写入者，失败时清理本次产物。
+    if (error.code !== "ERR_FS_CP_EEXIST") {
+      try { await fs.rm(entry, { recursive: true, force: true }); }
+      catch (cleanup) { throw new AggregateError([lastError, error, cleanup], "DESKTOP_BUILD_CACHE_PUBLISH_FAILED"); }
+    }
+    throw new AggregateError([lastError, error], "DESKTOP_BUILD_CACHE_PUBLISH_FAILED");
+  }
+}
+
 /** 枚举普通文件并保留执行位；禁止链接、设备或越界路径。 */
 async function inventory(directory) {
   const files = [];
@@ -136,7 +159,7 @@ export async function materializeDesktopBuildCache({ cacheDir, namespace, key, d
         await build(payload);
         const files = await inventory(payload);
         await fs.writeFile(path.join(temporary, "manifest.json"), `${JSON.stringify({ schemaVersion: 1, namespace, key, files })}\n`, { encoding: "utf8", flag: "wx" });
-        await fs.rename(temporary, entry);
+        await publishCacheEntry(temporary, entry);
         temporary = undefined;
       }
     } catch (error) {
