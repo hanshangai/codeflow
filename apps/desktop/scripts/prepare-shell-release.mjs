@@ -74,7 +74,7 @@ async function readPlannedInput(value) {
   asar.uncache(archive);
   const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(asar.extractFile(archive, "package.json")));
   if ((manifest.shellVersion ?? manifest.version) !== plan.shellVersion) throw new Error("DESKTOP_SHELL_RELEASE_CANDIDATE_VERSION_MISMATCH");
-  return { ...input, version: plan.shellVersion,
+  return { ...input, version: plan.shellVersion, environment: plan.environment,
     historyDir: input.historyDir ?? path.join(os.homedir(), ".codeflow", "shell-releases", plan.environment) };
 }
 
@@ -196,7 +196,8 @@ export async function prepareShellRelease(value, dependencies = {}) {
     const buildDirectory = path.join(staging, "build");
     const projectedDirectory = path.join(staging, "candidate");
     const { inventory, projected } = await projectShellCandidate(candidateDirectory, projectedDirectory, input.shellId);
-    const built = await builder({ candidateDirectory: projectedDirectory, shellId: input.shellId, outputDir: buildDirectory, ...(cacheDir ? { cacheDir } : {}) });
+    const built = await builder({ candidateDirectory: projectedDirectory, shellId: input.shellId, outputDir: buildDirectory,
+      fastCompress: input.environment === "test", ...(cacheDir ? { cacheDir } : {}) });
     if (built.shellId !== input.shellId || !Array.isArray(built.files)) throw new Error("DESKTOP_SHELL_RELEASE_BUILD_RESULT_INVALID");
     if (JSON.stringify(await readShellCandidateInventory(candidateDirectory, input.shellId)) !== JSON.stringify(inventory)
       || JSON.stringify(await readShellCandidateInventory(projectedDirectory, input.shellId)) !== JSON.stringify(projected)) {

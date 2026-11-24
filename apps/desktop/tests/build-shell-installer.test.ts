@@ -40,7 +40,7 @@ async function builder() {
     throw error;
   }), true, "candidate installer builder must exist");
   return await import(script.href) as {
-    buildShellInstaller(input: { candidateDirectory: string; shellId: string; outputDir: string; cacheDir: string }): Promise<{
+    buildShellInstaller(input: { candidateDirectory: string; shellId: string; outputDir: string; cacheDir: string; fastCompress?: boolean }): Promise<{
       executablePath: string; shellId: string; files: Array<{ path: string; size: number; sha256: string }>;
     }>;
   };
@@ -216,4 +216,22 @@ test("rejects invalid inventory and intersecting output paths before creating bu
   await assert.rejects(buildShellInstaller({ candidateDirectory: f.candidateDirectory, shellId: "fixture-01", outputDir, cacheDir }), /PAYLOAD_INVALID/);
   await assert.rejects(fs.access(outputDir), { code: "ENOENT" });
   await assert.rejects(fs.access(cacheDir), { code: "ENOENT" });
+});
+
+
+test("test-only fast compression builds and installs the same candidate payload", { timeout: 300_000 }, async () => {
+  const f = await fixture(), { buildShellInstaller } = await builder();
+  const built = await buildShellInstaller({ candidateDirectory: f.candidateDirectory, shellId: "fixture-fast",
+    outputDir: path.join(f.root, "fast-output"), cacheDir: path.join(f.root, "fast-cache"), fastCompress: true });
+  assert.equal(built.shellId, "fixture-fast");
+  assert.deepEqual(built.files, Object.entries(f.files).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([file, content]) => ({ path: file, size: Buffer.byteLength(content), sha256: crypto.createHash("sha256").update(content).digest("hex") })));
+  const installation = path.join(f.root, "fast-installation");
+  await fs.mkdir(path.join(installation, "shells"), { recursive: true });
+  const requestId = crypto.randomUUID();
+  const result = await runInstaller(built.executablePath, ["--codeflow-candidate-install", "--installation-root", installation,
+    "--request-id", requestId], f.root);
+  assert.deepEqual(result, { code: 0, stderr: "", stdout: "" });
+  assert.equal(await fs.readFile(path.join(installation, "shells/fixture-fast/CodeFlowAI.exe"), "utf8"),
+    f.files["CodeFlowAI.exe"]);
 });

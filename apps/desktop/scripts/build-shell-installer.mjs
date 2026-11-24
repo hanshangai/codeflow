@@ -139,6 +139,7 @@ async function run(executable, args, env, capture = false) {
 /** 只构建嵌入完整壳的候选安装器；不执行安装、签名或发布。 */
 export async function buildShellInstaller(input) {
   if (process.platform !== "win32") throw new Error("DESKTOP_SHELL_INSTALL_BUILD_WINDOWS_REQUIRED");
+  if (input.fastCompress !== undefined && typeof input.fastCompress !== "boolean") throw new Error("DESKTOP_SHELL_INSTALL_BUILD_INPUT_INVALID");
   const candidate = await fs.realpath(path.resolve(input.candidateDirectory));
   const sharedCache = !input.cacheDir;
   const output = await resolveNew(input.outputDir), cache = await resolveNew(input.cacheDir ?? resolveSharedShellBuilderCache());
@@ -171,7 +172,8 @@ export async function buildShellInstaller(input) {
   const payloadFile = path.join(output, "payload.nsh"), executablePath = path.join(output, "CodeFlowAI-shell-installer.exe");
   await fs.writeFile(payloadFile, payloadScript(candidate, files), { encoding: "utf8", flag: "wx" });
   await run(compilerPath, ["/V2", `/DOUTPUT_FILE=${literal(executablePath, false)}`, `/DPAYLOAD_FILE=${literal(payloadFile, false)}`, `/DSHELL_ID=${input.shellId}`,
-    `/DMAX_PAYLOAD_PATH=${Math.max(...files.map(file => file.path.length))}`, "/INPUTCHARSET", "UTF8", source], { ...env, ...compiler.env });
+    `/DMAX_PAYLOAD_PATH=${Math.max(...files.map(file => file.path.length))}`, "/INPUTCHARSET", "UTF8",
+    ...(input.fastCompress ? ["/DCODEFLOW_SHELL_FAST_COMPRESS"] : []), source], { ...env, ...compiler.env });
   if (!(await fs.lstat(executablePath)).isFile() || !(await fs.readFile(source)).equals(sourceBytes)
     || JSON.stringify(await inventory(candidate, input.shellId)) !== JSON.stringify(files)) throw new Error("DESKTOP_SHELL_INSTALL_BUILD_INPUT_CHANGED");
   return { executablePath, shellId: input.shellId, files };

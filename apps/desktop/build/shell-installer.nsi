@@ -6,7 +6,11 @@ AutoCloseWindow true
 ShowInstDetails nevershow
 Name "CodeFlow candidate shell"
 OutFile "${OUTPUT_FILE}"
-SetCompressor lzma
+!ifdef CODEFLOW_SHELL_FAST_COMPRESS
+  SetCompressor zlib
+!else
+  SetCompressor lzma
+!endif
 SetOverwrite on
 
 !include "LogicLib.nsh"
