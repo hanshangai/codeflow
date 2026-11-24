@@ -2713,7 +2713,6 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       <p v-if="buildSettingsMode" class="batch-explanation">目标项目：{{ workspaceName }}</p>
       <p class="batch-explanation">{{ buildSettingsMode ? '保存后同步规格对话及后续构建配置；切换引擎会新建会话并保留草稿。已创建任务保留原配置。默认复检，发现阻断问题时修订一次并再检，结果由你确认采用。' : '本次任务在后台执行，无需打开或切换规格会话。' }}</p>
       <p v-if="batchSourceContext" class="batch-explanation">只更新当前文件：读取所选候选和最新来源，保留正确内容，提交新版本后自动复检。旧版本保留，新结果仍需你确认采用。</p>
-      <details class="batch-advanced" :open="batchOpen && !batchSourceContext"><summary>{{ batchMode === 'review' && !buildSettingsMode ? '复检设置' : '引擎、模型与复检设置' }}</summary>
       <section v-if="batchMode !== 'review' || buildSettingsMode" class="batch-model-settings" aria-label="本批次引擎配置">
         <div class="batch-model-heading"><strong>执行引擎</strong></div>
         <div class="batch-model-fields">
@@ -2748,7 +2747,6 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         </div>
         <a-radio-group v-if="batchMode === 'batch' && !batchRepairReports.length && !batchSourceContext" v-model:value="batchStrategy" :disabled="batchLocked"><a-radio value="all">按要求处理选中知识</a-radio><a-radio value="missing">只补齐空白</a-radio></a-radio-group>
       </div>
-      </details>
       <h3 v-if="!buildSettingsMode" class="batch-section-title">本次范围 · {{ batchTargets.length }} 项</h3>
       <div v-if="!buildSettingsMode" class="batch-preview">
         <div v-for="item in batchTargets" :key="item.id">{{ pathTitle(item) }}</div>
@@ -2930,7 +2928,6 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .quick-generate { display: flex; flex-direction: column; gap: 10px; }
 .quick-generate__error { margin: 0; color: var(--app-danger); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .batch-explanation { color: var(--app-muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
-.batch-advanced > summary { cursor: pointer; color: var(--app-muted); font-size: 12px; padding-block: 8px; }
 .batch-scroll { max-height: calc(100dvh - 220px); min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 3px; }
 .batch-model-settings { padding-block: 6px; border-block: 1px solid var(--app-divider); margin-block: 6px; }
 .batch-model-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; font-size: 13px; color: var(--app-text); }
