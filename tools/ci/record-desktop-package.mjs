@@ -14,7 +14,7 @@ async function recordPackage() {
   const files = (await fs.readdir(installers)).filter(file => file.endsWith(".dmg"));
   if (files.length !== 1) throw new Error("MACOS_DMG_COUNT_INVALID");
   const bytes = await fs.readFile(path.join(installers, files[0]));
-  const metadata = { schemaVersion: 1, requestId, purpose: "ci-installation-test", sourceRepository: "hs-codeflow/codeflow",
+  const metadata = { schemaVersion: 1, requestId, purpose: "ci-installation-test", sourceRepository: "hanshangai/codeflow",
     sourceCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(),
     platform: process.platform, arch: process.arch, version: process.env.CODEFLOWAI_DESKTOP_DMG_VERSION,
     installer: files[0], size: bytes.length, sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
