@@ -86,6 +86,15 @@ test("批量生成允许独立选择执行引擎，并在切换时清理模型�
   assert.match(pageSource, /v-if="buildSettingsMode && batchHasGeneration"><span>思考强度/u);
 });
 
+test("生成批次用单一开关统一控制生成后复检与阻断问题修订", () => {
+  assert.match(pageSource, /function setPostGenerationReview\(enabled: boolean\)/u);
+  assert.match(pageSource, /batchReviewEnabled\.value = enabled;\s*batchReviewAutoRepair\.value = enabled/u);
+  assert.match(pageSource, /生成后复检并自动修订阻断问题/u);
+  assert.match(pageSource, /生成后仅复检，问题需手动修订/u);
+  assert.doesNotMatch(pageSource, /v-if="batchReviewEnabled \|\| batchMode === 'review'" class="review-auto-repair"/u);
+  assert.match(pageSource, /v-if="batchMode === 'review'" class="review-auto-repair"/u);
+});
+
 test("知识会话摘要进入主会话列表，页面恢复期间不会把目录状态写成空值", () => {
   assert.match(pageSource, /upsertKnowledgeThreadSummary/u);
   assert.match(pageSource, /hydratingPageState = true/u);

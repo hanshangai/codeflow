@@ -705,7 +705,7 @@ test.describe("项目知识库资产协作", () => {
     await preview.getByRole("button", { name: "重新复检", exact: true }).first().click();
     const modal = page.getByRole("dialog", { name: "复检已有文档", exact: true });
     await expect(modal.getByRole("combobox", { name: "批量生成引擎", exact: true })).toHaveCount(0);
-    await expect(modal.getByRole("switch", { name: "发现问题后自动修订", exact: true })).toBeChecked();
+    await expect(modal.getByRole("switch", { name: "发现阻断问题后自动修订", exact: true })).toBeChecked();
     if (!available) {
       await expect(modal.getByRole("alert")).toContainText("原生成引擎暂不可用");
       await expect(modal.getByRole("button", { name: "开始复检", exact: true })).toBeDisabled();
@@ -1365,9 +1365,8 @@ test.describe("项目知识库资产协作", () => {
     await expect(modal).toBeVisible();
     await expect(modal.locator(".batch-preview > div")).toHaveCount(1);
     await expect(modal).toContainText("功能说明");
-    await modal.locator("summary").click();
-    await expect(modal.getByRole("switch", { name: "生成后复检", exact: true })).toHaveAttribute("aria-checked", "true");
-    await expect(modal.getByRole("switch", { name: "生成后复检", exact: true })).toBeDisabled();
+    await expect(modal.getByRole("switch", { name: "生成后复检并自动修订阻断问题", exact: true })).toHaveAttribute("aria-checked", "true");
+    await expect(modal.getByRole("switch", { name: "生成后复检并自动修订阻断问题", exact: true })).toBeDisabled();
     await modal.getByRole("button", { name: /^取\s*消$/ }).click();
     expect(scenario.calls.generates).toHaveLength(0);
     await showKnowledgeAssistant(page);
@@ -1382,7 +1381,7 @@ test.describe("项目知识库资产协作", () => {
     let failModels = true;
     await page.route("**/api/engines/status**", route => failModels ? route.fulfill({ status: 503, json: { ok: false, code: "INTERNAL_ERROR", message: "模型目录暂不可用" } }) : route.fallback());
     await preview.getByRole("button", { name: "更新候选并复检", exact: true }).click();
-    await expect(modal.getByRole("alert")).toContainText("模型目录暂不可用");
+    await expect(modal.locator(".page-error")).toContainText("模型目录暂不可用");
     await expect(modal.getByRole("button", { name: "更新候选并复检", exact: true })).toBeDisabled();
     expect(scenario.calls.creates).toHaveLength(0);
     expect(scenario.calls.generates).toHaveLength(0);
@@ -5839,7 +5838,7 @@ test.describe("项目知识库资产协作", () => {
     const modal = page.getByRole("dialog", { name: "根据报告生成修订版", exact: true });
     await expect(modal).toContainText("本次任务在后台执行");
     await expect(modal.locator(".batch-advanced")).toBeVisible();
-    await expect(modal.getByRole("switch", { name: "生成后复检", exact: true })).toBeChecked();
+    await expect(modal.getByRole("switch", { name: "生成后复检并自动修订阻断问题", exact: true })).toBeChecked();
     await modal.getByRole("button", { name: "开始生成修订版", exact: true }).click();
     await expect.poll(() => scenario.calls.starts.length).toBe(1);
     expect(scenario.calls.generates).toHaveLength(1);
@@ -5919,7 +5918,7 @@ test.describe("项目知识库资产协作", () => {
     const modal = page.getByRole("dialog", { name: "复检已有文档", exact: true });
     await expect(modal.locator(".batch-preview > div")).toHaveCount(1);
     await expect(modal).toContainText("最新待采用版本");
-    await expect(modal.getByRole("switch", { name: "发现问题后自动修订", exact: true })).toBeChecked();
+    await expect(modal.getByRole("switch", { name: "发现阻断问题后自动修订", exact: true })).toBeChecked();
     await expect(modal.getByRole("combobox", { name: "批量生成模型", exact: true })).toHaveCount(0);
     await modal.getByRole("button", { name: "开始复检", exact: true }).click();
     await expect.poll(() => scenario.calls.starts.length).toBe(1);

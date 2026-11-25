@@ -40,9 +40,8 @@ let snapshotRead = 0;
 let disposed = false;
 let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
-const currentRows = computed(() => [
-  { label: "当前版本", value: formatDesktopCurrentVersion(details.value?.current ?? null) },
-]);
+const currentVersion = computed(() => formatDesktopCurrentVersion(details.value?.current ?? null));
+const currentRows = computed(() => [{ label: "当前版本", value: currentVersion.value }]);
 /** 只有检测到有效目标后才展示新版本；检查中不显示占位提示，历史失败目标不参与。 */
 const targetRows = computed(() => {
   const value = details.value;
@@ -88,13 +87,14 @@ const outcome = computed<DesktopUpdateOutcome>(() => {
   return resolveDesktopUpdateOutcome({ details: details.value, state: state.value, isMacDesktop, checking: checking.value });
 });
 
-/** 展示直接派生自原检查、重启与错误事实，不维护另一套升级状态。 */
+/** 无更新时在摘要中显示本机版本，更新状态仍来自宿主快照。 */
 const presentation = computed<DesktopUpdateOutcome>(() => {
   if (error.value || snapshotError.value) return outcome.value!;
   if (restarting.value && restartDelayed.value) return { tone: "warning", title: "重启更新尚未完成",
     detail: "暂未确认应用已重启。可以关闭此提示，原更新请求仍在处理中，请勿重复启动更新。" };
   if (restarting.value) return { tone: "info", title: "正在重启更新", detail: "应用将关闭并重新启动，请稍候。" };
-  return outcome.value;
+  const result = outcome.value;
+  return result.title === "当前已是最新版本" ? { ...result, detail: `当前版本 ${currentVersion.value}` } : result;
 });
 
 /** 每种结果只突出一个下一步；准备完成前不提供重启操作。 */

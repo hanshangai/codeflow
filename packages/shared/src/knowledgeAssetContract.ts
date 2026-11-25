@@ -89,7 +89,7 @@ const fields: Record<KnowledgeAssetAction, string[]> = {
   imports: ["directory", "offset"], source: ["path", "startLine", "count"],
   "tree.save": ["tree", "expectedHash"], "document.save": ["nodeId", "content", "sources", "expectedHash", "summary"],
   "revision.adopt": ["nodeId", "revisionId", "expectedHash"], "revision.adopt.batch": ["nodeIds"], "revision.dismiss": ["runId", "nodeId", "revisionId", "planHash"], import: ["path", "contentHash", "parentId", "treeHash", "category", "appliesTo"],
-  generate: ["requestId", "mode", "ownerThreadId", "selectedNodeIds", "includeDescendants", "strategy", "prompt", "treeHash", "engine", "model", "effort", "concurrency", "reviewConfig", "repairReports"],
+  generate: ["requestId", "mode", "ownerThreadId", "selectedNodeIds", "includeDescendants", "strategy", "prompt", "treeHash", "engine", "model", "effort", "concurrency", "reviewConfig", "repairReports", "sourceRevisions"],
   "run.apply": ["runId", "requestId", "treeHash", "planHash", "selections"], "run.cancelAdoption": ["runId", "requestId"], "run.start": ["runId", "retryFailed", "nodeIds", "prompt", "model", "effort", "concurrency", "reviewConfig"], "run.stop": ["runId"],
   "conversation.list": [], "conversation.create": ["nodeId", "engine", "title", "model", "effort"], "conversation.connect": ["threadId"], "conversation.end": ["threadId"],
 };

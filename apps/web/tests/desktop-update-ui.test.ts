@@ -84,6 +84,7 @@ test(`检查完成无更新时忽略历史目标，弹框和设置页一致：${
   f.details.shell.target = { shellId: "historical-shell", version: "1.0.0" };
   await f.panel.startCheck();
   assert.equal(f.panel.outcome.value.title, "当前已是最新版本");
+  assert.equal(f.panel.presentation.value.detail, "当前版本 1.0.1108");
   assert.deepEqual(f.panel.targetRows.value, []);
   assert.equal(f.panel.primaryAction.value.kind, "close");
   assert.equal(f.panel.restartDisabled.value, true);

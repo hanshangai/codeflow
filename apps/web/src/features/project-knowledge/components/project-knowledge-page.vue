@@ -474,8 +474,18 @@ const batchEffortOptions = computed(() => {
 });
 const batchCatalog = computed(() => engines.byWorkspaceId[workspaceId.value]);
 const batchIncludesProduct = computed(() => batchTargets.value.some(node => ancestors(node)[0]?.category === "product"));
-/** 自动修订至少预留首次检查和修订后再检两次预算，关闭时沿用原检查配置。 */
+const batchReviewToggleLabel = computed(() => batchIncludesProduct.value
+  ? "生成后复检（产品原文保留）"
+  : batchReviewEnabled.value && !batchReviewAutoRepair.value
+    ? "生成后仅复检，问题需手动修订"
+    : "生成后复检并自动修订阻断问题");
+/** 生成复检开关统一启用自动修订；纯复检任务继续单独控制自动修订。 */
 const batchReviewConfig = computed(() => ({ enabled: batchMode.value === "review" || batchReviewEnabled.value, model: batchModel.value.model, effort: batchModel.value.effort, autoRepair: batchReviewAutoRepair.value && !batchIncludesProduct.value, maxRounds: batchReviewAutoRepair.value && !batchIncludesProduct.value ? Math.max(2, batchReviewMaxRounds.value) : batchReviewMaxRounds.value }));
+/** 生成任务用单一开关表达自动复检和阻断问题修订，避免两个开关组合出歧义。 */
+function setPostGenerationReview(enabled: boolean): void {
+  batchReviewEnabled.value = enabled;
+  batchReviewAutoRepair.value = enabled;
+}
 watch([batchModelInfo, batchOpen], () => {
   if (!batchOpen.value || !batchModelInfo.value || !batchEffort.value) return;
   const info = batchModelInfo.value;
@@ -1934,7 +1944,7 @@ async function openBatch(ids = checkedIds.value.length ? checkedIds.value : snap
     batchSelectedIds.value = [...input.selectedNodeIds as string[]]; batchIncludeDescendants.value = input.includeDescendants as boolean;
     batchStrategy.value = input.strategy as "all" | "missing"; batchPrompt.value = input.prompt as string; batchConcurrency.value = input.concurrency as number;
     batchReviewEnabled.value = review.enabled;
-    batchReviewAutoRepair.value = review.autoRepair ?? true; batchReviewMaxRounds.value = review.maxRounds ?? 1;
+    batchReviewAutoRepair.value = review.enabled && (review.autoRepair ?? true); batchReviewMaxRounds.value = review.maxRounds ?? 1;
     batchRepairReports.value = (input.repairReports as typeof batchRepairReports.value | undefined)?.map(report => ({ ...report })) ?? [];
     const source = (input.sourceRevisions as Array<{ nodeId: string; revisionId: string }> | undefined)?.[0];
     if (source) batchSourceContext.value = { ...source, runId: null };
@@ -2490,7 +2500,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       <div class="header-actions">
         <a-tag v-if="snapshot && !canWrite">只读</a-tag>
         <a-button :title="`${checkedIds.length ? `所选 ${checkedIds.length} 项及其后代` : '整个项目'}：按默认配置生成规格草稿，确认采用后生效。`" type="primary" :size="narrowScreen ? 'small' : 'middle'" :loading="buildStarting" :disabled="quickGenerateDisabled" @click="openQuickGenerate">一键生成规格</a-button>
-        <a-dropdown :trigger="['click']"><a-button :size="narrowScreen ? 'small' : 'middle'" type="text" shape="circle" aria-label="规格库更多操作"><template #icon><EllipsisOutlined /></template></a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || updatesBusy" @click="openImport(importDirectory)">导入文档</a-menu-item><a-menu-item @click="changeHistoryOpen = true">修改建议记录</a-menu-item><a-menu-item :disabled="!canWrite || !nodeCount" @click="updateSettingsOpen = true">定时更新</a-menu-item><a-menu-divider /><a-menu-item :disabled="!canWrite || busy || updatesBusy || !nodeCount" @click="openReview()">{{ checkedIds.length ? `复检所选 · ${checkedIds.length}项` : '复检全项目' }}</a-menu-item></a-menu></template></a-dropdown>
+        <a-dropdown :trigger="['click']"><a-button :size="narrowScreen ? 'small' : 'middle'" type="text" shape="circle" aria-label="规格库更多操作"><template #icon><EllipsisOutlined /></template></a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || updatesBusy" @click="openImport(importDirectory)">导入文档</a-menu-item><a-menu-item @click="changeHistoryOpen = true">修改记录</a-menu-item><a-menu-item :disabled="!canWrite || !nodeCount" @click="updateSettingsOpen = true">定时更新</a-menu-item><a-menu-divider /><a-menu-item :disabled="!canWrite || busy || updatesBusy || !nodeCount" @click="openReview()">{{ checkedIds.length ? `复检所选 · ${checkedIds.length}项` : '复检全项目' }}</a-menu-item></a-menu></template></a-dropdown>
       </div>
     </header>
     <nav class="mobile-panels" aria-label="规格库面板"><button type="button" aria-label="规格库目录" :aria-expanded="treeOpen" @click="openMobilePanel('tree')">{{ treeTitle }} <span>{{ visibleTreeCount }}</span></button><button type="button" aria-label="会话面板" :aria-expanded="assistantOpen" @click="openMobilePanel('assistant')">✦ 会话面板 <span v-if="threadRunning || activeRun?.active" class="working-indicator" /></button></nav>
@@ -2735,9 +2745,9 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       <p v-if="batchMode === 'review' && !buildSettingsMode" class="batch-explanation">复检沿用原生成引擎和模型；原始资料使用项目配置。新结果仍需确认采用。</p>
       <p v-if="batchReviewLoading" class="batch-model-note" role="status">正在读取原生成配置…</p>
       <section v-if="!buildSettingsMode" class="batch-model-settings" aria-label="本批次复检配置">
-        <div class="batch-model-heading"><strong>{{ batchMode === 'review' ? '复检配置' : '生成后复检' }}</strong><a-switch v-if="batchMode === 'batch'" v-model:checked="batchReviewEnabled" aria-label="生成后复检" :disabled="batchLocked || Boolean(batchSourceContext)" /></div>
-        <label v-if="batchReviewEnabled || batchMode === 'review'" class="review-auto-repair"><span><strong>发现问题后自动修订</strong><small>{{ batchIncludesProduct ? '所选范围含产品文档，本次只复检并报告问题；请修改原始资料。' : '开启后，首次复检发现阻断问题时修订一次并再检；仅提醒不触发修订，新版本仍需确认采用。' }}</small></span><a-switch :checked="batchReviewAutoRepair && !batchIncludesProduct" aria-label="发现问题后自动修订" :disabled="batchLocked || batchIncludesProduct" @update:checked="batchReviewAutoRepair = $event" /></label>
-        <p class="batch-model-note">{{ batchMode === 'review' ? '在文件工作会话中运行复检子任务，优先检查最新待采用版本，其次为正式文档；空白知识跳过。' : batchReviewEnabled ? '文档生成后保存为待采用版本，在同一工作会话中由子任务独立核对代码与要求；确认后由你采用。' : '本批次跳过复检，生成内容仍可随后单独复检。' }}</p>
+        <label v-if="batchMode === 'review'" class="review-auto-repair"><span><strong>发现阻断问题后自动修订</strong><small>开启后修订一次并再检；仅提醒不触发修订，新版本仍需确认采用。</small></span><a-switch :checked="batchReviewAutoRepair" aria-label="发现阻断问题后自动修订" :disabled="batchLocked" @update:checked="batchReviewAutoRepair = $event" /></label>
+        <label v-else class="review-auto-repair"><span><strong>{{ batchReviewToggleLabel }}</strong><small>{{ batchIncludesProduct ? '生成后执行复检，但保留产品原文；发现问题后请修订原始资料。' : batchReviewEnabled && !batchReviewAutoRepair ? '生成后复检，但不会自动修改正文。' : '先复检；发现阻断问题时自动修订一次并再检。仅提醒不触发修订，新版本仍需你确认采用。' }}</small></span><a-switch :checked="batchReviewEnabled" :aria-label="batchIncludesProduct ? '生成后复检' : batchReviewToggleLabel" :disabled="batchLocked || Boolean(batchSourceContext)" @update:checked="setPostGenerationReview" /></label>
+        <p class="batch-model-note">{{ batchMode === 'review' ? '复检已有文档；开启自动修订时，仅阻断问题触发一次修订和再检。' : batchReviewEnabled ? batchIncludesProduct ? '生成后复检；产品资料只报告问题并保留原文。' : '开启后复检并自动修订阻断问题，最多复检两次；提醒不会触发修订，新版本仍需你确认采用。' : '关闭后跳过自动复检，生成内容仍可随后单独复检。' }}</p>
         <p v-if="batchMode === 'review' && batchCatalog?.lastError" class="batch-model-note" role="alert">模型列表读取失败：{{ batchCatalog.lastError }} <a-button type="link" size="small" @click="refreshBatchModels">重试</a-button></p>
       </section>
       <div v-if="!buildSettingsMode" class="batch-settings">
@@ -2758,7 +2768,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       <div class="batch-submit"><a-button :disabled="busy || binding" @click="batchOpen = false">取消</a-button><a-button v-if="buildSettingsMode" type="primary" :loading="binding" :disabled="modelSettingsBlocked || batchCatalog?.loading" @click="saveBuildSettings">{{ pendingBuildIds ? '保存并开始生成' : '保存构建设置' }}</a-button><a-button v-else type="primary" :loading="busy" :disabled="!batchTargets.length || !canWrite || threadRunning || (batchMode !== 'review' && Boolean(activeRun?.active)) || batchCatalog?.loading || batchReviewLoading || (batchMode === 'review' || batchSourceContext && !pendingBatch) && Boolean(batchError)" @click="submitBatch">{{ pendingBatch ? '重试原任务' : batchSourceContext ? '更新候选并复检' : batchMode === 'review' ? '开始复检' : batchRepairReports.length ? '开始生成修订版' : '开始生成' }}</a-button></div>
     </a-modal>
 
-    <a-modal v-model:open="changeHistoryOpen" title="修改建议记录" width="min(1100px, calc(100vw - 24px))" :style="{ top: '24px' }" :body-style="{ height: 'min(680px, calc(100dvh - 180px))', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }"><p class="batch-explanation">查看会话提出的修改、审批结果和历史依据，按状态筛选后核对具体差异。</p>
+    <a-modal v-model:open="changeHistoryOpen" title="修改记录" width="min(1100px, calc(100vw - 24px))" :style="{ top: '24px' }" :body-style="{ height: 'min(680px, calc(100dvh - 180px))', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }"><p class="batch-explanation">查看会话提出的修改、审批结果和历史依据，按状态筛选后核对具体差异。</p>
       <KnowledgeChangeInbox v-if="changeHistoryOpen" :workspace-id="workspaceId" :context="ctx()" :can-write="canWrite" @recheck="changeHistoryOpen = false; recheckKnowledgeChange($event)" @changed="historyChangeReviewed" />
       <template #footer><a-button @click="changeHistoryOpen = false">关闭</a-button></template>
     </a-modal>
