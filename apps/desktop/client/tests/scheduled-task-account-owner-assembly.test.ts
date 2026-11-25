@@ -42,7 +42,8 @@ function assembly() {
   assert.ok(declaration, "index must wire the trusted account getter into the real scheduler");
   const code = ts.transpileModule(declaration.getText(tree), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
   const state = { shutdown: false, desktop: false, generation: 1, baseGeneration: 1 as number | null, current: true, ready: true,
-    hello: { orchAssetAuthority: { assetContext: { kind: "personal", userId: "owner-1" } } } as any,
+    hello: { userSummary: { userId: "owner-1", email: "owner-1@test.local", fullName: "owner-1", accountRole: "personal_normal", enterpriseId: null },
+      orchAssetAuthority: { assetContext: { kind: "personal", userId: "owner-1" } } } as any,
     config: { serverWsUrl: "wss://example.test/ws", clientId: "client-1", apiKey: "legacy-key-must-not-be-used" },
     cloud: undefined as ReturnType<typeof createDesktopCloudAccount> | undefined, scheduler: undefined as ScheduledTaskScheduler | undefined,
     desktopContext: {} as ApiHandlerContext, context: {} as ApiHandlerContext };
@@ -56,7 +57,11 @@ function assembly() {
   });
   const getter = new Function("env", `with(env) { ${code}; return captureScheduledTaskAccountContext; }`)(env);
   Object.assign(env, { captureScheduledTaskAccountContext: getter, enableBuiltInRelayOnStartup: async () => ({ outcome: "skipped" }),
-    db: {}, logger, desktopRequestId: "assembly", crypto: { randomUUID: () => "assembly" } });
+    db: {}, logger, desktopRequestId: "assembly", crypto: { randomUUID: () => "assembly" },
+    // 装配表达式引用真实 index 的写库许可；测试夹具在当前进程内直接执行，不另造写库队列。
+    withDatabase: async <T>(_requestId: string, operation: () => T): Promise<T> => operation(),
+    workspaces: new Map(), isDesktopLocalAssetWorkspace: () => false, dispatchDesktopKnowledgeUpdate: () => {},
+    tickKnowledgeUpdates: async () => {} });
   /** 直接执行真实装配表达式，测试不复制传输回调或关联完成接线。 */
   const evaluate = (expression: ts.Expression | undefined): any => {
     assert.ok(expression);
@@ -174,6 +179,7 @@ async function desktopFixture(t: test.TestContext) {
   const origin = `http://127.0.0.1:${await listenLoopbackHttpServer(server)}`;
   let onlySkipped = false;
   const cloud = createDesktopCloudAccount({ clientId: "client-1", deviceId: "device-1", clientVersion: "test", timeoutMs: 3_000,
+    getWorkspaceIds: () => [],
     onHello: async () => {}, onMessage: async () => {}, onOwnerInvalidated() {}, onFailure(error) { failures.push(error); }, onLinked: f.onLinked() });
   f.state.cloud = cloud;
   const scheduler = new ScheduledTaskScheduler(f.schedulerInput()); f.state.scheduler = scheduler;
@@ -229,6 +235,94 @@ for (const failure of ["http", "logging", "storage"] as const) test(`desktop 后
     await assert.rejects(f.scheduler.waitForInFlightWork());
     assert.ok(fatal.length > 0, "日志或未知存储错误不能被账号隔离掩盖");
   }
+  f.scheduler.stop();
+});
+
+test("DEFERRED_ACCOUNT_SCAN desktop 账号任务扫描中 owner 切换只延后扫描，不失败启动恢复", async t => {
+  const f = await desktopFixture(t), warnings: unknown[][] = [], failures: unknown[] = [];
+  await f.cloud.link({ serverOrigin: f.origin, sessionToken: "test-session" }); await f.scheduler.waitForInFlightWork();
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, "now", () => now);
+  f.tasks.push({ id: "account-deferred", ownerUserId: "A", clientId: "client-1", deviceId: "device-1", deviceKind: "desktop", configRevision: 1,
+    clientNameSnapshot: "desktop", deviceLabelSnapshot: null, name: "account-deferred", description: null, taskType: "script", cronExpr: "* * * * *", timezone: "UTC",
+    enabled: true, payload: { shell: process.platform === "win32" ? "cmd" : "sh", command: "echo account-deferred" },
+    concurrencyPolicy: "skip_if_running", missedPolicy: "skip_missed", timeoutMs: 10_000,
+    nextRunAt: null, lastRunAt: null, lastStatus: null, lastSyncAt: null, createdAt: 1, updatedAt: 1 });
+  await f.scheduler.sync("load"); await f.scheduler.waitForInFlightWork();
+  now += 61_000;
+  const scheduler = f.scheduler as unknown as { accountForTask(task: ScheduledTask): unknown };
+  const original = scheduler.accountForTask;
+  // 真实桌面分支只抛 message，不带 code；必须按实际形态识别。
+  scheduler.accountForTask = () => { throw new Error("SCHEDULED_TASK_ACCOUNT_NOT_READY"); };
+  t.mock.method(logger, "warn", (...args: unknown[]) => { warnings.push(args); });
+  await f.scheduler.syncAndTick("desktop.ready").then(undefined, error => failures.push(error));
+  await f.scheduler.waitForInFlightWork();
+  assert.deepEqual(failures, []);
+  assert.equal(warnings.length, 1);
+  assert.match(JSON.stringify(warnings), /SCHEDULED_TASK_ACCOUNT_DEFERRED/u);
+  assert.doesNotMatch(JSON.stringify(warnings), /test-session/u);
+  scheduler.accountForTask = original;
+  await f.scheduler.syncAndTick("recovered"); await f.scheduler.waitForInFlightWork();
+  assert.deepEqual(f.failures, []);
+  f.scheduler.stop();
+});
+
+test("DEFERRED_ACCOUNT_OWNER desktop 云账号撤销错误在扫描中只延后", async t => {
+  const f = await desktopFixture(t), warnings: unknown[][] = [], failures: unknown[] = [];
+  await f.cloud.link({ serverOrigin: f.origin, sessionToken: "test-session" }); await f.scheduler.waitForInFlightWork();
+  let now = 1_800_000_000_000;
+  t.mock.method(Date, "now", () => now);
+  f.tasks.push({ id: "account-owner-cancelled", ownerUserId: "A", clientId: "client-1", deviceId: "device-1", deviceKind: "desktop", configRevision: 1,
+    clientNameSnapshot: "desktop", deviceLabelSnapshot: null, name: "account-owner-cancelled", description: null, taskType: "script", cronExpr: "* * * * *", timezone: "UTC",
+    enabled: true, payload: { shell: process.platform === "win32" ? "cmd" : "sh", command: "echo never" },
+    concurrencyPolicy: "skip_if_running", missedPolicy: "skip_missed", timeoutMs: 10_000,
+    nextRunAt: null, lastRunAt: null, lastStatus: null, lastSyncAt: null, createdAt: 1, updatedAt: 1 });
+  await f.scheduler.sync("load"); await f.scheduler.waitForInFlightWork();
+  now += 61_000;
+  const scheduler = f.scheduler as unknown as { accountForTask(task: ScheduledTask): unknown };
+  const original = scheduler.accountForTask;
+  scheduler.accountForTask = () => { throw Object.assign(new Error("DESKTOP_CLOUD_OWNER_STALE_OR_UNAVAILABLE"), { code: "DESKTOP_CLOUD_OWNER_STALE_OR_UNAVAILABLE" }); };
+  t.mock.method(logger, "warn", (...args: unknown[]) => { warnings.push(args); });
+  await f.scheduler.syncAndTick("desktop.ready").then(undefined, error => failures.push(error));
+  await f.scheduler.waitForInFlightWork();
+  assert.deepEqual(failures, []);
+  assert.equal(warnings.length, 1);
+  assert.match(JSON.stringify(warnings), /SCHEDULED_TASK_ACCOUNT_DEFERRED/u);
+  scheduler.accountForTask = original;
+  f.scheduler.stop();
+});
+
+test("DEFERRED_ACCOUNT_GUARD desktop 账号入口重核失败只延后，不关闭启动恢复", async t => {
+  const f = await desktopFixture(t), warnings: unknown[][] = [], failures: unknown[] = [];
+  await f.cloud.link({ serverOrigin: f.origin, sessionToken: "test-session" }); await f.scheduler.waitForInFlightWork();
+  f.state.shutdown = true;
+  t.mock.method(logger, "warn", (...args: unknown[]) => { warnings.push(args); });
+  await f.scheduler.syncAndTick("desktop.ready").then(undefined, error => failures.push(error));
+  await f.scheduler.waitForInFlightWork();
+  assert.deepEqual(failures, []);
+  assert.equal(warnings.length, 1);
+  assert.match(JSON.stringify(warnings), /SCHEDULED_TASK_ACCOUNT_DEFERRED/u);
+  f.state.shutdown = false;
+  await f.scheduler.syncAndTick("recovered"); await f.scheduler.waitForInFlightWork();
+  assert.deepEqual(f.failures, []);
+  f.scheduler.stop();
+});
+
+test("DEFERRED_ACCOUNT_SYNC desktop 账号同步阶段 owner 失效只延后", async t => {
+  const f = await desktopFixture(t), warnings: unknown[][] = [], failures: unknown[] = [];
+  await f.cloud.link({ serverOrigin: f.origin, sessionToken: "test-session" }); await f.scheduler.waitForInFlightWork();
+  const scheduler = f.scheduler as unknown as { syncExclusive(reason: string): Promise<void> };
+  const original = scheduler.syncExclusive;
+  scheduler.syncExclusive = async () => { throw Object.assign(new Error("controlled account switch"), { code: "SCHEDULED_TASK_ACCOUNT_STALE" }); };
+  t.mock.method(logger, "warn", (...args: unknown[]) => { warnings.push(args); });
+  await f.scheduler.syncAndTick("desktop.ready").then(undefined, error => failures.push(error));
+  await f.scheduler.waitForInFlightWork();
+  assert.deepEqual(failures, []);
+  assert.equal(warnings.length, 1);
+  assert.match(JSON.stringify(warnings), /SCHEDULED_TASK_ACCOUNT_DEFERRED/u);
+  scheduler.syncExclusive = original;
+  await f.scheduler.syncAndTick("recovered"); await f.scheduler.waitForInFlightWork();
+  assert.deepEqual(f.failures, []);
   f.scheduler.stop();
 });
 

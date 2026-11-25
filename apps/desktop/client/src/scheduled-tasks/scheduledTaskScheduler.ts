@@ -51,6 +51,16 @@ const OUTPUT_EXCERPT_LIMIT = 16 * 1024;
 const isolatedLocalConfigScan = Symbol("isolatedLocalConfigScan");
 const accountRequestFailure = Symbol("accountRequestFailure");
 const isolatedAccountRequestScan = Symbol("isolatedAccountRequestScan");
+const deferredAccountScan = Symbol("deferredAccountScan");
+/** 账号代际切换只延后扫描；任务执行/回执的同类错误仍按原边界显式失败。 */
+function isAccountContextDeferred(error: unknown): boolean {
+  if (error instanceof AggregateError) return error.errors.length > 0 && error.errors.every(isAccountContextDeferred);
+  const code = error instanceof Error ? Object.getOwnPropertyDescriptor(error, "code")?.value : undefined;
+  const message = error instanceof Error ? Object.getOwnPropertyDescriptor(error, "message")?.value : undefined;
+  return code === "SCHEDULED_TASK_ACCOUNT_NOT_READY" || code === "SCHEDULED_TASK_ACCOUNT_STALE"
+    || code === "DESKTOP_CLOUD_OWNER_STALE_OR_UNAVAILABLE" || message === "SCHEDULED_TASK_ACCOUNT_NOT_READY";
+}
+
 type ExecutableTask = ScheduledTask | LocalScheduledTaskConfig;
 export type ScheduledTaskAccountContext = ScheduledTaskAccountOwner & { generation: number; assertCurrent(): void };
 
@@ -384,16 +394,41 @@ export class ScheduledTaskScheduler {
           })(),
           (async () => {
             if (this.stopping || this.input.isTaskAdmissionPaused?.()) return;
-            if (this.input.localApiContext && (!this.input.requestAccountTasks || !this.input.captureAccountContext?.())) {
+            if (this.input.localApiContext && !this.input.requestAccountTasks) {
               this.clearAccountSnapshot();
               return;
             }
+            if (this.input.localApiContext) {
+              let captured: ScheduledTaskAccountContext | null | undefined;
+              try {
+                captured = this.input.captureAccountContext?.();
+              } catch (error) {
+                if (isAccountContextDeferred(error)) {
+                  const logFailure = this.deferAccountScan(error, requestId ?? `scheduled:account:${Date.now()}`);
+                  if (logFailure) throw logFailure;
+                  return;
+                }
+                throw error;
+              }
+              if (!captured) {
+                this.clearAccountSnapshot();
+                return;
+              }
+            }
             try {
-              await this.syncExclusive(reason);
+              await this.syncExclusive(reason).catch(error => {
+                if (isAccountContextDeferred(error)) Object.assign(error as object, { [deferredAccountScan]: this });
+                throw error;
+              });
               if (this.stopping || this.input.isTaskAdmissionPaused?.()) return;
               await this.tick();
             }
             catch (error) {
+              if (error instanceof Error && (error as Error & { [deferredAccountScan]?: ScheduledTaskScheduler })[deferredAccountScan] === this) {
+                const logFailure = this.deferAccountScan(error, requestId ?? `scheduled:account:${Date.now()}`);
+                if (logFailure) throw logFailure;
+                return;
+              }
               if (this.input.localApiContext && this.input.requestAccountTasks && error instanceof Error && !isScheduledTaskDiagnosticFailure(error)) {
                 const requestFailure = this.isAccountRequestFailure(error);
                 try {
@@ -874,6 +909,26 @@ export class ScheduledTaskScheduler {
     this.accountSnapshot = null; this.state.tasks.clear(); this.state.queuedByTaskId.clear();
   }
 
+  /** 账号代际切换只延后本轮账号扫描，等 accountLinked 或下一轮重新同步；日志失败返回显式错误。 */
+  private deferAccountScan(error: unknown, requestId: string, taskId?: string): Error | null {
+    this.state.tickPending = false;
+    this.clearAccountSnapshot();
+    try {
+      logger.warn("scheduled-tasks", "account task scan deferred", {
+        code: "SCHEDULED_TASK_ACCOUNT_DEFERRED",
+        requestId,
+        taskId: taskId ?? null,
+        clientId: this.input.config.clientId,
+        deviceId: this.input.deviceId,
+        rootCause: toErrorLog(error).error,
+        event: { category: "scheduled-tasks", action: "account.scan", outcome: "deferred" },
+      });
+      return null;
+    } catch (logError) {
+      return new AggregateError([error, logError], "SCHEDULED_TASK_SCAN_LOG_FAILED", { cause: error });
+    }
+  }
+
   /** 每个 await 后重核当次连接、账号和 ready，旧回执不能确认新 owner。 */
   private assertAccountCurrent(owner: ScheduledTaskAccountContext): void {
     owner.assertCurrent();
@@ -944,7 +999,10 @@ export class ScheduledTaskScheduler {
       try {
         const ctx = (await this.withDatabase(() => this.taskContext(task)));
         localTaskVerified = isLocalTask(task);
-        const account = isLocalTask(task) ? null : (await this.withDatabase(() => this.accountForTask(task)));
+        const account = isLocalTask(task) ? null : await this.withDatabase(() => this.accountForTask(task)).catch(error => {
+          if (isAccountContextDeferred(error)) Object.assign(error as object, { [deferredAccountScan]: this });
+          throw error;
+        });
         const accountState = account ? (await this.withDatabase(() => ctx.db.readAccountScheduledTaskState(task.id, account))) : null;
         const runtime = isLocalTask(task) ? (await this.withDatabase(() => ctx.db.getLocalScheduledTaskRuntime(task)))
           : accountState!.running?.runtime ?? accountState!.queued?.runtime ?? accountState!.locations.find(item => item.workspaceId === resolveTaskWorkspaceId(task))?.runtime ?? null;
@@ -1011,6 +1069,11 @@ export class ScheduledTaskScheduler {
           this.writeTaskLog(task, "error", "scheduled task run failed after dispatch", { requestId: `scheduled:${task.id}:${scheduledAt}`, taskId: task.id, revision: isLocalTask(task) ? task.revision : undefined, workspaceId: resolveTaskWorkspaceId(task), ...toErrorLog(error) });
         });
       } catch (error) {
+        if (error instanceof Error && (error as Error & { [deferredAccountScan]?: ScheduledTaskScheduler })[deferredAccountScan] === this) {
+          const logFailure = this.deferAccountScan(error, `scheduled:${task.id}:${now}`, task.id);
+          if (logFailure) errors.push(logFailure);
+          break;
+        }
         try {
           const logFailure = isScheduledTaskDiagnosticFailure(error);
           if (!logFailure && !(error as {scheduledTaskFailureLogged?:boolean}|null)?.scheduledTaskFailureLogged) {

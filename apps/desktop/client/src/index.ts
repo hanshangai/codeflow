@@ -2233,7 +2233,8 @@ async function main(options?: { apiKeyOverride?: unknown }) {
       if (!owner) return null;
       /** 精确session由原云模块核验；关闭与注销后的旧闭包不再执行副作用。 */
       const assertCurrent = (): void => {
-        if (shutdownRequested || desktopCloudAccount !== cloud) throw new Error("SCHEDULED_TASK_ACCOUNT_NOT_READY");
+        if (shutdownRequested || desktopCloudAccount !== cloud) throw Object.assign(new Error("SCHEDULED_TASK_ACCOUNT_NOT_READY"),
+          { code: "SCHEDULED_TASK_ACCOUNT_NOT_READY" });
         cloud!.assertOwner(owner);
       };
       assertCurrent();
