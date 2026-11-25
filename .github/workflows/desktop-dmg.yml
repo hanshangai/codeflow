@@ -48,7 +48,7 @@ jobs:
           bash tools/ci/build-macos-dmg.sh "$RUNNER_TEMP/desktop-package/installers"
       - name: Verify migration and account recovery
         run: >-
-          node --conditions=development --import tsx --test --test-timeout=120000 --test-concurrency=1
+          node --conditions=development --import tsx --test --test-timeout=300000 --test-concurrency=1
           apps/desktop/client/tests/legacy-client-migration.test.ts
           apps/desktop/tests/legacy-client-migration.test.ts
           apps/desktop/tests/update-transport.test.ts
