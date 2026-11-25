@@ -57,7 +57,7 @@ function canonicalReviewOutcome(issues: KnowledgeReviewIssue[]): KnowledgeReview
 export class KnowledgeReviewStore {
   constructor(readonly store: KnowledgeAssetStore) {}
 
-  /** 绑定正文、生成来源及可追溯要求；来源过期时拒绝复检旧候选。 */
+  /** 绑定正文、来源及可追溯要求；允许已采用正文按当前证据复检。 */
   snapshot(nodeId: string, revisionId: string): KnowledgeReviewSnapshot {
     const tree = this.store.readTree().tree;
     const ancestry = this.store.ancestry(nodeId, tree);
@@ -72,14 +72,19 @@ export class KnowledgeReviewStore {
       sourceHashes: [...new Set(document.sources.flatMap(source => source.path ? [source.path] : []))]
         .sort().map(sourcePath => ({ path: sourcePath, contentHash: this.sourceHash(sourcePath) })),
     };
+    this.assertSnapshot(snapshot);
+    return snapshot;
+  }
+
+  /** 旧生成来源已过期时阻止复检候选，避免通过报告误导用户继续尝试采用。 */
+  assertCandidateSourcesCurrent(snapshot: KnowledgeReviewSnapshot): void {
+    if (snapshot.document.revision.origin !== "ai" || !this.store.detail(snapshot.nodeId).drafts.some(draft => draft.id === snapshot.revisionId)) return;
     const currentSources = new Map(snapshot.sourceHashes.map(source => [source.path, source.contentHash]));
-    for (const source of document.sources) {
+    for (const source of snapshot.document.sources) {
       if (source.path && currentSources.get(source.path) !== source.contentHash) {
         throw new KnowledgeAssetError("KNOWLEDGE_ASSET_SOURCE_CHANGED", `生成时引用的来源已变化：${source.path}；请更新候选并复检，单独复检不会更新旧版本来源`);
       }
     }
-    this.assertSnapshot(snapshot);
-    return snapshot;
   }
 
   /** 保存绑定版本的报告，要求证据与文件证据分别校验，不接受未核对的来源。 */

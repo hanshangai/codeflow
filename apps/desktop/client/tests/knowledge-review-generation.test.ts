@@ -131,7 +131,7 @@ test("来源变化后拒绝复检旧候选并引导更新候选，新候选自�
   fs.appendFileSync(path.join(root, "src/permissions.ts"), "// 仅新增说明，权限行为不变\n", "utf8");
   const previousReports = reviews.list("permissions");
   assert.equal(previousReports[0]!.stale, true);
-  assert.match(previousReports[0]!.staleReasons.join("；"), /生成时引用的来源已变化.*更新候选/);
+  assert.match(previousReports[0]!.staleReasons.join("；"), /来源已变化/);
   const recheck = begin({ mode: "review" }); service.start(recheck.id);
   const failedReview = await settled(service, recheck.id);
   assert.equal(failedReview.items[0]!.review?.status, "failed");

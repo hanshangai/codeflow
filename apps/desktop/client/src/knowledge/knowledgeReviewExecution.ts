@@ -55,6 +55,7 @@ export async function executeKnowledgeReview(input: {
   const { store, run, item } = input;
   if (!item.revisionId || !run.reviewConfig?.enabled) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_INPUT_INVALID", "缺少复检版本或模型配置");
   const reports = new KnowledgeReviewStore(store), snapshot = reports.snapshot(item.nodeId, item.revisionId);
+  reports.assertCandidateSourcesCurrent(snapshot);
   if (snapshot.targetRevisionId !== item.revisionId) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", "排队期间文档版本已变化，请对最新版本重新发起复检");
   // 用版本的生成任务定位来源，避免最近任务上限或其他版本把复检接到错误会话。
   const sourceRunId = !item.executionThreadId ? snapshot.document.revision.runId : null;
