@@ -1037,7 +1037,7 @@ watch(
     :open="candidateDetailOpen"
     :title="activeCandidate?.title || '候选需求详情'"
     :width="'90vw'"
-    :style="{ top: '4vh' }"
+    :style="{ top: 'max(56px, 4vh)' }"
     :body-style="{ padding: '16px 18px', height: '84vh', maxHeight: '84vh', overflow: 'hidden' }"
     @cancel="closeCandidateDetail"
   >

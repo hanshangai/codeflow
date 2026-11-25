@@ -18,7 +18,8 @@ export function resolveDesktopWebBuildEnv(plan, baseEnv = process.env) {
   const origins = { test: "wss://codeflow-test.hanshangai.com", production: "wss://codeflowai.cn" };
   const origin = origins[plan.environment];
   if (!origin) throw new Error("DESKTOP_WEB_BUILD_ENVIRONMENT_INVALID");
-  const env = { ...baseEnv, VITE_CODEFLOWAI_SERVER_WS_ORIGIN: origin };
+  const environment = plan.environment === "test" ? "test" : "production";
+  const env = { ...baseEnv, VITE_CODEFLOWAI_SERVER_WS_ORIGIN: origin, VITE_CODEFLOWAI_RUNTIME_ENV: environment };
   delete env.VITE_AIDT_CODE_SERVER_WS_ORIGIN;
   return env;
 }

@@ -29,6 +29,7 @@ import { createUpdateNetworkRetry, type UpdateNetworkRetry } from "./updateNetwo
 import { runShellUpdateOperation, type ShellUpdateHostFacts, type ShellUpdateOperationBoundary, type ShellUpdateHelperOwner } from "./shellUpdateOperation.js";
 import type { ShellDiscovery } from "./shellUpdateNetwork.js";
 import { retireShellUpdateAttempt } from "./shellHandoff.js";
+import { createShellUpdateAttemptStore, isShellUpdateHandoffAttempt } from "./shellUpdateAttempt.js";
 import { createUpdateNoticeController, formatUpdateNoticeVersion, type PreparedUpdateNotice } from "./updateNotice.js";
 
 type ApplicationDownloadOptions = Omit<DownloadOptions, "transport" | "rootDir" | "trustedReleaseKeys" | "receivedReporter">;
@@ -503,7 +504,8 @@ export function createDesktopApplication(input: {
   };
 
   /** 显式重启沿统一关闭入口交接；失败后由原 Client 重启入口恢复。 */
-  const checkShellInternal = async (requestId: string, signal: AbortSignal, manual: boolean, allowRestart = false): Promise<void> => {
+  const checkShellInternal = async (requestId: string, signal: AbortSignal, manual: boolean, allowRestart = false,
+    deferAfterInstaller = false): Promise<void> => {
     const config = input.shellUpdate;
     if (!config) return;
     const currentRuntime = runtime;
@@ -527,7 +529,7 @@ export function createDesktopApplication(input: {
       configuredServerOrigin: input.configuredServerOrigin!, trustedKeys: input.trustedReleaseKeys ?? {}, requestId, signal,
       facts: config.facts, boundary: config.boundary, timeoutMs: config.timeoutMs, getClient: () => runtime.snapshot(),
       discovery: async discoveryRequestId => (await discoverUpdatesInternal({ requestId: discoveryRequestId, signal })).shell,
-      manual,
+      manual, deferAfterInstaller,
       /** 仅原日志的真实历史可授权人工新周期，ACK过的旧证据仍须存在。 */
       getFailureEvidence(failedRequestId, shellId) {
         if (!failureJournal || !identity) throw new Error("DESKTOP_UPDATE_UNAVAILABLE");
@@ -1097,7 +1099,7 @@ export function createDesktopApplication(input: {
               const facts = input.shellUpdate.facts;
               await retireShellUpdateAttempt({ ...facts, dataDir: input.dataDir, executablePath: facts.main.executable,
                 pid: facts.main.pid, parentPid: facts.main.parentPid, argv: [], trustedKeys: input.trustedReleaseKeys,
-                snapshot: input.shellUpdate.boundary?.snapshot });
+                snapshot: input.shellUpdate.boundary?.snapshot, preservePreparedInstaller: !restoreToBaseline });
             }
           } catch (error) {
             // 候选尚未启动，原库未迁移；协调器的 drain 尚未完成，恢复由此边界负责。
@@ -1155,6 +1157,12 @@ export function createDesktopApplication(input: {
         await databaseBackup.recover(activeReleaseId);
         preparedUpdate = undefined;
       } else if (bundleDetails.result === "restored") {
+        if (input.shellUpdate) {
+          const facts = input.shellUpdate.facts;
+          await retireShellUpdateAttempt({ ...facts, dataDir: input.dataDir, executablePath: facts.main.executable,
+            pid: facts.main.pid, parentPid: facts.main.parentPid, argv: [], trustedKeys: input.trustedReleaseKeys,
+            snapshot: input.shellUpdate.boundary?.snapshot });
+        }
         await clearPendingRelease(input.dataDir);
         preparedUpdate = undefined;
         const restored = activeReleaseId && activeAtStartup?.releaseId === activeReleaseId ? activeAtStartup
@@ -1276,14 +1284,21 @@ export function createDesktopApplication(input: {
         }
       }
       if (updatesSuppressed) return active;
-      // 优先完成已准备的资源；同轮创建壳绑定会在下次资源激活后失效。
+      // 资源和壳同时可更新时，先准备资源并暂存已验签的壳安装包。
       if (preparedUpdate) {
         const discovered = checkDiscoveries?.get(requestId);
-        if (discovered && (await discovered).shellError) {
+        const shellDiscovery = discovered && await discovered;
+        if (shellDiscovery?.shellError) {
           checkingShell = true;
           await checkShellInternal(requestId, signal, manual, allowRestart);
+          return active;
         }
-        if (!input.shellUpdate || input.shellUpdate.boundary?.spawnHelper) return active;
+        if (!input.shellUpdate) return active;
+        if (input.shellUpdate.boundary?.spawnHelper) {
+          if (shellDiscovery?.shell.available) await checkShellInternal(requestId, signal, manual, allowRestart, true);
+          else shellDetails = { requestId, target: null, phase: null, result: "none", failure: null };
+          return active;
+        }
       }
       switchCommitted = false;
       signal.throwIfAborted();
@@ -1457,6 +1472,7 @@ export function createDesktopApplication(input: {
       if (operation !== "idle" || window) throw new Error("DESKTOP_ALREADY_STARTED");
       operation = "starting";
       try {
+        let resumePreparedShellAfterStartup = false;
         const startupRequestId = crypto.randomUUID();
         let startupStageLabel = "启动初始化";
         let startupStageStartedAt = performance.now();
@@ -1710,6 +1726,13 @@ export function createDesktopApplication(input: {
         if (pending && pendingActivated && newerBaseline && bundleDetails.result === "same") {
           await clearPendingRelease(input.dataDir);
         }
+        if (pendingActivated && pending && bundleDetails.result === "healthy" && input.shellUpdate && !updateCheckFailure) {
+          const attempt = await createShellUpdateAttemptStore(input.dataDir).read();
+          resumePreparedShellAfterStartup = attempt?.schemaVersion === 5 && !isShellUpdateHandoffAttempt(attempt)
+            && attempt.phase === "preparing" && attempt.target !== null && attempt.network?.actionKey === "shell-installer"
+            && attempt.network.status === "succeeded" && attempt.network.evidence.kind === "shell-installer"
+            && attempt.network.evidence.sha256 === attempt.target.installerSha256;
+        }
         if (pending && !pendingActivated) {
           await activatePendingAtStartup(pending, startupActiveRelease, baselineRelease, newerBaseline);
           if (bundleDetails.result === "healthy" && !updateCheckFailure) {
@@ -1751,6 +1774,11 @@ export function createDesktopApplication(input: {
         window.show();
         await reportStartup("启动完成");
         scheduleTelemetry();
+        if (resumePreparedShellAfterStartup) setTimeout(() => {
+          void beginUpdateCheck(false, true).catch(error => {
+            reportShellFailure(error, readReceiptErrorRequestId(error) ?? "startup-shell-resume", { logOnly: true });
+          });
+        }, 0).unref?.();
       } catch (error) {
         if (startupExitRequested) {
           try { await startupExitFlight; }

@@ -129,7 +129,7 @@ onBeforeUnmount(release);
 </script>
 
 <template>
-  <a-modal :open="open" title="定时更新规格库" width="min(720px, calc(100vw - 24px))" :style="{ top: '24px' }" :body-style="{ maxHeight: 'calc(100dvh - 200px)', overflowY: 'auto' }" :closable="!saving && !checking" :mask-closable="!saving && !checking" :keyboard="!saving && !checking" @cancel="emit('update:open', false)">
+  <a-modal :open="open" title="定时更新规格库" width="min(720px, calc(100vw - 24px))" :style="{ top: '56px' }" :body-style="{ maxHeight: 'calc(100dvh - 200px)', overflowY: 'auto' }" :closable="!saving && !checking" :mask-closable="!saving && !checking" :keyboard="!saving && !checking" @cancel="emit('update:open', false)">
     <div class="update-settings" data-testid="knowledge-update-settings">
       <p class="update-note">设置检查时间与范围，来源或要求变化时生成更新草稿，确认采用后才生效。</p>
       <a-alert v-if="errorText" type="error" show-icon :message="errorText" />

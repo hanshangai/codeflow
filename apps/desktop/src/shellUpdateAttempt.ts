@@ -101,6 +101,8 @@ export type ShellUpdateAttemptStore = {
   bindPreparationMain(expected: unknown, facts: ShellUpdateRecoveryRuntimeFacts): Promise<ShellUpdatePreparationAttemptV5>;
   /** 当前准备主进程按完整快照持久化归属及释放。 */
   observePreparationOwned(expected: unknown, facts: { caller: ProcessIdentity; processes: ProcessIdentity[] }): Promise<ShellUpdatePreparationAttemptV5>;
+  /** 完整安装器证明仍有效时，以新主进程及Client快照更新准备期 binding。 */
+  rebindPrepared(expected: unknown, facts: unknown): Promise<ShellUpdatePreparationAttemptV5>;
   /** 已选目标显式交给helper；旧2保持3/4返回，新5保留准备历史。 */
   beginHandoff(expected: ShellUpdatePreparationAttemptV5, facts: ShellUpdateHandoffFacts & { lifecycle: true; processes: ProcessIdentity[] }): Promise<ShellUpdateHandoffAttemptV5>;
   beginHandoff<const F>(expectedV2: unknown, facts: F): Promise<F extends { lifecycle: true } ? ShellUpdateAttemptV4 : ShellUpdateAttemptV3>;
@@ -340,6 +342,42 @@ export function createShellUpdateAttemptStore(dataDir: string): ShellUpdateAttem
     async observePreparationOwned(expectedInput, factsInput) {
       const { expected, next } = preparationNext("observe", expectedInput, factsInput);
       return await physical(equal(expected, next) ? { kind: "checkExpected", expected } : { kind: "replace", expected, next }) as ShellUpdatePreparationAttemptV5;
+    },
+    /** 新资源必须健康且旧进程树已释放；只保留原 request、签名目标和完整安装器证明。 */
+    async rebindPrepared(expectedInput, factsInput) {
+      let expected: ShellUpdatePreparationAttemptV5, next: ShellUpdatePreparationAttemptV5;
+      let requestId: string | undefined;
+      try {
+        const attempt = readAttempt(expectedInput), input = fields(factsInput, undefined);
+        requestId = attempt.requestId;
+        if (!isPreparationV5(attempt) || attempt.phase !== "preparing" || !attempt.target
+          || attempt.network?.actionKey !== "shell-installer" || attempt.network.status !== "succeeded"
+          || attempt.network.evidence.kind !== "shell-installer" || attempt.network.evidence.sha256 !== attempt.target.installerSha256) invalid();
+        const facts = fields(input, ["caller", "processes", "launchState", "binding", "profile"]);
+        const caller = readProcess(facts.caller), processes = readProcessList(facts.processes, true);
+        const launch = fields(facts.launchState, ["status", "value"]), currentBinding = fields(facts.binding, ["status", "value"]);
+        const profile = fields(facts.profile, ["status", "dataDir", "userDataDir", "sessionDataDir"]);
+        const binding = readBinding(currentBinding.value, attempt.originalState.baselineShellId);
+        const roots = attempt.preparationMains.map(item => item.identity);
+        const changingMain = !sameIdentity(caller, roots.at(-1)!);
+        if (launch.status !== "known" || !equal(copyState(launch.value), attempt.originalState)
+          || currentBinding.status !== "matched" || binding.kind !== "active" || equal(binding, attempt.binding)
+          || profile.status !== "known" || profile.dataDir !== attempt.dataDir || profile.userDataDir !== attempt.userDataDir
+          || profile.sessionDataDir !== attempt.sessionDataDir || caller.executable !== shellExecutable(attempt, attempt.originalState.activeShellId)
+          || !processes.some(item => sameIdentity(item, caller)) || changingMain && (roots.some(root => root.pid === caller.pid
+            || processes.some(item => sameIdentity(item, root))) || attempt.preparationMains.length >= 1024
+            || [...roots, ...attempt.owned].some(item => item.pid === caller.pid))) invalid();
+        expected = attempt;
+        const revision = attempt.revision + 1;
+        const preparationMains = changingMain ? [...attempt.preparationMains, { identity: caller, boundAtRevision: revision }] : attempt.preparationMains;
+        const inventory = observeProcessInventory({ inventory: { owned: attempt.owned, lifecycle: attempt.ownedLifecycle },
+          roots: preparationMains.map(item => item.identity), processes, observer: caller, revision });
+        if (inventory.lifecycle.slice(0, attempt.owned.length).some(item => item.release === null)) invalid();
+        next = readAttempt({ ...attempt, revision, controlRevision: revision, binding, preparationMains,
+          owned: inventory.owned, ownedLifecycle: inventory.lifecycle }) as ShellUpdatePreparationAttemptV5;
+        assertTransition(expected, next);
+      } catch (cause) { throw operationError("REPLACE", "input", false, cause, requestId); }
+      return await physical({ kind: "replace", expected, next }) as ShellUpdatePreparationAttemptV5;
     },
     /** 双输入首次 await 前严格快照，沿同串行队列和物理替换入口迁移。 */
     async beginHandoff(expectedInput: unknown, factsInput: unknown) {
@@ -1021,6 +1059,10 @@ function assertTransition(expected: ShellUpdateAttempt | null, next: ShellUpdate
   if (expected.schemaVersion === 5 && (isShellUpdateHandoffAttempt(expected) !== isShellUpdateHandoffAttempt(next))) invalid();
   if (isShellUpdateHandoffAttempt(expected) && isShellUpdateHandoffAttempt(next)) { assertHandoffTransition(expected, next); return; }
   if (isPreparationV5(expected) && isPreparationV5(next)) {
+    if (!equal(expected.binding, next.binding)) {
+      assertPreparedRebindTransition(expected, next);
+      return;
+    }
     if (!equal(expected.preparationMains, next.preparationMains) || !equal(expected.owned, next.owned) || !equal(expected.ownedLifecycle, next.ownedLifecycle)) invalid();
     const before = readAttempt(Object.fromEntries([...FIELDS, "network" as const].map(key => [key, key === "schemaVersion" ? 2 : expected[key]])));
     const after = readAttempt(Object.fromEntries([...FIELDS, "network" as const].map(key => [key, key === "schemaVersion" ? 2 : next[key]])));
@@ -1037,6 +1079,33 @@ function assertTransition(expected: ShellUpdateAttempt | null, next: ShellUpdate
   }
   const increment = next.retriesUsed - expected.retriesUsed;
   if (increment !== 0 && !(increment === 1 && expected.phase === "preparing" && next.phase === "preparing")) invalid();
+}
+
+/** 重绑定只允许在完整安装器成功后追加一个已核进程根，不改其他准备事实。 */
+function assertPreparedRebindTransition(expected: ShellUpdatePreparationAttemptV5, next: ShellUpdatePreparationAttemptV5): void {
+  const appendedMain = next.preparationMains.length === expected.preparationMains.length + 1;
+  const sameMain = equal(next.preparationMains, expected.preparationMains);
+  if (expected.phase !== "preparing" || next.phase !== "preparing" || !expected.target
+    || expected.network?.actionKey !== "shell-installer" || expected.network.status !== "succeeded"
+    || expected.network.evidence.kind !== "shell-installer" || expected.network.evidence.sha256 !== expected.target.installerSha256
+    || next.controlRevision !== next.revision || !appendedMain && !sameMain
+    || appendedMain && (!equal(next.preparationMains.slice(0, -1), expected.preparationMains) || next.preparationMains.at(-1)?.boundAtRevision !== next.revision)
+    || !equal(rebindComparable(expected), rebindComparable(next))
+    || next.owned.length < expected.owned.length || next.ownedLifecycle.length !== next.owned.length) invalid();
+  for (let index = 0; index < expected.owned.length; index++) {
+    const previous = expected.ownedLifecycle[index]!, current = next.ownedLifecycle[index]!;
+    if (!sameIdentity(expected.owned[index]!, next.owned[index]!) || previous.key !== current.key || previous.parentKey !== current.parentKey
+      || previous.release !== null && !equal(previous.release, current.release)
+      || previous.release === null && (!current.release || current.release.revision <= expected.revision || current.release.revision > next.revision)) invalid();
+  }
+  if (next.ownedLifecycle.slice(expected.owned.length).some(item => item.release !== null)) invalid();
+}
+
+/** 重绑定比对除资源健康、进程根和其归属库存外的全部耐久事实。 */
+function rebindComparable(attempt: ShellUpdatePreparationAttemptV5): unknown {
+  const { revision: _revision, controlRevision: _controlRevision, binding: _binding, preparationMains: _mains,
+    owned: _owned, ownedLifecycle: _lifecycle, ...unchanged } = attempt;
+  return unchanged;
 }
 
 /** 唯一槽仅预约时扣次；未知发送不重放，成功后才允许下一动作。 */

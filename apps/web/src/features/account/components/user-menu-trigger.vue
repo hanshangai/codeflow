@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
-import { DownOutlined, GiftOutlined, MenuOutlined, MessageOutlined, PoweroffOutlined, ReloadOutlined, SettingOutlined } from "@ant-design/icons-vue";
+import { DownOutlined, GiftOutlined, MenuOutlined, MessageOutlined, PoweroffOutlined, ReloadOutlined, UserOutlined } from "@ant-design/icons-vue";
 import type { AccessContext, AccountRole } from "@codeflowai/shared";
 
 import { formatAccountRole, formatAccountRoleTag } from "../accountDisplay";
@@ -108,7 +108,7 @@ async function emitMenuAction(action: "open-account" | "open-redemption" | "open
     <template #overlay>
       <a-menu>
         <a-menu-item key="account" @click="emitMenuAction('open-account')">
-          <SettingOutlined />
+          <UserOutlined />
           {{ COPY.account }}
         </a-menu-item>
         <a-menu-item v-if="!hideRedemption" key="redemption" @click="emitMenuAction('open-redemption')">

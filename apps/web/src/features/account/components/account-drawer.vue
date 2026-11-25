@@ -1055,6 +1055,11 @@ function saveEnterpriseProfile(): void {
                     <p class="account-drawer__qr-caption">扫码加入微信群</p>
                   </article>
                   <article class="account-drawer__qr-card">
+                    <span class="account-drawer__qr-label">客服微信</span>
+                    <img src="/images/landing/customer-service-qr.png" alt="客服微信二维码" class="account-drawer__qr-image" />
+                    <p class="account-drawer__qr-caption">扫码添加客服微信</p>
+                  </article>
+                  <article class="account-drawer__qr-card">
                     <span class="account-drawer__qr-label">公众号</span>
                     <img src="/images/contact/official-account-qr.jpg" alt="公众号二维码" class="account-drawer__qr-image" />
                     <p class="account-drawer__qr-caption">扫码关注公众号</p>

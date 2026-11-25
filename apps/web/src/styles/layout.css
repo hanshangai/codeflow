@@ -42,6 +42,43 @@
   color: rgb(209, 121, 52);
 }
 
+/* 本地开发与测试环境标识；生产不渲染。 */
+.app-topbar__env-badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.5;
+  letter-spacing: 0.04em;
+  -webkit-app-region: no-drag;
+}
+
+.app-topbar__env-badge--dev {
+  color: #3b5bdb;
+  border-color: #b9c8ff;
+  background: #edf2ff;
+}
+
+.app-topbar__env-badge--test {
+  color: #a15c00;
+  border-color: #f3d19e;
+  background: #fff7e6;
+}
+
+.app-topbar--desktop .app-topbar__env-badge--dev {
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.5);
+  background: rgba(59, 91, 219, 0.55);
+}
+
+.app-topbar--desktop .app-topbar__env-badge--test {
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.55);
+  background: rgba(161, 92, 0, 0.55);
+}
+
 .app-topbar__logo {
   display: block;
   width: 22px;
@@ -2540,6 +2577,37 @@
   color: #fff;
   -webkit-app-region: drag;
   user-select: none;
+}
+
+/* 自定义标题栏下，仅可见弹层从窗口拖拽区扣除，避免拖动或双击弹层顶部带动主窗口；
+   不包含 message/notification 等常驻容器，否则会连带扣除顶栏拖拽区。 */
+.ant-modal-wrap,
+.ant-modal-content,
+.ant-drawer-content,
+.ant-drawer-mask,
+.ant-popover,
+.ant-dropdown,
+.ant-select-dropdown,
+.ant-picker-dropdown {
+  -webkit-app-region: no-drag;
+}
+
+/* 桌面无边框窗口：弹层遮罩与右侧抽屉从顶栏下方开始，保留标题导航与窗口控制可点。 */
+@media (min-width: 768px) {
+  .ant-modal-mask {
+    top: 44px !important;
+    height: calc(100% - 44px) !important;
+  }
+
+  .ant-drawer-right .ant-drawer-mask {
+    top: 44px !important;
+    height: calc(100% - 44px) !important;
+  }
+
+  .ant-drawer-right .ant-drawer-content-wrapper {
+    top: 44px;
+    height: calc(100% - 44px) !important;
+  }
 }
 
 :root[data-theme="dark"] .app-topbar.app-topbar--desktop {

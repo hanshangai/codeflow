@@ -38,6 +38,8 @@ export type ShellUpdateOperationInput = {
   onRetry: NetworkInput["onRetry"]; boundary?: Partial<ShellUpdateOperationBoundary>; timeoutMs?: number;
   /** 只有本次显式人工操作可用已有耐久壳失败开启新请求；共享自动 flight 不提升权限。 */
   manual?: boolean;
+  /** 资源与壳组合更新时，完整安装器验签落盘后先等资源激活再绑定健康事实。 */
+  deferAfterInstaller?: boolean;
   getFailureEvidence?(requestId: string, shellId: string | null): ShellUpdateFailureRecord;
   /** 恢复等待前同步报告首错；报告失败仍受原方向与清理门禁约束。 */
   onFailure?(error: Error): void;
@@ -151,10 +153,18 @@ export async function runShellUpdateOperation(input: ShellUpdateOperationInput):
         || !observedClient || clientIdentity && !sameIdentity(observedClient, clientIdentity) || readyRequestId && client.requestId !== readyRequestId) fail("CLIENT_BINDING_CHANGED");
       clientIdentity ??= structuredClone(observedClient); readyRequestId ??= client.requestId;
     }
-    if (binding && !equal(actualBinding, binding) || originalState && !equal(launch.state, originalState)) fail("ORIGINAL_FACTS_CHANGED");
+    const preparedInstaller = attempt?.schemaVersion === 5 && !isShellUpdateHandoffAttempt(attempt)
+      && attempt.phase === "preparing" && attempt.target !== null && attempt.network?.actionKey === "shell-installer"
+      && attempt.network.status === "succeeded" && attempt.network.evidence.kind === "shell-installer"
+      && attempt.network.evidence.sha256 === attempt.target.installerSha256;
+    if ((binding && !equal(actualBinding, binding) && !preparedInstaller) || (originalState && !equal(launch.state, originalState))) fail("ORIGINAL_FACTS_CHANGED");
     if (attempt?.schemaVersion === 5 && !isShellUpdateHandoffAttempt(attempt)) {
-      if (!sameIdentity(attempt.preparationMains.at(-1)!.identity, input.facts.main)) fail("MAIN_IDENTITY_CHANGED");
-      if (requireClient && observePreparation && !owned) attempt = await store.observePreparationOwned(attempt, { caller: input.facts.main, processes });
+      if (!sameIdentity(attempt.preparationMains.at(-1)!.identity, input.facts.main)) {
+        if (!requireClient || !attempt.target || attempt.network?.actionKey !== "shell-installer" || attempt.network.status !== "succeeded") fail("MAIN_IDENTITY_CHANGED");
+        attempt = await store.rebindPrepared(attempt, { caller: input.facts.main, processes,
+          launchState: { status: "known", value: launch.state }, binding: { status: "matched", value: actualBinding },
+          profile: { status: "known", dataDir: input.dataDir, userDataDir: input.facts.userDataDir, sessionDataDir: input.facts.sessionDataDir } });
+      } else if (requireClient && observePreparation && !owned) attempt = await store.observePreparationOwned(attempt, { caller: input.facts.main, processes });
     } else if (attempt?.schemaVersion === 2) sampleOwned(processes, [input.facts.main, ...(owned?.identity ? [owned.identity] : [])], knownOwned);
     return { state: launch.state, binding: actualBinding, active, baseline, processes };
   };
@@ -196,9 +206,15 @@ export async function runShellUpdateOperation(input: ShellUpdateOperationInput):
     else {
       requestId = attempt.requestId;
       if (!isPreparation(attempt) || attempt.phase !== "preparing") requireManual("RECOVERY_REQUIRED");
-      if (["dataDir", "installationDir", "userDataDir", "sessionDataDir", "originalState", "binding"]
+      const bindingChanged = !equal(attempt.binding, facts.binding);
+      if (["dataDir", "installationDir", "userDataDir", "sessionDataDir", "originalState"]
         .some(key => !equal(attempt![key as keyof ShellUpdateAttempt], fresh[key as keyof ShellUpdateAttemptV2]))) fail("ATTEMPT_FACTS_CHANGED");
-      if (attempt.schemaVersion === 5) attempt = await store.observePreparationOwned(attempt, { caller: input.facts.main, processes: facts.processes });
+      if (attempt.schemaVersion === 5) {
+        if (bindingChanged) attempt = await store.rebindPrepared(attempt, { caller: input.facts.main, processes: facts.processes,
+          launchState: { status: "known", value: facts.state }, binding: { status: "matched", value: facts.binding },
+          profile: { status: "known", dataDir: input.dataDir, userDataDir: input.facts.userDataDir, sessionDataDir: input.facts.sessionDataDir } });
+        else attempt = await store.observePreparationOwned(attempt, { caller: input.facts.main, processes: facts.processes });
+      } else if (bindingChanged) fail("ATTEMPT_FACTS_CHANGED");
     }
     requestId = attempt.requestId;
     recovery = "not_needed"; observe("prepare");
@@ -215,6 +231,11 @@ export async function runShellUpdateOperation(input: ShellUpdateOperationInput):
     if (!attempt || !samePreparation(attempt, beforeDownload) || attempt.phase !== "preparing" || !attempt.target || !equal(attempt.target, prepared.attempt.target)
       || downloaded.sha256 !== attempt.target.installerSha256 || downloaded.size !== attempt.target.installerSize) fail("TARGET_CHANGED");
     await readCurrent(true); await unchanged(); input.signal.throwIfAborted();
+    if (input.deferAfterInstaller) {
+      observe("download", "prepared", { shellId: attempt.target.shellId, version: prepared.manifest.version });
+      resumeNeeded = false;
+      return { status: "postponed", requestId };
+    }
     const install = input.boundary?.install ?? (async options => await (await import("./shellInstallerProcess.js")).installShellCandidate(options));
     observe("install");
     const installed = await install({ manifest: prepared.manifest, trustedKeys: input.trustedKeys, installerPath: downloaded.installerPath,

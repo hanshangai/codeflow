@@ -48,9 +48,11 @@ export function resolveDesktopUpdateOutcome(input: {
   }
   if (channels.some(channel => channel.result === "prepared" && channel.target)) {
     return { tone: "success", title: "新版本已下载，重启后生效",
-      detail: !isMacDesktop && value.bundle.result === "prepared"
-        ? "应用内容已下载并校验完成，重启后生效，并继续检查桌面壳更新。"
-        : "更新已下载并校验完成，可以立即重启，也可以稍后重启。" };
+      detail: !isMacDesktop && value.bundle.result === "prepared" && value.shell.result === "prepared"
+        ? "资源和桌面壳已下载并校验完成，一次重启即可完成更新。"
+        : !isMacDesktop && value.bundle.result === "prepared"
+          ? "应用内容已下载并校验完成，重启后生效，并继续检查桌面壳更新。"
+          : "更新已下载并校验完成，可以立即重启，也可以稍后重启。" };
   }
   if (channels.some(channel => channel.result === "cancelled" || channel.result === "postponed")) {
     return { tone: "warning", title: "更新未完成", detail: channels.some(channel => channel.result === "cancelled")

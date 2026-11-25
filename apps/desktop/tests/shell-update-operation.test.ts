@@ -111,6 +111,7 @@ async function fixture(t: test.TestContext, legacy = false) {
     /** 清理只关闭本次helper；恢复后必须重新核原S0。 */
     disconnect() { actions.push("disconnect"); if (control.cleanupFail) throw new Error("helper cleanup failed"); channel.connected = false; control.closed = true; queueMicrotask(() => channel.emit("close", 1, null)); },
     unref() { actions.push("unref"); } });
+  let installerDownloads = 0;
   const network = {
     /** 使用真实store推进发现结果，不伪造attempt引用。 */
     async prepare() { actions.push("network.prepare"); if (control.fail === "prepare") throw new Error("prepare failed");
@@ -124,10 +125,11 @@ async function fixture(t: test.TestContext, legacy = false) {
     },
     /** 原网络owner只产生真实安装器成功槽。 */
     async downloadInstaller() { actions.push("network.download"); if (control.fail === "download") throw new Error("download failed");
-      const current = await store.read() as ShellUpdateAttemptV2;
+      let current = await store.read() as ShellUpdateAttemptV2;
       if (current.network?.actionKey === "shell-installer" && current.network.status === "succeeded") return { installerPath: path.join(root, "installer.exe"), sha256: manifest.installerSha256, size: 1 };
+      installerDownloads++;
       const dispatch = await store.replace(current, { ...current, revision: current.revision + 1, network: { actionKey: "shell-installer", requestSha256: "f".repeat(64), status: "dispatching" } }) as ShellUpdateAttemptV2;
-      await store.replace(dispatch, { ...dispatch, revision: dispatch.revision + 1, network: { ...dispatch.network!, status: "succeeded", evidence: { kind: "shell-installer", sha256: "b".repeat(64) } } });
+      current = await store.replace(dispatch, { ...dispatch, revision: dispatch.revision + 1, network: { ...dispatch.network!, status: "succeeded", evidence: { kind: "shell-installer", sha256: "b".repeat(64) } } }) as ShellUpdateAttemptV2;
       return { installerPath: path.join(root, "installer.exe"), sha256: manifest.installerSha256, size: 1 }; }
   };
   const input = { dataDir, initialReleaseDir, identity, trustedKeys: { fixture: publicKey }, configuredServerOrigin: "http://127.0.0.1:1", requestId: crypto.randomUUID(), signal: new AbortController().signal,
@@ -150,8 +152,59 @@ async function fixture(t: test.TestContext, legacy = false) {
   if (legacy) await store.replace(null, { schemaVersion: 2, requestId: input.requestId, revision: 0,
     installationDir, dataDir, userDataDir, sessionDataDir, originalState,
     binding: { kind: "installation", baselineShellId: "baseline", health }, retriesUsed: 0, phase: "preparing", target: null, candidateState: null, network: null });
-  return { input, actions, control, store, root, channel, originalState, client, baseline, privateKey };
+  return { input, actions, control, store, root, channel, originalState, client, baseline, privateKey, get installerDownloads() { return installerDownloads; } };
 }
+
+/** 创建真实验签的新活动包，确保重绑定使用当前资源的签名和健康事实。 */
+async function createActiveRelease(f: Awaited<ReturnType<typeof fixture>>) {
+  const directory = path.join(f.input.dataDir, "releases", "active-new");
+  await fs.mkdir(path.join(directory, "client", "dist"), { recursive: true });
+  await fs.mkdir(path.join(directory, "web"), { recursive: true });
+  for (const relative of ["client/dist/index.cjs", "web/index.html", DESKTOP_STARTUP_CAPABILITY_PATH]) {
+    await fs.copyFile(path.join(f.input.initialReleaseDir, relative), path.join(directory, relative));
+  }
+  const files = await readReleaseBundleFiles(directory), webSha256 = computeReleaseDirectorySha256(files, "web");
+  const clientSha256 = computeReleaseDirectorySha256(files, "client");
+  const manifest = signReleaseBundleManifest({ schemaVersion: 2, releaseId: "active-new", version: "2", webVersion: "2", clientVersion: "2",
+    protocolVersion: 1, capabilityVersion: 1, dbSchemaVersion: 8, platform: process.platform, arch: process.arch, keyId: "fixture",
+    archiveSha256: "d".repeat(64), archiveSize: 1, files, webSha256, clientSha256,
+    packageSha256: computeReleasePackageSha256(webSha256, clientSha256), createdAt: "2026-01-01T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z" }, f.privateKey);
+  await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify(manifest));
+  await fs.writeFile(path.join(f.input.dataDir, "active-release.json"), JSON.stringify({ releaseId: manifest.releaseId }));
+  return manifest;
+}
+
+test("a prepared shell attempt rebinds to newly healthy resources without downloading its verified installer again", async t => {
+  const h = await api(), f = await fixture(t); f.control.confirm = false;
+  const first = await h.runShellUpdateOperation(f.input), prepared = await f.store.read() as ShellUpdateAttemptV2;
+  assert.equal(first.status, "postponed");
+  assert.equal(prepared.network?.actionKey, "shell-installer");
+  assert.equal(prepared.network?.status, "succeeded");
+  const manifest = await createActiveRelease(f);
+  const main: ProcessIdentity = { ...f.input.facts.main, pid: 201, created: 1201, commandLine: "new main" };
+  const client: ProcessIdentity = { ...f.client, pid: 202, parentPid: main.pid, created: 1202, commandLine: "new client" };
+  f.input.facts.main = main;
+  f.input.getClient = () => ({ status: "ready", requestId: "ready-new", releaseId: manifest.releaseId, errorCode: null,
+    pid: client.pid, health: { protocolVersion: 1, clientVersion: "2", dbSchemaVersion: 8, database: "ready" } });
+  f.input.boundary.snapshot = async () => [main, client];
+  f.input.boundary.health = async () => ({ schemaVersion: 1, requestId: crypto.randomUUID(), candidateShellId: "new", temporaryRoot: f.input.facts.temporaryParentDir,
+    status: "passed", phase: "completed", checks: [{ role: "baseline", releaseId: "installation", releaseDir: f.input.initialReleaseDir,
+      health: { protocolVersion: 1, clientVersion: "1", dbSchemaVersion: 7, database: "ready" }, native: { loaded: [], credentialsAccessed: false, ptyCreated: false },
+      web: { files: [] }, database: { integrity: "ok", schemaVersion: 7 }, childClosed: true }, { role: "active", releaseId: manifest.releaseId,
+      releaseDir: path.join(f.input.dataDir, "releases", manifest.releaseId), health: { protocolVersion: 1, clientVersion: "2", dbSchemaVersion: 8, database: "ready" },
+      native: { loaded: [], credentialsAccessed: false, ptyCreated: false },
+      web: { files: [] }, database: { integrity: "ok", schemaVersion: 8 }, childClosed: true }] } as any);
+
+  const resumed = await h.runShellUpdateOperation(f.input);
+  const rebound = await f.store.read() as ShellUpdateAttemptV2;
+  assert.equal(resumed.status, "postponed");
+  assert.equal(rebound.requestId, prepared.requestId);
+  assert.deepEqual(rebound.target, prepared.target);
+  assert.deepEqual(rebound.network, prepared.network);
+  assert.equal(rebound.binding.kind, "active");
+  assert.equal(rebound.binding.kind === "active" && rebound.binding.releaseId, manifest.releaseId);
+  assert.equal(f.installerDownloads, 1);
+});
 
 test("shell operation creates one original attempt and starts a fresh cycle only from proven no-update", async t => {
   const h = await api(), f = await fixture(t); f.control.available = false;

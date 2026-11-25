@@ -32,6 +32,7 @@ import { requestDesktopUpdateCheck } from "../../features/settings/desktopUpdate
 import { isCancelledRequestError } from "../../api/request";
 import { isSharedWorkspaceSelectionId, workspaceIdsReferToSameWorkspace } from "../../utils/workspaceId";
 import { resolveWorkspaceDisplayTitle } from "../../utils/workspaceTitle";
+import { resolveRuntimeEnvironmentBadge } from "../../utils/runtimeEnvironment";
 import { resolveWorkspaceRuntimeDisplay } from "../../utils/workspaceRuntimeDisplay";
 import {
   resolveDesktopAppVersionLabel,
@@ -51,6 +52,7 @@ const reminders = useReminderStore();
 const analysis = useRequirementAnalysisStore();
 const workspaces = useWorkspacesStore();
 const appModals = inject(APP_MODALS_KEY, null);
+const environmentBadge = resolveRuntimeEnvironmentBadge();
 
 const accountSummary = computed(() => props.shell.config.userSummary);
 
@@ -967,6 +969,12 @@ function openInAppNotice(notice: ActiveInAppNoticeItem): void {
           <img src="/favicon.svg" alt="" class="app-topbar__logo" />
         </span>
         CodeFlow
+        <a-tooltip v-if="environmentBadge" :title="environmentBadge.title">
+          <span
+            class="app-topbar__env-badge"
+            :class="`app-topbar__env-badge--${environmentBadge.label.toLowerCase()}`"
+          >{{ environmentBadge.label }}</span>
+        </a-tooltip>
       </div>
       <div v-if="canShowPrimaryNavigation" class="app-topbar__view-switch">
         <button class="app-topbar__view-tab" :class="{ 'app-topbar__view-tab--active': shell.ui.mainView === 'chat' }" @click="toggleChatEntry">

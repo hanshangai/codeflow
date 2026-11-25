@@ -14,7 +14,7 @@ import { abandonStalledShellUpdateRecovery } from "../src/shellUpdateRecoveryAba
 import { digestUpdateFailureRecord } from "@codeflowai/shared/desktop-update-failure";
 import type { ProcessIdentity } from "../src/windowsProcessIdentity.js";
 import { createUpdateNetworkRetry, type UpdateNetworkAction } from "../src/updateNetworkRetry.js";
-import { createShellUpdateAttemptNetworkAdapter, type ShellUpdateAttempt as AnyAttempt, type ShellUpdateAttemptV1 as ShellUpdateAttempt, type ShellUpdateAttemptStore, type ShellUpdateAttemptV2, type ShellUpdateAttemptV3, type ShellUpdateReadyEvidence, type ShellUpdateRecoveryFacts } from "../src/shellUpdateAttempt.js";
+import { createShellUpdateAttemptNetworkAdapter, type ShellUpdateAttempt as AnyAttempt, type ShellUpdateAttemptV1 as ShellUpdateAttempt, type ShellUpdateAttemptStore, type ShellUpdateAttemptV2, type ShellUpdateAttemptV3, type ShellUpdatePreparationAttemptV5, type ShellUpdateReadyEvidence, type ShellUpdateRecoveryFacts } from "../src/shellUpdateAttempt.js";
 
 const implementation = existsSync(fileURLToPath(new URL("../src/shellUpdateAttempt.ts", import.meta.url)))
   ? await import("../src/shellUpdateAttempt.js") : {} as typeof import("../src/shellUpdateAttempt.js");
@@ -156,8 +156,87 @@ async function preparationFixture() {
   const main = handoffProcess(fresh, 101, 1), client = handoffProcess(fresh, 201, main.pid), ordinary = handoffProcess(fresh, 301, main.pid);
   assert.equal(typeof owner.beginPreparation, "function", "beginPreparation must persist schema5 before network");
   const prepared = await owner.beginPreparation(null, fresh, { main, client, readyRequestId: "initial-ready", processes: [main, client, ordinary] });
-  return { directory, owner, fresh, prepared, main, client, ordinary };
+  return { directory, owner, fresh, sourceAttempt: attempt, prepared, main, client, ordinary };
 }
+
+/** 形成通过实际持久网络槽验证的签名目标和安装器下载事实。 */
+async function downloadedPreparationFixture(downloadInstaller = true) {
+  const f = await preparationFixture();
+  const network = createShellUpdateAttemptNetworkAdapter(f.owner);
+  await network.replace(await network.read(), { retriesUsed: 0,
+    network: { actionKey: "shell-discover", requestSha256: "d".repeat(64), status: "dispatching" } });
+  await network.replace(await network.read(), { retriesUsed: 0,
+    network: { actionKey: "shell-discover", requestSha256: "d".repeat(64), status: "succeeded", evidence: { kind: "shell-manifest", sha256: "e".repeat(64) } } });
+  const discovery = await f.owner.read() as typeof f.prepared;
+  const selected = await f.owner.replace(discovery, { ...discovery, revision: discovery.revision + 1,
+    target: f.sourceAttempt.target, candidateState: f.sourceAttempt.candidateState });
+  if (downloadInstaller) {
+    await network.replace(await network.read(), { retriesUsed: 0,
+      network: { actionKey: "shell-installer", requestSha256: "f".repeat(64), status: "dispatching" } });
+    await network.replace(await network.read(), { retriesUsed: 0,
+      network: { actionKey: "shell-installer", requestSha256: "f".repeat(64), status: "succeeded", evidence: { kind: "shell-installer", sha256: f.sourceAttempt.target.installerSha256 } } });
+  }
+  return { ...f, selected, attempt: await f.owner.read() as typeof f.prepared };
+}
+
+/** 跨资源切换只接受已启动新主进程、Client及匹配资源健康的完整快照。 */
+function rebindFacts(f: Awaited<ReturnType<typeof downloadedPreparationFixture>>, binding: unknown) {
+  const main = handoffProcess(f.attempt, 401, 1), client = handoffProcess(f.attempt, 402, main.pid);
+  return { caller: main, processes: [main, client], launchState: { status: "known", value: f.attempt.originalState },
+    binding: { status: "matched", value: binding },
+    profile: { status: "known", dataDir: f.attempt.dataDir, userDataDir: f.attempt.userDataDir, sessionDataDir: f.attempt.sessionDataDir } };
+}
+
+test("a verified shell installer attempt can rebind to the healthy activated resources", async () => {
+  const f = await downloadedPreparationFixture();
+  const previous = f.attempt as ShellUpdatePreparationAttemptV5;
+  const rebind = (f.owner as any).rebindPrepared;
+  assert.equal(typeof rebind, "function", "store must expose the resource-health-bound rebind transition");
+  const binding = { kind: "active", releaseId: "release-new", packageSha256: "1".repeat(64),
+    health: { protocolVersion: 1, clientVersion: "2.0.0", dbSchemaVersion: 8, database: "ready" } };
+  const rebound = await rebind.call(f.owner, f.attempt, rebindFacts(f, binding));
+  assert.equal(rebound.revision, previous.revision + 1);
+  assert.equal(rebound.requestId, previous.requestId);
+  assert.deepEqual(rebound.target, previous.target);
+  assert.deepEqual(rebound.network, previous.network);
+  assert.deepEqual(rebound.binding, binding);
+  assert.deepEqual(await f.owner.read(), rebound);
+});
+
+test("prepared shell rebind rejects stale revision or missing installer proof without changing state", async () => {
+  const f = await downloadedPreparationFixture();
+  const rebind = (f.owner as any).rebindPrepared;
+  assert.equal(typeof rebind, "function", "store must expose the resource-health-bound rebind transition");
+  const binding = { kind: "active", releaseId: "release-new", packageSha256: "1".repeat(64),
+    health: { protocolVersion: 1, clientVersion: "2.0.0", dbSchemaVersion: 8, database: "ready" } };
+  const facts = rebindFacts(f, binding);
+  await assert.rejects(rebind.call(f.owner, { ...f.attempt, revision: f.attempt.revision + 1 }, facts));
+  assert.deepEqual(await f.owner.read(), f.attempt);
+
+  const withoutInstaller = await downloadedPreparationFixture(false);
+  await assert.rejects(rebind.call(withoutInstaller.owner, withoutInstaller.selected, rebindFacts(withoutInstaller, binding)));
+  assert.deepEqual(await withoutInstaller.owner.read(), withoutInstaller.selected);
+});
+
+test("prepared shell rebind rejects invalid resource health and existing helper handoffs", async () => {
+  const f = await downloadedPreparationFixture();
+  const rebind = (f.owner as any).rebindPrepared;
+  assert.equal(typeof rebind, "function", "store must expose the resource-health-bound rebind transition");
+  const invalidBinding = { kind: "installation", baselineShellId: "wrong", health: {
+    protocolVersion: 1, clientVersion: "2.0.0", dbSchemaVersion: 8, database: "ready" } };
+  await assert.rejects(rebind.call(f.owner, f.attempt, rebindFacts(f, invalidBinding)));
+  assert.deepEqual(await f.owner.read(), f.attempt);
+  const facts = rebindFacts(f, { kind: "active", releaseId: "release-new", packageSha256: "1".repeat(64), health: {
+    protocolVersion: 1, clientVersion: "2.0.0", dbSchemaVersion: 8, database: "ready" } });
+  await assert.rejects(rebind.call(f.owner, f.attempt, { ...facts, processes: [...facts.processes, f.main, f.client] }));
+  assert.deepEqual(await f.owner.read(), f.attempt);
+
+  const handoff = await preparedHandoffFixture();
+  const handedOff = await handoff.owner.beginHandoff(handoff.prepared, handoff.facts);
+  await assert.rejects(rebind.call(handoff.owner, handedOff, rebindFacts(f, { kind: "active", releaseId: "release-new", packageSha256: "1".repeat(64),
+    health: { protocolVersion: 1, clientVersion: "2.0.0", dbSchemaVersion: 8, database: "ready" } })));
+  assert.deepEqual(await handoff.owner.read(), handedOff);
+});
 
 test("retiring a released preparation archives its evidence before a resource binding changes", async () => {
   const f = await preparationFixture();

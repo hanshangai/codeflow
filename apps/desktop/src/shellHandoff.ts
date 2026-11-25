@@ -62,7 +62,8 @@ export async function readShellUpdateHostFacts(input: Pick<StartupInput, "execut
 }
 
 /** 归档前核原安装/资源与进程释放；未准入恢复仅接受显式失败次数和原记录。 */
-export async function retireShellUpdateAttempt(input: StartupInput & { installationDir: string; recoveryFailures?: number; expectedAttempt?: ShellUpdateHandoffAttempt }): Promise<void> {
+export async function retireShellUpdateAttempt(input: StartupInput & { installationDir: string; recoveryFailures?: number; expectedAttempt?: ShellUpdateHandoffAttempt;
+  preservePreparedInstaller?: boolean }): Promise<void> {
   // 无尝试记录时不创建 owner 认证目录，安装预检仍保持只读。
   try { await fs.lstat(path.join(input.dataDir, "shell-update-attempt.json")); }
   catch (cause) { if ((cause as NodeJS.ErrnoException).code === "ENOENT" && !input.expectedAttempt) return; throw cause; }
@@ -75,10 +76,17 @@ export async function retireShellUpdateAttempt(input: StartupInput & { installat
   const expectedState = isShellUpdateHandoffAttempt(attempt) && attempt.admission ? attempt.candidateState : attempt.originalState;
   if (!equal(launch.state, expectedState) || launch.executablePath !== input.executablePath) fail("RETIRE_FACTS_INVALID");
   if (attempt.schemaVersion !== 5 && !isShellUpdateHandoffAttempt(attempt)) fail("RETIRE_FACTS_INVALID");
-  await currentBinding(input, attempt as ShellUpdateHandoffAttempt | ShellUpdatePreparationAttemptV5, true);
+  await currentBinding(input, attempt as ShellUpdateHandoffAttempt | ShellUpdatePreparationAttemptV5, isShellUpdateHandoffAttempt(attempt));
   const processes = await (input.snapshot ?? processSnapshot)(shellUpdateProcessSnapshotContext(attempt));
   const caller = processes.find(item => item.pid === input.pid);
   if (!caller || caller.parentPid !== input.parentPid || caller.executable !== input.executablePath) fail("PROCESS_IDENTITY_INVALID");
+  if (input.preservePreparedInstaller && attempt.schemaVersion === 5 && !isShellUpdateHandoffAttempt(attempt)
+    && attempt.phase === "preparing" && attempt.target && attempt.network?.actionKey === "shell-installer"
+    && attempt.network.status === "succeeded" && attempt.network.evidence.kind === "shell-installer"
+    && attempt.network.evidence.sha256 === attempt.target.installerSha256) {
+    await store.observePreparationOwned(attempt, { caller, processes });
+    return;
+  }
   await store.retire(attempt, { processes, caller, ...(input.recoveryFailures !== undefined ? { recoveryFailures: input.recoveryFailures } : {}) });
 }
 

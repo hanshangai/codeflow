@@ -350,7 +350,7 @@ watch(
     :footer="null"
     @cancel="closeModal"
     width="70%"
-    :style="{ top: '10%' }"
+    :style="{ top: 'max(56px, 10%)' }"
     :body-style="{ maxHeight: '70vh', overflow: 'auto' }"
   >
     <div v-if="selected" style="display: grid; gap: 10px">

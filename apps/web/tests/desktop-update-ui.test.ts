@@ -598,6 +598,17 @@ test("托盘只准备壳更新时可重启，并展示将运行的组合版本",
   assert.deepEqual(f.panel.currentRows.value, [{ label: "当前版本", value: "1.0.1108" }]);
 });
 
+test("资源和壳都准备完成时提示一次重启即可完成两项更新", async t => {
+  const f = modalFixture(t);
+  f.details.bundle = { requestId: "bundle:prepared", target: { releaseId: "bundle-next", version: "2026.11.25.01",
+    webVersion: "2026.11.25.01", clientVersion: "2026.11.25.01" }, phase: "prepare", result: "prepared", failure: null };
+  f.details.shell = { requestId: "shell:prepared", target: { shellId: "shell-next", version: "1.2" }, phase: "download", result: "prepared", failure: null };
+  await f.panel.startCheck();
+  assert.match(f.panel.outcome.value.detail, /资源和桌面壳.*一次重启/u);
+  assert.equal(f.panel.primaryAction.value.label, "重启并更新");
+  assert.equal(f.panel.restartDisabled.value, false);
+});
+
 test("托盘重启只调用一次，失败保持明确错误并允许后续重试", async t => {
   const f = modalFixture(t);
   let calls = 0, reject!: (cause: unknown) => void;

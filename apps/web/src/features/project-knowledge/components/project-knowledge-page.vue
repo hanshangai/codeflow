@@ -2052,23 +2052,51 @@ function changeBatchEngineEvent(event: Event): void {
 }
 /** 复用现有确认面板，复检范围与所选知识一致。 */
 async function openReview(ids?: string[], includeDescendants = true): Promise<void> { await openBatch(ids, includeDescendants, "review"); }
-/** 以用户正在查看的确切候选更新证据，复用单文件生成确认和自动复检。 */
+/** 以用户正在查看的确切候选更新证据，直接沿用原任务配置和固定复检，不弹确认框。 */
 async function refreshCandidateSources(context: KnowledgeDocumentContext): Promise<void> {
-  if (!canWrite.value || busy.value || updatesBusy.value || executionThreadRunning.value || pendingBatch.value || !context.runId || !context.revisionId || activelyProcessedNodeIds.value.has(context.nodeId)) return;
+  const pendingSource = (pendingBatch.value?.input.sourceRevisions as Array<{ nodeId: string; revisionId: string }> | undefined)?.[0];
+  if (!canWrite.value || busy.value || updatesBusy.value || executionThreadRunning.value
+    || (pendingBatch.value && (pendingSource?.nodeId !== context.nodeId || pendingSource?.revisionId !== context.revisionId))
+    || !context.runId || !context.revisionId || activelyProcessedNodeIds.value.has(context.nodeId)) return;
+  if (!snapshotStatesReady.value) { message.info("正在读取知识状态，请稍候再更新候选"); return; }
   const scope = workspaceId.value, epoch = scopeEpoch;
   const owner = taskList.value.find(run => run.id === context.runId);
   const item = owner?.items.find(item => item.nodeId === context.nodeId && item.revisionId === context.revisionId);
   try {
     if (!owner || !item) throw new Error("候选版本已变化，请重新选择需要更新的版本");
-    await openBatch([context.nodeId], false);
-    if (!isCurrent(epoch, scope) || !batchOpen.value) return;
     const execution = item.executionConfig ?? owner;
+    dismissError();
     batchSourceContext.value = { ...context };
+    batchMode.value = "batch"; batchSelectedIds.value = [context.nodeId]; batchIncludeDescendants.value = false;
+    batchStrategy.value = "all"; batchRepairReports.value = []; batchRevisionRunId.value = null; buildSettingsMode.value = false;
     batchEngine.value = owner.engine; batchModelId.value = execution.model ?? ""; batchEffort.value = execution.effort ?? "";
     batchReviewEnabled.value = true; batchReviewAutoRepair.value = true; batchReviewMaxRounds.value = 2;
+    batchConcurrency.value = Math.max(1, Math.min(activeRun.value?.concurrency ?? activeRun.value?.scheduler?.limit ?? 5, MAX_BATCH_CONCURRENCY));
     batchPrompt.value = "根据最新项目来源更新所选候选，保留仍然正确的内容，只修订受变化影响的部分。新版本复检通过后仍由用户确认采用。";
-    if (!await refreshBatchModels()) return;
-  } catch (error) { if (isCurrent(epoch, scope)) errorText.value = reportError(error, "KNOWLEDGE_SOURCE_REFRESH_PREPARE_FAILED", { ...context }); }
+    batchError.value = null;
+    if (!batchTargets.value.length) throw new Error("候选版本已变化，请重新选择需要更新的版本");
+    if (!await refreshBatchModels() || !isCurrent(epoch, scope)) {
+      if (isCurrent(epoch, scope)) {
+        if (batchError.value) errorText.value = batchError.value;
+        // 已创建待启动任务时只能沿原请求重试，回到既有恢复入口。
+        if (pendingBatch.value) batchOpen.value = true;
+        else { batchSourceContext.value = null; batchError.value = null; }
+      }
+      return;
+    }
+    await submitBatch();
+    if (isCurrent(epoch, scope)) {
+      if (batchError.value) errorText.value = batchError.value;
+      if (pendingBatch.value) batchOpen.value = true;
+      else { batchSourceContext.value = null; batchError.value = null; }
+    }
+  } catch (error) {
+    if (isCurrent(epoch, scope)) {
+      errorText.value = reportError(error, "KNOWLEDGE_SOURCE_REFRESH_PREPARE_FAILED", { ...context });
+      if (pendingBatch.value) batchOpen.value = true;
+      else { batchSourceContext.value = null; batchError.value = null; }
+    }
+  }
 }
 /** 修订绑定报告版本，活动任务或恢复中的原请求不能被新修订覆盖。 */
 async function repairReport(report: KnowledgeReviewReportView): Promise<void> {
@@ -2718,7 +2746,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         </div>
       </div>
     </a-modal>
-    <a-modal v-model:open="batchOpen" :title="buildSettingsMode ? '规格库构建设置' : batchSourceContext ? '更新候选并复检' : batchMode === 'review' ? '复检已有文档' : batchRepairReports.length ? '根据报告生成修订版' : '确认批量生成'" :z-index="1100" :closable="!busy && !binding" :mask-closable="!busy && !binding" :keyboard="!busy && !binding" :footer="null" width="min(680px, calc(100vw - 24px))" :style="{ top: '24px' }">
+    <a-modal v-model:open="batchOpen" :title="buildSettingsMode ? '规格库构建设置' : batchSourceContext ? '更新候选并复检' : batchMode === 'review' ? '复检已有文档' : batchRepairReports.length ? '根据报告生成修订版' : '确认批量生成'" :z-index="1100" :closable="!busy && !binding" :mask-closable="!busy && !binding" :keyboard="!busy && !binding" :footer="null" width="min(680px, calc(100vw - 24px))" :style="{ top: '56px' }">
       <div class="batch-scroll" :aria-busy="batchReviewLoading">
       <p v-if="buildSettingsMode" class="batch-explanation">目标项目：{{ workspaceName }}</p>
       <p class="batch-explanation">{{ buildSettingsMode ? '保存后同步规格对话及后续构建配置；切换引擎会新建会话并保留草稿。已创建任务保留原配置。默认复检，发现阻断问题时修订一次并再检，结果由你确认采用。' : '本次任务在后台执行，无需打开或切换规格会话。' }}</p>
@@ -2768,13 +2796,13 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       <div class="batch-submit"><a-button :disabled="busy || binding" @click="batchOpen = false">取消</a-button><a-button v-if="buildSettingsMode" type="primary" :loading="binding" :disabled="modelSettingsBlocked || batchCatalog?.loading" @click="saveBuildSettings">{{ pendingBuildIds ? '保存并开始生成' : '保存构建设置' }}</a-button><a-button v-else type="primary" :loading="busy" :disabled="!batchTargets.length || !canWrite || threadRunning || (batchMode !== 'review' && Boolean(activeRun?.active)) || batchCatalog?.loading || batchReviewLoading || (batchMode === 'review' || batchSourceContext && !pendingBatch) && Boolean(batchError)" @click="submitBatch">{{ pendingBatch ? '重试原任务' : batchSourceContext ? '更新候选并复检' : batchMode === 'review' ? '开始复检' : batchRepairReports.length ? '开始生成修订版' : '开始生成' }}</a-button></div>
     </a-modal>
 
-    <a-modal v-model:open="changeHistoryOpen" title="修改记录" width="min(1100px, calc(100vw - 24px))" :style="{ top: '24px' }" :body-style="{ height: 'min(680px, calc(100dvh - 180px))', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }"><p class="batch-explanation">查看会话提出的修改、审批结果和历史依据，按状态筛选后核对具体差异。</p>
+    <a-modal v-model:open="changeHistoryOpen" title="修改记录" width="min(1100px, calc(100vw - 24px))" :style="{ top: '56px' }" :body-style="{ height: 'min(680px, calc(100dvh - 180px))', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }"><p class="batch-explanation">查看会话提出的修改、审批结果和历史依据，按状态筛选后核对具体差异。</p>
       <KnowledgeChangeInbox v-if="changeHistoryOpen" :workspace-id="workspaceId" :context="ctx()" :can-write="canWrite" @recheck="changeHistoryOpen = false; recheckKnowledgeChange($event)" @changed="historyChangeReviewed" />
       <template #footer><a-button @click="changeHistoryOpen = false">关闭</a-button></template>
     </a-modal>
     <KnowledgeManagementPolicy v-model:open="policyOpen" />
     <a-modal :open="Boolean(pendingEditDecision)" title="这份文档还有未保存修改" :footer="null" @cancel="pendingEditDecision?.('stay')"><p>保存后继续、放弃修改，或留在当前文档继续编辑。</p><div class="quick-actions"><a-button @click="pendingEditDecision?.('stay')">继续编辑</a-button><a-button danger @click="pendingEditDecision?.('discard')">放弃修改</a-button><a-button type="primary" @click="pendingEditDecision?.('save')">保存并继续</a-button></div></a-modal>
-    <a-modal v-model:open="importOpen" title="选择项目文档导入" wrap-class-name="knowledge-import-modal" :closable="!busy" :mask-closable="!busy" :keyboard="!busy" width="min(880px, calc(100vw - 32px))" :style="{ top: '24px' }" :body-style="{ paddingTop: '12px' }">
+    <a-modal v-model:open="importOpen" title="选择项目文档导入" wrap-class-name="knowledge-import-modal" :closable="!busy" :mask-closable="!busy" :keyboard="!busy" width="min(880px, calc(100vw - 32px))" :style="{ top: '56px' }" :body-style="{ paddingTop: '12px' }">
       <p class="batch-explanation">选择来源与分类后导入，保留原文并按章节检索；不会自动改写原始资料。</p>
       <div class="import-layout">
         <aside class="import-settings" aria-label="导入归类设置">

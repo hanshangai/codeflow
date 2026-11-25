@@ -1079,7 +1079,8 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
   const originalState = { activeShellId: "old", previousShellId: null, baselineShellId: "baseline" };
   await fs.writeFile(path.join(installationDir, "shell-launch.ini"), shellLaunch.serializeShellLaunchState(originalState));
   const main = { pid: 101, parentPid: 90, created: 1101, executable: path.join(installationDir, "shells", "old", "CodeFlowAI.exe"), commandLine: "main" };
-  const helper = { ...main, pid: 103, parentPid: main.pid, created: 1103, commandLine: "helper" }, client = { ...main, pid: 123, parentPid: main.pid, created: 1123, commandLine: "client" };
+  const helper = { ...main, pid: 103, parentPid: main.pid, created: 1103, commandLine: "helper" };
+  let client = { ...main, pid: 123, parentPid: main.pid, created: 1123, commandLine: "client" };
   const health = f.runtime.snapshot().health!;
   let runtimeReleaseId: string | null = null;
   let heldId: string | undefined;
@@ -1152,7 +1153,17 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
       if (!control.available) return { status: "no-update", reason: "none", attempt: await store.replace(current, { ...current, revision: current.revision + 1, phase: "no-update" }) as ShellUpdateAttemptV2 };
       return { status: "target", manifest: shellManifest, attempt: await store.replace(current, { ...current, revision: current.revision + 1,
         target: { shellId: "new", manifestSha256: "c".repeat(64), installerSha256: "b".repeat(64), installerSize: 1 }, candidateState: { activeShellId: "new", previousShellId: "old", baselineShellId: "baseline" } }) as ShellUpdateAttemptV2 }; },
-    async downloadInstaller() { return { installerPath: path.join(f.dataDir, "installer.exe"), sha256: "b".repeat(64), size: 1 }; }
+    async downloadInstaller() {
+      const adapter = createShellUpdateAttemptNetworkAdapter(store), current = await adapter.read();
+      if (current.network?.actionKey === "shell-installer" && current.network.status === "succeeded") {
+        return { installerPath: path.join(f.dataDir, "installer.exe"), sha256: "b".repeat(64), size: 1 };
+      }
+      const sent = await adapter.replace(current, { retriesUsed: current.retriesUsed,
+        network: { actionKey: "shell-installer", requestSha256: "f".repeat(64), status: "dispatching" } });
+      await adapter.replace(sent, { retriesUsed: sent.retriesUsed,
+        network: { actionKey: "shell-installer", requestSha256: "f".repeat(64), status: "succeeded", evidence: { kind: "shell-installer", sha256: "b".repeat(64) } } });
+      return { installerPath: path.join(f.dataDir, "installer.exe"), sha256: "b".repeat(64), size: 1 };
+    }
   }), async install() { return { manifest: shellManifest, candidateDirectory: path.join(installationDir, "shells", "new") }; },
     /** 健康报告只列实际活动资源，准备候选不进入壳绑定。 */
     async health() { await control.holdHealth?.(); const activeReleaseId = await readActivePointer(f.dataDir);
@@ -1172,6 +1183,8 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
   let app = createDesktopApplication(options);
   await app.start(); f.actions.length = 0;
   return { ...f, get app() { return app; }, control, errors, store, manifest, boundary, requestPaths,
+    /** 替换启动后的Client实例，模拟资源切换后的真实PID生命周期。 */
+    setClient(value: typeof client) { client = value; },
     /** 使用同一磁盘尝试重建 owner，模拟下一次正常启动。 */
     async restart() { await app.exit(); control.drained = false; app = createDesktopApplication(options); await app.start(); } };
 }
@@ -1218,6 +1231,40 @@ test('one update check consumes a combined response for both channels without du
   assert.equal(f.requestPaths.filter(value => value.endsWith('/update-availability')).length, 1);
   assert.equal(f.requestPaths.some(value => value.endsWith('/release-availability') || value.endsWith('/shell-release-availability')), false);
   assert.equal((await f.app.getUpdateDetails()).shell.result, 'none');
+  await f.app.exit();
+});
+
+test('one combined check prepares resource and signed shell installer before asking for one restart', async t => {
+  const f = await shellApplicationFixture(t, true);
+  const result = await f.app.checkForUpdates();
+  const details = await f.app.getUpdateDetails(), attempt = await f.store.read();
+  assert.equal(result, null);
+  assert.equal(f.requestPaths.filter(value => value.endsWith('/update-availability')).length, 1);
+  assert.equal(details.bundle.result, 'prepared');
+  assert.equal(details.shell.result, 'prepared');
+  assert.equal(attempt?.schemaVersion, 5);
+  assert.equal(attempt?.network?.actionKey, 'shell-installer');
+  assert.equal(attempt?.network?.status, 'succeeded');
+  assert.equal(f.control.spawned, false, 'preparing both channels does not restart the application');
+  await f.app.exit();
+});
+
+test('one resource restart resumes the prepared shell attempt against the healthy new resources', async t => {
+  const f = await shellApplicationFixture(t, true);
+  await f.app.checkForUpdates();
+  const prepared = await f.store.read();
+  assert.equal(prepared?.schemaVersion === 5 && prepared.network?.actionKey, 'shell-installer');
+  assert.equal(prepared?.schemaVersion === 5 && prepared.network?.status, 'succeeded');
+  f.setClient({ pid: 125, parentPid: 101, created: 1125,
+    executable: path.join(f.dataDir, "installation", "shells", "old", "CodeFlowAI.exe"), commandLine: "updated client" });
+  await f.restart();
+  const deadline = Date.now() + 5_000;
+  while (!f.control.spawned && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(await readActivePointer(f.dataDir), 'hot-release');
+  assert.equal(f.control.spawned, true, "the resumed shell helper starts after the resource is active and healthy");
+  const resumed = await f.store.read();
+  assert.equal(resumed?.requestId, prepared?.requestId);
+  assert.equal(resumed?.schemaVersion === 5 && resumed.binding.kind === 'active' && resumed.binding.releaseId, 'hot-release');
   await f.app.exit();
 });
 
@@ -1304,17 +1351,24 @@ test("prepared resource defers shell discovery until its next activation", async
   assert.equal(f.actions.includes("drain"), false); assert.equal(f.errors.length, 0); await f.app.exit();
 });
 
-test("resource activation releases business startup without a shell discovery or automatic restart", async t => {
+test("resource activation releases business startup then resumes the prepared shell attempt", async t => {
   const f = await shellApplicationFixture(t, true);
   await f.app.checkForUpdates();
+  const prepared = await f.store.read();
+  f.setClient({ pid: 125, parentPid: 101, created: 1125,
+    executable: path.join(f.dataDir, "installation", "shells", "old", "CodeFlowAI.exe"), commandLine: "updated client" });
   await f.restart();
   assert.equal((await f.app.getUpdateDetails()).bundle.result, "healthy");
   assert.equal(f.actions.filter(action => action === "runtime.startup.continue").length, 1);
   assert.equal(await readPendingRelease(f.dataDir), null);
   assert.equal(await f.app.resumeStartupUpdate(), false);
-  assert.equal(await f.store.read(), null);
   assert.equal(f.actions.filter(action => action === "quit").length, 1);
-  assert.equal(f.control.spawned, false);
+  const deadline = Date.now() + 5_000;
+  while (!f.control.spawned && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+  const attempt = await f.store.read();
+  assert.equal(f.control.spawned, true);
+  assert.equal(attempt?.requestId, prepared?.requestId);
+  assert.equal(attempt?.schemaVersion === 5 && attempt.binding.kind === "active" && attempt.binding.releaseId, "hot-release");
   await f.app.exit();
 });
 
@@ -1504,7 +1558,10 @@ test("resource pending cleanup failure is explicit and cannot transfer lifecycle
 
 test("a prepared shell failure leaves activated resources usable across a cold restart", async t => {
   const f = await shellApplicationFixture(t, true);
-  await f.app.checkForUpdates(); await f.restart();
+  await f.app.checkForUpdates();
+  f.setClient({ pid: 125, parentPid: 101, created: 1125,
+    executable: path.join(f.dataDir, "installation", "shells", "old", "CodeFlowAI.exe"), commandLine: "updated client" });
+  await f.restart();
   f.control.holdHealth = async () => { throw new Error("candidate health interrupted"); };
   await assert.rejects(f.app.checkForUpdates());
   assert.ok((await f.store.read())?.target);
@@ -1522,15 +1579,20 @@ test("resources discovered after a prepared shell activate before that shell is 
   const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
   await f.app.checkForUpdates();
   const previous = await f.store.read(); assert.equal(previous?.target?.shellId, "new");
-  f.control.hotAvailable = true; await f.app.checkForUpdates(); await f.restart();
+  f.control.hotAvailable = true; await f.app.checkForUpdates();
+  f.setClient({ pid: 125, parentPid: 101, created: 1125,
+    executable: path.join(f.dataDir, "installation", "shells", "old", "CodeFlowAI.exe"), commandLine: "updated client" });
+  await f.restart();
   assert.equal(await readActivePointer(f.dataDir), "hot-release");
-  assert.equal(await f.store.read(), null, "old binding must be archived before resource activation");
   assert.equal(f.actions.includes("runtime.startup.continue"), true);
-  assert.equal(await f.app.resumeStartupUpdate(), false);
-  await f.app.checkForUpdates(); await f.app.restartForUpdate();
+  const deadline = Date.now() + 5_000;
+  while (!f.control.spawned && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   const current = await f.store.read();
-  assert.notEqual(current?.requestId, previous?.requestId);
-  assert.equal(current?.binding.kind === "active" && current.binding.releaseId, "hot-release");
+  assert.equal(f.control.spawned, true, "the previously prepared shell resumes after new resources are healthy");
+  assert.equal(current?.requestId, previous?.requestId, "the prepared shell attempt preserves its original request identity");
+  assert.equal(current?.schemaVersion === 5 && current.binding.kind === "active" && current.binding.releaseId, "hot-release");
+  assert.equal(await f.app.resumeStartupUpdate(), false);
+  await f.app.exit();
 });
 
 test("explicit shell restart also restarts for resources first discovered by that click", async t => {
@@ -1556,6 +1618,8 @@ test("newly discovered resources restart directly after an explicit update click
 test("resource rollback does not continue an older prepared shell update", async t => {
   const f = await shellApplicationFixture(t, true); f.control.hotAvailable = false;
   await f.app.checkForUpdates(); f.control.hotAvailable = true; await f.app.checkForUpdates();
+  f.setClient({ pid: 125, parentPid: 101, created: 1125,
+    executable: path.join(f.dataDir, "installation", "shells", "old", "CodeFlowAI.exe"), commandLine: "updated client" });
   const loadWeb = f.host.loadWeb;
   f.host.loadWeb = async (window, releaseDir, options) => {
     if (releaseDir.endsWith("hot-release")) throw new Error("candidate web rejected");
