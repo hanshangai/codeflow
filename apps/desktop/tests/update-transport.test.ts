@@ -322,6 +322,7 @@ test("HTTP failures retain raw Retry-After across error bodies without retrying 
     }
     const fixture = cases[Number(request.url!.split("/").at(-1))];
     response.setHeader("content-type", "application/json");
+    response.setHeader("x-request-id", "server-request-" + request.url!.split("/").at(-1));
     if (fixture.retryAfter !== null) response.setHeader("retry-after", fixture.retryAfter);
     response.writeHead(fixture.status);
     if (fixture.body === "interrupted") {
@@ -351,6 +352,7 @@ test("HTTP failures retain raw Retry-After across error bodies without retrying 
           assert.ok(error.requestId);
           if (requestId) assert.equal(error.requestId, requestId);
           assert.equal(error.retryAfter, fixture.retryAfter);
+          if (fixture.body !== "interrupted") assert.equal(error.serverRequestId, "server-request-" + index);
           if (fixture.body === "interrupted") {
             assert.ok(error.cause instanceof TypeError);
             assert.equal(error.cause.cause?.code, "UND_ERR_SOCKET");

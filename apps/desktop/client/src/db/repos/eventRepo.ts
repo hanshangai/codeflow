@@ -228,10 +228,37 @@ export class ConversationEventRepo {
     return this.db.transaction(() => this.presentation.isReady(threadId))();
   }
 
-  /** 冷构建复用一次diff保留快照，实时追加超过读取水位时才重新准备元数据。 */
-  async ensurePresentation(threadId: ThreadId, opts?: { withDatabase?: <T>(operation: () => T) => Promise<T> }): Promise<void> {
+  /** 冷构建复用diff快照并接纳实时追加；迁移可在同次读取校验原始信封。 */
+  async ensurePresentation(threadId: ThreadId, opts?: {
+    withDatabase?: <T>(operation: () => T) => Promise<T>;
+    validateEvent?: (event: ConversationEventEnvelope) => void;
+  }): Promise<void> {
     const pending = this.presentationBuilds.get(threadId);
     if (pending) return await pending;
+    const ready = opts?.validateEvent && (opts.withDatabase
+      ? await opts.withDatabase(() => this.presentation.isReady(threadId)) : this.presentation.isReady(threadId));
+    if (ready && opts?.validateEvent) {
+      let cursor = 0;
+      const owner = this.db.prepare("SELECT workspace_id,engine FROM threads WHERE id=?").get(threadId) as { workspace_id: string; engine: string } | undefined;
+      if (!owner) throw new Error("THREAD_PRESENTATION_THREAD_NOT_FOUND");
+      while (true) {
+        const sql = "SELECT e.seq,e.workspace_id,e.engine,e.event_json FROM conversation_events e WHERE e.thread_id=? AND e.seq>? ORDER BY e.seq LIMIT 256";
+        const rows = opts.withDatabase ? await opts.withDatabase(() => this.db.prepare(sql).all(threadId, cursor) as
+          Array<{ seq: number; workspace_id: string; engine: string; event_json: string }>)
+          : this.db.prepare(sql).all(threadId, cursor) as Array<{ seq: number; workspace_id: string; engine: string; event_json: string }>;
+        if (!rows.length) return;
+        for (const row of rows) {
+          const event = JSON.parse(row.event_json) as ConversationEventEnvelope;
+          if (event.seq !== row.seq || event.threadId !== threadId || event.workspaceId !== row.workspace_id
+            || row.workspace_id !== owner.workspace_id || event.engine !== row.engine || row.engine !== owner.engine) {
+            throw new Error("THREAD_PRESENTATION_EVENT_INVALID: threadId=" + threadId + ", seq=" + row.seq);
+          }
+          opts.validateEvent(event);
+          cursor = row.seq;
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    }
     let diffs: { throughSeq: number; retained: Set<number>; rows: Array<{ seq: number; item_id: string; turn_id: string | null; engine_turn_id: string | null }> } | undefined;
     /** 所属构建事务内读取，复用已有turn规则；不跨请求缓存历史事实。 */
     const diffSnapshot = (seq: number) => {

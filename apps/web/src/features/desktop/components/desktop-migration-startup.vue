@@ -41,6 +41,24 @@ const stageLabel = computed(() => ({ discover: "正在检查本地数据", quies
   convert: "正在迁移工作区与会话", verify: "正在校验数据", publish: "正在保存迁移结果", defer: "正在保留旧数据并进入桌面",
   runtime_starting: props.startupLabel || "正在启动本地服务", completed: props.startupLabel || "正在加载工作台" }[state.value?.stage ?? ""]
   ?? (state.value?.status === "running" ? "正在迁移本地数据" : props.startupLabel || "正在连接本地工作台")));
+/** 细进度显示实际工作区、线程和已处理行数；不让单工作区长阶段看似停滞。 */
+const progressDetail = computed(() => {
+  const progress = state.value?.progress;
+  if (!progress) return null;
+  const labels: Record<string, string> = {
+    presentation: "重建会话展示", raw_events: "校验原始事件", event_envelopes: "校验事件信封",
+    blobs: "校验文件块", attachments: "校验附件", copy: "复制数据", rewrite_references: "改写结构化引用",
+    event_sequences: "核对事件序号", application_cleanup: "整理应用数据",
+    application_snapshot: "准备应用数据", schema: "升级数据结构", workspace_schema: "准备工作区",
+    pause: "暂停未完成任务", workspace_completed: "工作区迁移完成", application_finalize: "整理迁移结果",
+  };
+  const parts = [labels[progress.phase] ?? progress.phase];
+  if (progress.workspaceIndex !== undefined && state.value?.total) parts.push("工作区 " + progress.workspaceIndex + "/" + state.value.total);
+  if (progress.threadIndex !== undefined && progress.threadCount) parts.push("会话 " + progress.threadIndex + "/" + progress.threadCount);
+  if (progress.processed !== undefined) parts.push(progress.processed.toLocaleString() + " 条");
+  if (progress.elapsedMs !== undefined) parts.push(Math.floor(progress.elapsedMs / 1000) + " 秒");
+  return parts.filter(Boolean).join(" · ");
+});
 // 只有已确认的迁移选择/失败处理页可独立就绪，自动启动仍等待实际工作台挂载。
 watch(() => !localReady.value && (state.value?.status === "available" || state.value?.status === "failed"),
   value => emit("interactive", value), { flush: "sync" });
@@ -175,6 +193,7 @@ onBeforeUnmount(() => { unsubscribe?.(); });
               <span v-if="stageLabel">{{ stageLabel }}</span>
               <span v-if="state?.total !== null && state?.total !== undefined" class="desktop-migration__count">{{ state.completed }} / {{ state.total }}</span>
             </div>
+            <div v-if="progressDetail" class="desktop-migration__detail" role="status">{{ progressDetail }}</div>
           </div>
         </template>
         <Alert v-if="actionError" class="desktop-migration__error desktop-migration__actions" type="error" show-icon :message="actionError" />
@@ -244,6 +263,7 @@ onBeforeUnmount(() => { unsubscribe?.(); });
 }
 .desktop-migration__status { display: flex; justify-content: center; flex-wrap: wrap; gap: 6px 16px; margin-top: 14px; color: var(--app-muted); font-size: 12px; line-height: 1.8; }
 .desktop-migration__count { font-variant-numeric: tabular-nums; }
+.desktop-migration__detail { margin-top: 6px; color: var(--app-muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .desktop-migration__summary { margin: 28px 0 0; padding: 22px; border: 1px solid var(--app-divider); border-radius: 16px; background: var(--app-panel-bg); }
 .desktop-migration__workspace-count { display: inline-flex; align-items: baseline; gap: 8px; font-size: 28px; font-weight: 600; line-height: 1.4; font-variant-numeric: tabular-nums; }
 .desktop-migration__workspace-count > span { font-size: 14px; font-weight: 400; }

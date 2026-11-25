@@ -462,6 +462,12 @@ export type DesktopRuntimeState = {
 
 export type DesktopWindowState = { maximized: boolean };
 
+/** 迁移进度定位到实际阶段和事件批次；不含正文、Key 或原路径。 */
+export type DesktopMigrationProgress = {
+  phase: string; table?: string; workspaceIndex?: number; threadIndex?: number; threadCount?: number;
+  processed?: number; elapsedMs?: number;
+};
+
 /** 启动迁移的脱敏事实；数量来自 Worker，凭据不进入状态或事件。 */
 export type DesktopMigrationState = {
   status: "checking" | "available" | "running" | "failed" | "ready";
@@ -472,6 +478,7 @@ export type DesktopMigrationState = {
   stage: string;
   completed: number;
   total: number | null;
+  progress?: DesktopMigrationProgress;
   errorCode: string | null;
   message: string | null;
   account: {

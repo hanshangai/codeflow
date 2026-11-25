@@ -43,9 +43,10 @@ function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnT
     takeMigrationAccount: () => { takes++; taking(); return migration ? migration.takeAccount() : take; },
     async acknowledgeMigrationAccount() { await migration?.acknowledgeAccount(); acknowledgements++; } };
   const code = ts.transpileModule(script, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
-  const exposed = {} as { error: () => string | null; showNotice: () => boolean; deferredNotice: () => string | null; openLogin: () => void; dismiss: () => void; label: () => string };
+  const exposed = {} as { error: () => string | null; showNotice: () => boolean; deferredNotice: () => string | null; openLogin: () => void;
+    dismiss: () => void; label: () => string; progress: () => string | null };
   const errors: unknown[] = [];
-  vm.runInNewContext(code + '\nexports.error = () => actionError.value; exports.showNotice = () => showAccountNotice.value; exports.deferredNotice = () => deferredMigrationNotice.value; exports.openLogin = openAccountLogin; exports.dismiss = dismissAccountNotice; exports.label = () => stageLabel.value;', { exports: exposed, URL,
+  vm.runInNewContext(code + '\nexports.error = () => actionError.value; exports.showNotice = () => showAccountNotice.value; exports.deferredNotice = () => deferredMigrationNotice.value; exports.openLogin = openAccountLogin; exports.dismiss = dismissAccountNotice; exports.label = () => stageLabel.value; exports.progress = () => progressDetail.value;', { exports: exposed, URL,
     console: { error: (...args: unknown[]) => { errors.push(args); } },
     defineEmits: () => (event: string) => { if (event === "ready") ready++; },
     defineProps: () => ({ startupLabel }),
@@ -57,7 +58,7 @@ function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnT
       if (id === "ant-design-vue") return {};
       throw new Error(`unexpected component dependency: ${id}`);
     } });
-  return { config, state, takeStarted, run: () => mounted(), send: (value: DesktopMigrationState) => listener(value), resolveTake,
+  return { config, state, takeStarted, progress: exposed.progress, run: () => mounted(), send: (value: DesktopMigrationState) => listener(value), resolveTake,
     error: exposed.error, showNotice: exposed.showNotice, deferredNotice: exposed.deferredNotice,
     openLogin: exposed.openLogin, dismiss: exposed.dismiss, label: exposed.label, errors, counts: () => ({ acknowledgements, ready, takes }) };
 }
@@ -289,6 +290,20 @@ test("迁移登录提示文案全中文且提供原生关闭入口", () => {
   assert.match(notice, />去登录<\/Button>/u);
   assert.match(notice, /closable/u);
   assert.doesNotMatch(notice, /account\.(?:message|errorCode)|description=/u);
+});
+
+test("长迁移阶段显示工作区、会话、处理量和耗时细进度", async () => {
+  const f = setup("cancelled");
+  await f.run();
+  f.send({ ...f.state, status: "running", stage: "convert", total: 2, completed: 0, progress: {
+    phase: "presentation", table: "conversation_events", workspaceIndex: 1, threadIndex: 4, threadCount: 37,
+    processed: 1_024, elapsedMs: 14_000,
+  } });
+  await nextTick();
+  assert.equal(f.progress(), "重建会话展示 · 工作区 1/2 · 会话 4/37 · 1,024 条 · 14 秒");
+  const source = fs.readFileSync(new URL("../src/features/desktop/components/desktop-migration-startup.vue", import.meta.url), "utf8");
+  assert.ok(source.includes('v-if="progressDetail"'));
+  assert.ok(source.includes('class="desktop-migration__detail" role="status"'));
 });
 
 test("主动切换账号与取消后，迟到迁移session不能覆盖新选择", async () => {

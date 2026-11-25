@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isUtf8 } from 'node:buffer';
 import { setTimeout as delay, setImmediate as yieldLoop } from 'node:timers/promises';
 import type { WorkspaceId, ThreadId, OrchestrationId } from '@codeflowai/shared';
 import { openSqliteDb, type SqliteDb } from '../db/sqliteDb.js';
@@ -23,10 +24,12 @@ import { ensureWorkspaceCodeflowaiDirectory, inspectExistingWorkspaceCodeflowaiD
   assertWorkspaceCodeflowaiDirectory } from '../codeflowai/workspaceCodeflowaiDirectory.js';
 import { resolveWorkspaceReadPath } from '../fs/fsHelpers.js';
 import { parseLegacyClientMigrationRequest, type LegacyClientMigrationRequest, type LegacyClientMigrationProgress,
-  type LegacyClientMigrationResult } from './legacyClientMigrationProtocol.js';
+  type LegacyClientMigrationResult, type LegacyClientMigrationContext } from './legacyClientMigrationProtocol.js';
 
 type Input = Omit<LegacyClientMigrationRequest, 'action'>;
 type Row = Record<string, any>;
+type ConversionReport = (phase: string, table?: string, processed?: number, threadId?: string,
+  workspaceIndex?: number, threadCount?: number) => void;
 type SourceConfig = { apiKey: string; serverWs: string; clientId: string };
 type Source = { configPath: string; dbPath: string; accountNamespace: string; sourceClientId: string; serverWs: string;
   workspaces: Array<PersistedWorkspace & { workspaceDbPath: string | null }>; candidateId: string };
@@ -419,6 +422,18 @@ function snapshot(source: string, target: string): void {
 
 /** 使用现有 schema 转换快照；覆盖基线固定取原始归档，不接纳中断后的来源写入。 */
 async function convertSnapshots(input: Input, journal: Journal, dependencies: LegacyClientMigrationDependencies): Promise<PublishedFile[]> {
+  const startedAt = Date.now();
+  let workspaceIndex: number | undefined;
+  /** 记录 SQLite 大步骤开始及完成时间，工作区/查询状态随 Worker 进度发送。 */
+  const report: ConversionReport = (phase, table, processed = 0, threadId, threadPosition, threadCount) => {
+    checkpoint(dependencies);
+    progress(dependencies, 'convert', 0, journal.source.workspaces.length, journal,
+      { phase, table, processed, elapsedMs: Date.now() - startedAt,
+        ...(threadId ? { threadId } : {}), ...(threadPosition === undefined ? {} : { threadIndex: threadPosition }),
+        ...(threadCount === undefined ? {} : { threadCount }),
+        ...(workspaceIndex === undefined ? {} : { workspaceIndex: workspaceIndex + 1 }) });
+  };
+  report('application_snapshot');
   const archive = archiveDirectory(input, journal), appPath = path.join(archive, 'target-application.db');
   removeOwnedTemporary(appPath);
   fs.copyFileSync(path.join(snapshotDirectory(input, journal), 'source-application.db'), appPath, fs.constants.COPYFILE_EXCL);
@@ -427,16 +442,19 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
   const app = openSqliteDb(appPath, { fileMustExist: true });
   let failure: unknown;
   try {
+    report('schema');
     assertApplicationSource(app); migrateClientDb(app); dropRetiredTables(app);
     assertKnownTables(app);
     if ((app.prepare("SELECT operation_id FROM workspace_directory_migrations WHERE state NOT IN ('completed','cancelled','failed') LIMIT 1").get())) fail('SOURCE_WORKSPACE_MOVE_ACTIVE');
     const mapping = new Map(journal.source.workspaces.map(work => [String(work.id), mappedWorkspaceId(work.id, journal.source.sourceClientId, input.targetClientId)]));
     for (const [oldId, newId] of mapping) new WorkspaceRepo(app).migrateWorkspaceId(oldId as WorkspaceId, newId as WorkspaceId);
-    rewriteBusinessReferences(app, mapping);
+    await rewriteBusinessReferences(app, mapping, report, dependencies);
     let highWater = validCounter(metaValue(app, 'event_seq'));
     for (let index = 0; index < journal.source.workspaces.length; index++) {
       checkpoint(dependencies);
       const source = journal.source.workspaces[index]!, id = mapping.get(source.id)!;
+      workspaceIndex = index;
+      report('workspace_schema', undefined, 0, undefined, undefined, journal.source.workspaces.length);
       const target = path.join(source.path, '.codeflow', 'workspace.db');
       const directory = ensureWorkspaceCodeflowaiDirectory(source.path, '.codeflow');
       const staged = path.join(directory.directoryPath, `legacy-migration-${journal.migrationId}.db`);
@@ -445,29 +463,33 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
       let workFailure: unknown;
       try {
         migrateClientDb(workspace, { scope: 'workspace' }); ensureWorkspaceCoreQueueTables(workspace); ensureWorkspaceAdditionalTables(workspace);
-        copyWorkspaceRows(app, workspace, id, false);
+        copyWorkspaceRows(app, workspace, id, false, report);
         if (source.workspaceDbPath) {
           const converted = path.join(archive, `converted-workspace-${index}.db`); removeOwnedTemporary(converted);
           fs.copyFileSync(path.join(snapshotDirectory(input, journal), `source-workspace-${index}.db`), converted, fs.constants.COPYFILE_EXCL);
-          withDatabase(converted, false, previous => {
+          await withDatabaseAsync(converted, false, async previous => {
             assertKnownTables(previous); assertWorkspaceOwnership(previous, source.id);
             dropRetiredTables(previous);
             migrateClientDb(previous, { scope: 'workspace' }); ensureWorkspaceCoreQueueTables(previous); ensureWorkspaceAdditionalTables(previous);
-            rewriteBusinessReferences(previous, mapping);
+            await rewriteBusinessReferences(previous, mapping, report, dependencies);
             for (const table of listTables(previous)) {
               const cols = columns(previous, table);
               if (cols.includes('workspace_id')) previous.prepare(`UPDATE ${quote(table)} SET workspace_id=? WHERE workspace_id=?`).run(id, source.id);
               if (cols.includes('workspace_scope_id')) previous.prepare(`UPDATE ${quote(table)} SET workspace_scope_id=? WHERE workspace_scope_id=?`).run(id, source.id);
             }
-            copyWorkspaceRows(previous, workspace, id, true);
+            copyWorkspaceRows(previous, workspace, id, true, report);
             const oldFloor = readWorkspaceEventSeqFloor(previous);
             if (oldFloor > 0) recordWorkspaceEventSeqFloor(workspace, oldFloor);
           });
         }
+        report('pause', undefined, 0, undefined, undefined, journal.source.workspaces.length);
         pauseExecution(workspace, input, id);
-        await verifyWorkspace(workspace, id, source.path);
-        for (const row of workspace.prepare('SELECT seq FROM conversation_events UNION ALL SELECT seq FROM raw_engine_events').all() as Row[]) {
+        await verifyWorkspace(workspace, id, source.path, report, dependencies);
+        report('event_sequences', 'conversation_events', 0, undefined, undefined, journal.source.workspaces.length);
+        let sequenceCount = 0;
+        for (const row of workspace.prepare('SELECT seq FROM conversation_events UNION ALL SELECT seq FROM raw_engine_events').iterate() as IterableIterator<Row>) {
           if (eventSequences.has(row.seq)) fail('SOURCE_EVENT_SEQUENCE_CONFLICT'); eventSequences.add(row.seq);
+          if (++sequenceCount % 1_024 === 0) report('event_sequences', 'conversation_events', sequenceCount);
         }
         const floor = referenceHighWater(workspace); if (floor > 0) recordWorkspaceEventSeqFloor(workspace, floor);
         highWater = Math.max(highWater, floor);
@@ -477,10 +499,13 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
       syncFile(staged); assertWorkspaceCodeflowaiDirectory(directory);
       files.push({ target, staged, sha256: sha256File(staged), originalSha256: source.workspaceDbPath
         ? sha256File(path.join(snapshotDirectory(input, journal), `original-workspace-${index}.db`)) : null, published: false });
-      progress(dependencies, 'convert', index + 1, journal.source.workspaces.length, journal);
+      progress(dependencies, 'convert', index + 1, journal.source.workspaces.length, journal,
+        { phase: 'workspace_completed', workspaceIndex: index + 1, elapsedMs: Date.now() - startedAt });
       await yieldLoop();
     }
-    cleanApplicationWorkspaceRows(app, mapping);
+    workspaceIndex = undefined;
+    cleanApplicationWorkspaceRows(app, mapping, report);
+    report('application_finalize');
     pauseExecution(app, input, null);
     app.prepare("UPDATE meta SET value=? WHERE key='client_id'").run(input.targetClientId);
     app.prepare("UPDATE meta SET value=? WHERE key='event_seq'").run(String(highWater));
@@ -503,7 +528,7 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
 }
 
 /** 表清单限定当前支持语义；按 workspace/thread/父实体闭包提取，冲突绝不忽略。 */
-function copyWorkspaceRows(source: SqliteDb, target: SqliteDb, id: string, whole: boolean): void {
+function copyWorkspaceRows(source: SqliteDb, target: SqliteDb, id: string, whole: boolean, report: ConversionReport): void {
   source.pragma('foreign_keys = ON'); target.pragma('foreign_keys = OFF');
   try {
     target.transaction(() => {
@@ -511,18 +536,21 @@ function copyWorkspaceRows(source: SqliteDb, target: SqliteDb, id: string, whole
         if (!hasTable(source, table)) continue;
         const predicate = whole ? '1' : workspacePredicate(source, table, id);
         if (!predicate) fail('SOURCE_TABLE_OWNERSHIP_UNSUPPORTED');
-        const rows = source.prepare(`SELECT * FROM ${quote(table)} WHERE ${predicate}`).all() as Row[];
-        if (!rows.length) continue;
+        report('copy', table);
+        const rows = source.prepare("SELECT * FROM " + quote(table) + " WHERE " + predicate).iterate() as IterableIterator<Row>;
         const names = columns(source, table), targetNames = columns(target, table);
         if (names.some(name => !targetNames.includes(name))) fail('SOURCE_SCHEMA_UNSUPPORTED');
         const before = tableCount(target, table);
         const insert = target.prepare(`INSERT INTO ${quote(table)} (${names.map(quote).join(',')}) VALUES (${names.map(() => '?').join(',')})`);
+        let copied = 0;
         for (const row of rows) {
           try { insert.run(...names.map(name => row[name])); }
           catch (error) { throw migrationError('SOURCE_LAYOUT_CONFLICT', error); }
+          if (++copied % 1_024 === 0) report('copy', table, copied);
         }
         const count = Number((target.prepare(`SELECT COUNT(*) AS count FROM ${quote(table)}`).get() as Row).count);
-        if (count - before !== rows.length) fail('MIGRATION_ROW_COUNT_MISMATCH');
+        if (count - before !== copied) fail('MIGRATION_ROW_COUNT_MISMATCH');
+        report('copy', table, copied);
       }
       if (whole && hasTable(source, 'meta')) {
         for (const row of source.prepare('SELECT key,value FROM meta').all() as Array<{ key: string; value: string }>) {
@@ -567,7 +595,7 @@ function workspacePredicate(db: SqliteDb, table: string, id: string): string | n
 }
 
 /** 移出的工作区事实只留在 W；个人资产和应用定时历史仍由现有应用库拥有。 */
-function cleanApplicationWorkspaceRows(db: SqliteDb, mapping: Map<string, string>): void {
+function cleanApplicationWorkspaceRows(db: SqliteDb, mapping: Map<string, string>, report: ConversionReport): void {
   const selected = new Map<string, Row[]>();
   for (const table of WORKSPACE_TABLES) {
     if (!hasTable(db, table)) continue;
@@ -577,46 +605,62 @@ function cleanApplicationWorkspaceRows(db: SqliteDb, mapping: Map<string, string
   db.pragma('foreign_keys = OFF');
   try { db.transaction(() => {
     for (const [table, rows] of selected) {
+      report('application_cleanup', table);
       const statement = db.prepare(`DELETE FROM ${quote(table)} WHERE rowid=?`);
       for (const row of rows) statement.run(row.migration_rowid);
     }
-    for (const table of CACHE_TABLES) db.prepare(`DELETE FROM ${quote(table)}`).run();
+    for (const table of CACHE_TABLES) db.prepare("DELETE FROM " + quote(table)).run();
   })(); } finally { db.pragma('foreign_keys = ON'); }
 }
 
 /** 结构化 ID 字段才改写；原始 trace、提示词和自由正文保留原字节语义。 */
-function rewriteBusinessReferences(db: SqliteDb, mapping: Map<string, string>): void {
+async function rewriteBusinessReferences(db: SqliteDb, mapping: Map<string, string>, report: ConversionReport,
+  dependencies: LegacyClientMigrationDependencies): Promise<void> {
   for (const table of listTables(db)) {
     if (CACHE_TABLES.includes(table) || table.endsWith('_fts') || table.includes('_fts_')) continue;
     const jsonColumns = columns(db, table).filter(column => column.endsWith('_json'));
     if (!jsonColumns.length) continue;
+    report('rewrite_references', table);
     const digestColumn = table === 'orch_node_attempts' ? 'submission_hash' : table === 'code_attribution_outbox' ? 'content_sha256' : null;
-    for (const row of db.prepare(`SELECT rowid AS migration_rowid, ${[...jsonColumns, ...(digestColumn ? [digestColumn] : [])].map(quote).join(',')} FROM ${quote(table)}`).all() as Row[]) {
-      for (const column of jsonColumns) {
-        const raw = row[column]; if (raw === null || raw === undefined || raw === '') continue;
-        let value: any; try { value = JSON.parse(raw); } catch (error) { throw migrationError('SOURCE_JSON_INVALID', error); }
-        if (table === 'orch_node_attempts' && column === 'submission_json'
-          && hashOrchNodeAttemptSubmission(value).submissionHash !== row.submission_hash) fail('SOURCE_SUBMISSION_HASH_INVALID');
-        if (table === 'code_attribution_outbox' && column === 'payload_json') {
-          serializeCodeAttributionOutboxPayload(value);
-          if (sha256(raw) !== row.content_sha256) fail('SOURCE_ATTRIBUTION_HASH_INVALID');
+    const select = db.prepare("SELECT rowid AS migration_rowid, " + [...jsonColumns, ...(digestColumn ? [digestColumn] : [])].map(quote).join(',')
+      + " FROM " + quote(table) + " WHERE rowid > ? ORDER BY rowid LIMIT ?");
+    let cursor = 0, processed = 0;
+    while (true) {
+      checkpoint(dependencies);
+      const rows = select.all(cursor, 1_024) as Row[];
+      if (!rows.length) break;
+      for (const row of rows) {
+        for (const column of jsonColumns) {
+          const raw = row[column]; if (raw === null || raw === undefined || raw === '') continue;
+          let value: any; try { value = JSON.parse(raw); } catch (error) { throw migrationError('SOURCE_JSON_INVALID', error); }
+          if (table === 'orch_node_attempts' && column === 'submission_json'
+            && hashOrchNodeAttemptSubmission(value).submissionHash !== row.submission_hash) fail('SOURCE_SUBMISSION_HASH_INVALID');
+          if (table === 'code_attribution_outbox' && column === 'payload_json') {
+            serializeCodeAttributionOutboxPayload(value);
+            if (sha256(raw) !== row.content_sha256) fail('SOURCE_ATTRIBUTION_HASH_INVALID');
+          }
+          if (table === 'raw_engine_events') {
+            if (value && mapping.has(value.workspaceId)) value.workspaceId = mapping.get(value.workspaceId);
+          } else rewriteJson(value, mapping);
+          const changed = JSON.stringify(value);
+          if (changed !== JSON.stringify(JSON.parse(raw))) {
+            if (table === 'controlled_experiment_snapshots') fail('SOURCE_HASHED_REFERENCE_UNSUPPORTED');
+            if (table === 'orch_node_attempts' && column === 'submission_json') {
+              const hashed = hashOrchNodeAttemptSubmission(value);
+              db.prepare('UPDATE orch_node_attempts SET submission_json=?,submission_hash=? WHERE rowid=?').run(hashed.submissionJson, hashed.submissionHash, row.migration_rowid);
+            } else if (table === 'code_attribution_outbox' && column === 'payload_json') {
+              const serialized = serializeCodeAttributionOutboxPayload(value);
+              db.prepare('UPDATE code_attribution_outbox SET payload_json=?,content_sha256=? WHERE rowid=?').run(serialized, sha256(serialized), row.migration_rowid);
+            } else db.prepare(`UPDATE ${quote(table)} SET ${quote(column)}=? WHERE rowid=?`).run(changed, row.migration_rowid);
+          }
         }
-        if (table === 'raw_engine_events') {
-          if (value && mapping.has(value.workspaceId)) value.workspaceId = mapping.get(value.workspaceId);
-        } else rewriteJson(value, mapping);
-        const changed = JSON.stringify(value);
-        if (changed !== JSON.stringify(JSON.parse(raw))) {
-          if (table === 'controlled_experiment_snapshots') fail('SOURCE_HASHED_REFERENCE_UNSUPPORTED');
-          if (table === 'orch_node_attempts' && column === 'submission_json') {
-            const hashed = hashOrchNodeAttemptSubmission(value);
-            db.prepare('UPDATE orch_node_attempts SET submission_json=?,submission_hash=? WHERE rowid=?').run(hashed.submissionJson, hashed.submissionHash, row.migration_rowid);
-          } else if (table === 'code_attribution_outbox' && column === 'payload_json') {
-            const serialized = serializeCodeAttributionOutboxPayload(value);
-            db.prepare('UPDATE code_attribution_outbox SET payload_json=?,content_sha256=? WHERE rowid=?').run(serialized, sha256(serialized), row.migration_rowid);
-          } else db.prepare(`UPDATE ${quote(table)} SET ${quote(column)}=? WHERE rowid=?`).run(changed, row.migration_rowid);
-        }
+        cursor = row.migration_rowid;
+        processed++;
       }
+      report('rewrite_references', table, processed);
+      await yieldLoop();
     }
+    report('rewrite_references', table, processed);
   }
   for (const [oldId, newId] of mapping) {
     if (hasTable(db, 'scheduled_task_configs')) db.prepare('UPDATE scheduled_task_configs SET workspace_scope_id=? WHERE workspace_scope_id=?').run(newId, oldId);
@@ -664,43 +708,75 @@ function pauseExecution(db: SqliteDb, input: Input, workspaceId: string | null):
 }
 
 /** 核对信封及正文引用；产物沿工作区真实路径解析，越界或摘要损坏均阻断发布。 */
-async function verifyWorkspace(db: SqliteDb, id: string, workspacePath: string): Promise<void> {
+async function verifyWorkspace(db: SqliteDb, id: string, workspacePath: string, report: ConversionReport,
+  dependencies: LegacyClientMigrationDependencies): Promise<void> {
   assertWorkspaceOwnership(db, id);
-  for (const table of ['conversation_events', 'raw_engine_events']) {
-    for (const row of db.prepare(`SELECT e.seq,e.thread_id,e.workspace_id,e.engine,e.event_json,
-      t.workspace_id AS parent_workspace_id,t.engine AS parent_engine FROM ${table} e LEFT JOIN threads t ON t.id=e.thread_id`).all() as Row[]) {
-      const value = JSON.parse(row.event_json);
-      if (!value || typeof value !== 'object' || Array.isArray(value) || value.workspaceId !== row.workspace_id
-        || value.threadId !== row.thread_id || value.seq !== row.seq) fail('SOURCE_EVENT_REFERENCE_INVALID');
-      if (table === 'conversation_events' && (value.schema !== 1 || !Number.isSafeInteger(value.seq) || value.seq <= 0
-        || typeof value.workspaceId !== 'string' || !value.workspaceId.trim() || row.workspace_id !== row.parent_workspace_id
-        || !['codex', 'claude'].includes(value.engine) || value.engine !== row.engine || row.engine !== row.parent_engine
-        || !Number.isSafeInteger(value.ts) || value.ts < 0 || typeof value.type !== 'string' || !value.type.trim()
-        || !value.payload || typeof value.payload !== 'object' || Array.isArray(value.payload))) fail('SOURCE_CANONICAL_EVENT_INVALID');
-    }
-  }
+  const counts = db.prepare("SELECT (SELECT COUNT(*) FROM conversation_events) AS canonical, (SELECT COUNT(*) FROM raw_engine_events) AS raw").get() as
+    { canonical: number; raw: number };
   const blobs = new FileBlobRepo(db);
   const threads = (db.prepare('SELECT id FROM threads').all() as Row[]).map(row => row.id as ThreadId);
   const canonical = new ConversationEventRepo(db);
   const raw = new RawEngineEventRepo(db);
-  for (const threadId of threads) {
-    try { await canonical.ensurePresentation(threadId); }
-    catch (error) { throw migrationError('SOURCE_CANONICAL_EVENT_INVALID', error); }
+  let projectedTotal = 0, checkedRawCount = 0;
+  for (const [threadIndex, threadId] of threads.entries()) {
+    let projected = 0;
+    try { await canonical.ensurePresentation(threadId, {
+      /** 同一次 reducer 事件读取中校验列与父会话，避免再全表解析 canonical JSON。 */
+      validateEvent(event) {
+        if (event.schema !== 1 || event.workspaceId !== id || event.threadId !== threadId || event.seq <= 0
+          || !['codex', 'claude'].includes(event.engine) || !Number.isSafeInteger(event.ts) || event.ts < 0
+          || typeof event.type !== 'string' || !event.type.trim() || !event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+          throw migrationError('SOURCE_CANONICAL_EVENT_INVALID', undefined, { phase: 'presentation', table: 'conversation_events',
+            workspaceId: id, threadId, reason: 'event_envelope' });
+        }
+        projected++;
+        if (projected % 1_024 === 0) report('presentation', 'conversation_events', projected, threadId, threadIndex + 1, threads.length);
+      },
+      /** 沿仓储原有 256 条事务边界汇报进度，异常仍保留统一 canonical 错误码。 */
+      async withDatabase<T>(operation: () => T): Promise<T> {
+        checkpoint(dependencies);
+        let result: T;
+        try { result = operation(); }
+        catch (error) { throw migrationError('SOURCE_CANONICAL_EVENT_INVALID', error); }
+        if (projected === 0 || projected % 1_024 === 0) report('presentation', 'conversation_events', projected, threadId, threadIndex + 1, threads.length);
+        return result;
+      },
+    }); }
+    catch (error) { if ((error as { code?: unknown })?.code === 'SOURCE_CANONICAL_EVENT_INVALID') throw error; throw migrationError('SOURCE_CANONICAL_EVENT_INVALID', error); }
+    report('presentation', 'conversation_events', projected, threadId, threadIndex + 1, threads.length);
+    projectedTotal += projected;
+    if (projectedTotal > counts.canonical) fail('SOURCE_EVENT_COUNT_CHANGED');
     let beforeSeq: number | null = null;
+    let processed = 0;
     do {
+      report('raw_events', 'raw_engine_events', processed, threadId, threadIndex + 1, threads.length);
       let page;
       try { page = raw.pageByThread(threadId, { beforeSeq, limit: 2_000 }); }
       catch (error) { throw migrationError('SOURCE_RAW_EVENT_INVALID', error); }
       beforeSeq = page.events.length ? page.nextBeforeSeq : null;
+      processed += page.events.length;
+      checkedRawCount += page.events.length;
+      report('raw_events', 'raw_engine_events', processed, threadId, threadIndex + 1, threads.length);
+      await yieldLoop();
     } while (beforeSeq !== null);
   }
+  if (projectedTotal !== counts.canonical || checkedRawCount !== counts.raw) fail('SOURCE_EVENT_COUNT_CHANGED');
+  const verifiedBlobs = await verifyAttachments(db, id, report);
+  let blobProcessed = 0;
   for (const reference of blobs.collectReferencedByThreadIds(threads)) {
-    const blob = blobs.get(reference.blobId);
-    if (!blob || blob.data.length !== blob.byteLen || sha256(blob.data) !== blob.blobId) fail('SOURCE_BLOB_INVALID');
+    if (!verifiedBlobs.has(reference.blobId)) {
+      const blob = blobs.get(reference.blobId);
+      if (!blob || blob.data.length !== blob.byteLen || sha256(blob.data) !== blob.blobId) {
+        throw migrationError('SOURCE_BLOB_INVALID', undefined, { phase: 'blobs', workspaceId: id, table: 'file_blobs',
+          blobId: reference.blobId, expectedSize: reference.byteLen,
+          reason: !blob ? 'missing_blob' : blob.data.length !== blob.byteLen ? 'blob_length' : 'blob_hash',
+          ...(blob ? { actualSize: blob.data.length } : {}) });
+      }
+      verifiedBlobs.add(reference.blobId);
+    }
+    if (++blobProcessed % 1_024 === 0) { report('blobs', 'file_blobs', blobProcessed); await yieldLoop(); }
   }
-  for (const table of ['thread_draft_attachments', 'thread_message_queue_attachments']) {
-    if (db.prepare(`SELECT 1 FROM ${table} a LEFT JOIN file_blobs b ON b.blob_id=a.blob_id WHERE b.blob_id IS NULL OR a.size<>b.byte_len LIMIT 1`).get()) fail('SOURCE_BLOB_INVALID');
-  }
+  report('blobs', 'file_blobs', blobProcessed);
   if (db.prepare('SELECT 1 FROM chat_workflow_actions a LEFT JOIN chat_workflow_tasks t ON t.id=a.task_id WHERE t.id IS NULL LIMIT 1').get()) fail('SOURCE_REFERENCE_INVALID');
   for (const row of db.prepare('SELECT staging_path,published_path,content_hash,size_bytes FROM orch_artifact_files').all() as Row[]) {
     const storedPath = row.published_path || row.staging_path;
@@ -709,6 +785,67 @@ async function verifyWorkspace(db: SqliteDb, id: string, workspacePath: string):
     assertFile(file);
     if (row.size_bytes !== null && fs.statSync(file).size !== row.size_bytes || row.content_hash && sha256File(file) !== row.content_hash) fail('SOURCE_ARTIFACT_INVALID');
   }
+}
+
+/** 对两个附件表使用同一编码规则，保留图片原始大小并拦截内容、引用和存储长度损坏。 */
+async function verifyAttachments(db: SqliteDb, workspaceId: string, report: ConversionReport): Promise<Set<string>> {
+  const verified = new Set<string>();
+  for (const table of ['thread_draft_attachments', 'thread_message_queue_attachments']) {
+    report('attachments', table);
+    const recordId = table === 'thread_draft_attachments' ? 'a.attachment_id' : 'a.id';
+    const threadId = table === 'thread_draft_attachments' ? 'a.thread_id' : 'q.thread_id';
+    const parent = table === 'thread_draft_attachments' ? '' : 'LEFT JOIN thread_message_queue q ON q.id=a.queue_item_id';
+    const sql = 'SELECT ' + recordId + ' AS record_id,' + threadId
+      + ' AS thread_id,a.kind,a.size,a.blob_id,b.byte_len,b.encoding,b.data FROM ' + table + ' a ' + parent
+      + ' LEFT JOIN file_blobs b ON b.blob_id=a.blob_id';
+    const rows = db.prepare(sql).iterate() as IterableIterator<Row>;
+    let processed = 0, lastProgressAt = Date.now();
+    for (const row of rows) {
+      const context: LegacyClientMigrationContext = { phase: 'attachments', workspaceId, table,
+        ...(row.record_id ? { recordId: String(row.record_id) } : {}), ...(row.thread_id ? { threadId: String(row.thread_id) } : {}),
+        blobId: String(row.blob_id ?? ''), expectedSize: Number(row.size),
+        ...(row.byte_len === null ? {} : { storedSize: Number(row.byte_len) }) };
+      /** 每种附件损坏均保留记录键和大小上下文，不输出 blob 正文。 */
+      const invalid = (reason: string, actualSize?: number): never => {
+        throw migrationError('SOURCE_BLOB_INVALID', undefined, { ...context, reason,
+          ...(actualSize === undefined ? {} : { actualSize }) });
+      };
+      if (!row.thread_id) invalid('attachment_parent_missing');
+      if (row.data === null) invalid(row.blob_id === null ? 'missing_reference' : 'missing_blob');
+      const data = Buffer.from(row.data);
+      if (data.length !== row.byte_len) invalid('blob_length', data.length);
+      if (!verified.has(row.blob_id) && sha256(data) !== row.blob_id) invalid('blob_hash', data.length);
+      if (!['binary', 'utf8', 'gb18030'].includes(row.encoding)) invalid('blob_encoding', data.length);
+      if (row.encoding === 'utf8' && !isUtf8(data)) invalid('invalid_utf8', data.length);
+      let actualSize = data.length;
+      if (row.kind === 'image' && row.encoding === 'utf8') {
+        const dataUrl = data.toString('utf8'), comma = dataUrl.indexOf(',');
+        const header = dataUrl.slice(5, comma);
+        if (!dataUrl.startsWith('data:') || comma < 0 || !(header === ';base64' || /.+;base64$/i.test(header))) invalid('invalid_data_url');
+        const encoded = dataUrl.slice(comma + 1).trim();
+        if (!encoded || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) invalid('invalid_base64');
+        const decoded = Buffer.from(encoded, 'base64'), canonical = decoded.toString('base64');
+        if (encoded !== canonical && encoded !== canonical.replace(/=+$/, '')) invalid('invalid_base64');
+        actualSize = decoded.length;
+      }
+      const size = Number(row.size);
+      const legacyTextFile = row.encoding === 'utf8' && ['file', 'text-file'].includes(String(row.kind));
+      // Text extraction keeps source-file size, which may exceed UTF-8 extracted text bytes.
+      const imageDataUrl = row.kind === 'image' && row.encoding === 'utf8';
+      const matches = Number.isSafeInteger(size) && size >= 0 && (imageDataUrl ? size === actualSize
+        : size === data.length || legacyTextFile && size >= data.length);
+      if (!matches) invalid('attachment_size', actualSize);
+      verified.add(row.blob_id);
+      processed++;
+      if (processed % 1_024 === 0 || Date.now() - lastProgressAt >= 1_000) {
+        report('attachments', table, processed);
+        lastProgressAt = Date.now();
+        await yieldLoop();
+      }
+    }
+    report('attachments', table, processed);
+  }
+  return verified;
 }
 
 /** 远端投递/权限缓存不授予新身份；工作区仅保留已知本地 schema 与提交下界。 */
@@ -939,6 +1076,11 @@ function withDatabase<T>(filename: string, readonly: boolean, operation: (db: Sq
   assertFile(filename); const db = openSqliteDb(filename, { readonly, fileMustExist: true }); let failure: unknown;
   try { return operation(db); } catch (error) { failure = error; throw error; } finally { closeDatabase(db, failure); }
 }
+/** 异步转换旧 workspace 副本时仍在原边界等待连接关闭并保留双错。 */
+async function withDatabaseAsync<T>(filename: string, readonly: boolean, operation: (db: SqliteDb) => Promise<T>): Promise<T> {
+  assertFile(filename); const db = openSqliteDb(filename, { readonly, fileMustExist: true }); let failure: unknown;
+  try { return await operation(db); } catch (error) { failure = error; throw error; } finally { closeDatabase(db, failure); }
+}
 /** SQLite 关闭失败不得覆盖原错误或伪造安全释放。 */
 function closeDatabase(db: SqliteDb, failure: unknown): void {
   try { db.close(); } catch (error) { throw failure === undefined ? error : new AggregateError([failure, error], 'MIGRATION_DB_CLOSE_FAILED', { cause: failure }); }
@@ -946,7 +1088,10 @@ function closeDatabase(db: SqliteDb, failure: unknown): void {
 /** 完整性及 FK 校验同时成立才允许提交转换结果。 */
 function integrity(db: SqliteDb): void {
   const result = db.pragma('integrity_check', { simple: true }), foreignKeys = db.prepare('PRAGMA foreign_key_check').all();
-  if (result !== 'ok' || foreignKeys.length) throw Object.assign(migrationError('SOURCE_INTEGRITY_INVALID'), { check: result, foreignKeys: foreignKeys.slice(0, 10) });
+  if (result !== 'ok' || foreignKeys.length) {
+    process.stderr.write(JSON.stringify({ diagnostic: 'MIGRATION_INTEGRITY_FIXTURE', check: result, foreignKeys: foreignKeys.slice(0, 10) }) + '\n');
+    throw Object.assign(migrationError('SOURCE_INTEGRITY_INVALID'), { check: result, foreignKeys: foreignKeys.slice(0, 10) });
+  }
 }
 /** 返回实际表清单，SQLite 自有 sequence 不属于迁移业务。 */
 function listTables(db: SqliteDb): string[] { return (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Row[]).map(row => row.name); }
@@ -1017,10 +1162,15 @@ function processRunning(pid: unknown): boolean { if (!Number.isInteger(pid) || N
 /** 取消会保留 journal，下一次继续原任务而非重复导入。 */
 function checkpoint(dependencies: LegacyClientMigrationDependencies): void { dependencies.signal?.throwIfAborted(); }
 /** 进度仅来自已完成的工作单元，不使用时间插值。 */
-function progress(dependencies: LegacyClientMigrationDependencies, stage: string, completed: number, total: number | null, journal: Journal): void { dependencies.onProgress?.({ stage, completed, total, workspaceCount: journal.source.workspaces.length }); }
+function progress(dependencies: LegacyClientMigrationDependencies, stage: string, completed: number, total: number | null, journal: Journal,
+  detail: Partial<LegacyClientMigrationProgress> = {}): void {
+  dependencies.onProgress?.({ ...detail, stage, completed, total, workspaceCount: journal.source.workspaces.length });
+}
 /** 对外错误只携带固定码，原异常由受管 Worker 边界安全记录。 */
-function migrationError(code: string, cause?: unknown): Error & { code: string } { return Object.assign(new Error(code, cause === undefined ? undefined : { cause }), { code }); }
+function migrationError(code: string, cause?: unknown, context?: LegacyClientMigrationContext): Error & { code: string; context?: LegacyClientMigrationContext } {
+  return Object.assign(new Error(code, cause === undefined ? undefined : { cause }), { code, ...(context ? { context } : {}) });
+}
 /** 无法验证的事实必须立即失败。 */
-function fail(code: string): never { throw migrationError(code); }
+function fail(code: string, context?: LegacyClientMigrationContext): never { throw migrationError(code, undefined, context); }
 /** journal 只保存稳定错误码，不保存可能含凭据的异常原文。 */
 function errorCode(error: unknown): string { const code = (error as { code?: unknown })?.code; return typeof code === 'string' && /^[A-Z0-9_]+$/.test(code) ? code : 'LEGACY_MIGRATION_FAILED'; }
