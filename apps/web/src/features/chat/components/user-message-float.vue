@@ -92,7 +92,7 @@ const hiddenImageCount = computed(() => Math.max(0, (props.images?.length ?? 0) 
 
     <div class="chat-user-msg-float__body">
       <p v-if="text" ref="textEl" class="chat-user-msg-float__text" :title="textTruncated ? text : undefined">{{ text }}</p>
-      <p v-else class="chat-user-msg-float__text chat-user-msg-float__text--placeholder">
+      <p v-else-if="!visibleImages.length" class="chat-user-msg-float__text chat-user-msg-float__text--placeholder">
         {{ loading ? "正在定位最近的消息…" : "当前会话还没有您的消息" }}
       </p>
     </div>
