@@ -162,9 +162,9 @@ const filteredMoveGroups = computed(() => {
 
 /** segmented tab 配置：所有用户共用一套，归档收入选项内部。 */
 const threadTabOptions = computed(() => [
-  { title: "普通会话", payload: { name: "普通" }, value: "current" as ThreadFilterTab },
-  { title: "流程会话", payload: { name: "流程" }, value: "orchestration" as ThreadFilterTab },
-  { title: "归档会话", payload: { name: "归档" }, value: "archived" as ThreadFilterTab },
+  { title: "普通会话", payload: { name: "普通会话" }, value: "current" as ThreadFilterTab },
+  { title: "流程会话", payload: { name: "流程会话" }, value: "orchestration" as ThreadFilterTab },
+  { title: "归档会话", payload: { name: "归档会话" }, value: "archived" as ThreadFilterTab },
 ]);
 
 /** 「规格」不再作为会话列表 tab；历史持久化选择静默回退到普通会话。 */
@@ -1196,7 +1196,7 @@ function getThreadSubtypeLabel(subtype: ThreadSubtype | null): string {
           block
         >
           <template #label="{ payload }">
-            <span>{{ payload.name }}<span class="thread-list__tab-suffix">会话</span></span>
+            <span>{{ payload.name }}</span>
           </template>
         </a-segmented>
         <a-tooltip :title="sharedOnlyRelatedToMe ? '关闭只看我' : '只看我'" placement="bottom">
@@ -1690,12 +1690,6 @@ function getThreadSubtypeLabel(subtype: ThreadSubtype | null): string {
 
 .thread-list__segmented :deep(.ant-segmented-item-label) {
   padding-inline: 4px;
-}
-
-@container thread-list-header (max-width: 395px) {
-  .thread-list__tab-suffix {
-    display: none;
-  }
 }
 
 /* 分组栏上下空隙来自共享规则（`.thread-list__tabs-row` margin-bottom 10px、`.thread-list__scroll` margin-top 8px）。

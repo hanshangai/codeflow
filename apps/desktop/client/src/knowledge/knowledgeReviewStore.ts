@@ -57,7 +57,7 @@ function canonicalReviewOutcome(issues: KnowledgeReviewIssue[]): KnowledgeReview
 export class KnowledgeReviewStore {
   constructor(readonly store: KnowledgeAssetStore) {}
 
-  /** 绑定正文、来源及可追溯要求；候选目录的自拟说明不构成用户要求。 */
+  /** 绑定正文、生成来源及可追溯要求；来源过期时拒绝复检旧候选。 */
   snapshot(nodeId: string, revisionId: string): KnowledgeReviewSnapshot {
     const tree = this.store.readTree().tree;
     const ancestry = this.store.ancestry(nodeId, tree);
@@ -72,6 +72,12 @@ export class KnowledgeReviewStore {
       sourceHashes: [...new Set(document.sources.flatMap(source => source.path ? [source.path] : []))]
         .sort().map(sourcePath => ({ path: sourcePath, contentHash: this.sourceHash(sourcePath) })),
     };
+    const currentSources = new Map(snapshot.sourceHashes.map(source => [source.path, source.contentHash]));
+    for (const source of document.sources) {
+      if (source.path && currentSources.get(source.path) !== source.contentHash) {
+        throw new KnowledgeAssetError("KNOWLEDGE_ASSET_SOURCE_CHANGED", `生成时引用的来源已变化：${source.path}；请更新候选并复检，单独复检不会更新旧版本来源`);
+      }
+    }
     this.assertSnapshot(snapshot);
     return snapshot;
   }
@@ -320,7 +326,8 @@ export class KnowledgeReviewStore {
       if (snapshot.instructionsHash !== report.instructionsHash) reasons.push("项目或目录的有效要求已变化");
       if (snapshot.sourceScopeHash !== report.sourceScopeHash) reasons.push("项目或目录的来源范围已变化");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error instanceof KnowledgeAssetError && ["KNOWLEDGE_ASSET_CONFLICT", "KNOWLEDGE_ASSET_FILE_INVALID", "KNOWLEDGE_ASSET_PATH_INVALID"].includes(error.code))) reasons.push("被复检文档或证据文件缺失、被修改或无法读取");
+      if (error instanceof KnowledgeAssetError && error.code === "KNOWLEDGE_ASSET_SOURCE_CHANGED") reasons.push(error.message);
+      else if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error instanceof KnowledgeAssetError && ["KNOWLEDGE_ASSET_CONFLICT", "KNOWLEDGE_ASSET_FILE_INVALID", "KNOWLEDGE_ASSET_PATH_INVALID"].includes(error.code))) reasons.push("被复检文档或证据文件缺失、被修改或无法读取");
       else throw error;
     }
     for (const source of [...report.sourceHashes, ...report.sources]) {

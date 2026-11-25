@@ -119,17 +119,25 @@ for (const outcome of ["passed_with_warnings", "issues"] as const) test(`同版�
   else { apply(); assert.equal(store.detail("permissions").current?.revision.id, revisionId); }
 });
 
-test("来源变化后复检通过仍明确要求更新候选，新候选自动复检后可以采用", async t => {
-  const { service, begin, store, root } = fixture(t, async input => {
+test("来源变化后拒绝复检旧候选并引导更新候选，新候选自动复检后可以采用", async t => {
+  let reviewCalls = 0;
+  const { service, begin, store, root, reviews } = fixture(t, async input => {
     input.onThreadCreated(`thread-${crypto.randomUUID()}`);
-    if (input.purpose === "review") await review(input);
+    if (input.purpose === "review") { reviewCalls++; await review(input); }
     else await generate(input);
   });
   const original = begin(); service.start(original.id);
   const first = await settled(service, original.id), oldRevision = first.items[0]!.revisionId!;
   fs.appendFileSync(path.join(root, "src/permissions.ts"), "// 仅新增说明，权限行为不变\n", "utf8");
+  const previousReports = reviews.list("permissions");
+  assert.equal(previousReports[0]!.stale, true);
+  assert.match(previousReports[0]!.staleReasons.join("；"), /生成时引用的来源已变化.*更新候选/);
   const recheck = begin({ mode: "review" }); service.start(recheck.id);
-  assert.equal((await settled(service, recheck.id)).items[0]!.review?.status, "passed");
+  const failedReview = await settled(service, recheck.id);
+  assert.equal(failedReview.items[0]!.review?.status, "failed");
+  assert.match(failedReview.items[0]!.review?.error?.message ?? "", /来源已变化.*更新候选/);
+  assert.equal(reviewCalls, 1, "来源过期时不得调用复检引擎或生成新的通过报告");
+  assert.equal(reviews.list("permissions").length, previousReports.length);
   const blocked = service.preview(original.id).items[0]!;
   assert.equal(blocked.canApply, false);
   assert.equal((blocked as typeof blocked & { reasonCode?: string }).reasonCode, "KNOWLEDGE_ASSET_SOURCE_CHANGED");
@@ -496,7 +504,7 @@ test("规格连续修订两轮可通过，系统修订说明始终不能充当�
   assert.equal(context.reviews.list("permissions").filter(report => !report.stale && report.outcome === "passed").length, 1);
 });
 
-test("过期修订重试保留单项要求，并在重新复检时排除历史系统说明", async t => {
+test("修订重试遇到来源变化时拒绝复检旧候选并保留单项要求", async t => {
   let generations = 0, reviewCount = 0;
   const generationPrompts: string[] = [];
   const context = fixture(t, async input => {
@@ -526,13 +534,14 @@ test("过期修订重试保留单项要求，并在重新复检时排除历史�
   fs.appendFileSync(path.join(context.root, "src/permissions.ts"), "// Changed source evidence.\n");
   context.service.start(run.id, { nodeIds: ["permissions"], retryFailed: true });
   const result = await settled(context.service, run.id);
-  assert.equal(result.phase, "completed", JSON.stringify(result));
-  assert.equal(result.items[0]?.review?.status, "passed");
+  assert.equal(result.phase, "partial");
+  assert.equal(result.items[0]?.review?.status, "failed");
+  assert.equal(result.items[0]?.review?.error?.code, "KNOWLEDGE_ASSET_SOURCE_CHANGED");
   assert.equal(context.store.readRun(run.id).prompt, "INITIAL_ALPHA");
-  assert.equal(generations, 5);
-  assert.equal(reviewCount, 4);
-  assert.ok(generationPrompts[4]!.includes("OVERRIDE_BETA"));
-  assert.equal(generationPrompts[4]!.includes("INITIAL_ALPHA"), false);
+  assert.equal(generations, 4, "来源过期后不得继续基于旧报告生成修订");
+  assert.equal(reviewCount, 2, "来源过期后不得启动新的旧版本复检");
+  assert.ok(generationPrompts[3]!.includes("OVERRIDE_BETA"));
+  assert.equal(generationPrompts[3]!.includes("INITIAL_ALPHA"), false);
 });
 
 test("架构事实不能仅用用户要求替代源码证据", async t => {
@@ -638,7 +647,7 @@ test("复检最大轮次按任务配置生效，达到配置值后停止自动�
   assert.equal(result.items[0]!.review?.maxRounds, 2);
 });
 
-test("自动修订等待期间来源变化，重试失败项会先重新复检而不复用旧报告", async t => {
+test("自动修订等待期间来源变化，重试失败项拒绝复检旧候选", async t => {
   let reviewCalls = 0, generationCalls = 0;
   const context = fixture(t, async input => {
     input.onThreadCreated(input.threadId ?? `execution-${input.purpose}-${reviewCalls + generationCalls + 1}`);
@@ -661,10 +670,11 @@ test("自动修订等待期间来源变化，重试失败项会先重新复检�
   context.service.start(run.id, { retryFailed: true });
   const retried = await settled(context.service, run.id);
   assert.equal(first.items[0]!.review?.status, "issues");
-  assert.equal(reviewCalls, 2);
+  assert.equal(reviewCalls, 1, "来源过期时不得调用复检引擎");
   assert.equal(generationCalls, 1, "来源变化后只重新复检，不重写已生成正文");
-  assert.equal(retried.items[0]!.review?.status, "issues");
-  assert.equal(retried.items[0]!.review?.stale, false);
+  assert.equal(retried.items[0]!.review?.status, "failed");
+  assert.equal(retried.items[0]!.review?.error?.code, "KNOWLEDGE_ASSET_SOURCE_CHANGED");
+  assert.equal(retried.items[0]!.review?.stale, true);
 });
 
 test("复检不能用已有指纹或原文引用伪造本轮阅读：未读正文、未读来源均拒绝通过", async t => {
