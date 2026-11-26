@@ -481,11 +481,8 @@ defineExpose({ hasRecovery: () => Boolean(pendingApply.value || maintenancePendi
             <template #message>
               <div class="review-notice-row">
                 <span class="review-notice-text" :title="reportsReadError ?? executionItem?.review?.error?.message ?? currentItem?.reason ?? undefined">{{ documentActivity ?? (readyToAdopt ? readyMessage : reviewGuidance ?? currentItem?.reason ?? restrictionReason) }}</span>
-                <a-space v-if="!documentActivity && reviewGuidance" wrap :size="6">
-                  <a-button v-if="sourceRefreshRequired && canStartTask && document" type="primary" size="small" :disabled="!canWrite || reviewBusy" @click="emit('refreshSources', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })">更新候选并复检</a-button>
-                  <a-button v-else-if="!sourceRefreshRequired && canResumeReview && document" type="primary" size="small" :disabled="!canWrite || reviewBusy || reportsLoading || Boolean(reportsReadError)" @click="emit('resumeReview', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })">{{ executionItem?.review?.status === 'failed' ? '重试复检' : '继续复检' }}</a-button>
-                  <a-button v-else-if="!sourceRefreshRequired && canStartTask && document" type="primary" size="small" :disabled="!canWrite || restartReviewBusy || reportsLoading || Boolean(reportsReadError) || !canReviewVersion" @click="emit('review', node.id)">重新复检</a-button>
-                  <a-button size="small" @click="previewTab = 'report'">查看复检报告</a-button>
+                <a-space v-if="!documentActivity && reviewGuidance && canResumeReview" wrap :size="6">
+                  <a-button v-if="canResumeReview && document" type="primary" size="small" :disabled="!canWrite || reviewBusy || reportsLoading || Boolean(reportsReadError)" @click="emit('resumeReview', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })">{{ executionItem?.review?.status === 'failed' ? '重试复检' : '继续复检' }}</a-button>
                 </a-space>
               </div>
             </template>

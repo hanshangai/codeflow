@@ -329,7 +329,7 @@ async function openKnowledge(page: Page, threadId?: string, initialView: "assets
   await expect(page.locator(".knowledge-page")).toBeVisible();
 }
 
-/** 对话面板默认收起，测试需要交互时通过公开入口展开。 */
+/** 会话面板默认展开；测试仍通过公开入口适配用户手动收起后的状态。 */
 async function showKnowledgeAssistant(page: Page): Promise<void> {
   const assistant = page.getByTestId("knowledge-assistant");
   // 后台会话可能先于点击自行展开；每次重查当前状态，不点击已消失的 rail。
@@ -411,9 +411,19 @@ async function openKnowledgeMenu(page: Page, name: string): Promise<void> {
   }
 }
 
-/** 文档复检和来源使用标题栏的统一更多入口。 */
+/** 文档视图用显式Tab切换，低频生成和复检操作保留在更多菜单。 */
 async function openDocumentMenu(page: Page, name: string): Promise<void> {
+  if (name === "来源依据" || name === "复检报告") {
+    await page.locator(".document-view-tabs").getByRole("tab", { name, exact: true }).click();
+    return;
+  }
   await page.locator(".reading-document .main-head").getByRole("button", { name: /更多操作$/u }).click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
+}
+
+/** 未完成任务的范围操作集中在任务菜单，主按钮始终继续全部剩余项。 */
+async function selectTaskAction(page: Page, name: string): Promise<void> {
+  await page.locator(".task-summary").getByRole("button", { name: "任务操作", exact: true }).click();
   await page.getByRole("menuitem", { name, exact: true }).click();
 }
 
@@ -423,9 +433,7 @@ async function openGenerationResults(page: Page): Promise<void> {
   // 文件自动预览只显示单篇；统一结果页必须回到全局“待确认更新”清单。
   const scoped = !await updates.isVisible() || await updates.locator(".updates-layout.single-file").count() > 0;
   if (scoped) {
-    const summary = page.locator(".updates-summary").getByRole("button", { name: "查看更新", exact: true });
-    if (await summary.count() && await summary.isVisible()) await summary.click();
-    else await page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u }).click();
+    await page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u }).click();
   }
   await expect(updates).toBeVisible({ timeout: 15_000 });
   await expect(updates.getByRole("button", { name: /^(采用所选内容|采用此版本)$/u })).toBeVisible({ timeout: 15_000 });
@@ -876,7 +884,7 @@ test.describe("项目知识库资产协作", () => {
     const updates = page.getByTestId("knowledge-updates");
     await expect(updates.getByRole("button", { name: "采用此版本", exact: true })).toBeDisabled();
     await expect(updates.getByTestId("knowledge-adoption-restriction")).toContainText("复检");
-    await updates.getByRole("button", { name: "查看复检报告", exact: true }).first().click();
+    await updates.getByRole("tab", { name: "复检报告", exact: true }).click();
     await expect(updates).toContainText("缺少错误码字段");
   });
 
@@ -1001,20 +1009,66 @@ test.describe("项目知识库资产协作", () => {
     await expect(help).toBeVisible();
   });
 
-  test("PK-updates-empty 无候选明确空态并收起空文件会话，主动讨论不丢失", async ({ page }) => {
+  test("PK-updates-empty 无候选明确空态且会话面板保持打开，主动讨论不丢失", async ({ page }) => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page);
     await page.goto("/knowledge");
     await page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u }).click();
     await expect(page.getByTestId("knowledge-updates")).toContainText("暂无待确认更新");
     await expect(page.getByTestId("knowledge-updates")).not.toContainText("选择具体更新");
-    await expect(page.getByTestId("knowledge-assistant")).not.toHaveClass(/open/u);
+    await expect(page.getByTestId("knowledge-assistant")).toHaveClass(/open/u);
     await page.goto(`/knowledge?threadId=${scenario.threadId}`);
     await expect(page.locator(".composer__textarea")).toBeEnabled();
     await page.getByTestId("knowledge-tree").getByRole("button", { name: /^待确认更新/u }).click();
     await expect(page.getByTestId("knowledge-updates")).toContainText("暂无待确认更新");
     await expect(page.locator(".composer__textarea")).toBeEnabled();
     await expect(page.getByTestId("knowledge-assistant")).toHaveClass(/open/u);
+  });
+
+  test("PK-workspace-tabs 在文档与待确认更新间切换并默认展开会话面板", async ({ page }) => {
+    await installSession(page);
+    await installUnifiedUpdatesScenario(page, { proposal: true });
+    await page.goto("/knowledge");
+
+    const assistant = page.getByTestId("knowledge-assistant");
+    await expect(assistant).toHaveClass(/open/u);
+    const tabs = page.getByRole("tablist", { name: "知识库工作区" });
+    const documentTab = tabs.getByRole("tab", { name: "文档", exact: true });
+    const updatesTab = tabs.getByRole("tab", { name: /待确认更新/u });
+    await expect(documentTab).toHaveAttribute("aria-selected", "true");
+    await expect(documentTab).toHaveAttribute("aria-controls", "knowledge-workspace-panel");
+    await expect(page.getByRole("tabpanel", { name: "文档", exact: true })).toHaveAttribute("id", "knowledge-workspace-panel");
+    await documentTab.focus();
+    await documentTab.press("ArrowRight");
+    await expect(updatesTab).toHaveAttribute("aria-selected", "true");
+    await documentTab.click();
+
+    await expandKnowledgeDirectory(page, "规格约束");
+    await page.getByTestId("knowledge-tree").getByRole("button", { name: "项目约定", exact: true }).click();
+    await expect(page.locator(".main-head")).toContainText("项目约定");
+    const documentViews = page.getByRole("tablist", { name: "项目约定文档视图" });
+    const bodyTab = documentViews.getByRole("tab", { name: "正文", exact: true });
+    const sourceTab = documentViews.getByRole("tab", { name: "来源依据", exact: true });
+    await expect(bodyTab).toHaveAttribute("aria-controls", "knowledge-document-view-panel");
+    await expect(page.getByRole("tabpanel", { name: "正文", exact: true })).toHaveAttribute("id", "knowledge-document-view-panel");
+    await bodyTab.focus();
+    await bodyTab.press("ArrowRight");
+    await expect(sourceTab).toHaveAttribute("aria-selected", "true");
+    await sourceTab.click();
+    await bodyTab.click();
+    await updatesTab.click();
+    await expect(page.getByTestId("knowledge-updates")).toBeVisible();
+    await expect(updatesTab).toHaveAttribute("aria-selected", "true");
+
+    await documentTab.click();
+    await expect(page.getByTestId("knowledge-updates")).toHaveCount(0);
+    await expect(documentTab).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator(".main-head")).toContainText("项目约定");
+    await expect(assistant).toHaveClass(/open/u);
+
+    await page.getByTestId("knowledge-assistant").getByRole("button", { name: "收起", exact: true }).click();
+    await page.reload();
+    await expect(assistant).not.toHaveClass(/open/u);
   });
 
   test("PK-updates-read-failed 读取失败不能显示暂无更新或收起主动讨论", async ({ page }) => {
@@ -1360,6 +1414,7 @@ test.describe("项目知识库资产协作", () => {
     const preview = page.getByTestId("knowledge-build-preview");
     await expect(preview.getByTestId("knowledge-review-notice")).toContainText("AGENTS.md");
     await expect(preview.getByRole("button", { name: "重新复检", exact: true })).toHaveCount(0);
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     let failModels = true;
     await page.route("**/api/engines/status**", route => failModels ? route.fulfill({ status: 503, json: { ok: false, code: "INTERNAL_ERROR", message: "模型目录暂不可用" } }) : route.fallback());
     await preview.getByRole("button", { name: "更新候选并复检", exact: true }).click();
@@ -1431,6 +1486,7 @@ test.describe("项目知识库资产协作", () => {
     await page.getByRole("button", { name: /待确认更新/ }).click();
     const updates = page.getByTestId("knowledge-updates"), preview = page.getByTestId("knowledge-build-preview");
     await updates.getByRole("button", { name: /项目约定/ }).first().click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await preview.getByRole("button", { name: "更新候选并复检", exact: true }).click();
     await expect(page.getByRole("dialog", { name: "更新候选并复检", exact: true })).toHaveCount(0);
     await expect.poll(() => scenario.calls.starts.length).toBe(1);
@@ -1740,9 +1796,10 @@ test.describe("项目知识库资产协作", () => {
     const scenario = await installKnowledgeScenario(page, { reviewState: "failed" });
     await openKnowledge(page, scenario.threadId);
     const summary = page.locator(".task-summary");
-    await expect(summary.getByRole("button", { name: "重试失败项", exact: true })).toBeVisible();
-    await expect(summary.getByRole("button", { name: "调整未完成项要求", exact: true })).toBeVisible();
-    await summary.getByRole("button", { name: "重试失败项", exact: true }).click();
+    await expect(summary.getByRole("button", { name: "继续处理全部未完成项", exact: true })).toBeVisible();
+    await summary.getByRole("button", { name: "任务操作", exact: true }).click();
+    await expect(page.getByRole("menuitem", { name: "只重试失败项", exact: true })).toBeVisible();
+    await page.getByRole("menuitem", { name: "只重试失败项", exact: true }).click();
     await expect.poll(() => scenario.calls.starts.length).toBe(1);
     expect(scenario.calls.starts[0]).toEqual({ workspaceId: WORKSPACE_ID, runId: "batch-e2e", retryFailed: true });
   });
@@ -1752,7 +1809,7 @@ test.describe("项目知识库资产协作", () => {
     const scenario = await installKnowledgeScenario(page, { reviewState: "pending" });
     scenario.setPendingItem();
     await openKnowledge(page, scenario.threadId);
-    await page.locator(".task-summary").getByRole("button", { name: "调整未完成项要求", exact: true }).click();
+    await selectTaskAction(page, "调整未完成项要求");
     const modal = page.getByRole("dialog", { name: "确认批量生成", exact: true });
     await expect(modal).toBeVisible();
     await modal.getByRole("textbox", { name: "批量生成要求", exact: true }).fill("重点检查失败边界");
@@ -1767,7 +1824,7 @@ test.describe("项目知识库资产协作", () => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page, { reviewState: "failed" });
     await openKnowledge(page, scenario.threadId);
-    await page.locator(".task-summary").getByRole("button", { name: "调整未完成项要求", exact: true }).click();
+    await selectTaskAction(page, "调整未完成项要求");
     const modal = page.getByRole("dialog", { name: "复检已有文档", exact: true });
     await expect(modal.getByRole("textbox", { name: "批量生成要求", exact: true })).toHaveCount(0);
     await expect(modal.getByRole("combobox", { name: "最大复检轮次", exact: true })).toHaveCount(0);
@@ -1787,7 +1844,7 @@ test.describe("项目知识库资产协作", () => {
     await expect.poll(() => scenario.calls.starts.length).toBe(1);
     scenario.interruptWithPendingItem();
     await page.reload();
-    await page.locator(".task-summary").getByRole("button", { name: "调整未完成项要求", exact: true }).click();
+    await selectTaskAction(page, "调整未完成项要求");
     const modal = page.getByRole("dialog", { name: "确认批量生成", exact: true });
     await expect(modal).toContainText("关键机制");
     await modal.getByRole("button", { name: "开始生成", exact: true }).click();
@@ -1804,7 +1861,7 @@ test.describe("项目知识库资产协作", () => {
     await expect.poll(() => scenario.calls.starts.length).toBe(1);
     scenario.interruptWithFailedReview();
     await page.reload();
-    await page.locator(".task-summary").getByRole("button", { name: "调整未完成项要求", exact: true }).click();
+    await selectTaskAction(page, "调整未完成项要求");
     const modal = page.getByRole("dialog", { name: "复检已有文档", exact: true });
     await expect(modal).toContainText("关键机制");
     await modal.getByRole("button", { name: "开始复检", exact: true }).click();
@@ -1900,7 +1957,7 @@ test.describe("项目知识库资产协作", () => {
     await expandKnowledgeDirectory(page, "规格约束");
     const tree = page.getByTestId("knowledge-tree");
     await tree.getByRole("button", { name: "项目约定", exact: true }).click();
-    await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     const updates = page.getByTestId("knowledge-updates");
     await page.route("**/api/knowledge/assets/node?**", route => {
       const url = new URL(route.request().url());
@@ -1949,7 +2006,7 @@ test.describe("项目知识库资产协作", () => {
     await openKnowledge(page);
     await expandKnowledgeDirectory(page, "规格约束");
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "项目约定", exact: true }).click();
-    await page.getByRole("button", { name: "查看更新 2", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     const updates = page.getByTestId("knowledge-updates");
     await updates.locator(".update-row").filter({ hasText: "普通会话" }).getByRole("button").click();
     await updates.getByRole("button", { name: "采用此版本", exact: true }).click();
@@ -2221,7 +2278,7 @@ test.describe("项目知识库资产协作", () => {
       expect(firstLineOffset).toBe(0);
       if (visit === 1) break;
       await tree.getByRole("button", { name: "编码规范", exact: true }).click();
-      await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+      await page.getByRole("tab", { name: /待确认更新/u }).click();
       await expect(diff.locator(".diff-editor.is-ready")).toBeVisible();
       await expect(diff.locator(".editor.modified .view-lines[role=presentation]")).toContainText("candidate-b");
       await expect(diff.locator(".line-delete").first()).toBeVisible();
@@ -2269,7 +2326,7 @@ test.describe("项目知识库资产协作", () => {
       };
       requestAnimationFrame(sample);
     }));
-    await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     await page.waitForFunction(() => document.documentElement.dataset.diffWorkerWaiting === "true");
     const diff = page.locator(".revision-diff");
     await expect(diff.locator(".monaco-diff-editor")).toHaveCount(1);
@@ -2282,7 +2339,7 @@ test.describe("项目知识库资产协作", () => {
     await expect(diff.locator(".diff-editor")).toHaveCSS("opacity", "0");
     await tree.getByRole("button", { name: "编码规范", exact: true }).click();
     await expect(page.locator("div.document")).toContainText("formal-b");
-    await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     await expect(diff.locator(".diff-loading")).toBeVisible();
     await expect(diff.locator(".monaco-diff-editor")).toBeHidden();
     const pendingBounds = (await diff.boundingBox())!;
@@ -2371,7 +2428,7 @@ test.describe("项目知识库资产协作", () => {
     await tree.getByRole("button", { name: "项目约定", exact: true }).click();
     await expect(page.locator("div.document")).toContainText("formal-a");
     await expect(page.getByTestId("knowledge-updates")).toHaveCount(0);
-    await page.getByRole("button", { name: "查看更新 2", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     const updates = page.getByTestId("knowledge-updates");
     await expect(updates.getByTestId("knowledge-build-preview")).toHaveCount(0);
     await expect(updates.getByRole("button", { name: "采用此版本", exact: true })).toBeDisabled();
@@ -2743,7 +2800,7 @@ test.describe("项目知识库资产协作", () => {
       await page.mouse.wheel(0, 10_000);
       await expect.poll(() => body.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
       await expect(lastEntry).toBeInViewport();
-      await reading.getByRole("button", { name: "返回文档", exact: true }).click();
+      await reading.locator(".document-view-tabs").getByRole("tab", { name: "正文", exact: true }).click();
       await expect(reading.getByRole("textbox", { name: "知识正文", exact: true })).toHaveValue(content);
       await reading.getByRole("button", { name: /^取\s*消$/u }).click();
     }
@@ -2871,7 +2928,7 @@ test.describe("项目知识库资产协作", () => {
     await tree.getByRole("button", { name: "项目约定", exact: true }).click();
     await showKnowledgeAssistant(page);
     await expect(assistant).toContainText("当前文件版本尚无可用的生成会话记录");
-    await page.getByRole("button", { name: "查看更新 2", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     const updates = page.getByTestId("knowledge-updates");
     await expect(assistant).toContainText("请选择一个候选版本");
     await updates.getByRole("button", { name: /项目约定/ }).first().click();
@@ -2885,7 +2942,7 @@ test.describe("项目知识库资产协作", () => {
     release();
     await expect(draft).toHaveValue("只给旧候选的补充要求");
     await tree.getByRole("button", { name: "编码规范", exact: true }).click();
-    await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     await expect(assistant).toContainText("知识工作会话 · 编码规范");
     await expect(draft).toHaveValue("");
     await draft.fill("编码规范的补充要求");
@@ -2917,7 +2974,7 @@ test.describe("项目知识库资产协作", () => {
     await openKnowledge(page);
     await expandKnowledgeDirectory(page, "规格约束");
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "项目约定", exact: true }).click();
-    await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     await showKnowledgeAssistant(page);
     const assistant = page.getByTestId("knowledge-assistant");
     await expect(assistant).toContainText("知识工作会话 · 项目约定");
@@ -4820,7 +4877,7 @@ test.describe("项目知识库资产协作", () => {
     const updates = page.getByTestId("knowledge-updates"), preview = page.getByTestId("knowledge-build-preview");
     await expect(preview).toContainText("复检发现 1 个阻断问题");
     await expect(updates.getByRole("button", { name: "采用此版本", exact: true })).toBeDisabled();
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     const report = preview.getByTestId("knowledge-review-report");
     await expect(report).toContainText("缺少错误码字段");
     await report.getByRole("button", { name: "按报告问题生成修订版", exact: true }).click();
@@ -4841,8 +4898,9 @@ test.describe("项目知识库资产协作", () => {
     const preview = page.getByTestId("knowledge-build-preview"), assistant = page.getByTestId("knowledge-assistant");
     await page.setViewportSize({ width: 390, height: 844 });
     const collapse = assistant.getByRole("button", { name: "收起", exact: true });
-    if (await collapse.isVisible()) await collapse.click();
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    if (await assistant.evaluate(element => element.classList.contains("open"))) await collapse.dispatchEvent("click");
+    await expect(assistant).not.toHaveClass(/open/u);
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await expectNoHorizontalOverflow(preview);
     await expectNoHorizontalOverflow(preview.getByTestId("knowledge-review-report"));
     await preview.getByRole("button", { name: "回知识工作会话修订", exact: true }).click();
@@ -4853,7 +4911,7 @@ test.describe("项目知识库资产协作", () => {
     expect(scenario.calls.adopts).toHaveLength(0);
   });
 
-  test("PK-preview-review-compact 提示保持紧凑，顶部可直接重新复检且窄屏不溢出", async ({ page }, testInfo) => {
+  test("PK-preview-review-compact 提示保持紧凑，复检操作集中在报告Tab且窄屏不溢出", async ({ page }, testInfo) => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page, { reviewState: "stale" });
     await page.setViewportSize({ width: 1920, height: 900 });
@@ -4865,7 +4923,9 @@ test.describe("项目知识库资产协作", () => {
     await page.screenshot({ path: testInfo.outputPath("compact-desktop.png") });
     expect((await notice.boundingBox())!.height).toBeLessThanOrEqual(48);
     await expect(preview.getByRole("tab", { name: "变更", exact: true })).toHaveAttribute("aria-selected", "true");
-    await notice.getByRole("button", { name: "重新复检", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
+    const report = preview.getByTestId("knowledge-review-report");
+    await report.getByRole("button", { name: "重新复检", exact: true }).click();
     const modal = page.getByRole("dialog", { name: "复检已有文档", exact: true });
     await expect(modal.locator(".batch-preview > div")).toHaveCount(1);
     expect(scenario.calls.starts).toHaveLength(0);
@@ -4874,10 +4934,10 @@ test.describe("项目知识库资产协作", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await expectNoHorizontalOverflow(preview);
     await expectNoHorizontalOverflow(notice);
-    await expectInside(notice.getByRole("button", { name: "重新复检", exact: true }), notice);
-    expect((await notice.boundingBox())!.height).toBeLessThanOrEqual(110);
+    await expectInside(report.getByRole("button", { name: "重新复检", exact: true }), report);
+    expect((await notice.boundingBox())!.height).toBeLessThanOrEqual(48);
     await page.screenshot({ path: testInfo.outputPath("compact-mobile.png") });
-    await notice.getByRole("button", { name: "重新复检", exact: true }).click();
+    await report.getByRole("button", { name: "重新复检", exact: true }).click();
     await modal.getByRole("button", { name: "开始复检", exact: true }).click();
     await expect.poll(() => scenario.calls.starts.length).toBe(1);
     expect(scenario.calls.generates[0]).toMatchObject({ mode: "review", selectedNodeIds: ["root"], includeDescendants: false });
@@ -5005,7 +5065,7 @@ test.describe("项目知识库资产协作", () => {
       await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
       const preview = page.getByTestId("knowledge-build-preview");
       await expect(preview).toContainText(state === "stale" ? "复检依据已变化" : state === "failed" ? "复检未完成，请重试复检" : "文档已保存，请继续复检");
-      await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+      await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
       const report = preview.getByTestId("knowledge-review-report");
       if (state === "stale") await expect(report.getByRole("button", { name: "按报告问题生成修订版", exact: true })).toBeDisabled();
       if (state !== "stale") {
@@ -5035,7 +5095,7 @@ test.describe("项目知识库资产协作", () => {
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
     const preview = page.getByTestId("knowledge-build-preview");
     await expect(preview).toContainText("请有维护权限的成员");
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     for (const name of ["重新复检", "按报告问题生成修订版", "回知识工作会话修订"]) {
       await expect(preview.getByRole("button", { name, exact: true }).first()).toBeDisabled();
       for (const button of await preview.getByRole("button", { name, exact: true }).all()) await expect(button).toBeDisabled();
@@ -5053,7 +5113,7 @@ test.describe("项目知识库资产协作", () => {
     const preview = page.getByTestId("knowledge-build-preview");
     await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await expect(preview).toContainText("复检通过（有提醒）");
-    await expect(preview.getByRole("button", { name: "查看复检报告", exact: true })).toHaveCount(0);
+    await expect(preview.getByRole("tab", { name: "复检报告", exact: true })).toHaveCount(1);
     await expect(preview.getByRole("button", { name: "按报告问题生成修订版", exact: true })).toHaveCount(0);
     await expect(page.getByTestId("knowledge-updates").getByRole("button", { name: "采用此版本", exact: true })).toBeEnabled();
   });
@@ -5068,9 +5128,10 @@ test.describe("项目知识库资产协作", () => {
     await page.route("**/api/knowledge/assets/reviews?**", route => route.fulfill({ json: { ok: true, data: [] } }));
     await page.reload();
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "关键机制", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     const preview = page.getByTestId("knowledge-build-preview");
     await expect(preview).toContainText("复检未完成，请重试复检");
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await expect(preview.getByRole("button", { name: "复检这份文档", exact: true })).toHaveCount(0);
     expect(scenario.calls.generates).toHaveLength(1);
     expect(scenario.calls.starts).toHaveLength(1);
@@ -5090,9 +5151,10 @@ test.describe("项目知识库资产协作", () => {
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
     const preview = page.getByTestId("knowledge-build-preview");
     await expect(preview).toContainText("复检报告读取失败");
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await expect(preview).not.toContainText("尚未复检");
-    await expect(preview.getByRole("button", { name: "重新复检", exact: true })).toBeDisabled();
+    await expect(preview.getByRole("button", { name: "重新复检", exact: true })).toHaveCount(0);
+    await expect(preview.getByRole("button", { name: "重新读取报告", exact: true })).toBeEnabled();
     failed = false;
     await preview.getByRole("button", { name: "重新读取报告", exact: true }).click();
     await expect(preview.getByTestId("knowledge-review-report")).toContainText("缺少错误码字段");
@@ -5109,8 +5171,8 @@ test.describe("项目知识库资产协作", () => {
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
     const preview = page.getByTestId("knowledge-build-preview");
     await expect(preview).toContainText("已有更新的待采用版本");
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
-    await expect(preview.getByRole("button", { name: "重新复检", exact: true })).toHaveCount(2);
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
+    await expect(preview.getByRole("button", { name: "重新复检", exact: true })).toHaveCount(1);
     for (const button of await preview.getByRole("button", { name: "重新复检", exact: true }).all()) await expect(button).toBeDisabled();
     expect(scenario.calls.starts).toHaveLength(0);
   });
@@ -5123,10 +5185,10 @@ test.describe("项目知识库资产协作", () => {
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
     const preview = page.getByTestId("knowledge-build-preview");
     await expect(preview).toContainText("请更新资料后重新导入并复检");
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await expect(preview.getByRole("button", { name: "按报告问题生成修订版", exact: true })).toHaveCount(0);
     await expect(preview.getByRole("button", { name: "回知识工作会话修订", exact: true })).toHaveCount(0);
-    await expect(preview.getByTestId("knowledge-review-notice").getByRole("button", { name: "重新复检", exact: true })).toBeEnabled();
+    await expect(preview.getByTestId("knowledge-review-report").getByRole("button", { name: "重新复检", exact: true })).toBeEnabled();
     expect(scenario.calls.generates).toHaveLength(0);
   });
 
@@ -5136,7 +5198,7 @@ test.describe("项目知识库资产协作", () => {
     await openKnowledge(page, scenario.threadId);
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
     const preview = page.getByTestId("knowledge-build-preview");
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await preview.getByRole("button", { name: "回知识工作会话修订", exact: true }).click();
     const assistant = page.getByTestId("knowledge-assistant");
     await assistant.locator(".composer__textarea").press("Enter");
@@ -5164,7 +5226,7 @@ test.describe("项目知识库资产协作", () => {
     await page.reload();
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "功能说明", exact: true }).click();
     const preview = page.getByTestId("knowledge-build-preview");
-    await preview.getByRole("button", { name: "查看复检报告", exact: true }).click();
+    await preview.getByRole("tab", { name: "复检报告", exact: true }).click();
     await preview.getByRole("button", { name: "回知识工作会话修订", exact: true }).click();
     const input = page.getByTestId("knowledge-assistant").locator(".composer__textarea");
     await expect(input).toHaveValue(/缺少错误码字段/);
@@ -5185,7 +5247,7 @@ test.describe("项目知识库资产协作", () => {
     let validations = 0;
     await page.route("**/api/knowledge/assets/update.schedule?**", async route => { await scheduleGate; await route.fallback(); });
     await page.route("**/api/knowledge/assets/run.preview?**", async route => { validations++; await route.fallback(); });
-    await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     const updates = page.getByTestId("knowledge-updates");
     await expect(updates.locator(".revision-diff")).toContainText("candidate-a");
     await expect.poll(() => validations).toBeGreaterThan(0);
@@ -5204,7 +5266,7 @@ test.describe("项目知识库资产协作", () => {
     await page.getByTestId("knowledge-tree").getByRole("button", { name: "项目约定", exact: true }).click();
     await expect(page.locator("div.document")).toContainText("formal-a");
     await page.route("**/api/knowledge/assets/update.schedule?**", route => route.fulfill({ status: 503, json: { ok: false, code: "E2E_MAINTENANCE_READ_FAILED", message: "维护配置暂时无法读取" } }));
-    await page.getByRole("button", { name: "查看更新 1", exact: true }).click();
+    await page.getByRole("tab", { name: /待确认更新/u }).click();
     const updates = page.getByTestId("knowledge-updates");
     await expect(updates.locator(".revision-diff")).toContainText("candidate-a");
     await expect(updates).toContainText("维护配置暂时无法读取");
@@ -5924,7 +5986,7 @@ test.describe("项目知识库资产协作", () => {
     expect(scenario.calls.adopts).toHaveLength(0);
     await page.getByRole("button", { name: "仍然采用", exact: true }).click();
     await expect.poll(() => scenario.calls.adopts.length).toBe(1);
-    await page.getByRole("button", { name: "返回文档", exact: true }).click();
+    await page.locator(".document-view-tabs").getByRole("tab", { name: "正文", exact: true }).click();
     await expect(page.locator(".document-title")).toContainText("已确认采用");
     await expect(page.locator("div.document")).toContainText("错误日志规范");
     await openDocumentMenu(page, "复检报告");

@@ -182,7 +182,7 @@ const busy = ref(false);
 const errorText = ref<string | null>(null);
 const errorDiagnostics = ref<{ code: string; source: string; requestId: string | null; operation: string | null; rootCause: string | null } | null>(null);
 const treeOpen = ref(true);
-const assistantOpen = ref(false);
+const assistantOpen = ref(true);
 const sessionMenuOpen = ref(false);
 const editing = ref(false);
 const editContent = ref("");
@@ -800,7 +800,7 @@ function previousPageStateKey(): string {
 function legacyPageStateKey(): string {
   return `knowledge-page-state:${encodeURIComponent(JSON.stringify([config.serverWsOrigin, config.userSummary?.userId ?? "", workspaceId.value]))}`;
 }
-type KnowledgePageState = { selectedId: string | null; overviewOpen?: boolean; directoryPreviewId?: string | null; viewTab: "node" | "sources" | "review"; assistantOpen: boolean; selectedChangeId: string | null; updatesTarget: KnowledgeUpdateTarget | null };
+type KnowledgePageState = { selectedId: string | null; overviewOpen?: boolean; directoryPreviewId?: string | null; viewTab: "node" | "sources" | "review"; assistantOpen: boolean; assistantOpenExplicit: boolean; selectedChangeId: string | null; updatesTarget: KnowledgeUpdateTarget | null };
 /** 读取本标签页上次的目录、面板和文档视图状态；损坏数据按空状态处理并记录错误。 */
 function restorePageState(): KnowledgePageState | null {
   if (typeof window === "undefined") return null;
@@ -816,7 +816,8 @@ function restorePageState(): KnowledgePageState | null {
     const target = value.updatesTarget && typeof value.updatesTarget === "object" ? value.updatesTarget as Record<string, unknown> : null;
     return { selectedId: typeof legacyNode === "string" ? legacyNode : typeof value.selectedId === "string" ? value.selectedId : null,
       directoryPreviewId: typeof value.directoryPreviewId === "string" ? value.directoryPreviewId : null,
-      viewTab, overviewOpen: value.overviewOpen === true, assistantOpen: value.assistantOpen === true,
+      viewTab, overviewOpen: value.overviewOpen === true,
+      assistantOpen: value.assistantOpenExplicit === true ? value.assistantOpen === true : true, assistantOpenExplicit: true,
       selectedChangeId: typeof value.selectedChangeId === "string" ? value.selectedChangeId : null,
       updatesTarget: target ? { scopeNodeId: typeof target.scopeNodeId === "string" ? target.scopeNodeId : null, changeId: typeof target.changeId === "string" ? target.changeId : null, focusId: typeof target.focusId === "string" ? target.focusId : null, focusRunId: typeof target.focusRunId === "string" ? target.focusRunId : undefined, report: target.report === true, recoveryRunId: typeof target.recoveryRunId === "string" ? target.recoveryRunId : undefined }
         : value.updatesOpen === true || value.pageView === "results" || value.pageView === "approvals" ? { scopeNodeId: typeof legacyNode === "string" ? legacyNode : null } : null };
@@ -828,7 +829,7 @@ function persistPageState(): void {
   try {
     // 后台快照不能清空用户已选节点，正文选择与左树保持一致。
     const persistedSelectedId = selectedId.value ?? selectedNodeIntent.value;
-    window.sessionStorage.setItem(pageStateKey(), JSON.stringify({ selectedId: overviewOpen.value ? null : persistedSelectedId, overviewOpen: overviewOpen.value, viewTab: viewTab.value, assistantOpen: assistantOpen.value, selectedChangeId: selectedChangeId.value, updatesTarget: updatesTarget.value } satisfies KnowledgePageState));
+    window.sessionStorage.setItem(pageStateKey(), JSON.stringify({ selectedId: overviewOpen.value ? null : persistedSelectedId, overviewOpen: overviewOpen.value, viewTab: viewTab.value, assistantOpen: assistantOpen.value, assistantOpenExplicit: true, selectedChangeId: selectedChangeId.value, updatesTarget: updatesTarget.value } satisfies KnowledgePageState));
   }
   catch (error) { reportError(error, "KNOWLEDGE_PAGE_STATE_SAVE_FAILED"); }
 }
@@ -1055,18 +1056,38 @@ async function openUpdates(scopeNodeId: string | null = selectedId.value): Promi
   return true;
 }
 
-/** 更新列表确认读取成功且无候选时收起空文件会话；主动项目讨论与运行中任务保留。 */
-function handleUpdatesEmpty(empty: boolean): void {
-  if (empty && showUpdates.value && !updatesBusy.value && !busy.value && !showProjectConversation.value && !displayedExecutionSession.value && !executionSessionLoading.value && !requestedExecutionThreadId.value && !executionThreadRunning.value && !executionRunActive.value) assistantOpen.value = false;
-}
-
 /** 返回正式内容，空文件保留可见占位，不自动再次打开候选。 */
-function closeUpdates(): void {
-  if (updatesBusy.value) return;
+async function closeUpdates(): Promise<void> {
+  if (updatesBusy.value || !await guardEdits()) return;
+  if (!await clearApprovalRoute(selectedId.value ?? undefined)) return;
   closeExecutionSession();
   updatesTarget.value = null; selectedChangeId.value = null; suppressAutoPreview.value = readingNodeId.value;
   overviewOpen.value = route.query.view === "overview" || route.query.view !== "assets" && !readingNodeId.value;
-  clearApprovalRoute();
+}
+
+/** 主工作区Tab保留文档选择，在文档与待确认清单间切换。 */
+async function setWorkspaceView(view: "document" | "updates"): Promise<void> {
+  if (view === "updates") {
+    if (!showUpdates.value) await openUpdates(selectedId.value);
+    return;
+  }
+  if (showUpdates.value) await closeUpdates();
+}
+
+/** Tab列表使用左右方向键循环切换，并与点击复用相同的编辑保护。 */
+function moveTabFocus(event: KeyboardEvent): void {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  const current = event.target;
+  if (!(current instanceof HTMLButtonElement)) return;
+  const list = current.closest<HTMLElement>("[role='tablist']");
+  const tabs = list ? Array.from(list.querySelectorAll<HTMLButtonElement>("[role='tab']:not(:disabled)")) : [];
+  const index = tabs.indexOf(current);
+  if (index < 0 || tabs.length < 2) return;
+  event.preventDefault();
+  const offset = event.key === "ArrowRight" ? 1 : -1;
+  const next = tabs[(index + offset + tabs.length) % tabs.length]!;
+  next.focus();
+  next.click();
 }
 
 /** 采用或不采用后刷新事实和索引，不改变文件、版本、会话选择。 */
@@ -1495,7 +1516,7 @@ async function load(): Promise<void> {
   importOpen.value = false; importLoading.value = false; importItems.value = []; importDirectories.value = [];
   importCategory.value = "product"; importAppliesTo.value = "";
   importNextOffset.value = null; selectedImportPaths.value = []; importDirectory.value = ""; importDirectoryInput.value = ""; importError.value = null; importSubmitError.value = null;
-  if (restoredPage && !narrowScreen.value) assistantOpen.value = restoredPage.assistantOpen;
+  if (!narrowScreen.value) assistantOpen.value = restoredPage?.assistantOpen ?? true;
   if (!scope) { hydratingPageState = false; return; }
   // 有缓存时先交付目录和上次正文，首屏快照与状态补齐继续在后台进行。
   if (cachedSnapshot) {
@@ -2575,18 +2596,32 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
       </aside>
 
       <main class="main">
+        <div class="workspace-tabs" role="tablist" aria-label="知识库工作区" @keydown="moveTabFocus">
+          <button id="knowledge-document-tab" type="button" role="tab" aria-controls="knowledge-workspace-panel" :aria-selected="!showUpdates" :tabindex="showUpdates ? -1 : 0" :class="{ active: !showUpdates }" @click="setWorkspaceView('document')">文档</button>
+          <button id="knowledge-updates-tab" type="button" role="tab" aria-controls="knowledge-workspace-panel" :aria-selected="showUpdates" :tabindex="showUpdates ? 0 : -1" :class="{ active: showUpdates }" @click="setWorkspaceView('updates')">待确认更新 <a-badge :count="visibleWorkTree.targetCount" :show-zero="true" :overflow-count="99" color="var(--app-muted)" /></button>
+        </div>
+        <div id="knowledge-workspace-panel" class="workspace-panel" role="tabpanel" :aria-labelledby="showUpdates ? 'knowledge-updates-tab' : 'knowledge-document-tab'">
         <div v-if="summaryRun && ((!selectedId && !showUpdates && !readingPending) || summaryRun.active || summaryUnfinished || summaryRun.id === maintenanceRunId || summaryRun.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled))" class="task-summary" role="status">
           <div><strong>{{ summaryRun.active ? '文档生成中' : summaryRun.id === maintenanceRunId ? '内容已采用，维护设置尚未保存' : summaryRun.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled) ? '有未完成采用，需恢复或终止' : '文档生成需要处理' }}</strong><span>{{ summaryIssue ?? (summaryRun.mode === 'conversation' ? `已交付 ${summaryRun.items.filter(item => item.status === 'completed').length} 份文档` : `已保存 ${summaryRun.items.filter(item => item.status === 'completed').length} / ${summaryRun.items.length} 篇`) }}</span></div>
           <a-button v-if="summaryRun.id === maintenanceRunId || summaryRun.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled)" size="small" :disabled="busy || updatesBusy" @click="openRecovery(summaryRun)">恢复未完成操作</a-button>
-          <template v-else-if="summaryUnfinished"><a-button v-if="summaryAdjustable" size="small" :disabled="!canWrite || busy || updatesBusy || threadRunning" @click="reviseBatch(summaryRun)">调整未完成项要求</a-button><a-button v-if="summaryFailed" size="small" :disabled="!canWrite || busy || updatesBusy || threadRunning" @click="resumeGeneration(summaryRun, true)">重试失败项</a-button><a-button size="small" type="primary" :disabled="!canWrite || busy || updatesBusy || threadRunning" @click="resumeGeneration(summaryRun)">继续未完成项</a-button></template>
+          <template v-else-if="summaryUnfinished">
+            <a-button size="small" type="primary" :disabled="!canWrite || busy || updatesBusy || threadRunning" @click="resumeGeneration(summaryRun)">继续处理全部未完成项</a-button>
+            <a-dropdown v-if="summaryAdjustable || summaryFailed" :trigger="['click']">
+              <a-button size="small" aria-label="任务操作">任务操作</a-button>
+              <template #overlay><a-menu>
+                <a-menu-item v-if="summaryAdjustable" :disabled="!canWrite || busy || updatesBusy || threadRunning" @click="reviseBatch(summaryRun)">调整未完成项要求</a-menu-item>
+                <a-menu-item v-if="summaryFailed" :disabled="!canWrite || busy || updatesBusy || threadRunning" @click="resumeGeneration(summaryRun, true)">只重试失败项</a-menu-item>
+              </a-menu></template>
+            </a-dropdown>
+          </template>
           <a-button v-if="summaryRun.active" size="small" :disabled="busy || !canWrite" @click="stopGeneration(summaryRun)">停止</a-button>
         </div>
-        <div v-if="visibleWorkTree.targetCount && !selectedId && !showUpdates && !readingPending" class="updates-summary"><span>{{ visibleWorkTree.documentCount }} 篇文档有待确认更新<span v-if="visibleWorkTree.structureCount">，另含 {{ visibleWorkTree.structureCount }} 项结构调整</span></span><a-button size="small" @click="openUpdates(null)">查看更新</a-button></div>
+        <div v-if="visibleWorkTree.targetCount && !selectedId && !showUpdates && !readingPending" class="updates-summary"><span>{{ visibleWorkTree.documentCount }} 篇文档有待确认更新<span v-if="visibleWorkTree.structureCount">，另含 {{ visibleWorkTree.structureCount }} 项结构调整</span></span></div>
         <div class="reading-layout">
           <section class="reading-document">
         <!-- 采用至结果定位完成前持续加载，保留组件执行请求和失败恢复。 -->
         <div v-if="showUpdates && updatesBusy" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
-        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesScopeNodeId" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-run-id="updatesTarget?.focusRunId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @stop-run="stopGeneration($event)" @focus="rememberUpdateFocus" @preview="updatePreview = $event" @empty="handleUpdatesEmpty" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @refresh-sources="refreshCandidateSources" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
+        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesScopeNodeId" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-run-id="updatesTarget?.focusRunId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @stop-run="stopGeneration($event)" @focus="rememberUpdateFocus" @preview="updatePreview = $event" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @refresh-sources="refreshCandidateSources" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
         <KnowledgeOverview v-else-if="overviewOpen" :snapshot="snapshot" :runs="taskList" :changes="pendingChangeNodes" :loading="loading || Boolean(snapshot && !snapshotStatesReady && !snapshotStatesError)" :state-error="snapshotStatesError" :run-error="resultsLoadError" :can-write="canWrite" :busy="busy || updatesBusy || buildStarting || binding || conversationLoading || taskList.some(run => run.active)" @improve="openQuickGenerate" @discuss="openSpecificationConversation" @updates="openUpdates(null)" @select="selectTreeNode" @retry="retryOverview" @policy="policyOpen = true" />
         <!-- 尚未确定正式正文或候选预览时保持加载，避免先渲染普通正文页。 -->
         <div v-else-if="documentReadError" class="empty" role="alert"><h3>文档读取失败</h3><p>{{ documentReadError.message }}</p><a-button :disabled="busy || updatesBusy" @click="retryReadDocument">重新读取文档</a-button></div>
@@ -2600,10 +2635,13 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
                 <a-button v-if="!editing && !previewIsDraft" size="small" :disabled="!canWrite" @click="editing = true">编辑文档</a-button>
                 <template v-else-if="editing"><a-button size="small" @click="editing = false; editContent = documentText">取消</a-button><a-button size="small" type="primary" :loading="busy" :disabled="!canWrite" @click="saveManual">保存到项目</a-button></template>
               </template>
-              <a-button v-if="currentUpdatesCount" size="small" @click="openUpdates(node.id)">查看更新 {{ currentUpdatesCount }}</a-button><a-button v-if="viewTab !== 'node'" size="small" @click="setContentView('node')">返回文档</a-button><a-dropdown :trigger="['click']"><a-button size="small" :aria-label="`${node.title}更多操作`">更多</a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="startBuild([node!.id])">重新生成此文档</a-menu-item><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="openReview([node!.id], false)">复检此文档</a-menu-item><a-menu-item @click="setContentView('sources')">来源依据</a-menu-item><a-menu-item @click="setContentView('review')">复检报告</a-menu-item></a-menu></template></a-dropdown>
+              <a-dropdown :trigger="['click']"><a-button size="small" :aria-label="`${node.title}更多操作`">更多</a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="startBuild([node!.id])">重新生成此文档</a-menu-item><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="openReview([node!.id], false)">复检此文档</a-menu-item></a-menu></template></a-dropdown>
             </div>
           </div>
-          <div class="content" :class="{ 'editing-content': editing && viewTab === 'node', 'document-loading': documentLoading }">
+          <div class="document-view-tabs" role="tablist" :aria-label="`${node.title}文档视图`" @keydown="moveTabFocus">
+            <button v-for="tab in [{ key: 'node', title: '正文' }, { key: 'sources', title: '来源依据' }, { key: 'review', title: '复检报告' }]" :id="`knowledge-document-tab-${tab.key}`" :key="tab.key" type="button" role="tab" aria-controls="knowledge-document-view-panel" :aria-selected="viewTab === tab.key" :tabindex="viewTab === tab.key ? 0 : -1" :class="{ active: viewTab === tab.key }" @click="setContentView(tab.key as 'node' | 'sources' | 'review')">{{ tab.title }}</button>
+          </div>
+          <div id="knowledge-document-view-panel" role="tabpanel" :aria-labelledby="`knowledge-document-tab-${viewTab}`" class="content" :class="{ 'editing-content': editing && viewTab === 'node', 'document-loading': documentLoading }">
             <div v-if="documentLoading" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
             <template v-else>
             <div v-if="detail?.drafts.length && !currentUpdatesCount" class="revision-bar">
@@ -2645,6 +2683,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           <p>先明确规格约束，再实现与验证。点击“一键生成规格”整理规格及支撑文档，确认采用后，在研发会话中开启 Spec 使用。</p>
         </div>
           </section>
+        </div>
         </div>
       </main>
 
@@ -2893,6 +2932,12 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .collapsed-rail:hover { background: var(--app-sidebar-hover-bg); color: var(--app-accent); }
 .assistant-rail { border-left: 1px solid var(--app-divider); }
 .main { background: var(--app-bg); }
+.workspace-tabs, .document-view-tabs { display: flex; flex: 0 0 auto; align-items: stretch; gap: 14px; min-width: 0; padding: 0 16px; border-bottom: 1px solid var(--app-divider); }
+.workspace-panel { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.workspace-tabs button, .document-view-tabs button { position: relative; display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0 2px; border: 0; background: transparent; color: var(--app-muted); font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-tabs button.active, .document-view-tabs button.active { color: var(--app-accent); font-weight: 600; }
+.workspace-tabs button.active::after, .document-view-tabs button.active::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: var(--app-accent); content: ""; }
+.workspace-tabs button span { min-width: 18px; padding: 0 5px; border-radius: 10px; background: var(--app-sidebar-active-bg); color: var(--app-muted); text-align: center; font-size: 10px; line-height: 18px; }
 .task-summary, .updates-summary { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 6px 12px; border-bottom: 1px solid var(--app-divider); font-size: 12px; }
 .task-summary > div { display: flex; flex: 1; flex-wrap: wrap; gap: 8px; }.task-summary span { color: var(--app-muted); }
 .updates-summary > span { flex: 1; }.updates-summary { background: color-mix(in srgb, var(--app-warning) 5%, var(--app-bg)); }

@@ -732,7 +732,10 @@ if (process.versions.electron) {
         await persistDesktopStorageLocation(location);
       }
       if (quitAllowed) return;
-      const configuredServerOrigin = readInstalledUpdateOrigin(releaseResourcesDir, process.env.CODEFLOWAI_DESKTOP_SERVER_ORIGIN);
+      /** 本地联调显式关闭更新检查；生产不设置该变量，保持原更新链路。 */
+      const updatesDisabled = /^(?:1|true)$/iu.test(String(process.env.CODEFLOWAI_DESKTOP_DISABLE_UPDATES ?? "").trim());
+      const configuredServerOrigin = updatesDisabled ? undefined
+        : readInstalledUpdateOrigin(releaseResourcesDir, process.env.CODEFLOWAI_DESKTOP_SERVER_ORIGIN);
       const unsignedLocal = readUnsignedLocalMarker();
       if (unsignedLocal) console.warn(JSON.stringify({ code: "DESKTOP_UNSIGNED_LOCAL_BASELINE_SKIPPED", requestId: startupRequestId }));
       const shellVersion = readRunningShellVersion();
