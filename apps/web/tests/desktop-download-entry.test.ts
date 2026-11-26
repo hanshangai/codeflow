@@ -16,6 +16,7 @@ const installer = {
   sha256: "a".repeat(64),
   downloadPath: "/api/public/desktop-download/windows-x64",
 };
+const info = { packages: [installer] };
 
 test("detects the desktop download platform from browser facts", () => {
   assert.equal(detectDesktopDownloadPlatform("Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Win32"), "win32");
@@ -28,12 +29,18 @@ test("windows downloads the registered installer while other systems open the do
   const direct = await resolveDesktopDownloadTarget({
     platform: "win32",
     origin: "wss://codeflow.example",
-    load: async () => installer,
+    load: async () => info,
   });
   assert.deepEqual(direct, { kind: "direct", url: "https://codeflow.example/api/public/desktop-download/windows-x64" });
 
+  // 仅登记 macOS 包时 Windows 入口回到下载页，避免下发错误平台安装包。
+  const macOnly = await resolveDesktopDownloadTarget({ platform: "win32", origin: "wss://codeflow.example",
+    load: async () => ({ packages: [{ ...installer, platform: "darwin" as const, arch: "arm64" as const,
+      downloadPath: "/api/public/desktop-download/darwin-arm64" }] }) });
+  assert.deepEqual(macOnly, { kind: "page" });
+
   for (const platform of ["darwin", "linux", "unknown"] as const) {
-    const target = await resolveDesktopDownloadTarget({ platform, origin: "wss://codeflow.example", load: async () => installer });
+    const target = await resolveDesktopDownloadTarget({ platform, origin: "wss://codeflow.example", load: async () => info });
     assert.deepEqual(target, { kind: "page" });
   }
 

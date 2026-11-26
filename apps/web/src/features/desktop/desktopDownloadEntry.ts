@@ -32,7 +32,9 @@ export async function resolveDesktopDownloadTarget(input: {
   if (input.platform !== "win32") return { kind: "page" };
   try {
     const info = await input.load();
-    return { kind: "direct", url: `${wsOriginToHttpOrigin(input.origin)}${info.downloadPath}` };
+    // 只有登记了 Windows x64 包才直达；仅发布 macOS 时不把 dmg 交给 Windows 用户。
+    const target = info.packages.find(item => item.platform === "win32" && item.arch === "x64");
+    return target ? { kind: "direct", url: `${wsOriginToHttpOrigin(input.origin)}${target.downloadPath}` } : { kind: "page" };
   } catch (error) {
     input.onError?.(error);
     return { kind: "page" };
