@@ -995,7 +995,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchRoles(ctx, workspaceId, purpose);
         if (!isCurrentAssetListRefresh(this, "role", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "role", res.roles, res.assetMetadata, purpose);
+        const snapshot = await prepareServerAssetListSnapshot(ctx, workspaceId, "role", res.roles, res.assetMetadata, purpose);
         if (!isCurrentAssetListRefresh(this, "role", workspaceEpoch, refreshVersion)) return;
         this.roles = snapshot.definitions;
         this.assetListMetadata.role = snapshot.metadata;
@@ -1090,7 +1090,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchKnowledgeBundles(ctx, workspaceId);
         if (!isCurrentAssetListRefresh(this, "knowledge_bundle", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "knowledge_bundle", res.bundles, res.assetMetadata);
+        const snapshot = await prepareServerAssetListSnapshot(ctx, workspaceId, "knowledge_bundle", res.bundles, res.assetMetadata);
         if (!isCurrentAssetListRefresh(this, "knowledge_bundle", workspaceEpoch, refreshVersion)) return;
         this.knowledgeBundles = snapshot.definitions;
         this.assetListMetadata.knowledge_bundle = snapshot.metadata;
@@ -1183,7 +1183,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchSkills(ctx, workspaceId);
         if (!isCurrentAssetListRefresh(this, "skill", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "skill", res.skills, res.assetMetadata);
+        const snapshot = await prepareServerAssetListSnapshot(ctx, workspaceId, "skill", res.skills, res.assetMetadata);
         if (!isCurrentAssetListRefresh(this, "skill", workspaceEpoch, refreshVersion)) return;
         this.skills = snapshot.definitions;
         this.assetListMetadata.skill = snapshot.metadata;
@@ -1309,7 +1309,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchToolsets(ctx, workspaceId);
         if (!isCurrentAssetListRefresh(this, "toolset", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "toolset", res.toolsets, res.assetMetadata);
+        const snapshot = await prepareServerAssetListSnapshot(ctx, workspaceId, "toolset", res.toolsets, res.assetMetadata);
         if (!isCurrentAssetListRefresh(this, "toolset", workspaceEpoch, refreshVersion)) return;
         this.toolsets = snapshot.definitions;
         this.assetListMetadata.toolset = snapshot.metadata;
@@ -1402,7 +1402,7 @@ export const useOrchestrationStore = defineStore("orchestration", {
         const res = await listOrchWorkflows(ctx, workspaceId, purpose);
         if (!isCurrentAssetListRefresh(this, "workflow", workspaceEpoch, refreshVersion)) return;
         if (!res.ok) throw createApiResultError(res);
-        const snapshot = await prepareSharedAssetListSnapshot(ctx, workspaceId, "workflow", res.workflows, res.assetMetadata, purpose);
+        const snapshot = await prepareServerAssetListSnapshot(ctx, workspaceId, "workflow", res.workflows, res.assetMetadata, purpose);
         if (!isCurrentAssetListRefresh(this, "workflow", workspaceEpoch, refreshVersion)) return;
         this.workflows = snapshot.definitions;
         this.assetListMetadata.workflow = snapshot.metadata;
@@ -3499,15 +3499,14 @@ function getAssetDefinitionIds(state: OrchestrationState, assetType: OrchAssetTy
   return definitions.filter(item => !hostIds.has(item.id)).map(item => item.id);
 }
 
-/** 共享及桌面远程工作区补读目标 Client；保留 Server 修订，Client 原件沿 Host 只读边界展示。 */
-async function prepareSharedAssetListSnapshot<T extends OrchAssetType, D extends { id: string }>(
+/** 服务端权威列表统一补读承载 Client 内置资产；旧 Client 仍从自身目录返回，原件沿 Host 只读边界展示。 */
+async function prepareServerAssetListSnapshot<T extends OrchAssetType, D extends { id: string }>(
   ctx: ApiRequestContext, workspaceId: WorkspaceId, assetType: T, definitions: D[],
   metadata: OrchAssetListMetadata<T>[] | undefined, purpose?: "execution",
 ): Promise<{ definitions: D[]; metadata: OrchAssetListMetadata<T>[] | null; hostAssetIds?: string[]; hostFailure?: { cause: unknown } }> {
   const snapshot = prepareAssetListSnapshot(assetType, definitions, metadata);
-  const localClientId = ctx.desktopClientId?.trim();
-  const remoteDesktopWorkspace = Boolean(localClientId && workspaceId.indexOf(":") > 0 && !workspaceId.startsWith(`${localClientId}:`));
-  if ((!isSharedWorkspaceSelectionId(workspaceId) && !remoteDesktopWorkspace) || purpose || snapshot.metadata === null) return snapshot;
+  // 带 Client 命名空间的工作区（本地/远程/共享）都由承载 Client 提供内置资产；纯 Server 工作区不补读。
+  if (workspaceId.indexOf(":") <= 0 || purpose || snapshot.metadata === null) return snapshot;
   const list = assetType === "role" ? listOrchRoles : assetType === "workflow" ? listOrchWorkflows
     : assetType === "knowledge_bundle" ? listOrchKnowledgeBundles : assetType === "skill" ? listOrchSkills : listOrchToolsets;
   try {

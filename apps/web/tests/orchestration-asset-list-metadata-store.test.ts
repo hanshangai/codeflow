@@ -269,6 +269,34 @@ for (const { assetType, path, listKey } of [
   { assetType: "knowledge_bundle", path: "knowledge-bundles", listKey: "bundles" },
   { assetType: "skill", path: "skills", listKey: "skills" },
   { assetType: "toolset", path: "toolsets", listKey: "toolsets" },
+] as const) test(`浏览器本地工作区补读 Client 内置 ${assetType}，兼容服务端权威空目录`, async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore(), workspaceId = "client-a:workspace" as WorkspaceId;
+  const purposes: Array<string | null> = [];
+  globalThis.fetch = (async input => {
+    const url = new URL(String(input));
+    assert.equal(url.pathname, `/api/orch/${path}`);
+    assert.equal(url.searchParams.get("workspaceId"), workspaceId);
+    const purpose = url.searchParams.get("purpose"); purposes.push(purpose);
+    return jsonResponse(purpose === "execution"
+      ? { ok: true, [listKey]: [{ id: "builtin-host", kind: "builtin" }] }
+      : { ok: true, [listKey]: [], assetMetadata: [] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded(createApiContext(), workspaceId, assetType);
+  const list = assetType === "knowledge_bundle" ? store.knowledgeBundles : store[listKey];
+  assert.deepEqual(list.map(item => item.id), ["builtin-host"]);
+  assert.deepEqual(store.assetListHostIds[assetType], ["builtin-host"]);
+  assert.deepEqual(store.assetListMetadata[assetType], []);
+  assert.equal(store.assetListLoaded[assetType], true);
+  assert.deepEqual(purposes, [null, "execution"]);
+});
+
+for (const { assetType, path, listKey } of [
+  { assetType: "role", path: "roles", listKey: "roles" },
+  { assetType: "workflow", path: "workflows", listKey: "workflows" },
+  { assetType: "knowledge_bundle", path: "knowledge-bundles", listKey: "bundles" },
+  { assetType: "skill", path: "skills", listKey: "skills" },
+  { assetType: "toolset", path: "toolsets", listKey: "toolsets" },
 ] as const) test(`桌面远程普通工作区补读目标 Client ${assetType}，不把空账号目录当作完整列表`, async () => {
   setActivePinia(createPinia());
   const store = useOrchestrationStore(), workspaceId = "remote-client:server" as WorkspaceId;
@@ -365,8 +393,23 @@ test("远程执行和旧Client列表只读一次，不额外合并账号目录",
   assert.deepEqual(store.workflows.map(item => item.id), ["client-workflow"]);
 });
 
-for (const [workspaceId, desktopClientId] of [["remote:workspace", undefined], ["local:workspace", "local"], ["unnamespaced", "local"]] as const)
-test(`资产补读不改变浏览器、本机或未知归属范围 ${workspaceId}/${desktopClientId}`, async () => {
+for (const [workspaceId, desktopClientId] of [["remote:workspace", undefined], ["local:workspace", "local"]] as const)
+test(`浏览器或本机命名空间工作区补读 Client 资产 ${workspaceId}`, async () => {
+  setActivePinia(createPinia());
+  const store = useOrchestrationStore();
+  const purposes: Array<string | null> = [];
+  globalThis.fetch = (async input => {
+    const purpose = new URL(String(input)).searchParams.get("purpose"); purposes.push(purpose);
+    return jsonResponse(purpose === "execution"
+      ? { ok: true, workflows: [{ id: "client-builtin", kind: "builtin" }] }
+      : { ok: true, workflows: [], assetMetadata: [] });
+  }) as typeof fetch;
+  await store.ensureAssetListLoaded({ ...createApiContext(), desktopClientId }, workspaceId as WorkspaceId, "workflow");
+  assert.deepEqual(purposes, [null, "execution"]);
+  assert.deepEqual(store.workflows.map(item => item.id), ["client-builtin"]);
+});
+
+test("无命名空间的 Server 工作区不补读 Host 资产", async () => {
   setActivePinia(createPinia());
   const store = useOrchestrationStore();
   let calls = 0;
@@ -374,7 +417,7 @@ test(`资产补读不改变浏览器、本机或未知归属范围 ${workspaceId
     calls++; assert.equal(new URL(String(input)).searchParams.has("purpose"), false);
     return jsonResponse({ ok: true, workflows: [], assetMetadata: [] });
   }) as typeof fetch;
-  await store.ensureAssetListLoaded({ ...createApiContext(), desktopClientId }, workspaceId as WorkspaceId, "workflow");
+  await store.ensureAssetListLoaded({ ...createApiContext(), desktopClientId: "local" }, "unnamespaced" as WorkspaceId, "workflow");
   assert.equal(calls, 1);
 });
 
