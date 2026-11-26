@@ -6,9 +6,10 @@ import { pathToFileURL } from "node:url";
 import pnpmCommand from "./pnpm-command.cjs";
 import { defaultDesktopBuildCacheDir, desktopBuildCacheKey, materializeDesktopBuildCache } from "../../apps/desktop/scripts/desktop-build-cache.mjs";
 
-/** 当前构建机必须与目标平台一致；arm64-only 阶段拒绝在 arm64 Mac 上伪造 x64。 */
+/** 当前构建机必须与目标平台一致；不支持交叉伪造架构。 */
 export function currentDesktopPlatform() {
   if (process.platform === "win32" && process.arch === "x64") return { platform: "win32", arch: "x64", key: "win32/x64" };
+  if (process.platform === "darwin" && process.arch === "x64") return { platform: "darwin", arch: "x64", key: "darwin/x64" };
   if (process.platform === "darwin" && process.arch === "arm64") return { platform: "darwin", arch: "arm64", key: "darwin/arm64" };
   throw new Error(`DESKTOP_BUILD_PLATFORM_UNSUPPORTED: ${process.platform}/${process.arch}`);
 }

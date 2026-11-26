@@ -10,7 +10,7 @@
 
 ```bash
 # 只在 Windows 协调机执行一次；Mac 使用同一个 plan 文件
-pnpm release:desktop plan:new --test --platforms win,mac-arm64 --key-id <keyId>
+pnpm release:desktop plan:new --test --platforms win,mac-arm64,mac-x64 --key-id <keyId>
 
 # Windows 构建内置 client + web 资源包
 pnpm release:desktop build --plan <plan.json> --platform win --mode resources \
@@ -18,6 +18,10 @@ pnpm release:desktop build --plan <plan.json> --platform win --mode resources \
 
 # Mac arm64 构建同一版本的资源包，产物直接复制到共享目录
 pnpm release:desktop build --plan <plan.json> --platform mac-arm64 --mode resources \
+  --private-key <private.pem> --trust <trust.json> --shared-dir <共享目录>
+
+# Mac x64 使用同一 plan，在 Intel Mac 或 x64 macOS CI 上构建
+pnpm release:desktop build --plan <plan.json> --platform mac-x64 --mode resources \
   --private-key <private.pem> --trust <trust.json> --shared-dir <共享目录>
 
 # Windows 汇总两个平台并发布；--upload 自动创建远端目录并上传
@@ -32,7 +36,7 @@ pnpm release:desktop publish --plan <plan.json> --trust <trust.json> \
 ```bash
 pnpm release --test --scope server    # Server + Web
 pnpm release --test --scope win       # 仅当前 Windows 资源
-pnpm release --test --scope mac       # 仅当前 arm64 Mac 资源
+pnpm release --test --scope mac       # 仅当前 Mac 资源（arm64 或 x64）
 pnpm release --test --scope desktop   # 当前平台构建，配合 --publish 汇总发布
 pnpm release --test --scope all       # 先 Server/Web，再当前桌面平台
 ```
@@ -41,7 +45,7 @@ pnpm release --test --scope all       # 先 Server/Web，再当前桌面平台
 
 `publish --upload` 会创建本地/远端资源目录，并在上传前检查 Server 配置路径上的 `trust.json`；该公钥文件必须由发布方提前放置，不会自动生成或覆盖。
 
-当前只支持 `win32/x64 + darwin/arm64`；`darwin/x64` 需要在 Intel Mac 或 x64 macOS CI 上构建，暂不纳入计划。注意：Server 生产发布校验仍要求三平台，`win32/x64 + darwin/arm64` 目前可用于测试环境；arm64-only 生产发布需要另行调整平台策略。
+当前支持 `win32/x64 + darwin/x64 + darwin/arm64`。Intel Mac 资源必须在 Intel Mac 或 x64 macOS CI（例如 `macos-15-intel`）上构建，Apple Silicon 资源在 arm64 Mac 上构建。测试发布可以使用平台子集；Server 生产发布要求三平台齐全。
 
 ## 本地桌面候选工件
 
@@ -114,6 +118,6 @@ pnpm -C apps/desktop package:local:mac -- <完整资源目录> <新独占输出�
 
 命令关闭官方 Developer ID 签名与 hardened runtime，但在 `afterPack` 阶段对 `.app` 做 ad-hoc 签名并执行 `codesign --verify`；DMG 使用拖拽到 Applications 的布局。ad-hoc 签名只能降低 Apple Silicon 直接判损坏的概率，不能替代 Developer ID 签名和公证。资源目录没有签名基线时，输出会携带 `desktop-unsigned-local.json`，应用仅跳过打包态基线要求，并在启动日志中记录 `DESKTOP_UNSIGNED_LOCAL_BASELINE_SKIPPED`；该标记不能替代签名、公证或正式发布材料。提供 `baseline-release-manifest.json` 时可用 `--require-baseline-proof` 先复验完整 held payload。
 
-CI 或无交互构建可使用 `bash tools/ci/build-macos-dmg.sh <新独占输出目录>`；脚本会构建资源、安装固定 npm 12.2.2、生成 Client 归档并调用上述 DMG 打包入口。`.github/workflows/desktop-dmg.yml` 当前只在 `macos-15`（arm64）产出 DMG；x64 Mac 包需要 Intel Mac 或 x64 macOS CI。
+CI 或无交互构建可使用 `bash tools/ci/build-macos-dmg.sh <新独占输出目录>`；脚本会构建资源、安装固定 npm 12.2.2、生成 Client 归档并调用上述 DMG 打包入口。`.github/workflows/desktop-dmg.yml` 在 `macos-15`（arm64）和 `macos-15-intel`（x64）分别产出 DMG。
 
 macOS 应用内托盘提供“卸载 CodeFlow…”：确认后停止 Client，清理授权数据与缓存，保留默认工作区与未知文件，再把 `.app` 移入废纸篓。卸载结果写入 `~/Library/Logs/CodeFlow/macos-uninstall.log`。

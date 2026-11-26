@@ -8,9 +8,9 @@ import { EventEmitter } from "node:events";
 import test, { mock } from "node:test";
 import { buildReleaseBundle as realBuildReleaseBundle } from "../scripts/build-release-bundle.mjs";
 
-const unsupportedPlatform = !["win32/x64", "darwin/arm64"].includes(`${process.platform}/${process.arch}`);
+const unsupportedPlatform = !["win32/x64", "darwin/x64", "darwin/arm64"].includes(`${process.platform}/${process.arch}`);
 if (!process.env.CODEFLOWAI_RESOURCE_BUILD_TEST_CHILD) {
-  test("desktop resource cache integration", { skip: unsupportedPlatform ? "desktop releases require win32/x64 or darwin/arm64" : false }, () => {
+  test("desktop resource cache integration", { skip: unsupportedPlatform ? "desktop releases require win32/x64, darwin/x64 or darwin/arm64" : false }, () => {
     const env = { ...process.env, CODEFLOWAI_RESOURCE_BUILD_TEST_CHILD: "1" };
     delete env.NODE_TEST_CONTEXT;
     const result = realSpawnSync(process.execPath, ["--experimental-test-module-mocks", "--conditions=development", "--import", "tsx", "--test", import.meta.filename], {

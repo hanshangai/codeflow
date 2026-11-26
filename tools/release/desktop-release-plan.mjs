@@ -7,7 +7,7 @@ import { allocateDesktopShellVersion, assertShellVersion, readDesktopShellInputs
 const requireRelease = createRequire(import.meta.url);
 const releaseVersioning = requireRelease("./release-versioning.cjs");
 const PLAN_SCHEMA_VERSION = 1;
-export const DESKTOP_PLAN_PLATFORMS = Object.freeze(["win32/x64", "darwin/arm64"]);
+export const DESKTOP_PLAN_PLATFORMS = Object.freeze(["win32/x64", "darwin/x64", "darwin/arm64"]);
 
 /** 读取当前源码事实；计划必须绑定同一提交和同一数据库 schema。 */
 export async function readDesktopPlanFacts(root, { allowDirty = false } = {}) {
@@ -23,7 +23,7 @@ export async function readDesktopPlanFacts(root, { allowDirty = false } = {}) {
   return { sourceCommit: commit, dbSchemaVersion: Number(schemaMatch[1]) };
 }
 
-/** 计划只允许当前实际支持的平台；arm64-only 阶段不生成 darwin/x64。 */
+/** 计划只允许当前实际支持的平台；顺序固定以保证发布产物稳定。 */
 function normalizePlatforms(platforms) {
   if (!Array.isArray(platforms) || !platforms.length || new Set(platforms).size !== platforms.length
     || platforms.some(item => !DESKTOP_PLAN_PLATFORMS.includes(item))) throw new Error("DESKTOP_PLAN_PLATFORMS_INVALID");
@@ -46,8 +46,11 @@ async function existingPlanVersions(directory) {
 export async function createDesktopReleasePlan({ root, platforms, keyId, expiresAt, environment = "test", now = new Date(), planDir = null, allowDirty = false }) {
   if (typeof keyId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(keyId)) throw new Error("DESKTOP_PLAN_KEY_ID_INVALID");
   if (!["test", "production"].includes(environment)) throw new Error("DESKTOP_PLAN_ENVIRONMENT_INVALID");
-  /** 当前 Server 生产发布仍要求 win32/x64 + darwin/x64 + darwin/arm64；先阻止误建 arm64-only 生产计划。 */
-  if (environment === "production") throw new Error("DESKTOP_PLAN_PRODUCTION_ARM64_ONLY_UNSUPPORTED");
+  const normalizedPlatforms = normalizePlatforms(platforms);
+  /** Server 生产发布要求 win32/x64 + darwin/x64 + darwin/arm64 三平台齐全。 */
+  if (environment === "production" && normalizedPlatforms.length !== DESKTOP_PLAN_PLATFORMS.length) {
+    throw new Error("DESKTOP_PLAN_PRODUCTION_PLATFORMS_REQUIRED");
+  }
   const expiry = new Date(expiresAt ?? new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString());
   if (!Number.isFinite(expiry.getTime()) || expiry.getTime() <= now.getTime()) throw new Error("DESKTOP_PLAN_EXPIRY_INVALID");
   const facts = await readDesktopPlanFacts(root, { allowDirty });
@@ -76,7 +79,7 @@ export async function createDesktopReleasePlan({ root, platforms, keyId, expires
       protocolVersion: 1,
       capabilityVersion: 1,
       dbSchemaVersion: facts.dbSchemaVersion,
-      platformSet: normalizePlatforms(platforms),
+      platformSet: normalizedPlatforms,
       sourceCommit: facts.sourceCommit,
       shellVersion,
       shellInputFingerprint: inputs.shellInputFingerprint,

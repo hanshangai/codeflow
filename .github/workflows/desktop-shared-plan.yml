@@ -1,0 +1,140 @@
+name: Desktop macOS shared plan
+
+# 共享计划 macOS 构建：Apple 代码签名保持 ad-hoc，资源清单使用 CodeFlow 发布私钥签名。
+# 在仓库或 desktop-release 环境保护环境中配置：
+#   DESKTOP_RELEASE_PRIVATE_KEY：与 plan.keyId 对应的 Ed25519 私钥 PEM
+#   DESKTOP_RELEASE_TRUST：包含该 keyId 公钥的 trust JSON
+on:
+  workflow_dispatch:
+    inputs:
+      plan_base64:
+        description: 共享计划 JSON 的 Base64（由 plan:new 生成）
+        required: true
+        type: string
+      source_commit:
+        description: 计划绑定的公开仓提交 SHA（40 位）
+        required: true
+        type: string
+      update_origin:
+        description: DMG 内置更新源，例如 https://codeflow-test.hanshangai.com
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-macos-shared-plan
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macos-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    environment: desktop-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            platform: mac-arm64
+          - runner: macos-15-intel
+            arch: x64
+            platform: mac-x64
+    steps:
+      - name: Checkout planned source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.14.0"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.2"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare plan and signing material
+        id: plan
+        env:
+          PLAN_BASE64: ${{ inputs.plan_base64 }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          UPDATE_ORIGIN: ${{ inputs.update_origin }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          DESKTOP_RELEASE_PRIVATE_KEY: ${{ secrets.DESKTOP_RELEASE_PRIVATE_KEY }}
+          DESKTOP_RELEASE_TRUST: ${{ secrets.DESKTOP_RELEASE_TRUST }}
+        run: |
+          set -euo pipefail
+          umask 077
+          node -e "if(process.platform!=='darwin'||process.arch!==process.env.EXPECTED_ARCH)throw new Error('MACOS_RUNNER_ARCH_MISMATCH')"
+          test -n "$PLAN_BASE64"
+          test -n "$DESKTOP_RELEASE_PRIVATE_KEY"
+          test -n "$DESKTOP_RELEASE_TRUST"
+          case "$UPDATE_ORIGIN" in https://?*) ;; *) echo "update_origin 必须是 https 地址" >&2; exit 1;; esac
+          node -e 'const fs=require("node:fs");fs.writeFileSync(process.argv[1],Buffer.from(process.argv[2].replace(/\s+/gu,""),"base64"),{flag:"wx"})' "$RUNNER_TEMP/plan.json" "$PLAN_BASE64"
+          node -e '
+            const fs = require("node:fs");
+            const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const source = process.argv[2];
+            if (!/^[0-9a-f]{40}$/u.test(source)) throw new Error("SOURCE_COMMIT_INVALID");
+            if (plan.sourceCommit !== source) throw new Error("PLAN_SOURCE_COMMIT_MISMATCH");
+            if (!/^\d{4}\.\d{2}\.\d{2}\.\d+$/u.test(plan.version)) throw new Error("PLAN_VERSION_INVALID");
+            if (!Array.isArray(plan.platformSet) || ["win32/x64", "darwin/x64", "darwin/arm64"].some(key => !plan.platformSet.includes(key))) throw new Error("PLAN_PLATFORM_SET_INVALID");
+            if (!["test", "production"].includes(plan.environment)) throw new Error("PLAN_ENVIRONMENT_INVALID");
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(plan.keyId)) throw new Error("PLAN_KEY_ID_INVALID");
+            console.log(`version=${plan.version}`);
+          ' "$RUNNER_TEMP/plan.json" "$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          printf '%s\n' "$DESKTOP_RELEASE_PRIVATE_KEY" > "$RUNNER_TEMP/release-private.pem"
+          printf '%s\n' "$DESKTOP_RELEASE_TRUST" > "$RUNNER_TEMP/release-trust.json"
+
+      - name: Build DMG and signed resources
+        env:
+          UPDATE_ORIGIN: ${{ inputs.update_origin }}
+        run: |
+          set -euo pipefail
+          pnpm release:desktop build \
+            --plan "$RUNNER_TEMP/plan.json" \
+            --platform ${{ matrix.platform }} \
+            --mode dmg \
+            --private-key "$RUNNER_TEMP/release-private.pem" \
+            --trust "$RUNNER_TEMP/release-trust.json" \
+            --update-origin "$UPDATE_ORIGIN" \
+            --output "$RUNNER_TEMP/output" \
+            --shared-dir "$RUNNER_TEMP/shared"
+          test -f "$RUNNER_TEMP/shared/darwin-arm64/bundle/manifest.json"
+          test -f "$RUNNER_TEMP/shared/darwin-arm64/bundle/bundle.tar.gz"
+          test -n "$(find "$RUNNER_TEMP/shared/darwin-arm64/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+
+      - name: Record ad-hoc DMG metadata
+        env:
+          CODEFLOWAI_DESKTOP_DMG_VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          node tools/ci/record-desktop-package.mjs "$RUNNER_TEMP/shared/darwin-arm64/dmg"
+          cp "$RUNNER_TEMP/plan.json" "$RUNNER_TEMP/shared/darwin-arm64/desktop-release-plan.json"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeFlowAI-macos-${{ steps.plan.outputs.version }}-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/shared/darwin-arm64
+            ${{ runner.temp }}/plan.json
+          if-no-files-found: error
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release-private.pem" "$RUNNER_TEMP/release-trust.json"

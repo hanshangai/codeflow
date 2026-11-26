@@ -34,6 +34,7 @@ function parse(argv) {
 function platformKey(value) {
   if (value === "win") return "win32/x64";
   if (value === "mac-arm64" || value === "mac") return "darwin/arm64";
+  if (value === "mac-x64" || value === "mac-intel") return "darwin/x64";
   throw new Error(`不支持的平台：${value}`);
 }
 
@@ -44,7 +45,7 @@ function resolveTarget(options) {
 
 async function planNew(options) {
   const environment = resolveTarget(options);
-  const platforms = String(options.platforms ?? "win,mac-arm64").split(",").filter(Boolean).map(platformKey);
+  const platforms = String(options.platforms ?? "win,mac-arm64,mac-x64").split(",").filter(Boolean).map(platformKey);
   if (!options["key-id"]) throw new Error("plan:new 需要 --key-id");
   // --allow-dirty 跳过干净工作区校验；计划仍绑定当前 HEAD，产物会携带未提交内容。
   const { file, plan } = await createDesktopReleasePlan({ root, platforms, keyId: options["key-id"], expiresAt: options["expires-at"], environment,
