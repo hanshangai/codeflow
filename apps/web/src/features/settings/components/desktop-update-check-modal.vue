@@ -9,7 +9,8 @@ import {
   getDesktopUpdateState, reportDesktopUpdateError, restartDesktopForUpdate, subscribeDesktopUpdateCheckRequested, subscribeDesktopUpdateProgress,
   takeDesktopUpdateCheckRequest,
 } from "../../../services/desktop";
-import { formatDesktopCurrentVersion, resolveDesktopUpdateOutcome, type DesktopUpdateOutcome } from "../desktopUpdateLabels";
+import { formatDesktopCurrentVersion, isDesktopManualUpdate, resolveDesktopUpdateOutcome, type DesktopUpdateOutcome } from "../desktopUpdateLabels";
+import { openDesktopDownloadPage } from "../../desktop/desktopDownloadEntry";
 import { desktopUpdateCheckRequestTick } from "../desktopUpdateCheckRequest";
 import { activeDesktopUpdateNotice, dismissDesktopUpdateNoticeLater, hideDesktopUpdateNotice } from "../desktopUpdateNoticeState";
 import { openUpgradeNotes } from "../../../utils/upgradeNotes";
@@ -74,6 +75,8 @@ const downloadSize = computed(() => downloadPercent.value !== null && updateProg
 
 /** macOS 桌面壳不参与自动更新，manual_required 是人工安装提示，不是失败。 */
 const isMacDesktop = typeof window !== "undefined" && window.codeflowDesktop?.platform === "darwin";
+/** 资源已准备时先重启应用资源，壳的手动安装等重启后再提示。 */
+const manualUpdate = computed(() => isDesktopManualUpdate(details.value, isMacDesktop));
 
 /** 读取及操作错误优先，其余展示结论与设置页共用。 */
 const outcome = computed<DesktopUpdateOutcome>(() => {
@@ -107,17 +110,25 @@ const primaryAction = computed(() => {
   }
   if (updateInProgress.value) return { kind: "close" as const, label: "后台继续", disabled: false };
   if (prepared.value && capabilities.restart) return { kind: "restart" as const, label: "重启并更新", disabled: restartDisabled.value };
+  if (manualUpdate.value) return { kind: "download" as const, label: "下载安装包", disabled: false };
   if (presentation.value.tone === "error") return { kind: "check" as const, label: "重试", disabled: !capabilities.check };
   if (presentation.value.tone === "success" || prepared.value) return { kind: "close" as const, label: "完成", disabled: false };
   return { kind: "check" as const, label: "重新检查", disabled: !capabilities.check };
 });
 
-/** 主操作复用现有检查、重启和关闭入口，禁用时不派发。 */
+/** 主操作复用现有检查、重启、下载和关闭入口，禁用时不派发。 */
 async function performPrimaryAction(): Promise<void> {
   if (primaryAction.value.disabled) return;
   if (primaryAction.value.kind === "restart") await restart();
   else if (primaryAction.value.kind === "check") await startCheck();
+  else if (primaryAction.value.kind === "download") downloadInstaller();
   else close();
+}
+
+/** 手动安装更新：关闭弹框后打开系统浏览器下载页，不在桌面壳内打开安装包页面。 */
+function downloadInstaller(): void {
+  close();
+  openDesktopDownloadPage();
 }
 
 /** 将桥错误映射为可读结论；原始异常正文只进日志，不直接展示 IPC 包装文本。 */

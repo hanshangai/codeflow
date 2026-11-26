@@ -31,7 +31,7 @@ function fixture(t: test.TestContext) {
   const active = vue.ref<shared.DesktopUpdateNotice | null>(null);
   const dismissals: string[] = [];
   const toastErrors: unknown[] = [];
-  let checkRequests = 0;
+  let downloadPages = 0;
   const bindings = setupComponent(t, {
     "ant-design-vue": { message: { error: (value: unknown) => toastErrors.push(value) } },
     "../../../services/desktop": {
@@ -45,14 +45,14 @@ function fixture(t: test.TestContext) {
       reportDesktopUpdateError: async () => {},
       restartDesktopForUpdate: async () => {},
     },
-    "../desktopUpdateCheckRequest": { requestDesktopUpdateCheck: () => { checkRequests += 1; } },
+    "../../desktop/desktopDownloadEntry": { openDesktopDownloadPage: () => { downloadPages += 1; } },
     "../desktopUpdateNoticeState": {
       activeDesktopUpdateNotice: active,
       showDesktopUpdateNotice: (notice: shared.DesktopUpdateNotice) => { active.value = notice; },
       hideDesktopUpdateNotice: () => { active.value = null; },
     },
   });
-  return { bindings, active, dismissals, toastErrors, checkRequests: () => checkRequests };
+  return { bindings, active, dismissals, toastErrors, downloadPages: () => downloadPages };
 }
 
 const notice: shared.DesktopUpdateNotice = { releaseId: "release-1", version: "2026.11.13.05", currentVersion: "2026.11.13.04", shellOnly: false };
@@ -83,22 +83,22 @@ test("勾选本次不再提醒后关闭提交 session 动作", async t => {
   assert.deepEqual(f.dismissals, ["session"]);
 });
 
-test("壳更新转交检查弹窗并记录已提醒", async t => {
+test("壳更新直接打开安装包下载页并记录已提醒", async t => {
   const f = fixture(t);
   f.bindings.applyNotice({ ...notice, shellOnly: true });
-  f.bindings.openCheck();
+  f.bindings.downloadInstaller();
   await Promise.resolve();
-  assert.equal(f.checkRequests(), 1);
+  assert.equal(f.downloadPages(), 1);
   assert.deepEqual(f.dismissals, ["later"]);
 });
 
-test("壳更新勾选本次不再提醒后转交检查弹窗仍提交 session", async t => {
+test("壳更新勾选本次不再提醒后下载安装包仍提交 session", async t => {
   const f = fixture(t);
   f.bindings.applyNotice({ ...notice, shellOnly: true });
   f.bindings.suppressSession.value = true;
-  f.bindings.openCheck();
+  f.bindings.downloadInstaller();
   await Promise.resolve();
-  assert.equal(f.checkRequests(), 1);
+  assert.equal(f.downloadPages(), 1);
   assert.deepEqual(f.dismissals, ["session"]);
 });
 
@@ -118,7 +118,7 @@ test("关闭动作失败显式提示且不重新打开提醒", async t => {
       reportDesktopUpdateError: async () => {},
       restartDesktopForUpdate: async () => {},
     },
-    "../desktopUpdateCheckRequest": { requestDesktopUpdateCheck: () => {} },
+    "../../desktop/desktopDownloadEntry": { openDesktopDownloadPage: () => {} },
     "../desktopUpdateNoticeState": {
       activeDesktopUpdateNotice: active,
       showDesktopUpdateNotice: (value: shared.DesktopUpdateNotice) => { active.value = value; },

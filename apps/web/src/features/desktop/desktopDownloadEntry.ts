@@ -41,6 +41,13 @@ export async function resolveDesktopDownloadTarget(input: {
   }
 }
 
+/** macOS 壳只能整包手动安装：交给系统浏览器打开当前环境的下载页，由用户选择芯片版本。 */
+export function openDesktopDownloadPage(): void {
+  if (typeof window === "undefined") return;
+  // 桌面壳主进程 setWindowOpenHandler 会把 http(s) 链接转交系统浏览器。
+  window.open(`${window.location.origin}/download`, "_blank");
+}
+
 /** 官网下载入口：按平台直达安装包，未提供时进入下载页说明。 */
 export function useDesktopDownloadEntry(source: string) {
   const router = useRouter();

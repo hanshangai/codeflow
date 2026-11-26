@@ -43,6 +43,7 @@ function modalFixture(t: test.TestContext, canRestart = true, platform: "win32" 
     bundle: { requestId: "prepare:1", target: { releaseId: "next", version: "2026.11.09.02", webVersion: "next", clientVersion: "next" }, phase: "prepare", result: "prepared", failure: null },
     shell: { requestId: null, target: null, phase: null, result: "same", failure: null } };
   let checks = 0;
+  let downloadPages = 0;
   const bridge = { platform, getState: async () => ({}), request: async () => { throw new Error("unexpected request"); },
     getUpdateState: async () => structuredClone(state), getUpdateDetails: async () => structuredClone(details), checkForUpdates: async () => { checks++; },
     ...(canRestart ? { restartForUpdate: async () => {} } : {}) };
@@ -58,8 +59,9 @@ function modalFixture(t: test.TestContext, canRestart = true, platform: "win32" 
     "@ant-design/icons-vue": { ArrowRightOutlined: {}, CheckCircleFilled: {}, CloseCircleFilled: {}, DownloadOutlined: {}, ExportOutlined: {}, InfoCircleOutlined: {} },
     "../../../utils/upgradeNotes": { openUpgradeNotes() {} },
     "../../../utils/fileMetaPresentation": fileMeta,
+    "../../desktop/desktopDownloadEntry": { openDesktopDownloadPage: () => { downloadPages++; } },
   });
-  return { panel, bridge, state, details, checks: () => checks };
+  return { panel, bridge, state, details, checks: () => checks, downloadPages: () => downloadPages };
 }
 
 /** 设置页复用同一宿主快照，停用自动读取以单独验证首屏结论。 */
@@ -538,6 +540,11 @@ test("macOS 资源准备及生效保留桌面壳人工安装提示", async t => 
   f.details.bundle.result = "same";
   await f.panel.startCheck();
   assert.equal(f.panel.outcome.value.title, "需要手动安装更新");
+  assert.equal(f.panel.primaryAction.value.kind, "download");
+  assert.equal(f.panel.primaryAction.value.label, "下载安装包");
+  await f.panel.performPrimaryAction();
+  assert.equal(f.downloadPages(), 1);
+  assert.equal(f.panel.open.value, false);
 });
 
 for (const result of ["unknown", "failure"] as const) test(`设置页资源已生效但桌面壳${result}时明确后续待处理`, t => {

@@ -12,7 +12,7 @@ import {
   restartDesktopForUpdate,
   subscribeDesktopUpdateNotice,
 } from "../../../services/desktop";
-import { requestDesktopUpdateCheck } from "../desktopUpdateCheckRequest";
+import { openDesktopDownloadPage } from "../../desktop/desktopDownloadEntry";
 import { activeDesktopUpdateNotice, hideDesktopUpdateNotice, showDesktopUpdateNotice } from "../desktopUpdateNoticeState";
 
 defineOptions({ name: "DesktopUpdateNoticeModal" });
@@ -72,13 +72,13 @@ async function updateNow(): Promise<void> {
   } finally { restarting.value = false; }
 }
 
-/** macOS 壳需手动安装，转交检查更新弹窗展示说明与更新日志；勾选复选框同样生效。 */
-function openCheck(): void {
+/** macOS 壳需手动安装，直接打开完整安装包下载页；勾选复选框同样生效。 */
+function downloadInstaller(): void {
   const current = notice.value;
   const effective = suppressSession.value ? "session" : "later";
   suppressSession.value = false;
   hideDesktopUpdateNotice();
-  requestDesktopUpdateCheck();
+  openDesktopDownloadPage();
   if (!current) return;
   void dismissDesktopUpdateNotice(effective).catch(error => report("dismiss_failed", error, current.releaseId));
 }
@@ -117,7 +117,7 @@ onBeforeUnmount(() => {
       <a-checkbox v-model:checked="suppressSession">本次不再提醒</a-checkbox>
       <div class="update-notice__actions">
         <a-button :disabled="restarting" @click="close('later')">稍后提醒</a-button>
-        <a-button v-if="notice?.shellOnly" type="primary" @click="openCheck">查看更新方式</a-button>
+        <a-button v-if="notice?.shellOnly" type="primary" @click="downloadInstaller">下载安装包</a-button>
         <a-button v-else type="primary" :loading="restarting" @click="updateNow">{{ restarting ? '正在应用更新…' : '立即更新' }}</a-button>
       </div>
     </div>

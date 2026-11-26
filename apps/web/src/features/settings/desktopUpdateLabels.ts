@@ -10,6 +10,11 @@ export function formatDesktopCurrentVersion(current: DesktopUpdateDetails["curre
 
 export type DesktopUpdateOutcome = { tone: "success" | "error" | "warning" | "info"; title: string; detail: string };
 
+/** macOS 桌面壳不能自动安装；任一通道要求人工处理时改走完整安装包下载。 */
+export function isDesktopManualUpdate(details: DesktopUpdateDetails | null, isMacDesktop: boolean): boolean {
+  return isMacDesktop && !!details && (details.bundle.result === "manual_required" || details.shell.result === "manual_required");
+}
+
 /** 弹框与设置页共用宿主事实；历史目标不改变无更新结论，未知结果不能推成下载中或成功。 */
 export function resolveDesktopUpdateOutcome(input: {
   details: DesktopUpdateDetails | null; state: DesktopUpdateState | null; isMacDesktop: boolean; checking?: boolean;
