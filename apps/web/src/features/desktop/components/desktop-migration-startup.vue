@@ -3,7 +3,7 @@ import { computed, inject, onBeforeUnmount, onMounted, ref, watch, type Ref } fr
 import { Alert, Button, ConfigProvider, Progress, Space } from "ant-design-vue";
 import type { DesktopMigrationState } from "@codeflowai/shared";
 import { getDesktopBridge } from "../../../services/desktop";
-import { useConfigStore } from "../../../store/config";
+import { normalizeConfiguredServerWsOrigin, shouldDropProductionServerOrigin, useConfigStore } from "../../../store/config";
 import { desktopAuthModalOpen } from "../../account/desktopAuthPromptState";
 
 const emit = defineEmits<{ ready: []; interactive: [value: boolean] }>();
@@ -84,8 +84,15 @@ async function accept(value: DesktopMigrationState): Promise<void> {
     if (restored) {
       const origin = new URL(restored.serverOrigin);
       origin.protocol = origin.protocol === "https:" ? "wss:" : "ws:";
-      config.serverWsOrigin = origin.origin;
-      config.setAccountSession(restored.session);
+      // 测试构建把旧账号的生产地址归一到测试域名，且不恢复生产会话。
+      config.serverWsOrigin = normalizeConfiguredServerWsOrigin(origin.origin);
+      if (shouldDropProductionServerOrigin(origin.origin)) {
+        config.logout();
+        console.warn("[DESKTOP_MIGRATION_PRODUCTION_ACCOUNT_SKIPPED]", { errorCode: "DESKTOP_MIGRATION_PRODUCTION_ACCOUNT_SKIPPED",
+          migrationId: value.migrationId, from: origin.origin, to: config.serverWsOrigin });
+      } else {
+        config.setAccountSession(restored.session);
+      }
       expectedScope = JSON.stringify([config.serverWsOrigin, config.sessionToken, config.userSummary?.userId, config.logoutInProgress]);
       config.persistAccountSession();
       await bridge?.acknowledgeMigrationAccount?.();

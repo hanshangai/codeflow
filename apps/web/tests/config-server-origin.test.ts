@@ -39,10 +39,12 @@ function memoryStorage(): Storage {
 }
 
 /** 每场重新求值真实模块，以实际 Pinia 初始化、hydrate 和公开迁移观察地址。 */
-function fixture(t: test.TestContext, href?: string, env: Record<string, string> = {}, persistedOrigin?: string) {
+function fixture(t: test.TestContext, href?: string, env: Record<string, string> = {}, persistedOrigin?: string,
+  persistedFields: Record<string, unknown> = {}) {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
   const storage = memoryStorage();
-  if (persistedOrigin !== undefined) storage.setItem("config", JSON.stringify({ serverWsOrigin: persistedOrigin }));
+  if (persistedOrigin !== undefined || Object.keys(persistedFields).length) storage.setItem("config",
+    JSON.stringify({ ...persistedFields, ...(persistedOrigin !== undefined ? { serverWsOrigin: persistedOrigin } : {}) }));
   if (href) Object.defineProperty(globalThis, "window", { configurable: true, value: {
     location: new URL(href), localStorage: storage, sessionStorage: memoryStorage(),
   } });
@@ -74,13 +76,36 @@ for (const legacy of ["ws://47.98.203.210:39280", "ws://47.98.203.210:39280/ws/w
   });
 }
 
-for (const [target, saved] of [["wss://codeflow-test.hanshangai.com", "wss://codeflowai.cn"],
-  ["wss://codeflow-test.hanshangai.com", "ws://127.0.0.1:39280"], ["wss://codeflowai.cn", "ws://47.98.203.210:39280"]]) {
+for (const [target, saved] of [["wss://codeflow-test.hanshangai.com", "ws://127.0.0.1:39280"],
+  ["wss://codeflowai.cn", "ws://47.98.203.210:39280"]]) {
   test(`默认 ${target} 不改写其他已保存入口 ${saved}`, t => {
     const { store, migrate } = fixture(t, "codeflow://desktop/chat", { VITE_CODEFLOWAI_SERVER_WS_ORIGIN: target }, saved);
     migrate(); assert.equal(store.serverWsOrigin, saved);
   });
 }
+
+test("测试包把持久生产地址迁移到测试域名并丢弃生产会话", t => {
+  const target = "wss://codeflow-test.hanshangai.com";
+  const { store, migrate, storage } = fixture(t, "codeflow://desktop/chat", { VITE_CODEFLOWAI_SERVER_WS_ORIGIN: target },
+    "wss://codeflowai.cn/ws/web", { authMode: "account", sessionToken: "prod-session",
+      sessionExpiresAt: Date.now() + 3_600_000, userSummary: { userId: "prod-user" } });
+  assert.equal(store.serverWsOrigin, target, "hydrate 后已切到测试域名");
+  assert.equal(store.sessionToken, null, "生产会话不保留");
+  assert.equal(store.authMode, null);
+  migrate(); store.$persist();
+  const saved = JSON.parse(storage.getItem("config")!);
+  assert.equal(saved.serverWsOrigin, target);
+  assert.equal(saved.sessionToken, null);
+});
+
+test("生产构建保留生产地址和既有会话", t => {
+  const { store, migrate } = fixture(t, "codeflow://desktop/chat", { VITE_CODEFLOWAI_SERVER_WS_ORIGIN: "wss://codeflowai.cn" },
+    "wss://codeflowai.cn/ws/web", { authMode: "account", sessionToken: "prod-session",
+      sessionExpiresAt: Date.now() + 3_600_000, userSummary: { userId: "prod-user" } });
+  migrate();
+  assert.equal(store.serverWsOrigin, "wss://codeflowai.cn");
+  assert.equal(store.sessionToken, "prod-session");
+});
 
 for (const href of ["codeflow://desktop/chat", "file:///app/index.html", "data:text/html,test", "about:blank"]) {
   test(`${href.split(":")[0]} 默认未配置 Server，公共信息不发网络请求`, async t => {

@@ -9,7 +9,7 @@ import { computed, createApp, nextTick, reactive, ref, watch } from "vue";
 import { createPinia } from "pinia";
 import persistedstate from "pinia-plugin-persistedstate";
 import type { AccountLoginResponseBody, DesktopMigrationState } from "@codeflowai/shared";
-import { useConfigStore } from "../src/store/config.ts";
+import { normalizeConfiguredServerWsOrigin, shouldDropProductionServerOrigin, useConfigStore } from "../src/store/config.ts";
 import { desktopAuthModalOpen } from "../src/features/account/desktopAuthPromptState.ts";
 import { createLegacyClientMigration } from "../../desktop/src/legacyClientMigration.ts";
 
@@ -19,8 +19,13 @@ function accountUser(userId: string): AccountLoginResponseBody["userSummary"] {
     accountRole: "personal_normal", status: "active", enterpriseId: null, enterpriseName: null };
 }
 
+type OriginHelpers = { normalizeConfiguredServerWsOrigin: typeof normalizeConfiguredServerWsOrigin;
+  shouldDropProductionServerOrigin: typeof shouldDropProductionServerOrigin };
+
 /** 执行真实组件脚本，只替换宿主传输和store边界以控制迟到会话。 */
-function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnType<typeof useConfigStore>, migration?: ReturnType<typeof createLegacyClientMigration>, startupLabel = "") {
+function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnType<typeof useConfigStore>,
+  migration?: ReturnType<typeof createLegacyClientMigration>, startupLabel = "",
+  originHelpers: OriginHelpers = { normalizeConfiguredServerWsOrigin, shouldDropProductionServerOrigin }) {
   const source = fs.readFileSync(new URL("../src/features/desktop/components/desktop-migration-startup.vue", import.meta.url), "utf8");
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/u)?.[1];
   assert.ok(script);
@@ -47,13 +52,13 @@ function setup(status: "restored" | "cancelled" | "failed", realConfig?: ReturnT
     dismiss: () => void; label: () => string; progress: () => string | null };
   const errors: unknown[] = [];
   vm.runInNewContext(code + '\nexports.error = () => actionError.value; exports.showNotice = () => showAccountNotice.value; exports.deferredNotice = () => deferredMigrationNotice.value; exports.openLogin = openAccountLogin; exports.dismiss = dismissAccountNotice; exports.label = () => stageLabel.value; exports.progress = () => progressDetail.value;', { exports: exposed, URL,
-    console: { error: (...args: unknown[]) => { errors.push(args); } },
+    console: { error: (...args: unknown[]) => { errors.push(args); }, warn: (...args: unknown[]) => { errors.push(args); } },
     defineEmits: () => (event: string) => { if (event === "ready") ready++; },
     defineProps: () => ({ startupLabel }),
     require: (id: string) => {
       if (id === "vue") return { computed, ref, watch, inject: () => ref(true), onMounted(fn: typeof mounted) { mounted = fn; }, onBeforeUnmount() {}, onScopeDispose() {} };
       if (id.endsWith("services/desktop")) return { getDesktopBridge: () => bridge };
-      if (id.endsWith("store/config")) return { useConfigStore: () => config };
+      if (id.endsWith("store/config")) return { useConfigStore: () => config, ...originHelpers };
       if (id.endsWith("desktopAuthPromptState")) return { desktopAuthModalOpen };
       if (id === "ant-design-vue") return {};
       throw new Error(`unexpected component dependency: ${id}`);
@@ -252,6 +257,29 @@ test("最终复核：真实session完整保存后才确认迁移账号", async t
   assert.equal(f.counts().acknowledgements, 1);
   assert.equal(JSON.parse(persistence.values.get("config")!).sessionToken, restoredSession.sessionToken);
   assert.equal(f.error(), null);
+});
+
+test("测试构建丢弃生产迁移账号并切换到测试服务器", async () => {
+  const config = reactive<{
+    serverWsOrigin: string; sessionToken: string | null; userSummary: ReturnType<typeof accountUser> | null;
+    logoutInProgress: boolean; isAccountSession: boolean; hasActiveSession: boolean; localRuntimeReady: boolean;
+    logout(): void; setAccountSession(): void; persistAccountSession(): void;
+    refreshDesktopRuntime(): Promise<void>; syncDesktopCloudAccount(): Promise<void>;
+  }>({ serverWsOrigin: "wss://codeflowai.cn", sessionToken: "prod-session", userSummary: accountUser("prod-user"),
+    logoutInProgress: false, isAccountSession: true, hasActiveSession: true, localRuntimeReady: true,
+    logout() { this.sessionToken = null; this.userSummary = null; this.isAccountSession = false; this.hasActiveSession = false; },
+    setAccountSession() { throw new Error("PRODUCTION_SESSION_RESTORED"); },
+    persistAccountSession() {}, async refreshDesktopRuntime() {}, async syncDesktopCloudAccount() {} });
+  const f = setup("restored", config as unknown as ReturnType<typeof useConfigStore>, undefined, "", {
+    normalizeConfiguredServerWsOrigin: () => "wss://codeflow-test.hanshangai.com",
+    shouldDropProductionServerOrigin: () => true,
+  });
+  const pending = f.run(); await f.takeStarted;
+  f.resolveTake({ serverOrigin: "https://codeflowai.cn", session: restoredSession }); await pending;
+  assert.equal(config.serverWsOrigin, "wss://codeflow-test.hanshangai.com");
+  assert.equal(config.sessionToken, null, "生产会话不导入测试构建");
+  assert.equal(f.counts().acknowledgements, 1);
+  assert.equal(f.counts().ready, 1);
 });
 
 test("迁移账号未登录提示可关闭，重复状态通知不重新弹出", async () => {

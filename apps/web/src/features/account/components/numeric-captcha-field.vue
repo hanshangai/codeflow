@@ -54,13 +54,17 @@ async function loadChallenge(): Promise<void> {
     const result = await account.fetchNumericCaptchaChallenge(resolveCaptchaTheme());
     if (!result.ok) {
       challenge.value = null;
-      errorText.value = result.message || "验证码加载失败";
+      errorText.value = "验证码加载失败，请检查服务器连接";
+      console.error("[NUMERIC_CAPTCHA_LOAD_FAILED]", { errorCode: "NUMERIC_CAPTCHA_LOAD_FAILED",
+        code: result.code, message: result.message });
       return;
     }
     challenge.value = result;
   } catch (error) {
     challenge.value = null;
-    errorText.value = error instanceof Error ? error.message : "验证码加载失败";
+    errorText.value = "验证码加载失败，请检查服务器连接";
+    console.error("[NUMERIC_CAPTCHA_LOAD_FAILED]", { errorCode: "NUMERIC_CAPTCHA_LOAD_FAILED",
+      rootCause: error instanceof Error ? error.message : String(error) });
   } finally {
     loading.value = false;
   }

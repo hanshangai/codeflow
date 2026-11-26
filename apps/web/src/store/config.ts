@@ -40,12 +40,34 @@ const DEFAULT_WORKSPACE_ID = String(
   ?? "",
 );
 
-/** 仅测试包迁移明确的旧测试入口，保留生产和用户自定义服务器配置。 */
+const TEST_SERVER_WS_ORIGIN = "wss://codeflow-test.hanshangai.com";
+const PRODUCTION_SERVER_WS_ORIGINS = ["wss://codeflowai.cn", "ws://codeflowai.cn"];
+
+/** 仅识别生产账号域名；测试构建据此拒绝继承生产地址和生产会话。 */
+export function isProductionServerWsOrigin(value: string): boolean {
+  return PRODUCTION_SERVER_WS_ORIGINS.includes(normalizeServerWsOrigin(value));
+}
+
+/** 测试包统一到测试域名：旧测试入口和生产地址都不保留，避免测试客户端读写生产。 */
 export function normalizeConfiguredServerWsOrigin(value: string, defaultOrigin = DEFAULT_SERVER_WS_ORIGIN): string {
   const normalized = normalizeServerWsOrigin(value);
-  const target = "wss://codeflow-test.hanshangai.com";
-  return normalizeServerWsOrigin(defaultOrigin) === target
-    && ["ws://47.98.203.210:39280", "ws://codeflow-test.hanshangai.com"].includes(normalized) ? target : normalized;
+  if (normalizeServerWsOrigin(defaultOrigin) !== TEST_SERVER_WS_ORIGIN) return normalized;
+  return isProductionServerWsOrigin(normalized)
+    || ["ws://47.98.203.210:39280", "ws://codeflow-test.hanshangai.com"].includes(normalized) ? TEST_SERVER_WS_ORIGIN : normalized;
+}
+
+/** 仅测试构建会把该生产地址归一为测试域名，供迁移分支判断是否丢弃生产账号。 */
+export function shouldDropProductionServerOrigin(value: string): boolean {
+  return normalizeConfiguredServerWsOrigin(value) === TEST_SERVER_WS_ORIGIN && isProductionServerWsOrigin(value);
+}
+
+/** 测试构建从生产地址迁走后丢弃生产会话，避免把生产 token 关联到测试服务器。 */
+function dropProductionSessionOnOriginRemap(store: ConfigStore, previousOrigin: string, nextOrigin: string): void {
+  if (nextOrigin !== TEST_SERVER_WS_ORIGIN || !isProductionServerWsOrigin(previousOrigin)) return;
+  if (store.authMode !== "account" && !store.sessionToken) return;
+  store.logout();
+  console.warn("[CONFIG_PRODUCTION_SERVER_DROPPED]", { errorCode: "CONFIG_PRODUCTION_SERVER_DROPPED",
+    from: previousOrigin, to: nextOrigin });
 }
 
 export type ConfigState = {
@@ -118,8 +140,10 @@ export const useConfigStore = defineStore("config", {
     afterHydrate: ({ store }) => {
       const config = store as ConfigStore;
       // Normalize historical persisted values such as ".../ws/web" before any scope restore runs.
+      const previousServerWsOrigin = normalizeServerWsOrigin(config.serverWsOrigin);
       const normalizedServerWsOrigin = normalizeConfiguredServerWsOrigin(config.serverWsOrigin);
       if (normalizedServerWsOrigin && normalizedServerWsOrigin !== config.serverWsOrigin) {
+        dropProductionSessionOnOriginRemap(config, previousServerWsOrigin, normalizedServerWsOrigin);
         config.serverWsOrigin = normalizedServerWsOrigin;
       }
       config.restoreWorkspaceSelectionForCurrentScope();
@@ -611,6 +635,7 @@ function notifyWorkspaceUrlSync(workspaceId: string): void {
 export function migrateConfigDefaults() {
   if (typeof window === "undefined") return;
   const store = useConfigStore();
+  const previousServerWsOrigin = normalizeServerWsOrigin(store.serverWsOrigin);
   const normalizedServerWsOrigin = normalizeConfiguredServerWsOrigin(store.serverWsOrigin);
   if (window.location.protocol === "codeflow:" && !normalizedServerWsOrigin && DEFAULT_SERVER_WS_ORIGIN) {
     store.serverWsOrigin = normalizeServerWsOrigin(DEFAULT_SERVER_WS_ORIGIN);
@@ -623,6 +648,7 @@ export function migrateConfigDefaults() {
     return;
   }
   if (normalizedServerWsOrigin && normalizedServerWsOrigin !== store.serverWsOrigin) {
+    dropProductionSessionOnOriginRemap(store, previousServerWsOrigin, normalizedServerWsOrigin);
     store.serverWsOrigin = normalizedServerWsOrigin;
     store.restoreWorkspaceSelectionForCurrentScope();
   }
