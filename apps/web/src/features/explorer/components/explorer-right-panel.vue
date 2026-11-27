@@ -38,13 +38,18 @@ function isTextDiffPreview(result: WorkspaceFilePreviewResult | null): boolean {
 }
 
 /** 把统一预览结果映射为预览窗口字段。 */
-function previewFields(result: WorkspaceFilePreviewResult | null): Pick<PreviewWindow, "previewType" | "content" | "base64" | "mimeType" | "spreadsheet"> {
+function previewFields(result: WorkspaceFilePreviewResult | null): Pick<PreviewWindow, "previewType" | "content" | "base64" | "mimeType" | "spreadsheet"
+  | "size" | "mtimeMs" | "truncated" | "encoding"> {
   return {
     previewType: result?.previewType ?? "none",
     content: result?.preview?.content ?? null,
     base64: result?.preview?.base64 ?? null,
     mimeType: result?.preview?.mimeType ?? result?.spreadsheet?.mimeType ?? null,
     spreadsheet: result?.spreadsheet ?? null,
+    size: result?.preview?.size ?? null,
+    mtimeMs: result?.preview?.mtimeMs ?? null,
+    truncated: result?.preview?.truncated ?? null,
+    encoding: result?.preview?.encoding ?? null,
   };
 }
 

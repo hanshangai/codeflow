@@ -50,6 +50,11 @@ export type PreviewWindow = {
   content: string | null;
   base64: string | null;
   mimeType: string | null;
+  /** 编辑基线：打开时的大小、修改时间与截断/编码事实 */
+  size?: number | null;
+  mtimeMs?: number | null;
+  truncated?: boolean | null;
+  encoding?: "utf8" | "gb18030" | null;
   spreadsheet?: FsSpreadsheetPreviewResponseBody | null;
   diffOriginal: string | null;
   diffModified: string | null;

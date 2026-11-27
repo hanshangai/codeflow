@@ -43,6 +43,25 @@ export type FsReadFileResponseBody = {
   mimeType?: string | null;
   /** 实际采用的文本解码方式；二进制文件可为空 */
   encoding?: "utf8" | "gb18030" | null;
+  /** 文件修改时间；编辑保存时用于拒绝覆盖外部改动 */
+  mtimeMs?: number | null;
+  /** 内容是否因超出读取上限被截断；截断文件禁止编辑 */
+  truncated?: boolean | null;
+};
+
+/** 只允许覆盖已存在的工作区文本文件；期望时间/大小用于冲突检测。 */
+export type FsWriteFileRequestBody = {
+  workspaceId: WorkspaceId;
+  path: string;
+  content: string;
+  expectedMtimeMs?: number | null;
+  expectedSize?: number | null;
+};
+
+export type FsWriteFileResponseBody = {
+  path: string;
+  size: number;
+  mtimeMs: number;
 };
 
 export type FsSpreadsheetCellValue = string | number | boolean | null;

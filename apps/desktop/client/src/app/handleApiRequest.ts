@@ -147,6 +147,7 @@ import {
   handleFsUploadCancel,
   handleFsUploadChunk,
   handleFsUploadComplete,
+  handleFsWriteFile,
 } from "./handlers/fsHandlers.js";
 import {
   handleGitStatus, handleGitDiff, handleGitDiffFiles, handleGitStage, handleGitUnstage, handleGitDiscard,
@@ -1002,6 +1003,7 @@ export async function handleApiRequest(ctx: ApiHandlerContext, req: ApiRequestMe
     if (req.method === "fs.search") return await database(() => handleFsSearch(ctx, req));
     if (req.method === "fs.reindex") return await handleFsReindex(ctx, req);
     if (req.method === "fs.readFile") return await handleFsReadFile(ctx, req);
+    if (req.method === "fs.writeFile") return await handleFsWriteFile(ctx, req);
     if (req.method === "fs.downloadFile") return await database(() => handleFsDownloadFile(ctx, req));
     if (req.method === "fs.uploadBegin") return await database(() => handleFsUploadBegin(ctx, req));
     if (req.method === "fs.uploadChunk") return await database(() => handleFsUploadChunk(ctx, req));

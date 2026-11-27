@@ -4,6 +4,7 @@ import type {
   FsSearchRequestBody, FsSearchResponseBody,
   FsReindexRequestBody, FsReindexResponseBody,
   FsReadFileRequestBody, FsReadFileResponseBody,
+  FsWriteFileRequestBody, FsWriteFileResponseBody,
   FsDocumentPreviewRequestBody, FsDocumentPreviewResponseBody,
   FsDownloadFileRequestBody, FsDownloadFileResponseBody,
   FsDownloadRequestBody,
@@ -38,6 +39,11 @@ export async function rebuildFsIndex(ctx: ApiRequestContext, body: FsReindexRequ
 
 export async function fetchFsReadFile(ctx: ApiRequestContext, body: FsReadFileRequestBody, options?: FsRequestOptions) {
   return requestJson<FsReadFileResponseBody>(ctx, { method: "POST", path: "/api/fs/readFile", body, signal: options?.signal });
+}
+
+/** 保存工作区文本文件；冲突由 Client 按打开时的大小/修改时间拒绝。 */
+export async function fetchFsWriteFile(ctx: ApiRequestContext, body: FsWriteFileRequestBody, options?: FsRequestOptions) {
+  return requestJson<FsWriteFileResponseBody>(ctx, { method: "POST", path: "/api/fs/writeFile", body, signal: options?.signal });
 }
 
 /** 下载 workspace 内原始文件，响应以 base64 承载文件内容。 */

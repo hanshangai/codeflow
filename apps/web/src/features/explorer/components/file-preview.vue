@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import { FileExclamationOutlined } from "@ant-design/icons-vue";
 import type { WorkspaceId } from "@codeflowai/shared";
 import { useApiContext } from "../../../composables/useApiContext";
 import { useExplorerStore } from "../../../store/explorer";
+import { canEditFilePreview, ensureFileEditorDraft, updateFileEditorContent, type FileEditorDraft } from "../fileEditorState";
 import CodePreview from "./code-preview.vue";
 import HtmlPreview from "./html-preview.vue";
 import ImagePreview from "./image-preview.vue";
@@ -20,9 +21,35 @@ const props = defineProps<{
   showRawMarkdown?: boolean;
   zoomScale?: number;
 }>();
+const emit = defineEmits<{
+  (e: "save"): void;
+}>();
 
 const explorer = useExplorerStore();
 const { ctx } = useApiContext();
+const isMobile = typeof window !== "undefined" && window.innerWidth <= 767;
+const editorDraft = ref<FileEditorDraft | null>(null);
+const editable = computed(() => !isMobile && canEditFilePreview({ workspaceId: props.workspaceId,
+  previewType: explorer.previewType, preview: explorer.preview, rawMarkdown: props.showRawMarkdown === true }));
+const editorContent = computed(() => editorDraft.value?.content ?? explorer.preview?.content ?? "");
+
+/** 预览切换后按当前内容建立或复用草稿；有未保存修改时保留用户输入。 */
+watch([() => explorer.preview, () => explorer.selectedPath, () => props.workspaceId, editable], () => {
+  const preview = explorer.preview, content = preview?.content;
+  if (!editable.value || !explorer.selectedPath || content == null) { editorDraft.value = null; return; }
+  editorDraft.value = ensureFileEditorDraft(props.workspaceId, explorer.selectedPath, {
+    content,
+    mtimeMs: preview?.mtimeMs,
+    size: preview?.size,
+    truncated: preview?.truncated,
+    encoding: preview?.encoding,
+  });
+}, { immediate: true });
+
+/** 编辑事件只更新共享草稿；保存由面板工具栏或 Ctrl+S 触发。 */
+function onEditorChange(value: string): void {
+  if (editorDraft.value) updateFileEditorContent(editorDraft.value, value);
+}
 
 const fileName = computed(() => {
   if (!explorer.selectedPath) return "";
@@ -78,6 +105,17 @@ function onSheetChange(sheetName: string): void {
       :zoom-scale="zoomScale"
     />
 
+    <!-- Markdown 原文编辑 -->
+    <CodePreview
+      v-else-if="explorer.previewType === 'markdown' && showRawMarkdown && explorer.preview?.content != null"
+      :content="editorContent"
+      :file-path="explorer.selectedPath"
+      :font-scale="zoomScale"
+      :editable="editable"
+      @change="onEditorChange"
+      @save="emit('save')"
+    />
+
     <!-- Markdown -->
     <MarkdownPreview
       v-else-if="explorer.previewType === 'markdown' && explorer.preview?.content != null"
@@ -127,9 +165,12 @@ function onSheetChange(sheetName: string): void {
     <!-- 代码 -->
     <CodePreview
       v-else-if="explorer.previewType === 'code' && explorer.preview?.content != null"
-      :content="explorer.preview.content"
+      :content="editorContent"
       :file-path="explorer.selectedPath"
       :font-scale="zoomScale"
+      :editable="editable"
+      @change="onEditorChange"
+      @save="emit('save')"
     />
 
     <!-- 无内容 -->

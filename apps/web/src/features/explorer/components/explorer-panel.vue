@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { EyeOutlined, CodeOutlined, ColumnWidthOutlined, ColumnHeightOutlined, CompressOutlined, ExpandOutlined, UpOutlined, DownOutlined, MinusOutlined, PlusOutlined } from "@ant-design/icons-vue";
+import { EyeOutlined, CodeOutlined, ColumnWidthOutlined, ColumnHeightOutlined, CompressOutlined, ExpandOutlined, UpOutlined, DownOutlined, MinusOutlined, PlusOutlined, SaveOutlined, RollbackOutlined } from "@ant-design/icons-vue";
 import { message } from "ant-design-vue";
 import type { WorkspaceId } from "@codeflowai/shared";
 import { useApiContext } from "../../../composables/useApiContext";
@@ -15,6 +15,7 @@ import DiffViewer from "../../chat/components/diff-viewer.vue";
 import GitBranchManager from "./git-branch-manager.vue";
 import GitCommitDetail from "./git-commit-detail.vue";
 import { usePreviewZoom, type PreviewZoomKind } from "../usePreviewZoom";
+import { discardFileEditorDraft, getFileEditorDraft, isFileEditorDirty, saveFileEditorDraft } from "../fileEditorState";
 
 defineOptions({ name: "ExplorerPanel" });
 
@@ -193,6 +194,33 @@ const rightPanelMode = computed(() => {
   return "empty";
 });
 
+/** 当前文件草稿；diff/分支视图不展示保存操作。 */
+const editorDraft = computed(() => {
+  if (activeTab.value !== "preview" || isDiffView.value || !explorer.selectedPath) return null;
+  return getFileEditorDraft(props.workspaceId, explorer.selectedPath);
+});
+const editorDirty = computed(() => isFileEditorDirty(editorDraft.value));
+const savingEdits = computed(() => editorDraft.value?.saving === true);
+
+/** 保存后同步预览快照，确认弹窗复制与 Markdown 渲染使用最新内容。 */
+async function savePreviewEdits(): Promise<void> {
+  const draft = editorDraft.value, path = explorer.selectedPath;
+  if (!draft || !path) return;
+  try {
+    const result = await saveFileEditorDraft(ctx.value, draft, props.workspaceId, path);
+    if (explorer.preview) {
+      explorer.preview = { ...explorer.preview, content: draft.content, size: result.size, mtimeMs: result.mtimeMs, truncated: false };
+    }
+    message.success("已保存");
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : "保存失败");
+  }
+}
+
+function discardPreviewEdits(): void {
+  if (editorDraft.value) discardFileEditorDraft(editorDraft.value);
+}
+
 /** Tab 栏文件路径显示 */
 const tabFilePath = computed(() => {
   if (rightPanelMode.value === "commit-file-diff" && explorer.gitCommitDetail) {
@@ -307,6 +335,15 @@ watch(
         <span v-if="tabFilePath" class="explorer-panel__filepath">
           {{ tabFilePath }}
         </span>
+        <template v-if="editorDraft">
+          <span v-if="editorDirty" class="explorer-panel__dirty">未保存</span>
+          <a-button v-if="editorDirty" size="small" type="text" class="explorer-panel__raw-btn" title="放弃修改" @click="discardPreviewEdits">
+            <RollbackOutlined />
+          </a-button>
+          <a-button size="small" type="text" class="explorer-panel__raw-btn" title="保存 (Ctrl+S)" :loading="savingEdits" :disabled="!editorDirty" @click="savePreviewEdits">
+            <SaveOutlined />
+          </a-button>
+        </template>
         <a-button
           v-if="isMarkdownPreview"
           size="small"
@@ -429,7 +466,7 @@ watch(
         />
 
         <!-- 文件预览 -->
-        <FilePreview v-else-if="activeTab === 'preview'" :workspace-id="workspaceId" :show-raw-markdown="showRawMarkdown" :zoom-scale="scale" />
+        <FilePreview v-else-if="activeTab === 'preview'" :workspace-id="workspaceId" :show-raw-markdown="showRawMarkdown" :zoom-scale="scale" @save="savePreviewEdits" />
 
         <!-- 分支管理 -->
         <GitBranchManager
@@ -486,6 +523,16 @@ watch(
 
 .explorer-panel__raw-btn {
   flex-shrink: 0;
+}
+
+.explorer-panel__dirty {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-warning, #d97706) 14%, transparent);
+  color: var(--app-warning, #d97706);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .explorer-panel__diff-version {

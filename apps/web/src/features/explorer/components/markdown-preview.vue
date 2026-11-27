@@ -89,13 +89,18 @@ function resolveWorkspaceLinkPath(currentFilePath: string, href: string): string
 }
 
 /** 把统一文件预览结果映射为全局预览窗口字段。 */
-function previewFields(result: WorkspaceFilePreviewResult): Pick<PreviewWindow, "previewType" | "content" | "base64" | "mimeType" | "spreadsheet"> {
+function previewFields(result: WorkspaceFilePreviewResult): Pick<PreviewWindow, "previewType" | "content" | "base64" | "mimeType" | "spreadsheet"
+  | "size" | "mtimeMs" | "truncated" | "encoding"> {
   return {
     previewType: result.previewType,
     content: result.preview?.content ?? null,
     base64: result.preview?.base64 ?? null,
     mimeType: result.preview?.mimeType ?? result.spreadsheet?.mimeType ?? null,
     spreadsheet: result.spreadsheet ?? null,
+    size: result.preview?.size ?? null,
+    mtimeMs: result.preview?.mtimeMs ?? null,
+    truncated: result.preview?.truncated ?? null,
+    encoding: result.preview?.encoding ?? null,
   };
 }
 

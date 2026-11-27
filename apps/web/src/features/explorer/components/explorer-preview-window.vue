@@ -6,6 +6,7 @@ import {
   CompressOutlined, ExpandOutlined, UpOutlined, DownOutlined,
   MinusOutlined, PlusOutlined, CopyOutlined, UnorderedListOutlined,
   DownloadOutlined, FullscreenExitOutlined, FullscreenOutlined, CloseOutlined,
+  SaveOutlined, RollbackOutlined,
 } from "@ant-design/icons-vue";
 import { useUiStore, type PreviewWindow } from "../../../store/ui";
 import { useConfigStore } from "../../../store/config";
@@ -25,6 +26,8 @@ import { trackProductEvent } from "../../../analytics/analytics";
 import { isSharedWorkspaceSelectionId } from "../../../utils/workspaceId";
 import { usePreviewZoom, type PreviewZoomKind } from "../usePreviewZoom";
 import { loadWorkspaceFilePreview } from "../workspaceFilePreview";
+import { canEditFilePreview, discardFileEditorDraft, ensureFileEditorDraft, isFileEditorDirty,
+  saveFileEditorDraft, updateFileEditorContent, type FileEditorDraft, type FileEditorSource } from "../fileEditorState";
 
 defineOptions({ name: "ExplorerPreviewWindow" });
 
@@ -103,6 +106,60 @@ const canDownloadPreviewFile = computed(() =>
 const canCopyPreviewContent = computed(() =>
   !["image", "binary", "spreadsheet", "pdf", "word", "presentation"].includes(props.win.previewType),
 );
+
+/** 独立窗口只按快照事实判断可编辑性；缺少修改时间的历史窗口保持只读。 */
+const editorPreview = computed<FileEditorSource | null>(() => {
+  if (props.win.content == null) return null;
+  return { content: props.win.content, size: props.win.size ?? 0, mtimeMs: props.win.mtimeMs ?? null,
+    truncated: props.win.truncated ?? false, encoding: props.win.encoding ?? "utf8" };
+});
+const editablePreview = computed(() => !isMobile.value && !showDiff.value && Boolean(props.win.workspaceId)
+  && canEditFilePreview({ workspaceId: props.win.workspaceId!, previewType: props.win.previewType,
+    preview: editorPreview.value, rawMarkdown: showRawMarkdown.value }));
+const editorDraft = ref<FileEditorDraft | null>(null);
+const editorDirty = computed(() => isFileEditorDirty(editorDraft.value));
+const editorContent = computed(() => editorDraft.value?.content ?? props.win.content ?? "");
+
+/** Markdown 原文与代码文件共用同一草稿；只读预览不建立草稿。 */
+watch([editorPreview, editablePreview], () => {
+  if (!editablePreview.value || !props.win.workspaceId || !editorPreview.value) { editorDraft.value = null; return; }
+  editorDraft.value = ensureFileEditorDraft(props.win.workspaceId, props.win.filePath, editorPreview.value);
+}, { immediate: true });
+
+function onEditorChange(value: string): void {
+  if (editorDraft.value) updateFileEditorContent(editorDraft.value, value);
+}
+
+/** 保存后同步窗口快照，复制与后续渲染使用新内容。 */
+async function saveEdits(): Promise<void> {
+  const draft = editorDraft.value, workspaceId = props.win.workspaceId;
+  if (!draft || !workspaceId) return;
+  try {
+    const result = await saveFileEditorDraft(ctx.value, draft, workspaceId, props.win.filePath);
+    props.win.content = draft.content;
+    props.win.size = result.size;
+    props.win.mtimeMs = result.mtimeMs;
+    props.win.truncated = false;
+    message.success("已保存");
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : "保存失败");
+  }
+}
+
+function discardEdits(): void {
+  if (editorDraft.value) discardFileEditorDraft(editorDraft.value);
+}
+
+/** 关闭前确认丢弃未保存修改，避免直接丢失编辑内容。 */
+function closeWindow(): void {
+  const draft = editorDraft.value;
+  if (draft && isFileEditorDirty(draft)) {
+    Modal.confirm({ title: "有未保存的修改", content: "关闭后这些修改将丢失。", okText: "放弃修改并关闭", cancelText: "继续编辑",
+      onOk: () => { discardFileEditorDraft(draft); ui.closePreviewWindow(props.win.id); } });
+    return;
+  }
+  ui.closePreviewWindow(props.win.id);
+}
 
 // ---- z-index：用 antd 原生 zIndex prop 控制 wrap 层级 ----
 const BASE_Z = 2101;
@@ -273,7 +330,7 @@ function onWindowMousedown(e: MouseEvent) {
   <component
     :is="embedded ? 'div' : Modal"
     v-bind="modalBinding"
-    v-on="!embedded ? { cancel: () => ui.closePreviewWindow(win.id) } : {}"
+    v-on="!embedded ? { cancel: closeWindow } : {}"
   >
     <template v-if="!embedded" #title>
       <div class="preview-window__titlebar">
@@ -310,7 +367,7 @@ function onWindowMousedown(e: MouseEvent) {
             size="small"
             aria-label="关闭预览"
             @mousedown.stop
-            @click.stop="ui.closePreviewWindow(win.id)"
+            @click.stop="closeWindow"
           >
             <CloseOutlined />
           </a-button>
@@ -328,6 +385,15 @@ function onWindowMousedown(e: MouseEvent) {
       <!-- 工具栏 -->
       <div class="preview-window__toolbar">
         <span class="preview-window__filepath" :title="win.filePath">{{ win.filePath }}</span>
+        <template v-if="editorDraft">
+          <span v-if="editorDirty" class="preview-window__dirty">未保存</span>
+          <a-button v-if="editorDirty" size="small" type="text" title="放弃修改" @click="discardEdits">
+            <RollbackOutlined />
+          </a-button>
+          <a-button size="small" type="text" title="保存 (Ctrl+S)" :loading="editorDraft.saving" :disabled="!editorDirty" @click="saveEdits">
+            <SaveOutlined />
+          </a-button>
+        </template>
         <a-button
           v-if="canCopyPreviewContent"
           size="small"
@@ -447,6 +513,15 @@ function onWindowMousedown(e: MouseEvent) {
           :base64="win.base64"
           :file-path="win.filePath"
         />
+        <CodePreview
+          v-else-if="win.previewType === 'markdown' && showRawMarkdown && win.content != null"
+          :content="editorContent"
+          :file-path="win.filePath"
+          :font-scale="scale"
+          :editable="editablePreview"
+          @change="onEditorChange"
+          @save="saveEdits"
+        />
         <MarkdownPreview
           v-else-if="win.previewType === 'markdown' && win.content != null"
           :content="win.content"
@@ -463,9 +538,12 @@ function onWindowMousedown(e: MouseEvent) {
         />
         <CodePreview
           v-else-if="win.previewType === 'code' && win.content != null"
-          :content="win.content"
+          :content="editorContent"
           :file-path="win.filePath"
           :font-scale="scale"
+          :editable="editablePreview"
+          @change="onEditorChange"
+          @save="saveEdits"
         />
         <div v-else-if="win.previewType === 'binary'" class="preview-window__placeholder">
           <p>{{ fileName }}</p>
@@ -536,6 +614,16 @@ function onWindowMousedown(e: MouseEvent) {
   white-space: nowrap;
   min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.preview-window__dirty {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-warning, #d97706) 14%, transparent);
+  color: var(--app-warning, #d97706);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .preview-window__zoom-group {

@@ -10,6 +10,12 @@ const props = defineProps<{
   content: string;
   filePath: string;
   fontScale?: number;
+  /** 本地 UTF-8 文本可编辑；只读预览保持现有行为。 */
+  editable?: boolean;
+}>();
+const emit = defineEmits<{
+  (e: "change", value: string): void;
+  (e: "save"): void;
 }>();
 
 const ui = useUiStore();
@@ -26,6 +32,8 @@ let model: monaco.editor.ITextModel | null = null;
 let focusDisposables: monaco.IDisposable[] = [];
 let resizeObserver: ResizeObserver | null = null;
 let layoutFrame: number | null = null;
+/** 外部重载内容或重建编辑器时不回传 change，避免把同步当成用户编辑。 */
+let suppressChange = false;
 
 function guessLanguage(path: string): string {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -55,11 +63,12 @@ function createEditor(): void {
   const lang = guessLanguage(props.filePath);
   model = monaco.editor.createModel(props.content, lang);
 
+  const editable = props.editable === true && !isMobileViewport();
   editor = monaco.editor.create(containerRef.value, {
     model,
-    readOnly: true,
-    domReadOnly: isMobileViewport(),
-    tabIndex: isMobileViewport() ? -1 : 0,
+    readOnly: !editable,
+    domReadOnly: !editable,
+    tabIndex: editable ? 0 : -1,
     automaticLayout: true,
     minimap: { enabled: false },
     scrollBeyondLastLine: false,
@@ -74,6 +83,12 @@ function createEditor(): void {
   });
   attachResizeObserver();
   scheduleEditorLayout();
+  editor.onDidChangeModelContent(() => {
+    if (!suppressChange) emit("change", editor?.getValue() ?? "");
+  });
+  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+    if (props.editable) emit("save");
+  });
 
   if (isMobileViewport()) {
     const blur = () => {
@@ -142,13 +157,21 @@ onUnmounted(() => {
 });
 
 watch(
-  () => [props.content, props.filePath, props.fontScale ?? 1, isDark.value] as const,
+  () => [props.filePath, props.fontScale ?? 1, isDark.value, props.editable === true] as const,
   async () => {
     destroyEditor();
     await nextTick();
     createEditor();
   },
 );
+
+/** 保留编辑光标：外部内容变化时只同步模型，不重建编辑器。 */
+watch(() => props.content, (value) => {
+  if (!model || model.getValue() === value) return;
+  suppressChange = true;
+  model.setValue(value);
+  suppressChange = false;
+});
 </script>
 
 <template>

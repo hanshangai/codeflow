@@ -343,6 +343,7 @@ export type DesktopApiMethod =
   | "fs.stat"
   | "fs.downloadFile"
   | "fs.readFile"
+  | "fs.writeFile"
   | "fs.spreadsheetPreview"
   | "fs.documentPreview"
   | "fs.extractAttachment"

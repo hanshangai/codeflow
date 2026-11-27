@@ -12,6 +12,7 @@ import {
   type FsUploadCancelRequestBody,
   type FsUploadChunkRequestBody,
   type FsUploadCompleteRequestBody,
+  type FsWriteFileRequestBody,
   type WorkspaceId,
 } from "@codeflowai/shared";
 import type { ApiHandlerContext, ApiRequestMessage } from "../handleApiRequest.js";
@@ -149,6 +150,25 @@ export async function handleFsReadFile(ctx: ApiHandlerContext, req: ApiRequestMe
     ctx.send({ t: "api.res", id: req.id, status: 200, body: { ok: true, ...result } });
   } catch (e) {
     sendFsError(ctx, req, e);
+  }
+}
+
+/** 保存工作区文本文件；编码、大小与冲突边界统一由 fsService 校验。 */
+export function handleFsWriteFile(ctx: ApiHandlerContext, req: ApiRequestMessage): void {
+  const body = (req.body ?? {}) as Partial<FsWriteFileRequestBody>;
+  const workspace = resolveWorkspace(ctx, req, body.workspaceId);
+  if (!workspace) return;
+  const filePath = String(body.path ?? "").trim();
+  if (!filePath || typeof body.content !== "string") {
+    ctx.send({ t: "api.res", id: req.id, status: 400, body: { ok: false, code: "BAD_REQUEST", message: "参数错误：path/content" } });
+    return;
+  }
+  try {
+    const result = fsService.writeFile(workspace.workspacePath, filePath, body.content,
+      { mtimeMs: body.expectedMtimeMs ?? null, size: body.expectedSize ?? null });
+    ctx.send({ t: "api.res", id: req.id, status: 200, body: { ok: true, ...result } });
+  } catch (error) {
+    sendFsError(ctx, req, error, { workspaceId: workspace.workspaceId });
   }
 }
 
@@ -398,7 +418,10 @@ function sendFsError(ctx: ApiHandlerContext, req: ApiRequestMessage, error: unkn
     const description = describeWorkspaceApiFailure(error);
     const code = description.code ?? (options?.document ? "BAD_REQUEST" : "CLIENT_ERROR");
     status = options?.document ? code === "TIMEOUT" ? 504 : code === "RATE_LIMITED" ? 429 : code === "INTERNAL_ERROR" ? 500 : 400
-      : code === "SHARED_WORKSPACE_FORBIDDEN" ? 403 : code === "FILE_ALREADY_EXISTS" ? 409 : code === "FILE_TRANSFER_PATH_INVALID" || code === "ENOTDIR" ? 400 : code === "ENOENT" ? 404 : 500;
+      : code === "SHARED_WORKSPACE_FORBIDDEN" ? 403 : code === "FILE_ALREADY_EXISTS" || code === "FS_WRITE_CONFLICT" ? 409
+        : code === "FILE_TRANSFER_PATH_INVALID" || code === "ENOTDIR" || code === "FS_WRITE_CONTENT_INVALID"
+          || code === "FS_WRITE_TARGET_INVALID" || code === "FS_WRITE_TOO_LARGE" || code === "FS_WRITE_ENCODING_UNSUPPORTED" ? 400
+          : code === "ENOENT" ? 404 : 500;
     errorCode = code === "ENOTDIR" ? "BAD_REQUEST" : code === "ENOENT" ? "NOT_FOUND" : code;
     message = description.message;
     const indexError = error instanceof WorkspacePathIndexPathError ? error : null;

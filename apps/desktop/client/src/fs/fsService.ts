@@ -23,6 +23,7 @@ import type {
   FsSpreadsheetPreviewResponseBody,
   FsTreeNode,
   FsReadFileResponseBody,
+  FsWriteFileResponseBody,
 } from "@codeflowai/shared";
 import { getMimeType, isBinaryFile, isDocumentPreviewFile, isImageFile, isSpreadsheetFile, resolveWorkspacePath, resolveWorkspaceReadPath } from "./fsHelpers.js";
 import { decodeTextBuffer } from "./textEncoding.js";
@@ -615,13 +616,13 @@ export function readFile(workspacePath: string, relPath: string, maxBytes?: numb
   const mime = getMimeType(abs);
 
   if (binary && !image) {
-    return { path: relPath, content: null, isBinary: true, size: stat.size, mimeType: mime };
+    return { path: relPath, content: null, isBinary: true, size: stat.size, mimeType: mime, mtimeMs: stat.mtimeMs };
   }
 
   if (image) {
     // 图片限 5MB
     if (stat.size > 5 * 1024 * 1024) {
-      return { path: relPath, content: null, isBinary: true, size: stat.size, mimeType: mime };
+      return { path: relPath, content: null, isBinary: true, size: stat.size, mimeType: mime, mtimeMs: stat.mtimeMs };
     }
     const buf = fs.readFileSync(readPath);
     return {
@@ -631,6 +632,7 @@ export function readFile(workspacePath: string, relPath: string, maxBytes?: numb
       size: stat.size,
       base64: buf.toString("base64"),
       mimeType: mime,
+      mtimeMs: stat.mtimeMs,
     };
   }
 
@@ -648,11 +650,14 @@ export function readFile(workspacePath: string, relPath: string, maxBytes?: numb
       size: stat.size,
       mimeType: mime,
       encoding: decoded.encoding,
+      mtimeMs: stat.mtimeMs,
+      truncated: true,
     };
   }
 
   const decoded = decodeTextBuffer(fs.readFileSync(readPath));
-  return { path: relPath, content: decoded.content, isBinary: false, size: stat.size, mimeType: mime, encoding: decoded.encoding };
+  return { path: relPath, content: decoded.content, isBinary: false, size: stat.size, mimeType: mime, encoding: decoded.encoding,
+    mtimeMs: stat.mtimeMs, truncated: false };
 }
 
 /** 小预览同轮完成避免线程池排队；超过64KB后异步有界读取，保持原编码与截断合同。 */
@@ -664,7 +669,9 @@ export async function readFileAsync(workspacePath: string, relPath: string, maxB
   if (!stat.isFile()) throw new Error(`不是文件：${relPath}`);
   if (stat.size <= 64 * 1024) return readFile(workspacePath, relPath, maxBytes);
   const image = isImageFile(abs), binary = isBinaryFile(abs), mimeType = getMimeType(abs);
-  if (binary && !image || image && stat.size > 5 * 1024 * 1024) return { path: relPath, content: null, isBinary: true, size: stat.size, mimeType };
+  if (binary && !image || image && stat.size > 5 * 1024 * 1024) {
+    return { path: relPath, content: null, isBinary: true, size: stat.size, mimeType, mtimeMs: stat.mtimeMs };
+  }
   resolveWorkspaceReadPath(workspacePath, relPath);
   const file = await fsp.open(readPath, "r");
   let failure: { error: unknown } | undefined;
@@ -682,14 +689,54 @@ export async function readFileAsync(workspacePath: string, relPath: string, maxB
       offset += result.bytesRead;
     }
     const content = bytes.subarray(0, offset);
-    if (image) return { path: relPath, content: null, isBinary: true, size: stat.size, base64: content.toString("base64"), mimeType };
+    if (image) return { path: relPath, content: null, isBinary: true, size: stat.size, base64: content.toString("base64"), mimeType, mtimeMs: stat.mtimeMs };
     const decoded = decodeTextBuffer(content, { allowPartialTail: stat.size > limit });
-    return { path: relPath, content: decoded.content + (stat.size > limit ? "\n…(文件过大，已截断)" : ""), isBinary: false, size: stat.size, mimeType, encoding: decoded.encoding };
+    return { path: relPath, content: decoded.content + (stat.size > limit ? "\n…(文件过大，已截断)" : ""), isBinary: false, size: stat.size,
+      mimeType, encoding: decoded.encoding, mtimeMs: stat.mtimeMs, truncated: stat.size > limit };
   } catch (error) { failure = { error }; throw error; }
   finally {
     try { await file.close(); }
     catch (error) { if (failure) throw new AggregateError([failure.error, error], "FS_PREVIEW_READ_CLOSE_FAILED", { cause: failure.error }); throw error; }
   }
+}
+
+const EDIT_MAX_BYTES = 5 * 1024 * 1024;
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+
+/** 只覆盖工作区内已存在的 UTF-8 文本文件；冲突、编码或目标异常显式失败。 */
+export function writeFile(workspacePath: string, relPath: string, content: string,
+  expected?: { mtimeMs?: number | null; size?: number | null }): FsWriteFileResponseBody {
+  if (typeof content !== "string") throw Object.assign(new Error("文件内容无效"), { code: "FS_WRITE_CONTENT_INVALID" });
+  const logical = resolveWorkspacePath(workspacePath, relPath);
+  const abs = resolveWorkspaceReadPath(workspacePath, relPath);
+  let stat: fs.Stats;
+  try { stat = fs.lstatSync(logical); }
+  catch (error) {
+    throw Object.assign(new Error(`无法写入文件：${relPath}（文件不存在）`), { code: "FS_WRITE_TARGET_INVALID", cause: error });
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) throw Object.assign(new Error(`不是可编辑的普通文件：${relPath}`), { code: "FS_WRITE_TARGET_INVALID" });
+  if (stat.size > EDIT_MAX_BYTES) throw Object.assign(new Error(`文件过大，无法编辑：${relPath}`), { code: "FS_WRITE_TOO_LARGE" });
+  if (expected?.size != null && expected.size !== stat.size
+    || expected?.mtimeMs != null && Math.abs(expected.mtimeMs - stat.mtimeMs) > 1) {
+    throw Object.assign(new Error("文件已被其他程序修改，请重新加载后再保存"), { code: "FS_WRITE_CONFLICT" });
+  }
+  const bytes = Buffer.from(content, "utf8");
+  if (bytes.byteLength > EDIT_MAX_BYTES) throw Object.assign(new Error("文件内容过大，无法保存"), { code: "FS_WRITE_TOO_LARGE" });
+  const original = fs.readFileSync(abs);
+  const { encoding } = decodeTextBuffer(original);
+  if (encoding !== "utf8") throw Object.assign(new Error("该文件不是 UTF-8 编码，暂不支持编辑"), { code: "FS_WRITE_ENCODING_UNSUPPORTED" });
+  const payload = original.subarray(0, 3).equals(UTF8_BOM) ? Buffer.concat([UTF8_BOM, bytes]) : bytes;
+  const temporary = path.join(path.dirname(abs), `.${path.basename(abs)}.codeflow-edit-${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temporary, payload, { mode: stat.mode & 0o777, flag: "wx" });
+    fs.renameSync(temporary, abs);
+  } catch (error) {
+    try { fs.rmSync(temporary, { force: true }); }
+    catch (cleanup) { throw new AggregateError([error, cleanup], "FS_WRITE_CLEANUP_FAILED"); }
+    throw error;
+  }
+  const after = fs.statSync(abs);
+  return { path: relPath, size: after.size, mtimeMs: after.mtimeMs };
 }
 
 /** 返回工作区内真实文件的下载字节，沿原 RPC 传输 base64。 */

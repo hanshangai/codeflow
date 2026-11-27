@@ -248,6 +248,7 @@ const ALLOWED_FIELDS = {
   "fs.stat": ["workspaceId", "path"],
   "fs.downloadFile": ["workspaceId", "path"],
   "fs.readFile": ["workspaceId", "path", "maxBytes"],
+  "fs.writeFile": ["workspaceId", "path", "content", "expectedMtimeMs", "expectedSize"],
   "fs.spreadsheetPreview": ["workspaceId", "path", "sheetName", "maxRows", "maxColumns"],
   "fs.documentPreview": ["workspaceId", "path"],
   "fs.extractAttachment": ["workspaceId", "fileName", "base64"],
