@@ -11,7 +11,7 @@ import { CLIENT_DB_SCHEMA_VERSION, migrateClientDb, assertWorkspaceDbReadOnlySch
 import { WorkspaceRepo, type PersistedWorkspace } from '../db/repos/workspaceRepo.js';
 import { ThreadQueueStateRepo } from '../db/repos/threadQueueStateRepo.js';
 import { FileBlobRepo } from '../db/repos/fileBlobRepo.js';
-import { OrchInstanceRepo } from '../db/repos/orchInstanceRepo.js';
+import { OrchInstanceRepo, OrchInstanceScopeError, readStrictInstanceScope } from '../db/repos/orchInstanceRepo.js';
 import { ChatWorkflowRepo } from '../db/repos/chatWorkflowRepo.js';
 import { hashOrchNodeAttemptSubmission } from '../db/repos/orchNodeAttemptRepo.js';
 import { serializeCodeAttributionOutboxPayload } from '../db/repos/codeAttributionOutboxRepo.js';
@@ -34,6 +34,12 @@ type SourceConfig = { apiKey: string; serverWs: string; clientId: string };
 type Source = { configPath: string; dbPath: string; accountNamespace: string; sourceClientId: string; serverWs: string;
   workspaces: Array<PersistedWorkspace & { workspaceDbPath: string | null }>; candidateId: string };
 type PublishedFile = { target: string; staged: string; sha256: string; originalSha256: string | null; published: boolean };
+type WorkflowScopeRepairFix = { workspaceId: string; instanceId: string; previousScopeId: string };
+type WorkflowScopeRepairBackup = { schemaVersion: 1; migrationId: string; fixes: WorkflowScopeRepairFix[] };
+type MigrationSkippedRecord = { workspaceId: string; table: string; recordId: string;
+  reason: 'constraint' | 'parent_record_skipped'; rootCauseCode: 'SQLITE_CONSTRAINT_IGNORED' | 'MIGRATION_PARENT_RECORD_SKIPPED' };
+type MigrationSkipReport = { schemaVersion: 1; migrationId: string; skipped: MigrationSkippedRecord[] };
+type WorkspaceCopyState = { skippedLocalTaskIds: Set<string>; skippedAccountRuntimeKeys: Set<string> };
 type Journal = { schemaVersion: 1 | 2; migrationId: string; candidateId: string; targetClientId: string; targetDeviceId: string;
   source: Source; stage: string; files: PublishedFile[]; snapshotsReady: boolean; converted: boolean;
   completed: boolean; deferred?: boolean; errorCode: string | null; snapshotGeneration: string | null;
@@ -47,9 +53,11 @@ export type LegacyClientMigrationDependencies = {
   afterPublish?: (file: { target: string }) => void;
 };
 const JOURNAL = 'legacy-client-migration-journal.json';
+const WORKFLOW_SCOPE_REPAIR = 'workflow-scope-repair.json';
+const MIGRATION_SKIPPED_RECORDS = 'migration-skipped-records.json';
 const SIDECARS = ['-wal', '-shm', '-journal'];
 const PROFILE_TABLES = ['workspace_execution_profiles', 'workspace_prefs', 'scheduled_task_configs', 'scheduled_task_runs',
-  'scheduled_task_runtime_states', 'scheduled_task_account_configs'];
+  'scheduled_task_account_configs', 'scheduled_task_runtime_states'];
 const CACHE_TABLES = ['conversation_presentations', 'conversation_presentation_items', 'orch_list_status_count_cache'];
 const WORKSPACE_TABLES = [...new Set([...WORKSPACE_CORE_TABLES, ...WORKSPACE_ADDITIONAL_TABLES, ...PROFILE_TABLES])]
   .filter(table => table !== 'meta' && !CACHE_TABLES.includes(table));
@@ -60,7 +68,7 @@ const RETIRED_TABLES = ['notes', 'orch_asset_bundle_sync', 'orch_asset_cache_ent
 const REFERENCE_KEYS = new Set(['workspaceId', 'workspace_id', 'workspaceScopeId', 'workspace_scope_id',
   'sourceWorkspaceId', 'targetWorkspaceId', 'localWorkspaceId', 'hostWorkspaceId']);
 
-/** 只读发现当前配置账号；完成或中断事实优先读取同一安装的 journal。 */
+/** 发现当前配置账号；已完成迁移先校验并修复可确定的工作流本机范围。 */
 export async function discoverLegacyClientMigration(input: Input, dependencies: LegacyClientMigrationDependencies = {}): Promise<LegacyClientMigrationResult> {
   validateInput(input);
   const journal = readJournal(input);
@@ -69,7 +77,7 @@ export async function discoverLegacyClientMigration(input: Input, dependencies: 
       if (!isPrepublication(journal)) fail('MIGRATION_DEFER_UNSAFE');
       return { candidateId: null, workspaceCount: 0, migrationId: journal.migrationId, deferred: true };
     }
-    if (journal.completed) { validateCompleted(input, journal); return await journalResult(journal, dependencies); }
+    if (journal.completed) { validateCompleted(input, journal, true); return await journalResult(journal, dependencies); }
     return { candidateId: journal.candidateId, workspaceCount: journal.source.workspaces.length, migrationId: journal.migrationId,
       resume: true, canDefer: canDeferJournal(journal) };
   }
@@ -133,6 +141,10 @@ export function clearLegacyMigrationCredentials(input: Input): void {
       else if (database.test(base) && name !== base) {
         if (name.endsWith('.snapshot')) temporary.push(file);
         else if (!exists(path.join(directory, base))) fail('MIGRATION_ARCHIVE_ORPHAN_SIDECAR');
+      } else if (!generation && name === WORKFLOW_SCOPE_REPAIR) {
+        validateWorkflowScopeRepairBackup(readObject(file), journal);
+      } else if (!generation && name === MIGRATION_SKIPPED_RECORDS) {
+        validateMigrationSkipReport(readObject(file), journal);
       } else if (generation && name === 'source-application.meta.json') {
         readObject(file);
       } else if (!generation && ['target-config.json', 'target-meta.json'].includes(name)) {
@@ -195,7 +207,7 @@ export async function migrateLegacyClientMigration(input: Input, dependencies: L
   parseLegacyClientMigrationRequest({ ...input, action: 'migrate' }); validateInput(input);
   let journal = readJournal(input);
   if (journal?.deferred) fail('MIGRATION_DATA_DEFERRED');
-  if (journal?.completed) { validateCompleted(input, journal); return await journalResult(journal, dependencies); }
+  if (journal?.completed) { validateCompleted(input, journal, true); return await journalResult(journal, dependencies); }
   if (!journal) {
     const source = await discoverSource(input, dependencies);
     if (!source || source.candidateId !== input.candidateId) fail('MIGRATION_CANDIDATE_CHANGED');
@@ -435,6 +447,16 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
   };
   report('application_snapshot');
   const archive = archiveDirectory(input, journal), appPath = path.join(archive, 'target-application.db');
+  const skipReportPath = path.join(archive, MIGRATION_SKIPPED_RECORDS);
+  removeOwnedTemporary(skipReportPath);
+  const skipped: MigrationSkippedRecord[] = [];
+  const recordSkipped = (entry: MigrationSkippedRecord): void => {
+    if (skipped.some(row => JSON.stringify(row) === JSON.stringify(entry))) return;
+    skipped.push(entry);
+  };
+  const persistSkipped = (): void => {
+    if (skipped.length) writeAtomic(skipReportPath, { schemaVersion: 1, migrationId: journal.migrationId, skipped });
+  };
   removeOwnedTemporary(appPath);
   fs.copyFileSync(path.join(snapshotDirectory(input, journal), 'source-application.db'), appPath, fs.constants.COPYFILE_EXCL);
   const files: PublishedFile[] = [];
@@ -460,10 +482,12 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
       const staged = path.join(directory.directoryPath, `legacy-migration-${journal.migrationId}.db`);
       removeOwnedTemporary(staged);
       const workspace = openSqliteDb(staged);
+      const copyState: WorkspaceCopyState = { skippedLocalTaskIds: new Set(), skippedAccountRuntimeKeys: new Set() };
       let workFailure: unknown;
       try {
         migrateClientDb(workspace, { scope: 'workspace' }); ensureWorkspaceCoreQueueTables(workspace); ensureWorkspaceAdditionalTables(workspace);
-        copyWorkspaceRows(app, workspace, id, false, report);
+        copyWorkspaceRows(app, workspace, id, false, report, copyState, recordSkipped);
+        persistSkipped();
         if (source.workspaceDbPath) {
           const converted = path.join(archive, `converted-workspace-${index}.db`); removeOwnedTemporary(converted);
           fs.copyFileSync(path.join(snapshotDirectory(input, journal), `source-workspace-${index}.db`), converted, fs.constants.COPYFILE_EXCL);
@@ -477,7 +501,8 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
               if (cols.includes('workspace_id')) previous.prepare(`UPDATE ${quote(table)} SET workspace_id=? WHERE workspace_id=?`).run(id, source.id);
               if (cols.includes('workspace_scope_id')) previous.prepare(`UPDATE ${quote(table)} SET workspace_scope_id=? WHERE workspace_scope_id=?`).run(id, source.id);
             }
-            copyWorkspaceRows(previous, workspace, id, true, report);
+            copyWorkspaceRows(previous, workspace, id, true, report, copyState, recordSkipped);
+            persistSkipped();
             const oldFloor = readWorkspaceEventSeqFloor(previous);
             if (oldFloor > 0) recordWorkspaceEventSeqFloor(workspace, oldFloor);
           });
@@ -527,8 +552,9 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
   return files;
 }
 
-/** 表清单限定当前支持语义；按 workspace/thread/父实体闭包提取，冲突绝不忽略。 */
-function copyWorkspaceRows(source: SqliteDb, target: SqliteDb, id: string, whole: boolean, report: ConversionReport): void {
+/** 按行复制；SQLite 约束拒绝时记账跳过该行，数据库和 I/O 故障仍终止迁移。 */
+function copyWorkspaceRows(source: SqliteDb, target: SqliteDb, id: string, whole: boolean, report: ConversionReport,
+  state: WorkspaceCopyState, recordSkipped: (entry: MigrationSkippedRecord) => void): void {
   source.pragma('foreign_keys = ON'); target.pragma('foreign_keys = OFF');
   try {
     target.transaction(() => {
@@ -541,16 +567,32 @@ function copyWorkspaceRows(source: SqliteDb, target: SqliteDb, id: string, whole
         const names = columns(source, table), targetNames = columns(target, table);
         if (names.some(name => !targetNames.includes(name))) fail('SOURCE_SCHEMA_UNSUPPORTED');
         const before = tableCount(target, table);
-        const insert = target.prepare(`INSERT INTO ${quote(table)} (${names.map(quote).join(',')}) VALUES (${names.map(() => '?').join(',')})`);
+        const insert = target.prepare(`INSERT OR IGNORE INTO ${quote(table)} (${names.map(quote).join(',')}) VALUES (${names.map(() => '?').join(',')})`);
         let copied = 0;
+        let scanned = 0;
         for (const row of rows) {
-          try { insert.run(...names.map(name => row[name])); }
-          catch (error) { throw migrationError('SOURCE_LAYOUT_CONFLICT', error); }
-          if (++copied % 1_024 === 0) report('copy', table, copied);
+          scanned++;
+          if (table === 'scheduled_task_runtime_states' && skippedScheduledTaskParent(target, row.task_id, state)) {
+            recordSkipped({ workspaceId: id, table, recordId: migrationRecordId(source, table, row, scanned),
+              reason: 'parent_record_skipped', rootCauseCode: 'MIGRATION_PARENT_RECORD_SKIPPED' });
+            continue;
+          }
+          const result = insert.run(...names.map(name => row[name]));
+          if (Number(result.changes ?? 0) === 0) {
+            recordSkipped({ workspaceId: id, table, recordId: migrationRecordId(source, table, row, scanned),
+              reason: 'constraint', rootCauseCode: 'SQLITE_CONSTRAINT_IGNORED' });
+            if (table === 'scheduled_task_configs' && typeof row.id === 'string') state.skippedLocalTaskIds.add(row.id);
+            if (table === 'scheduled_task_account_configs' && typeof row.task_id === 'string'
+              && [row.server_origin, row.owner_user_id, row.client_id, row.device_id].every(value => typeof value === 'string' && value)) {
+              state.skippedAccountRuntimeKeys.add(scheduledTaskAccountRuntimeKey(row.task_id,
+                { serverOrigin: row.server_origin, ownerUserId: row.owner_user_id, clientId: row.client_id, deviceId: row.device_id }));
+            }
+          } else copied++;
+          if (scanned % 1_024 === 0) report('copy', table, scanned);
         }
         const count = Number((target.prepare(`SELECT COUNT(*) AS count FROM ${quote(table)}`).get() as Row).count);
         if (count - before !== copied) fail('MIGRATION_ROW_COUNT_MISMATCH');
-        report('copy', table, copied);
+        report('copy', table, scanned);
       }
       if (whole && hasTable(source, 'meta')) {
         for (const row of source.prepare('SELECT key,value FROM meta').all() as Array<{ key: string; value: string }>) {
@@ -558,8 +600,31 @@ function copyWorkspaceRows(source: SqliteDb, target: SqliteDb, id: string, whole
           target.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(row.key, row.value);
         }
       }
+      skipRowsWithMissingParents(target, id, state, recordSkipped);
     })();
   } finally { target.pragma('foreign_keys = ON'); }
+}
+
+/** 父记录因约束被跳过后，递归跳过外键未闭合的子记录。 */
+function skipRowsWithMissingParents(target: SqliteDb, workspaceId: string, state: WorkspaceCopyState,
+  recordSkipped: (entry: MigrationSkippedRecord) => void): void {
+  while (true) {
+    const violations = target.prepare('PRAGMA foreign_key_check').all() as Array<{ table: string; rowid: number | null }>;
+    if (!violations.length) return;
+    let removed = 0;
+    for (const violation of violations) {
+      if (!WORKSPACE_TABLES.includes(violation.table) || !Number.isSafeInteger(violation.rowid)) fail('MIGRATION_FOREIGN_KEY_ROW_UNIDENTIFIABLE');
+      const row = target.prepare(`SELECT * FROM ${quote(violation.table)} WHERE rowid=?`).get(violation.rowid!) as Row | undefined;
+      if (!row) fail('MIGRATION_FOREIGN_KEY_ROW_UNIDENTIFIABLE');
+      const result = target.prepare(`DELETE FROM ${quote(violation.table)} WHERE rowid=?`).run(violation.rowid!);
+      if (Number(result.changes ?? 0) !== 1) fail('MIGRATION_FOREIGN_KEY_ROW_UNIDENTIFIABLE');
+      if (violation.table === 'scheduled_task_configs' && typeof row.id === 'string') state.skippedLocalTaskIds.add(row.id);
+      recordSkipped({ workspaceId, table: violation.table, recordId: migrationRecordId(target, violation.table, row, Number(violation.rowid)),
+        reason: 'parent_record_skipped', rootCauseCode: 'MIGRATION_PARENT_RECORD_SKIPPED' });
+      removed++;
+    }
+    if (!removed) fail('MIGRATION_FOREIGN_KEY_ROW_UNIDENTIFIABLE');
+  }
 }
 
 /** 集中库按已有实体键关联；无 FK 的业务表在这里明确归属，禁止扫表后默认丢弃。 */
@@ -592,6 +657,32 @@ function workspacePredicate(db: SqliteDb, table: string, id: string): string | n
   if (cols.includes('snapshot_id')) return `snapshot_id IN (SELECT id FROM controlled_experiment_snapshots WHERE workspace_id=${literal})`;
   if (cols.includes('thread_id')) return `thread_id IN (${threads})`;
   return null;
+}
+
+/** 已跳过配置的调度状态没有可验证的父配置，随父记录一起跳过。 */
+function skippedScheduledTaskParent(target: SqliteDb, taskId: unknown, state: WorkspaceCopyState): boolean {
+  if (typeof taskId !== 'string') return false;
+  const localPrefix = '__local_scheduled_task__:', accountPrefix = '__account_scheduled_task__:';
+  if (taskId.startsWith(localPrefix) && state.skippedLocalTaskIds.has(taskId.slice(localPrefix.length))) {
+    return !target.prepare('SELECT 1 FROM scheduled_task_configs WHERE id=?').get(taskId.slice(localPrefix.length));
+  }
+  if (taskId.startsWith(accountPrefix) && state.skippedAccountRuntimeKeys.has(taskId)) {
+    const ownerAndTask = JSON.parse(taskId.slice(accountPrefix.length)) as unknown[];
+    if (ownerAndTask.length !== 5 || ownerAndTask.some(value => typeof value !== 'string')) return false;
+    const exists = target.prepare(`SELECT 1 FROM scheduled_task_account_configs WHERE
+      server_origin=? AND owner_user_id=? AND client_id=? AND device_id=? AND task_id=?`).get(...ownerAndTask);
+    return !exists;
+  }
+  return false;
+}
+
+/** 诊断只保留稳定主键；自由文本主键改用表内扫描序号避免泄漏正文。 */
+function migrationRecordId(db: SqliteDb, table: string, row: Row, rowIndex: number): string {
+  const keys = (db.prepare(`PRAGMA table_info(${quote(table)})`).all() as Array<{ name: string; pk: number }>)
+    .filter(column => column.pk > 0).sort((left, right) => left.pk - right.pk);
+  const values = keys.map(column => row[column.name]);
+  const value = values.length === 1 ? String(values[0]) : JSON.stringify(values);
+  return value && value.length <= 256 && /^[A-Za-z0-9_:.\/-]+$/.test(value) ? value : `row:${rowIndex}`;
 }
 
 /** 移出的工作区事实只留在 W；个人资产和应用定时历史仍由现有应用库拥有。 */
@@ -641,7 +732,13 @@ async function rewriteBusinessReferences(db: SqliteDb, mapping: Map<string, stri
           }
           if (table === 'raw_engine_events') {
             if (value && mapping.has(value.workspaceId)) value.workspaceId = mapping.get(value.workspaceId);
-          } else rewriteJson(value, mapping);
+          } else {
+            rewriteJson(value, mapping);
+            if (table === 'orch_instances' && column === 'runtime_config_json') {
+              const scope = value?.executionProfileScope;
+              if (scope?.scopeType === 'local_workspace' && mapping.has(scope.scopeId)) scope.scopeId = mapping.get(scope.scopeId);
+            }
+          }
           const changed = JSON.stringify(value);
           if (changed !== JSON.stringify(JSON.parse(raw))) {
             if (table === 'controlled_experiment_snapshots') fail('SOURCE_HASHED_REFERENCE_UNSUPPORTED');
@@ -711,6 +808,15 @@ function pauseExecution(db: SqliteDb, input: Input, workspaceId: string | null):
 async function verifyWorkspace(db: SqliteDb, id: string, workspacePath: string, report: ConversionReport,
   dependencies: LegacyClientMigrationDependencies): Promise<void> {
   assertWorkspaceOwnership(db, id);
+  report('workflow_instances', 'orch_instances');
+  let instanceCount = 0;
+  for (const row of db.prepare(`SELECT id,workspace_id,intake_snapshot_json,runtime_config_json,node_states_json
+    FROM orch_instances WHERE workspace_id=? ORDER BY id`).iterate(id) as IterableIterator<Row>) {
+    checkpoint(dependencies);
+    readStrictInstanceScope(row);
+    if (++instanceCount % 256 === 0) { report('workflow_instances', 'orch_instances', instanceCount); await yieldLoop(); }
+  }
+  report('workflow_instances', 'orch_instances', instanceCount);
   const counts = db.prepare("SELECT (SELECT COUNT(*) FROM conversation_events) AS canonical, (SELECT COUNT(*) FROM raw_engine_events) AS raw").get() as
     { canonical: number; raw: number };
   const blobs = new FileBlobRepo(db);
@@ -890,8 +996,8 @@ function publishFile(input: Input, journal: Journal, file: PublishedFile): void 
   file.published = true; writeJournal(input, journal);
 }
 
-/** 完成事实只验稳定身份、完整性与已知版本；后续 schema 升级仍归正常 Client。 */
-function validateCompleted(input: Input, journal: Journal): void {
+/** 核验完成库的稳定事实；正常启动允许修复旧工作流引用，维护入口仍只读核验。 */
+function validateCompleted(input: Input, journal: Journal, repairWorkflowScopes = false): void {
   const config = readObject(path.join(input.dataDir, 'config.json'));
   if (config.clientId !== input.targetClientId) fail('TARGET_IDENTITY_CONFLICT');
   const meta = readObject(path.join(input.dataDir, 'codeflowai.db.meta.json'));
@@ -902,6 +1008,156 @@ function validateCompleted(input: Input, journal: Journal): void {
     if (db.pragma('application_id', { simple: true }) !== 0 || !Number.isInteger(version) || version < 83 || version > CLIENT_DB_SCHEMA_VERSION) fail('TARGET_SCHEMA_UNSUPPORTED');
     integrity(db);
   });
+  if (repairWorkflowScopes) repairCompletedWorkflowScopes(input, journal);
+}
+
+/** 完成库只修复能从原workspace映射唯一确定的本机Profile引用，并先保存可回放备份。 */
+function repairCompletedWorkflowScopes(input: Input, journal: Journal): void {
+  const mapping = new Map(journal.source.workspaces.map(work => [work.id, mappedWorkspaceId(work.id, journal.source.sourceClientId, input.targetClientId)]));
+  const applicationDb = path.join(input.dataDir, 'codeflowai.db');
+  const migratedIds = new Set(mapping.values());
+  /** 用当前注册定位仍可访问的迁移库，软删除的库恢复注册后也能被修复。 */
+  const findTargets = () => withDatabase(applicationDb, true, db => new WorkspaceRepo(db).list({ includeDeleted: true }).flatMap(work => {
+    if (!migratedIds.has(work.id)) return [];
+    const dbPath = path.join(work.path, '.codeflow', 'workspace.db');
+    if (!exists(dbPath)) return [];
+    assertFile(dbPath);
+    return [{ workspaceId: work.id, dbPath }];
+  }));
+  if (!collectWorkflowScopeRepairs(findTargets(), mapping).length) return;
+
+  const locks: ClientProcessLock[] = [];
+  let failure: unknown;
+  try {
+    locks.push(acquireClientProcessLock({ dbPath: applicationDb, clientId: input.targetClientId }));
+    const targets = findTargets();
+    for (const target of targets) locks.push(acquireClientProcessLock({ dbPath: target.dbPath, clientId: input.targetClientId }));
+    const current = collectWorkflowScopeRepairs(targets, mapping);
+    if (!current.length) return;
+    const archive = archiveDirectory(input, journal), archiveRoot = path.dirname(archive);
+    if (exists(archiveRoot)) assertDirectory(archiveRoot); else { fs.mkdirSync(archiveRoot); assertDirectory(archiveRoot); }
+    if (exists(archive)) assertDirectory(archive); else { fs.mkdirSync(archive); assertDirectory(archive); }
+    const backupPath = path.join(archive, WORKFLOW_SCOPE_REPAIR);
+    const backup = exists(backupPath) ? validateWorkflowScopeRepairBackup(readObject(backupPath), journal, mapping).fixes : [];
+    const saved = new Set(backup.map(repairFixKey));
+    const additions = current.filter(fix => !saved.has(repairFixKey(fix)));
+    if (additions.length) writeAtomic(backupPath, { schemaVersion: 1, migrationId: journal.migrationId, fixes: [...backup, ...additions] });
+
+    for (const target of targets) {
+      const fixes = current.filter(fix => fix.workspaceId === target.workspaceId);
+      if (!fixes.length) continue;
+      withDatabase(target.dbPath, false, db => {
+        db.transaction(() => {
+          const select = db.prepare('SELECT id,workspace_id,intake_snapshot_json,runtime_config_json,node_states_json FROM orch_instances WHERE id=?');
+          const update = db.prepare('UPDATE orch_instances SET runtime_config_json=? WHERE id=? AND workspace_id=? AND runtime_config_json=?');
+          for (const fix of fixes) {
+            const row = select.get(fix.instanceId) as Row | undefined;
+            if (!row) fail('MIGRATION_WORKFLOW_SCOPE_REPAIR_CONFLICT');
+            if (row.workspace_id !== fix.workspaceId || typeof row.runtime_config_json !== 'string') fail('MIGRATION_WORKFLOW_SCOPE_REPAIR_CONFLICT');
+            let runtimeConfig: any;
+            try { runtimeConfig = JSON.parse(row.runtime_config_json); } catch (error) { throw migrationError('MIGRATION_WORKFLOW_SCOPE_REPAIR_CONFLICT', error); }
+            const scope = runtimeConfig?.executionProfileScope;
+            if (!scope || scope.scopeType !== 'local_workspace') fail('MIGRATION_WORKFLOW_SCOPE_REPAIR_CONFLICT');
+            if (scope.scopeId !== fix.previousScopeId || mapping.get(fix.previousScopeId) !== fix.workspaceId) fail('MIGRATION_WORKFLOW_SCOPE_REPAIR_CONFLICT');
+            scope.scopeId = fix.workspaceId;
+            const changed = JSON.stringify(runtimeConfig);
+            readStrictInstanceScope({ ...row, runtime_config_json: changed });
+            if (update.run(changed, fix.instanceId, fix.workspaceId, row.runtime_config_json).changes !== 1) fail('MIGRATION_WORKFLOW_SCOPE_REPAIR_CONFLICT');
+          }
+          integrity(db);
+        })();
+      });
+      syncFile(target.dbPath);
+    }
+  } catch (error) { failure = error; throw error; }
+  finally {
+    const releaseErrors: unknown[] = [];
+    for (const lock of locks.reverse()) { try { lock.release(); } catch (error) { releaseErrors.push(error); } }
+    if (releaseErrors.length) throw new AggregateError([...(failure === undefined ? [] : [failure]), ...releaseErrors],
+      'MIGRATION_WORKFLOW_SCOPE_REPAIR_LOCK_RELEASE_FAILED', { cause: failure });
+  }
+}
+
+/** 只预检旧迁移涉及的本机范围不一致，其他工作流归正常读取边界校验。 */
+function collectWorkflowScopeRepairs(targets: Array<{ workspaceId: string; dbPath: string }>, mapping: Map<string, string>): WorkflowScopeRepairFix[] {
+  const fixes: WorkflowScopeRepairFix[] = [];
+  for (const target of targets) withDatabase(target.dbPath, true, db => {
+    if (!hasTable(db, 'orch_instances')) return;
+    for (const row of db.prepare(`SELECT id,workspace_id,intake_snapshot_json,runtime_config_json,node_states_json
+      FROM orch_instances WHERE workspace_id=? AND CASE WHEN json_valid(runtime_config_json) THEN
+        json_extract(runtime_config_json,'$.executionProfileScope.scopeType')='local_workspace'
+        AND json_extract(runtime_config_json,'$.executionProfileScope.scopeId')<>workspace_id END ORDER BY id`)
+      .iterate(target.workspaceId) as IterableIterator<Row>) {
+      try { readStrictInstanceScope(row); }
+      catch (error) {
+        if (!(error instanceof OrchInstanceScopeError) || error.details.field !== 'runtime_config_json.executionProfileScope'
+          || error.details.reason !== 'local_profile_workspace_mismatch') throw error;
+        let runtimeConfig: any;
+        try { runtimeConfig = JSON.parse(row.runtime_config_json); } catch (parseError) { throw migrationError('MIGRATION_WORKFLOW_SCOPE_REPAIR_CONFLICT', parseError); }
+        const profileScope = runtimeConfig.executionProfileScope, previousScopeId = profileScope.scopeId;
+        if (mapping.get(previousScopeId) !== target.workspaceId) throw error;
+        profileScope.scopeId = target.workspaceId;
+        readStrictInstanceScope({ ...row, runtime_config_json: JSON.stringify(runtimeConfig) });
+        fixes.push({ workspaceId: target.workspaceId, instanceId: String(row.id), previousScopeId });
+      }
+    }
+  });
+  return fixes.sort((left, right) => repairFixKey(left).localeCompare(repairFixKey(right)));
+}
+
+/** 已存在的修复备份只接受本迁移生成的固定、无正文记录。 */
+function validateWorkflowScopeRepairBackup(value: unknown, journal: Journal,
+  mapping?: Map<string, string>): WorkflowScopeRepairBackup {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail('MIGRATION_WORKFLOW_SCOPE_BACKUP_INVALID');
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).sort().join('|') !== 'fixes|migrationId|schemaVersion' || record.schemaVersion !== 1
+    || record.migrationId !== journal.migrationId || !Array.isArray(record.fixes)) fail('MIGRATION_WORKFLOW_SCOPE_BACKUP_INVALID');
+  const workspaceMapping = mapping ?? new Map(journal.source.workspaces.map(work =>
+    [work.id, mappedWorkspaceId(work.id, journal.source.sourceClientId, journal.targetClientId)]));
+  const seen = new Set<string>();
+  const fixes = record.fixes.map((value): WorkflowScopeRepairFix => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail('MIGRATION_WORKFLOW_SCOPE_BACKUP_INVALID');
+    const fix = value as Record<string, unknown>;
+    if (Object.keys(fix).sort().join('|') !== 'instanceId|previousScopeId|workspaceId' || typeof fix.workspaceId !== 'string'
+      || typeof fix.instanceId !== 'string' || !fix.instanceId || typeof fix.previousScopeId !== 'string'
+      || workspaceMapping.get(fix.previousScopeId) !== fix.workspaceId) fail('MIGRATION_WORKFLOW_SCOPE_BACKUP_INVALID');
+    const result = { workspaceId: fix.workspaceId, instanceId: fix.instanceId, previousScopeId: fix.previousScopeId };
+    const key = repairFixKey(result);
+    if (seen.has(key)) fail('MIGRATION_WORKFLOW_SCOPE_BACKUP_INVALID');
+    seen.add(key);
+    return result;
+  });
+  return { schemaVersion: 1, migrationId: journal.migrationId, fixes };
+}
+
+/** 固定组合键用于备份幂等比对，不依赖不可信分隔符。 */
+function repairFixKey(fix: WorkflowScopeRepairFix): string { return JSON.stringify([fix.workspaceId, fix.instanceId, fix.previousScopeId]); }
+
+/** 跳过清单只允许固定业务键和原因码，不保存异常正文或记录内容。 */
+function validateMigrationSkipReport(value: unknown, journal: Journal): MigrationSkipReport {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail('MIGRATION_SKIP_REPORT_INVALID');
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).sort().join('|') !== 'migrationId|schemaVersion|skipped' || record.schemaVersion !== 1
+    || record.migrationId !== journal.migrationId || !Array.isArray(record.skipped)) fail('MIGRATION_SKIP_REPORT_INVALID');
+  const workspaces = new Set(journal.source.workspaces.map(work =>
+    mappedWorkspaceId(work.id, journal.source.sourceClientId, journal.targetClientId)));
+  const seen = new Set<string>();
+  const skipped = record.skipped.map((value): MigrationSkippedRecord => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail('MIGRATION_SKIP_REPORT_INVALID');
+    const entry = value as Record<string, unknown>;
+    if (typeof entry.workspaceId !== 'string' || !workspaces.has(entry.workspaceId)
+      || typeof entry.table !== 'string' || !WORKSPACE_TABLES.includes(entry.table)
+      || typeof entry.recordId !== 'string' || !entry.recordId || entry.recordId.length > 256
+      || entry.reason !== 'constraint' && entry.reason !== 'parent_record_skipped'
+      || entry.reason === 'constraint' && entry.rootCauseCode !== 'SQLITE_CONSTRAINT_IGNORED'
+      || entry.reason === 'parent_record_skipped' && entry.rootCauseCode !== 'MIGRATION_PARENT_RECORD_SKIPPED'
+      || Object.keys(entry).sort().join('|') !== 'reason|recordId|rootCauseCode|table|workspaceId') fail('MIGRATION_SKIP_REPORT_INVALID');
+    const result = entry as MigrationSkippedRecord, key = JSON.stringify(result);
+    if (seen.has(key)) fail('MIGRATION_SKIP_REPORT_INVALID');
+    seen.add(key);
+    return result;
+  });
+  return { schemaVersion: 1, migrationId: journal.migrationId, skipped };
 }
 
 /** 完成响应的凭据只从原配置即时读取，绝不进入迁移记录。 */

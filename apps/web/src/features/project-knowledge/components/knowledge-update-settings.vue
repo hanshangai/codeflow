@@ -21,6 +21,14 @@ const cronExpr = computed(() => {
   return `${minute} ${hour} * * ${form.frequency === "weekly" ? form.weekday : "*"}`;
 });
 const busy = computed(() => view.value?.lastCheck?.outcome === "checking" || Boolean(view.value?.run?.active));
+/** 空计划只展示核对结论；目录或正文候选仍走统一采用入口。 */
+const checkOnly = computed(() => {
+  const run = view.value?.run;
+  if (!run?.maintenance || run.phase !== "completed" || run.items.length || !run.proposedTree || !run.baseTree
+    || run.proposedTree.schemaVersion !== run.baseTree.schemaVersion || run.proposedTree.nodes.length !== run.baseTree.nodes.length) return false;
+  const baseline = new Map(run.baseTree.nodes.map(node => [node.id, JSON.stringify(node)]));
+  return run.proposedTree.nodes.every(node => JSON.stringify(node) === baseline.get(node.id));
+});
 const statusText = computed(() => {
   const state = view.value?.lastCheck, run = view.value?.run;
   if (!state) return "尚未检查";
@@ -28,7 +36,8 @@ const statusText = computed(() => {
   if (state.outcome === "checking") return "正在比较来源与要求";
   if (state.outcome === "unchanged") return "没有需要更新的资产";
   if (state.outcome === "busy") return "资产正在其他任务中处理，本次暂缓";
-  if (run?.active) return "正在生成与复检";
+  if (run?.active) return run.maintenance && !run.proposedTree ? "正在核对规格与项目变化" : "正在生成与复检";
+  if (checkOnly.value) return run?.gaps.length ? "检查完成，有事项待核对" : "检查完成，无需更新";
   return run?.phase === "completed" ? "已完成，请查看结果并采用" : "部分任务未完成，请查看结果";
 });
 let controller: AbortController | null = null;
@@ -169,7 +178,12 @@ onBeforeUnmount(release);
           <span v-if="view.nextRunAt">下次执行：{{ new Date(view.nextRunAt).toLocaleString() }}</span>
           <span v-if="view.lastCheck">最近检查：{{ new Date(view.lastCheck.checkedAt).toLocaleString() }} · 选中 {{ view.lastCheck.selectedCount }} 项 · 暂缓 {{ view.lastCheck.deferredCount }} 项</span>
           <a-alert v-if="view.lastCheck?.error" type="error" show-icon :message="view.lastCheck.error.message" />
-          <a-button v-if="view.run" @click="emit('view-run', view.run); emit('update:open', false)">查看生成结果</a-button>
+          <span v-if="view.run && checkOnly">{{ view.run.rationale }}</span>
+          <template v-if="view.run?.maintenance && view.run.gaps.length">
+            <span v-if="view.lastCheck?.outcome !== 'started'">上一次核对发现的问题</span>
+            <ul><li v-for="(gap, index) in view.run.gaps" :key="index">{{ gap }}</li></ul>
+          </template>
+          <a-button v-if="view.run && view.lastCheck?.outcome === 'started' && !checkOnly" @click="emit('view-run', view.run); emit('update:open', false)">查看生成结果</a-button>
         </section>
       </template>
     </div>

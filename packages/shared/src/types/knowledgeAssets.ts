@@ -306,6 +306,8 @@ export type KnowledgeGenerationRun = {
   baseTree?: KnowledgeAssetTree;
   /** 来源变动只提示规划，不成为正文生成要求。 */
   changePaths?: string[];
+  /** 定时检查中已检测到有效要求或适用范围变化的规格。 */
+  maintenanceRequirementNodeIds?: string[];
   /** 自动维护遵守同一来源指纹下的不采用回执；人工构建允许重新评估。 */
   maintenance?: boolean;
   planningThreadId?: string | null;

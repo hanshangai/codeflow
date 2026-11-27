@@ -120,6 +120,124 @@ test("计划保存在项目，执行绑定由当前 Client 决定，空库和错
   assert.throws(() => empty.save(f.settings(), null, "ws"), /先生成知识库目录/);
 });
 
+test("规格维护以现行长期要求建立基线，代码冲突只记录检查结论，权威要求变化才生成候选", async t => {
+  const calls: string[] = [];
+  const formalContent = "# 开关要求\n\n开关须启用。\n\n" + "历史说明\n".repeat(8_000) + "规格末尾。";
+  let generatedContent = formalContent;
+  const f = fixture(t, async input => {
+    calls.push(input.purpose ?? "generation");
+    const tool = (toolId: string, toolInput: unknown) => input.execute({ toolId, toolInput, accessMode: "read-only" });
+    const accepted = async (toolId: string, toolInput: unknown) => {
+      const result = await tool(toolId, toolInput);
+      assert.ok(result.ok, JSON.stringify(result));
+      return result.output as Record<string, unknown>;
+    };
+    const readCode = async () => {
+      const code = await accepted("knowledge.source.read", { path: "src/feature.ts", count: 1 });
+      return { kind: "code", path: code.path, contentHash: code.contentHash, startLine: 1, endLine: 1, relation: "开关实现" };
+    };
+    const submitPlan = (sources: unknown[], gaps: string[] = []) => tool("knowledge.plan.submit", {
+      nodes: [], generateNodeIds: sources.length ? ["same"] : [], rationale: "核对开关要求", gaps,
+      decisions: sources.length ? [{ nodeId: "same", question: "开关规则是否变化", whyGenerate: "核对开关默认值", sources }] : [],
+    });
+    if (input.purpose === "planning") {
+      await accepted("knowledge.source.read", { path: "src/unrelated.md", count: 1 });
+      assert.equal((await submitPlan([])).ok, false, "未读取正式规格时不能将核对收为无变更");
+      if (calls.length === 1) {
+        await readCode();
+        await accepted("knowledge.source.read", { path: "src/notes.md", count: 1 });
+        await accepted("knowledge.node.read", { nodeId: "same", offset: 80_000 });
+        assert.equal((await submitPlan([])).ok, false, "读到空页不能算作读过正式正文");
+      }
+      const document = await accepted("knowledge.node.read", { nodeId: "same" });
+      if (calls.length === 1) {
+        assert.equal((await submitPlan([])).ok, false, "只读首屏不能结束规格核对");
+      }
+      await accepted("knowledge.node.read", { nodeId: "same", offset: document.nextOffset });
+      if (calls.length === 1) {
+        const source = await readCode();
+        const notes = await accepted("knowledge.source.read", { path: "src/notes.md", count: 1 });
+        assert.equal((await submitPlan([source])).ok, false, "代码变化本身不能授权生成规格候选");
+        assert.equal((await submitPlan([{ ...source, kind: "document" }])).ok, false, "给代码改标签也不能作为规则文档");
+        assert.equal((await submitPlan([{ ...source, kind: "document", path: notes.path, contentHash: notes.contentHash }])).ok, false, "普通说明的文件变化不能作为规格依据");
+        assert.ok((await submitPlan([], ["实现与规格不一致：开关已关闭，现行规格仍要求启用。"])).ok);
+      } else {
+        assert.equal((await submitPlan([])).ok, false, "仅看无关资料和正式正文不能处理尚未读取的变更");
+        const rules = await accepted("knowledge.source.read", { path: "src/AGENTS.md", count: 1 });
+        const rule = { kind: "document", path: rules.path, contentHash: rules.contentHash, startLine: 1, endLine: 1, relation: "现行项目明确要求开关关闭" };
+        assert.equal((await submitPlan([{ ...rule, startLine: 2, endLine: 2 }])).ok, false, "规则依据必须覆盖真实已读行段");
+        assert.ok((await submitPlan([rule])).ok);
+      }
+      return;
+    }
+    const source = await readCode();
+    await accepted("knowledge.source.read", { path: "src/AGENTS.md", count: 1 });
+    if (input.purpose === "review") {
+      await accepted("knowledge.review.read", { startLine: 1, count: 500 });
+      await accepted("knowledge.review.submit", { outcome: "passed", summary: "已核对", sources: [source], issues: [] });
+    } else {
+      const rules = f.store.readSource("src/AGENTS.md", 1, 1);
+      assert.equal((await tool("knowledge.asset.submit", { content: generatedContent, summary: "代码变化", sources: [source] })).ok, false);
+      await accepted("knowledge.asset.submit", { content: generatedContent, summary: "核对开关要求",
+        sources: [{ ...source, kind: "document", path: rules.path, contentHash: rules.contentHash, relation: "项目要求" }] });
+    }
+  });
+  const rulesPath = path.join(f.root, "src", "AGENTS.md");
+  fs.writeFileSync(rulesPath, "开关须启用。\n", "utf8");
+  const notesPath = path.join(f.root, "src", "notes.md");
+  fs.writeFileSync(notesPath, "本地演示。\n", "utf8");
+  fs.writeFileSync(path.join(f.root, "src", "unrelated.md"), "示例。\n", "utf8");
+  const current = f.store.readTree();
+  f.store.saveTree({ schemaVersion: 3, instructions: "", nodes: [...knowledgeCategoryNodes(),
+    ...current.tree.nodes.map(node => node.id === "same" ? { ...node, parentId: "knowledge-specifications", sourceScope: ["src/AGENTS.md", "src/notes.md"] }
+      : { ...node, parentId: node.parentId ?? "knowledge-product" }),
+  ] }, current.hash);
+  const original = f.store.saveDocument({ nodeId: "same", content: formalContent, origin: "manual", expectedHash: null, adopt: true,
+    instructions: "按上次复检报告修正一处引用路径", sources: [f.source,
+      { ...f.source, kind: "document", path: "src/AGENTS.md", contentHash: f.store.readSource("src/AGENTS.md").contentHash, relation: "项目要求" }],
+  });
+  f.save({ selectedNodeIds: ["same"] });
+  f.start();
+  assert.equal((await settled(f)).lastCheck?.outcome, "unchanged");
+  assert.deepEqual(calls, []);
+
+  fs.writeFileSync(path.join(f.root, "src", "feature.ts"), "export const enabled = false;\n", "utf8");
+  fs.writeFileSync(notesPath, "本地演示可以关闭开关。\n", "utf8");
+  f.start();
+  const conflict = (await settled(f)).run!;
+  assert.equal(conflict.phase, "completed");
+  assert.match(conflict.gaps[0] ?? "", /实现与规格不一致/);
+  assert.deepEqual(f.generation.preview(conflict.id).items, []);
+  f.start();
+  const next = await settled(f);
+  assert.equal(next.lastCheck?.outcome, "unchanged");
+  assert.equal(next.run?.id, conflict.id, "没有新的变更时仍可查看上次的冲突");
+  assert.deepEqual(calls, ["planning"]);
+
+  const observed = f.store.readTree();
+  f.store.saveTree({ ...observed.tree, nodes: observed.tree.nodes.map(node => node.id === "same" ? { ...node, sourceScope: ["src"] } : node) }, observed.hash);
+  f.start();
+  assert.equal((await settled(f)).lastCheck?.outcome, "unchanged", "仅调整资料扫描范围没有改变规格要求");
+  assert.deepEqual(calls, ["planning"]);
+
+  fs.writeFileSync(rulesPath, "开关须启用。\n调整排版说明。\n", "utf8");
+  f.start();
+  const noChange = (await settled(f)).run!;
+  assert.equal(noChange.phase, "completed");
+  assert.deepEqual(noChange.items, []);
+  assert.deepEqual(f.generation.preview(noChange.id).items, []);
+  assert.equal(f.store.revisions("same").length, 1);
+
+  fs.writeFileSync(rulesPath, "开关须关闭。\n第二条规则不变。\n", "utf8");
+  generatedContent = "# 开关要求\n\n开关须关闭。";
+  f.start();
+  const update = (await settled(f)).run!;
+  assert.deepEqual(calls, ["planning", "planning", "generation", "planning", "generation", "review"]);
+  assert.ok(update.items[0]?.revisionId);
+  assert.equal(f.generation.preview(update.id).items[0]?.canApply, true);
+  assert.equal(f.store.detail("same").current?.revision.id, original.id);
+});
+
 test("维护摘要和领取不解析历史路径，后台完整校验分批让出且首错停止", async t => {
   const f = fixture(t);
   f.save();

@@ -20,6 +20,7 @@ const unpersistedFailures = new Map<string, UnpersistedUpdateFailure>();
 type PendingFile = { contentHash: string | null; discovery: boolean; nodeIds: string[] };
 type UpdateDiscovery = {
   schemaVersion: 1;
+  specificationRequirements?: true;
   files: Record<string, string>;
   pending: Record<string, PendingFile>;
   requirements: Record<string, string>;
@@ -163,7 +164,7 @@ export class KnowledgeUpdateService {
     catch (error) { checks.delete(this.store.files.root); throw error; }
     owner.promise = (async () => {
       await yieldImmediate();
-      try { await this.performCheck(schedule, check, input); }
+      try { await this.performCheck(schedule, check, input, previous?.runId ?? null); }
       catch (error) { this.recordCheckFailure(schedule, check, input.requestId, error); }
       finally { if (checks.get(this.store.files.root) === owner) checks.delete(this.store.files.root); }
     })();
@@ -216,7 +217,7 @@ export class KnowledgeUpdateService {
   async selectTargets(schedule: KnowledgeUpdateSchedule): Promise<{ nodeIds: string[]; deferredCount: number }> {
     const previous = await this.readDiscoveryForCheck();
     const files = await this.store.scanMaintenanceFiles();
-    const discovery = this.observeFiles(schedule, files, previous);
+    const discovery = await this.observeFiles(schedule, files, previous);
     return this.selectFromInventory(schedule, discovery);
   }
 
@@ -243,12 +244,18 @@ export class KnowledgeUpdateService {
       if (this.store.category(node.id) === "product") continue;
       if (dismissals.has(node.id) && dismissals.get(node.id)!.has(await this.store.maintenanceFingerprint(node.id, schedule.prompt, discovery.files))) continue;
       if (state?.draftCount) { deferredCount += 1; continue; }
-      // 从未生成过的默认槽位只在显式构建时生成，定时维护不把它们当成变化。
+      const requirementsChanged = node.id in discovery.pendingRequirements;
+      if (this.store.category(node.id) === "specifications") {
+        const checkSources = state?.revisionId || !isKnowledgeDefaultDocumentSlot(node.id);
+        if (requirementsChanged || checkSources && Object.values(discovery.pending).some(pending => pending.nodeIds.includes(node.id))) nodeIds.push(node.id);
+        continue;
+      }
+      // 空白默认文档留给显式构建，定时检查不会仅因空白生成。
       if (!state?.revisionId && isKnowledgeDefaultDocumentSlot(node.id)) continue;
       if (!state?.revisionId) { nodeIds.push(node.id); continue; }
       const doc = this.store.readRevision(node.id, state.revisionId);
       const instructions = [this.store.effectiveInstructions(node.id), schedule.prompt].filter(Boolean).join("\n\n");
-      let changed = this.revisionInstructions(doc.revision) !== instructions || node.id in discovery.pendingRequirements || Object.values(discovery.pending).some(pending => pending.nodeIds.includes(node.id));
+      let changed = this.revisionInstructions(doc.revision) !== instructions || requirementsChanged || Object.values(discovery.pending).some(pending => pending.nodeIds.includes(node.id));
       for (const source of doc.sources) {
         if (!source.path) continue;
         if (!hashes.has(source.path)) hashes.set(source.path, source.path in discovery.files ? Promise.resolve(discovery.files[source.path]!) : this.sourceHash(source.path));
@@ -260,11 +267,11 @@ export class KnowledgeUpdateService {
   }
 
   /** 生成前重新确认计划未被停用或改写，再调用原批量入口。 */
-  private async performCheck(schedule: KnowledgeUpdateSchedule, check: KnowledgeUpdateCheck, input: { generation: KnowledgeGenerationService; createOwner: () => string }): Promise<void> {
+  private async performCheck(schedule: KnowledgeUpdateSchedule, check: KnowledgeUpdateCheck, input: { generation: KnowledgeGenerationService; createOwner: () => string }, previousRunId: string | null): Promise<void> {
     const previous = await this.readDiscoveryForCheck();
     if (previous) this.reconcileSubmission(previous, input.generation);
     const files = await this.store.scanMaintenanceFiles();
-    const discovery = this.observeFiles(schedule, files, previous);
+    const discovery = await this.observeFiles(schedule, files, previous);
     const targets = await this.selectFromInventory(schedule, discovery);
     check.deferredCount = targets.deferredCount;
     const current = this.schedule();
@@ -278,11 +285,21 @@ export class KnowledgeUpdateService {
     const discoveryPaths = schedule.selectedNodeIds.length ? [] : Object.entries(discovery.pending).filter(([, pending]) => pending.discovery).map(([relative]) => relative);
     const pendingStructure = runs.some(run => run.mode === "build" && run.proposedTree && input.generation.preview(run.id).items.some(item => !item.applied && !item.dismissed && item.reason !== "没有待采用子项"));
     const discoveryBusy = discoveryPaths.length > 0 && (check.deferredCount > 0 || runs.some(run => run.active) || pendingStructure);
-    const planDiscovery = discoveryPaths.length > 0 && !discoveryBusy;
-    if (discoveryBusy) check.deferredCount += discoveryPaths.length;
+    const planSpecifications = nodeIds.some(id => this.store.category(id) === "specifications");
+    // 先完成已定位规格的核对，项目发现仍保留到后续检查。
+    const planDiscovery = discoveryPaths.length > 0 && !discoveryBusy && !planSpecifications;
+    const usePlanner = planDiscovery || planSpecifications;
+    const selected = new Set(nodeIds);
+    const changes = Object.fromEntries(Object.entries(discovery.pending).filter(([, entry]) =>
+      (planDiscovery && entry.discovery) || entry.nodeIds.some(id => selected.has(id))));
+    if (!planDiscovery) check.deferredCount += discoveryPaths.length;
     check.selectedCount = nodeIds.length;
     if (!nodeIds.length && !planDiscovery) {
       check.outcome = check.deferredCount ? "busy" : "unchanged";
+      if (previousRunId) {
+        const reviewed = this.store.readRun(previousRunId);
+        if (reviewed.maintenance && reviewed.gaps.length) check.runId = previousRunId;
+      }
       this.writeCheck(check, discovery);
       return;
     }
@@ -291,26 +308,48 @@ export class KnowledgeUpdateService {
     const run = await this.database(() => {
       const ownerThreadId = input.createOwner();
       return input.generation.begin({
-      requestId: `${schedule.id}_${check.scheduledAt}`, mode: planDiscovery ? "build" : "batch", ownerThreadId, selectedNodeIds: planDiscovery ? [] : nodeIds, includeDescendants: false, strategy: "all",
-      prompt: schedule.prompt, maintenance: true, ...(planDiscovery ? { changePaths: Object.keys(discovery.pending) } : {}), treeHash: this.store.readTree().hash, engine: schedule.engine, model: schedule.model, effort: schedule.effort, concurrency: schedule.concurrency,
+      requestId: `${schedule.id}_${check.scheduledAt}`, mode: usePlanner ? "build" : "batch", ownerThreadId, selectedNodeIds: planDiscovery ? [] : nodeIds, includeDescendants: false, strategy: "all",
+      prompt: schedule.prompt, maintenance: true,
+      ...(usePlanner ? { changePaths: Object.keys(changes), maintenanceRequirementNodeIds: nodeIds.filter(id =>
+        id in discovery.pendingRequirements && this.store.category(id) === "specifications") } : {}),
+      treeHash: this.store.readTree().hash, engine: schedule.engine, model: schedule.model, effort: schedule.effort, concurrency: schedule.concurrency,
       reviewConfig: { ...schedule.reviewConfig, enabled: true },
       });
     });
     check.runId = run.id;
-    discovery.submission = { runId: run.id, paths: { ...discovery.pending }, requirements: Object.fromEntries(nodeIds.map(id => [id, this.requirementsHash(id, schedule.prompt)])), discovery: planDiscovery };
+    discovery.submission = { runId: run.id, paths: changes, requirements: Object.fromEntries(nodeIds.map(id => [id, this.requirementsHash(id, schedule.prompt)])), discovery: planDiscovery };
     check.outcome = "started";
     this.writeCheck(check, discovery);
     await this.database(() => input.generation.startAsync(run.id));
   }
 
   /** 完整扫描后推进观察；待处理事实与已观察基线分开，草稿期间的新增变化不会丢失。 */
-  private observeFiles(schedule: KnowledgeUpdateSchedule, files: Record<string, string>, previous?: UpdateDiscovery): UpdateDiscovery {
+  private async observeFiles(schedule: KnowledgeUpdateSchedule, files: Record<string, string>, previous?: UpdateDiscovery): Promise<UpdateDiscovery> {
     const pending = { ...previous?.pending };
     // 观察始终覆盖整个项目；派发仍受本次选区限制，避免缩小选区后丢掉其他节点的事实。
     const { nodes, states } = this.scope({ selectedNodeIds: [], includeDescendants: true });
     const generated = nodes.filter(node => node.contentMode !== "reference" && node.contentMode !== "directory" && this.store.category(node.id) !== "product");
     const generatedIds = new Set(generated.map(node => node.id));
     const generatedScopes = new Map(generated.map(node => [node.id, this.store.ancestry(node.id).flatMap(parent => parent.sourceScope)]));
+    const specifications = new Set(generated.filter(node => this.store.category(node.id) === "specifications").map(node => node.id));
+    const specificationSources = new Map<string, Map<string, string>>();
+    for (const nodeId of specifications) {
+      await yieldImmediate();
+      const state = states.get(nodeId);
+      if (state?.error) throw new KnowledgeAssetError(state.error.code, state.error.message);
+      if (!state?.revisionId) continue;
+      for (const source of this.store.readRevision(nodeId, state.revisionId).sources) {
+        if (!source.path || !source.contentHash) continue;
+        const owners = specificationSources.get(source.path) ?? new Map<string, string>();
+        owners.set(nodeId, source.contentHash);
+        specificationSources.set(source.path, owners);
+      }
+    }
+    for (const relative of specificationSources.keys()) {
+      if (Object.hasOwn(files, relative)) continue;
+      const hash = await this.sourceHash(relative);
+      if (hash !== null) files[relative] = hash;
+    }
     const referencePaths = new Set(nodes.flatMap(node => node.contentMode === "reference" && node.reference ? [node.reference.path] : []));
     // 已归类的历史产品正文只观察其原始资料，不再派发 AI 重写或重复发现同一资料。
     for (const node of nodes.filter(node => this.store.category(node.id) === "product" && node.contentMode !== "reference" && node.contentMode !== "directory")) {
@@ -324,27 +363,36 @@ export class KnowledgeUpdateService {
       if (!nodeIds.length && !discovery) delete pending[relative];
       else pending[relative] = { ...entry, nodeIds, discovery };
     }
-    for (const relative of new Set([...Object.keys(previous?.files ?? {}), ...Object.keys(files)])) {
-      const affectedIds = [...generatedScopes].filter(([, scopes]) => this.inSourceScope(relative, scopes)).map(([id]) => id);
-      const changed = previous ? previous.files[relative] !== files[relative] : affectedIds.length === 0;
+    for (const relative of new Set([...Object.keys(previous?.files ?? {}), ...Object.keys(files), ...specificationSources.keys()])) {
+      const directSources = specificationSources.get(relative);
+      const affectedIds = [...generatedScopes]
+        .filter(([id, scopes]) => directSources?.has(id) || this.inSourceScope(relative, scopes))
+        .map(([id]) => id);
+      const firstChangedSpecs = previous ? [] : [...(directSources ?? [])].filter(([, hash]) => hash !== files[relative]).map(([id]) => id);
+      const changed = previous ? previous.files[relative] !== files[relative] : firstChangedSpecs.length > 0 || affectedIds.length === 0;
       if (!changed) continue;
-      const discover = !referencePaths.has(relative) && (!previous?.files[relative] || affectedIds.length === 0);
+      const discover = !referencePaths.has(relative) && (affectedIds.length === 0 || (previous !== undefined && !Object.hasOwn(previous.files, relative)));
       if (!discover && !affectedIds.length) continue;
-      pending[relative] = { contentHash: files[relative] ?? null, discovery: discover || pending[relative]?.discovery === true, nodeIds: affectedIds };
+      pending[relative] = { contentHash: files[relative] ?? null, discovery: discover || pending[relative]?.discovery === true, nodeIds: previous ? affectedIds : firstChangedSpecs };
     }
     const requirements = { ...previous?.requirements }, pendingRequirements = { ...previous?.pendingRequirements };
     for (const nodeId of Object.keys(requirements)) if (!generatedIds.has(nodeId)) delete requirements[nodeId];
     for (const nodeId of Object.keys(pendingRequirements)) if (!generatedIds.has(nodeId)) delete pendingRequirements[nodeId];
     for (const node of generated) {
       const current = this.requirementsHash(node.id, schedule.prompt);
-      if (!(node.id in requirements)) {
+      if (specifications.has(node.id)) {
+        // 旧指纹包含资料扫描范围，迁移时以现行规则为基线，避免把旧摘要判成要求变化。
+        if (!previous?.specificationRequirements || !(node.id in requirements)) {
+          requirements[node.id] = previous ? current : this.requirementsHash(node.id, "");
+        }
+      } else if (!(node.id in requirements)) {
         const state = states.get(node.id);
         if (state?.revisionId && !state.error) requirements[node.id] = this.requirementsHash(node.id, schedule.prompt, this.revisionInstructions(this.store.readRevision(node.id, state.revisionId).revision));
       }
       if (requirements[node.id] !== current) pendingRequirements[node.id] = current;
       else delete pendingRequirements[node.id];
     }
-    return { schemaVersion: 1, files, pending, requirements, pendingRequirements, ...(previous?.submission ? { submission: previous.submission } : {}) };
+    return { schemaVersion: 1, specificationRequirements: true, files, pending, requirements, pendingRequirements, ...(previous?.submission ? { submission: previous.submission } : {}) };
   }
 
   /** 已完成的任务承接对应变化；失败及其间继续变化的路径保留到下一次检查。 */
@@ -355,6 +403,11 @@ export class KnowledgeUpdateService {
     if (run.active) return;
     const completedIds = new Set(run.items.filter(item => item.status === "completed" && !item.error && !item.review?.error).map(item => item.nodeId));
     const completedDiscovery = submitted.discovery && run.phase === "completed";
+    // 完成的定向规划也要消费已核对但无需生成的规格，避免次日反复检查。
+    if (!submitted.discovery && run.mode === "build" && run.maintenance && ["completed", "partial"].includes(run.phase)) {
+      const generatedIds = new Set(run.items.map(item => item.nodeId));
+      for (const nodeId of run.selectedNodeIds ?? []) if (!generatedIds.has(nodeId)) completedIds.add(nodeId);
+    }
     for (const [relative, expected] of Object.entries(submitted.paths)) {
       if (discovery.pending[relative]?.contentHash !== expected.contentHash) continue;
       const remaining = discovery.pending[relative]!;
@@ -381,9 +434,15 @@ export class KnowledgeUpdateService {
     return revision.userInstructions ?? userInstructions;
   }
 
-  /** 来源范围和有效要求只在对应节点处理成功后推进，范围本身变化也会触发维护。 */
+  /** 规格只比较生效范围与长期要求；传统知识仍按来源范围维护。 */
   private requirementsHash(nodeId: string, prompt: string, formalInstructions?: string): string {
-    return knowledgeHash(knowledgeJson({ sourceScope: this.store.ancestry(nodeId).flatMap(node => node.sourceScope), instructions: formalInstructions ?? [this.store.effectiveInstructions(nodeId), prompt].filter(Boolean).join("\n\n") }));
+    const ancestry = this.store.ancestry(nodeId);
+    const instructions = formalInstructions ?? [this.store.effectiveInstructions(nodeId), prompt].filter(Boolean).join("\n\n");
+    if (ancestry[0]?.category === "specifications") {
+      const appliesTo = [...ancestry].reverse().find(node => node.appliesTo !== undefined)?.appliesTo ?? [];
+      return knowledgeHash(knowledgeJson({ instructions, appliesTo: [...new Set(appliesTo)].sort() }));
+    }
+    return knowledgeHash(knowledgeJson({ sourceScope: ancestry.flatMap(node => node.sourceScope), instructions }));
   }
 
   /** 来源删除属于需要更新；权限和 I/O 错误显式失败。 */
@@ -448,7 +507,8 @@ export class KnowledgeUpdateService {
     if (!raw || !Number.isFinite(raw.scheduledAt) || !Number.isFinite(raw.checkedAt) || !["checking", "started", "unchanged", "busy", "failed"].includes(raw.outcome)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_FILE_INVALID", "定时更新执行摘要损坏，请检查 update-state.json");
     if (raw.discovery) {
       const discovery = raw.discovery;
-      if (discovery.schemaVersion !== 1 || !discovery.files || !discovery.pending || !discovery.requirements || !discovery.pendingRequirements || Array.isArray(discovery.files) || Array.isArray(discovery.pending)
+      if (discovery.schemaVersion !== 1 || discovery.specificationRequirements !== undefined && discovery.specificationRequirements !== true
+        || !discovery.files || !discovery.pending || !discovery.requirements || !discovery.pendingRequirements || Array.isArray(discovery.files) || Array.isArray(discovery.pending)
         || Object.values(discovery.files).some(hash => typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash))
         || Object.values(discovery.pending).some(item => !item || !Array.isArray(item.nodeIds) || item.nodeIds.some(id => typeof id !== "string") || typeof item.discovery !== "boolean" || item.contentHash !== null && (typeof item.contentHash !== "string" || !/^[a-f0-9]{64}$/.test(item.contentHash)))
         || Object.values({ ...discovery.requirements, ...discovery.pendingRequirements }).some(hash => typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash))) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_FILE_INVALID", "项目发现基线损坏，请检查 update-state.json");

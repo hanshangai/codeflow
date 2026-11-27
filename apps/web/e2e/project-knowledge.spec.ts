@@ -4160,6 +4160,26 @@ test.describe("项目知识库资产协作", () => {
     await expect(page.getByRole("button", { name: "知识浏览", exact: true })).toHaveCount(0);
   });
 
+  test("PK-scheduled-spec-check 定时维护显示实现与规格冲突，只有候选才引导采用", async ({ page }) => {
+    await installSession(page);
+    await installKnowledgeScenario(page);
+    const tree = { schemaVersion: 3, instructions: "", nodes: [...KNOWLEDGE_CATEGORIES.map(category => assetNode(category.id, category.title))] };
+    const schedule = { enabled: true, engine: "codex", cronExpr: "0 3 * * *", timezone: "Asia/Shanghai", selectedNodeIds: [], includeDescendants: true,
+      concurrency: 2, reviewConfig: { enabled: true, model: null, effort: null, autoRepair: true, maxRounds: 2 } };
+    const run = { id: "check-only", maintenance: true, phase: "completed", active: false, baseTree: tree,
+      proposedTree: { ...tree, nodes: [...tree.nodes].reverse() }, items: [],
+      rationale: "现行规格保持有效。", gaps: ["实现与规格不一致：开关已关闭，规格要求启用。"] };
+    await page.route("**/api/knowledge/assets/update.schedule?**", route => route.fulfill({ json: { ok: true, data: {
+      schedule, lastCheck: { outcome: "started", checkedAt: Date.now(), selectedCount: 1, deferredCount: 0, runId: run.id }, run,
+    } } }));
+    await openKnowledge(page);
+    await openKnowledgeMenu(page, "定时更新");
+    const settings = page.getByTestId("knowledge-update-settings");
+    await expect(settings).toContainText(run.gaps[0]!);
+    await expect(settings).toContainText("检查完成，有事项待核对");
+    await expect(settings.getByRole("button", { name: "查看生成结果", exact: true })).toHaveCount(0);
+  });
+
   test("PK-51 定时检查状态不覆盖未保存要求，结果由用户打开，暗色窄屏面板不溢出", async ({ page }) => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page, { children: 1, reviewState: "pending" });
