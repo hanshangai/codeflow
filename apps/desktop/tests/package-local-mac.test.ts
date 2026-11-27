@@ -44,10 +44,10 @@ async function fixture(t: TestContext) {
 }
 
 /** 执行原完整 CLI；仅替换 builder 结果与进程平台，所有写入留在独占夹具。 */
-async function runScript(f: Fixture, output: string, extra: string[] = [], baselineVersion = "2026.11.21.02") {
+async function runScript(f: Fixture, output: string, extra: string[] = [], baselineVersion = "2026.11.21.02", env: Record<string, string> = {}) {
   const state: { argv: string[]; platform: string; arch: string; env: Record<string, string>; exitCode?: number } = {
     argv: [process.execPath, path.join(f.shell, "scripts/package-local-mac.mjs"), f.resources, output, ...extra],
-    platform: "darwin", arch: "arm64", env: {},
+    platform: "darwin", arch: "arm64", env: { ...env },
   };
   const messages: Array<Record<string, unknown>> = [];
   const calls: Array<{ projectDir: string; targets: unknown; publish: string; config: string }> = [];
@@ -85,6 +85,30 @@ test("macOS 打包声明最低系统为 Ventura", async () => {
   const { load } = requireBuilderLibrary("js-yaml");
   const config = load(await fs.readFile(new URL("../electron-builder.yml", import.meta.url), "utf8"));
   assert.equal(config.mac.minimumSystemVersion, "13.0");
+});
+
+test("macOS production packaging requires Developer ID and notarization unless explicitly allowed", async t => {
+  const f = await fixture(t);
+  const missing = await runScript(f, path.join(f.root, "prod-missing"), ["--environment", "production"]);
+  assert.equal(missing.messages[0]?.rootCause, "DESKTOP_MAC_SIGNING_REQUIRED");
+  await assert.rejects(fs.access(path.join(f.root, "prod-missing")), { code: "ENOENT" });
+
+  const unsigned = await runScript(f, path.join(f.root, "prod-unsigned"), ["--environment", "production", "--allow-unsigned-production"]);
+  assert.equal(unsigned.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY");
+  assert.equal(unsigned.messages[0]?.signed, false);
+  const unsignedConfig = JSON.parse(await fs.readFile(unsigned.calls[0]!.config, "utf8"));
+  assert.equal(unsignedConfig.mac.identity, null);
+  assert.equal(unsignedConfig.mac.notarize, undefined);
+
+  const signed = await runScript(f, path.join(f.root, "prod-signed"), ["--environment", "production"],
+    "2026.11.21.02", { CODEFLOWAI_DESKTOP_MAC_SIGN_IDENTITY: "Developer ID Application: Fixture",
+      APPLE_ID: "fixture@example.invalid", APPLE_APP_SPECIFIC_PASSWORD: "fixture", APPLE_TEAM_ID: "FIXTURE" });
+  assert.equal(signed.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY");
+  assert.equal(signed.messages[0]?.signed, true);
+  assert.equal(signed.messages[0]?.adhocSigned, false);
+  const signedConfig = JSON.parse(await fs.readFile(signed.calls[0]!.config, "utf8"));
+  assert.equal(signedConfig.mac.identity, "Developer ID Application: Fixture");
+  assert.equal(signedConfig.mac.notarize, true);
 });
 
 test("macOS planned packaging consumes the allocated shell version", async t => {

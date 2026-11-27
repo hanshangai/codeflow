@@ -10,7 +10,7 @@ import { prepareResourcePublication, verifyResourcePublication } from "./desktop
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const valueOptions = new Set(["--platforms", "--platform", "--key-id", "--expires-at", "--plan", "--private-key", "--trust",
   "--mode", "--output", "--publication-output", "--update-origin", "--artifacts", "--shared-dir", "--npm-package", "--client-archive"]);
-const flagOptions = new Set(["--test", "--prod", "--publish", "--allow-dirty"]);
+const flagOptions = new Set(["--test", "--prod", "--publish", "--allow-dirty", "--allow-unsigned-production"]);
 
 /** 解析简单 CLI；未知项直接失败，避免静默忽略发布参数。 */
 function parse(argv) {
@@ -70,17 +70,21 @@ async function build(options) {
   if (mode === "installer" && target.platform !== "win32") throw new Error("installer 只能由 Windows 构建");
   if (mode === "dmg" && target.platform !== "darwin") throw new Error("dmg 只能由 macOS 构建");
   if (mode !== "resources" && !options["update-origin"]) throw new Error("installer/dmg 模式需要 --update-origin");
+  if (options["allow-unsigned-production"] && plan.environment !== "production") throw new Error("--allow-unsigned-production 仅用于生产计划");
   const result = await buildDesktopResources({ root, plan, outputDir, privateKeyFile: path.resolve(options["private-key"]),
     trustedReleaseKeysFile: path.resolve(options.trust), updateServerOrigin: options["update-origin"],
     npmPackageDir: options["npm-package"], clientArchive: options["client-archive"] });
+  const packagingArgs = [result.resourcesDir, "", "--require-baseline-proof", "--target", mode === "dmg" ? "dmg" : "nsis",
+    "--plan", file, "--environment", plan.environment, ...(options["allow-dirty"] ? ["--allow-dirty"] : []),
+    ...(options["allow-unsigned-production"] ? ["--allow-unsigned-production"] : [])];
   if (mode === "installer") {
     const installerDir = path.join(outputDir, "installer");
-    runNode(path.join(root, "apps/desktop/scripts/package-local-win.mjs"),
-      [result.resourcesDir, installerDir, "--require-baseline-proof", "--target", "nsis", "--plan", file, ...(options["allow-dirty"] ? ["--allow-dirty"] : [])]);
+    packagingArgs[1] = installerDir;
+    runNode(path.join(root, "apps/desktop/scripts/package-local-win.mjs"), packagingArgs);
   } else if (mode === "dmg") {
     const dmgDir = path.join(outputDir, "dmg");
-    runNode(path.join(root, "apps/desktop/scripts/package-local-mac.mjs"),
-      [result.resourcesDir, dmgDir, "--require-baseline-proof", "--target", "dmg", "--plan", file, ...(options["allow-dirty"] ? ["--allow-dirty"] : [])]);
+    packagingArgs[1] = dmgDir;
+    runNode(path.join(root, "apps/desktop/scripts/package-local-mac.mjs"), packagingArgs);
   }
   if (options["shared-dir"]) {
     const sharedDir = path.resolve(options["shared-dir"]);

@@ -53,9 +53,10 @@ async function fixture(t: TestContext) {
 
 /** 执行原完整 CLI；隔离本机 Electron 和 builder 边界，所有写入留在独占夹具。 */
 async function runScript(f: Fixture, output: string, input = f.resources, extra: string[] = [], argv = [input, output, ...extra],
-  builderResult?: (executable: string) => Promise<string[]>, installedElectronVersion = "45.0.0", nativeFailure?: Error) {
+  builderResult?: (executable: string) => Promise<string[]>, installedElectronVersion = "45.0.0", nativeFailure?: Error,
+  env: Record<string, string> = {}) {
   const state: { argv: string[]; platform: string; env: Record<string, string>; exitCode?: number } = {
-    argv: [process.execPath, path.join(f.shell, "scripts/package-local-win.mjs"), ...argv], platform: "win32", env: {},
+    argv: [process.execPath, path.join(f.shell, "scripts/package-local-win.mjs"), ...argv], platform: "win32", env: { ...env },
   };
   const messages: Array<Record<string, unknown>> = [];
   const calls: Array<{ projectDir: string; targets: unknown; publish: string; config: string;
@@ -134,6 +135,32 @@ test("Windows dir packaging retains signed-tree dotfiles before reporting a read
   const result = await runScript(f, output);
   assert.equal(result.state.exitCode, undefined);
   assert.equal(await fs.readFile(path.join(output, "win-unpacked/resources/client/node_modules/undici/lib/llhttp/.gitkeep"), "utf8"), "");
+});
+
+test("production packaging requires Windows signing unless explicitly allowed", async t => {
+  const f = await fixture(t);
+  const missing = await runScript(f, path.join(f.root, "prod-missing"), f.resources, ["--environment", "production"]);
+  assert.equal(missing.state.exitCode, 1);
+  assert.equal(missing.messages[0]?.rootCause, "DESKTOP_WIN_SIGNING_REQUIRED");
+  await assert.rejects(fs.access(path.join(f.root, "prod-missing")), { code: "ENOENT" });
+
+  const unsigned = await runScript(f, path.join(f.root, "prod-unsigned"), f.resources,
+    ["--environment", "production", "--allow-unsigned-production"]);
+  assert.equal(unsigned.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY", JSON.stringify(unsigned.messages[0]));
+  assert.equal(unsigned.messages[0]?.signed, false);
+  assert.equal(JSON.parse(await fs.readFile(unsigned.calls[0]!.config, "utf8")).win.signExecutable, false);
+
+  const signed = await runScript(f, path.join(f.root, "prod-signed"), f.resources,
+    ["--environment", "production"], undefined, undefined, "45.0.0", undefined, { CSC_LINK: "fixture-certificate" });
+  assert.equal(signed.messages[0]?.code, "DESKTOP_LOCAL_PACKAGE_READY");
+  assert.equal(signed.messages[0]?.signed, true);
+  assert.equal(JSON.parse(await fs.readFile(signed.calls[0]!.config, "utf8")).win.signExecutable, undefined);
+
+  const { file } = await createDesktopReleasePlan({ root: fileURLToPath(new URL("../../..", import.meta.url)),
+    platforms: ["win32/x64", "darwin/x64", "darwin/arm64"], keyId: "fixture", environment: "production",
+    planDir: path.join(f.root, "production-plans"), allowDirty: true });
+  const fromPlan = await runScript(f, path.join(f.root, "prod-plan"), f.resources, ["--plan", file, "--allow-dirty"]);
+  assert.equal(fromPlan.messages[0]?.rootCause, "DESKTOP_WIN_SIGNING_REQUIRED");
 });
 
 test("planned packaging injects the exact allocated shell version and refuses a different installed Electron", async t => {

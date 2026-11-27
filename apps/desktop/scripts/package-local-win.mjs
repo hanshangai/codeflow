@@ -76,9 +76,10 @@ async function verifyBaselineProof(resources, required) {
 /** 仅接受本地 dir/nsis 目标，选项重复、缺值和未知项均在写前拒绝。 */
 function readPackageArguments(argv) {
   const [input, output, ...options] = argv;
-  const usage = "用法：package-local-win.mjs <完整资源目录> <新独占输出目录> [--require-baseline-proof] [--target dir|nsis] [--plan <file>] [--allow-dirty]";
+  const usage = "用法：package-local-win.mjs <完整资源目录> <新独占输出目录> [--require-baseline-proof] [--target dir|nsis] [--plan <file>] [--allow-dirty] [--environment test|production] [--allow-unsigned-production]";
   if (!input || !output || input.startsWith("--") || output.startsWith("--")) throw new Error(usage);
   let required = false, target = "dir", targetSeen = false, planFile, allowDirty = false;
+  let environment = "test", environmentSeen = false, allowUnsignedProduction = false;
   for (let index = 0; index < options.length; index++) {
     const option = options[index];
     if (option === "--require-baseline-proof" && !required) required = true;
@@ -86,9 +87,32 @@ function readPackageArguments(argv) {
       target = options[++index]; targetSeen = true;
     } else if (option === "--plan" && !planFile && options[index + 1] && !options[index + 1].startsWith("--")) planFile = path.resolve(options[++index]);
     else if (option === "--allow-dirty" && !allowDirty) allowDirty = true;
+    else if (option === "--environment" && !environmentSeen && ["test", "production"].includes(options[index + 1])) {
+      environment = options[++index]; environmentSeen = true;
+    } else if (option === "--allow-unsigned-production" && !allowUnsignedProduction
+      && (environment === "production" || !environmentSeen)) allowUnsignedProduction = true;
     else throw new Error(usage);
   }
-  return { input, output, required, target, planFile, allowDirty };
+  if (allowUnsignedProduction && environment !== "production") throw new Error("DESKTOP_WIN_UNSIGNED_PRODUCTION_ONLY");
+  return { input, output, required, target, planFile, allowDirty, environment, environmentSeen, allowUnsignedProduction };
+}
+
+/** 生产默认要求 Windows 签名材料；只有显式允许时才构建未签名包。 */
+function resolveWindowsSigning(original, environment, allowUnsignedProduction) {
+  if (environment !== "production" || allowUnsignedProduction) return { signed: false, signExecutable: false };
+  const material = process.env.CSC_LINK || process.env.WIN_CSC_LINK
+    || original.win?.certificateFile || original.win?.certificateSubjectName;
+  if (!material) throw Object.assign(new Error("DESKTOP_WIN_SIGNING_REQUIRED"), { code: "DESKTOP_WIN_SIGNING_REQUIRED" });
+  return { signed: true, signExecutable: undefined };
+}
+
+/** 有计划时环境必须来自计划；显式参数只能与计划一致，不能把生产计划当测试包。 */
+async function resolvePlanEnvironment(planFile, environment, explicit) {
+  if (!planFile) return environment;
+  const plan = JSON.parse(await fs.readFile(planFile, "utf8"));
+  if (!["test", "production"].includes(plan.environment)) throw new Error("DESKTOP_PACKAGE_PLAN_ENVIRONMENT_INVALID");
+  if (explicit && environment !== plan.environment) throw new Error("DESKTOP_PACKAGE_ENVIRONMENT_MISMATCH");
+  return plan.environment;
 }
 
 /** 发布构建使用已验来源计划；无计划仅保留原本地打包入口。 */
@@ -102,7 +126,10 @@ async function resolveLocalPackageVersion(desktopDir, planFile, allowDirty) {
 
 /** 完整资源及维护 Worker 须齐备；安装包强制携带基线证明，所有检查先于输出写入。 */
 async function packageLocalWindows() {
-  const { input, output, required, target, planFile, allowDirty } = readPackageArguments(process.argv.slice(2));
+  const args = readPackageArguments(process.argv.slice(2));
+  const { input, output, required, target, planFile, allowDirty, allowUnsignedProduction } = args;
+  const environment = await resolvePlanEnvironment(planFile, args.environment, args.environmentSeen);
+  if (allowUnsignedProduction && environment !== "production") throw new Error("DESKTOP_WIN_UNSIGNED_PRODUCTION_ONLY");
   if (process.platform !== "win32") throw new Error("DESKTOP_LOCAL_WINDOWS_REQUIRED");
   const resources = await fs.realpath(path.resolve(input));
   const outputDir = path.resolve(output);
@@ -133,13 +160,15 @@ async function packageLocalWindows() {
   if (!displayVersion || /[<>:"/\\|?*$\u0000-\u001f]/u.test(displayVersion) || [".", ".."].includes(displayVersion)) {
     throw new Error("DESKTOP_PACKAGE_DISPLAY_VERSION_INVALID");
   }
-  // mkdir 的非递归原子创建同时拒绝既有目录、文件及链接，不覆盖旧工件。
-  await fs.mkdir(outputDir);
-  process.env.CSC_IDENTITY_AUTO_DISCOVERY = "false";
   const requireBuilder = createRequire(import.meta.resolve("electron-builder"));
   const requireBuilderLibrary = createRequire(requireBuilder.resolve("app-builder-lib"));
   const { load } = requireBuilderLibrary("js-yaml");
   const original = load(await fs.readFile(path.join(desktopDir, "electron-builder.yml"), "utf8"));
+  // 签名材料缺失必须在创建输出目录前失败。
+  const signing = resolveWindowsSigning(original, environment, allowUnsignedProduction);
+  if (!signing.signed) process.env.CSC_IDENTITY_AUTO_DISCOVERY = "false";
+  // mkdir 的非递归原子创建同时拒绝既有目录、文件及链接，不覆盖旧工件。
+  await fs.mkdir(outputDir);
   const configPath = path.join(outputDir, "local-builder.json");
   const builderProjectDir = await createBuilderProject(desktopDir, shellVersion);
   let artifacts, buildError;
@@ -151,8 +180,8 @@ async function packageLocalWindows() {
       electronVersion, electronDist,
       artifactName: `CodeFlowAI-${displayVersion}-win32-x64.\${ext}`,
       npmRebuild: false,
-      // 本地包只跳过签名，仍写入应用图标和版本资源，避免安装后沿用 Electron 默认图标。
-      win: { ...original.win, signExecutable: false },
+      // 生产默认让 electron-builder 使用证书签名；测试或显式允许时跳过但保留图标与版本资源。
+      win: signing.signed ? { ...original.win } : { ...original.win, signExecutable: false },
       afterPack: path.join(desktopDir, "scripts/packaged-resource-copy.mjs"),
       // afterPack 后 builder 仍校验根 resources/app.asar；资源编辑后、归档前再转换布局。
       ...(target === "nsis" ? { nsis: { ...original.nsis, runAfterFinish: true },
@@ -202,7 +231,7 @@ async function packageLocalWindows() {
     await fs.access(installer); destination = { installer };
   }
   console.log(JSON.stringify({ code: "DESKTOP_LOCAL_PACKAGE_READY", requestId, resources, outputDir, artifacts,
-    shellVersion, displayVersion, target: `win32-x64-${target}`, ...destination, signed: false, published: false }));
+    shellVersion, displayVersion, target: `win32-x64-${target}`, ...destination, signed: signing.signed, published: false }));
 }
 
 try { await packageLocalWindows(); }

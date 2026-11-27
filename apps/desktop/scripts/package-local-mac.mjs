@@ -64,9 +64,10 @@ async function verifyBaselineProof(resources, required, arch) {
 /** 仅接受本地 dir/dmg 目标，选项重复、缺值和未知项均在写前拒绝。 */
 function readPackageArguments(argv) {
   const [input, output, ...options] = argv;
-  const usage = "用法：package-local-mac.mjs <完整资源目录> <新独占输出目录> [--require-baseline-proof] [--target dir|dmg] [--plan <file>] [--allow-dirty]";
+  const usage = "用法：package-local-mac.mjs <完整资源目录> <新独占输出目录> [--require-baseline-proof] [--target dir|dmg] [--plan <file>] [--allow-dirty] [--environment test|production] [--allow-unsigned-production]";
   if (!input || !output || input.startsWith("--") || output.startsWith("--")) throw new Error(usage);
   let required = false, target = "dir", targetSeen = false, planFile, allowDirty = false;
+  let environment = "test", environmentSeen = false, allowUnsignedProduction = false;
   for (let index = 0; index < options.length; index++) {
     const option = options[index];
     if (option === "--require-baseline-proof" && !required) required = true;
@@ -74,9 +75,33 @@ function readPackageArguments(argv) {
       target = options[++index]; targetSeen = true;
     } else if (option === "--plan" && !planFile && options[index + 1] && !options[index + 1].startsWith("--")) planFile = path.resolve(options[++index]);
     else if (option === "--allow-dirty" && !allowDirty) allowDirty = true;
+    else if (option === "--environment" && !environmentSeen && ["test", "production"].includes(options[index + 1])) {
+      environment = options[++index]; environmentSeen = true;
+    } else if (option === "--allow-unsigned-production" && !allowUnsignedProduction
+      && (environment === "production" || !environmentSeen)) allowUnsignedProduction = true;
     else throw new Error(usage);
   }
-  return { input, output, required, target, planFile, allowDirty };
+  if (allowUnsignedProduction && environment !== "production") throw new Error("DESKTOP_MAC_UNSIGNED_PRODUCTION_ONLY");
+  return { input, output, required, target, planFile, allowDirty, environment, environmentSeen, allowUnsignedProduction };
+}
+
+/** 生产默认要求 Developer ID 与公证凭据；显式允许时才退回 ad-hoc。 */
+function resolveMacSigning(environment, allowUnsignedProduction) {
+  if (environment !== "production" || allowUnsignedProduction) return { signed: false, identity: null, notarize: false };
+  const identity = String(process.env.CODEFLOWAI_DESKTOP_MAC_SIGN_IDENTITY ?? "").trim();
+  if (!identity) throw Object.assign(new Error("DESKTOP_MAC_SIGNING_REQUIRED"), { code: "DESKTOP_MAC_SIGNING_REQUIRED" });
+  const notarize = ["APPLE_ID", "APPLE_APP_SPECIFIC_PASSWORD", "APPLE_TEAM_ID"].every(name => String(process.env[name] ?? "").trim());
+  if (!notarize) throw Object.assign(new Error("DESKTOP_MAC_NOTARIZATION_REQUIRED"), { code: "DESKTOP_MAC_NOTARIZATION_REQUIRED" });
+  return { signed: true, identity, notarize: true };
+}
+
+/** 有计划时环境必须来自计划；显式参数只能与计划一致，不能把生产计划当测试包。 */
+async function resolvePlanEnvironment(planFile, environment, explicit) {
+  if (!planFile) return environment;
+  const plan = JSON.parse(await fs.readFile(planFile, "utf8"));
+  if (!["test", "production"].includes(plan.environment)) throw new Error("DESKTOP_PACKAGE_PLAN_ENVIRONMENT_INVALID");
+  if (explicit && environment !== plan.environment) throw new Error("DESKTOP_PACKAGE_ENVIRONMENT_MISMATCH");
+  return plan.environment;
 }
 
 /** 发布构建使用已验来源计划；无计划仅保留原本地打包入口。 */
@@ -110,7 +135,12 @@ async function writeUnsignedMarker(outputDir) {
 
 /** 完整资源与卸载 Worker 须齐备；强制基线证明先于输出写入。 */
 async function packageLocalMac() {
-  const { input, output, required, target, planFile, allowDirty } = readPackageArguments(process.argv.slice(2));
+  const args = readPackageArguments(process.argv.slice(2));
+  const { input, output, required, target, planFile, allowDirty, allowUnsignedProduction } = args;
+  const environment = await resolvePlanEnvironment(planFile, args.environment, args.environmentSeen);
+  if (allowUnsignedProduction && environment !== "production") throw new Error("DESKTOP_MAC_UNSIGNED_PRODUCTION_ONLY");
+  // 签名材料缺失必须在创建输出目录前失败。
+  const signing = resolveMacSigning(environment, allowUnsignedProduction);
   if (process.platform !== "darwin") throw new Error("DESKTOP_LOCAL_MACOS_REQUIRED");
   if (!["x64", "arm64"].includes(process.arch)) throw new Error("DESKTOP_LOCAL_MACOS_ARCH_UNSUPPORTED");
   const resources = await fs.realpath(path.resolve(input));
@@ -145,8 +175,8 @@ async function packageLocalMac() {
   }
   // mkdir 的非递归原子创建同时拒绝既有目录、文件及链接，不覆盖旧工件。
   await fs.mkdir(outputDir);
-  const unsignedMarker = hasBaselineProof ? undefined : await writeUnsignedMarker(outputDir);
-  process.env.CSC_IDENTITY_AUTO_DISCOVERY = "false";
+  const unsignedMarker = hasBaselineProof || signing.signed ? undefined : await writeUnsignedMarker(outputDir);
+  if (!signing.signed) process.env.CSC_IDENTITY_AUTO_DISCOVERY = "false";
   const requireBuilder = createRequire(import.meta.resolve("electron-builder"));
   const requireBuilderLibrary = createRequire(requireBuilder.resolve("app-builder-lib"));
   const { load } = requireBuilderLibrary("js-yaml");
@@ -157,10 +187,13 @@ async function packageLocalMac() {
       electronVersion,
       artifactName: `CodeFlowAI-${displayVersion}-darwin-\${arch}.\${ext}`,
       npmRebuild: false,
-      // 本地包不进入官方签名，但仍做 ad-hoc 签名并保留图标、分类与包标识。
+      // 生产签名使用 Developer ID 并公证；测试或显式允许时仍做 ad-hoc 签名并保留图标、分类与包标识。
       // Apple 系统版本须为三段数字，四段产品号只写入说明字段。
-      mac: { ...original.mac, identity: null, hardenedRuntime: false, gatekeeperAssess: false,
-        extendInfo: { ...original.mac?.extendInfo, CFBundleGetInfoString: `CodeFlow ${displayVersion}` } },
+      mac: signing.signed
+        ? { ...original.mac, identity: signing.identity, hardenedRuntime: true, notarize: true, gatekeeperAssess: false,
+          extendInfo: { ...original.mac?.extendInfo, CFBundleGetInfoString: `CodeFlow ${displayVersion}` } }
+        : { ...original.mac, identity: null, hardenedRuntime: false, gatekeeperAssess: false,
+          extendInfo: { ...original.mac?.extendInfo, CFBundleGetInfoString: `CodeFlow ${displayVersion}` } },
       afterPack: path.join(desktopDir, "scripts/packaged-resource-copy.mjs"),
       dmg: { ...(original.dmg ?? {}), title: "CodeFlow", contents: [
         { x: 130, y: 220 },
@@ -209,7 +242,7 @@ async function packageLocalMac() {
   }
   console.log(JSON.stringify({ code: "DESKTOP_LOCAL_PACKAGE_READY", requestId, resources, outputDir, artifacts,
     shellVersion, displayVersion, target: `darwin-${process.arch}-${target}`, ...destination,
-    signed: false, adhocSigned: true, baseline: hasBaselineProof, published: false }));
+    signed: signing.signed, adhocSigned: !signing.signed, baseline: hasBaselineProof, published: false }));
 }
 
 try { await packageLocalMac(); }
