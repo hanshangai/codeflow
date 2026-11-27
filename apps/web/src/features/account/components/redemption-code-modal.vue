@@ -157,7 +157,7 @@ watch(() => props.open, (open) => {
     :open="open"
     :title="contentText.title"
     :footer="null"
-    width="820px"
+    width="1080px"
     @cancel="close"
   >
     <div class="redemption-modal">
