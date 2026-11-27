@@ -34,3 +34,12 @@ export function readInstalledUpdateOrigin(resourcesDir: string, environmentOrigi
   }
   return validateOrigin(config.serverOrigin);
 }
+
+/** 从当前安装的更新来源构造固定平台下载地址，离线和不支持的平台无下载入口。 */
+export function readDesktopRepairDownloadUrl(resourcesDir: string, platform: string, arch: string): string | undefined {
+  const target = platform === "win32" && arch === "x64" ? "windows-x64"
+    : platform === "darwin" && (arch === "arm64" || arch === "x64") ? `darwin-${arch}` : undefined;
+  if (!target) return undefined;
+  const origin = readInstalledUpdateOrigin(resourcesDir);
+  return origin ? `${origin}/api/public/desktop-download/${target}` : undefined;
+}

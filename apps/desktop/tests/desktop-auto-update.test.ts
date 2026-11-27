@@ -57,7 +57,7 @@ async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'd
   const control = { available: true, authorized: true, busy: false, badSignature: false, holdArchive: false,
     failuresRemaining: 0, failReceipt: undefined as string | undefined, rejectLoadWeb: false, holdErrorBody: false,
     holdDiscovery: undefined as (() => Promise<void>) | undefined,
-    onCandidateStart: undefined as (() => Promise<void>) | undefined };
+    onCandidateStart: undefined as (() => Promise<void>) | undefined, refuseCandidateContinuation: false };
   const server = http.createServer((request, response) => {
     void (async () => {
       const chunks: Buffer[] = [];
@@ -114,7 +114,13 @@ async function fixture(t: test.TestContext, installed?: 'same' | 'conflict' | 'd
     /** 候选迁移故障只注入临时数据库，保持原启动与健康协议。 */
     async start() { actions.push('start'); actions.push(`start:${expected?.releaseId ?? 'installation'}`); if (expected?.releaseId === manifest.releaseId) await control.onCandidateStart?.(); },
     async waitReady() {}, async stop() {}, async drain() { actions.push('drain'); }, onEvent() { return () => {}; },
-    async request(request) { actions.push(request.method); return { status: 200, body: request.method === 'runtime.startup.continue' ? { ok: true } : { ok: true, hasRunningSessions: control.busy } }; },
+    async request(request) {
+      actions.push(request.method);
+      if (request.method === 'runtime.startup.continue' && expected?.releaseId === manifest.releaseId && control.refuseCandidateContinuation) {
+        return { status: 503, body: { ok: false } };
+      }
+      return { status: 200, body: request.method === 'runtime.startup.continue' ? { ok: true } : { ok: true, hasRunningSessions: control.busy } };
+    },
     snapshot() { return { status: 'ready', requestId: null, releaseId: expected?.releaseId ?? null, errorCode: null, pid: 123,
       health: { protocolVersion: 1, clientVersion: expected?.clientVersion ?? '1.0.0', dbSchemaVersion: expected?.dbSchemaVersion ?? 88, database: 'ready' },
       ...(startup?.mode === 'held' ? { startup: { continuationId: startup.continuationId, admission: 'paused' as const } } : {}) }; } });
@@ -188,12 +194,17 @@ test('内置已安装发布与目标相同，不下载、不准备也不提示�
   assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 0);
 });
 
-test('内置发布同 ID 不同摘要必须显式拒绝，不能按相同版本忽略冲突', async t => {
+test('内置发布同版本重打包时使用本地版本，摘要差异只记诊断', async t => {
   const f = await fixture(t, 'conflict');
-  await assert.rejects(f.app.checkForUpdates(), /DESKTOP_RELEASE_CACHE_CONFLICT/);
+  const diagnostics: Array<{ diagnostic?: Record<string, unknown> }> = [];
+  f.host.onUpgradeDiagnostic = event => diagnostics.push(event);
+  assert.equal(await f.app.checkForUpdates(), null);
   assert.equal(f.requests.filter(request => request.path.endsWith('/archive')).length, 0);
-  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'failure');
-  assert.ok(f.app.updateCheckFailure);
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.bundle.result, 'same');
+  assert.equal(details.current.bundle?.version, '1.0.0');
+  assert.equal(f.app.updateCheckFailure, null);
+  assert.ok(diagnostics.some(event => event.diagnostic?.code === 'DESKTOP_RELEASE_ARCHIVE_DIFFERS'));
 });
 
 test('资源版本相同但发布身份不同，不重复下载更新', async t => {
@@ -278,18 +289,27 @@ test('启动恢复的待更新候选未获切换资格时不保留可重启状�
   await fs.access(pendingFile);
 });
 
-test('恢复同 ID 异摘要的过期候选时保留失败和原待更新记录', async t => {
+test('覆盖安装同版本后，过期异摘要的待更新包只在本地资源健康后收口', async t => {
   const f = await fixture(t);
   await f.app.checkForUpdates();
   const pendingFile = path.join(f.dataDir, 'pending-release.json'), pending = await fs.readFile(pendingFile);
   await f.installPreparedAsBaseline(true);
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse(f.manifest.expiresAt) + 1 });
-  await f.restart();
-  assert.equal((f.app.updateCheckFailure?.error as { code?: string })?.code, 'DESKTOP_RELEASE_CACHE_CONFLICT');
-  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'failure');
+  f.host.loadWeb = async () => {
+    assert.deepEqual(await fs.readFile(pendingFile), pending);
+    throw new Error('CURRENT_WEB_FAILED');
+  };
+  await assert.rejects(f.restart(), /CURRENT_WEB_FAILED/u);
   assert.deepEqual(await fs.readFile(pendingFile), pending);
+  const { stagingName } = JSON.parse(pending.toString('utf8'));
+  await fs.unlink(path.join(f.dataDir, '.staging', stagingName, 'web/index.html'));
+  f.host.loadWeb = async () => { assert.deepEqual(await fs.readFile(pendingFile), pending); };
+  await f.restart();
+  assert.equal(f.app.updateCheckFailure, null);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'same');
+  await assert.rejects(fs.access(pendingFile), { code: 'ENOENT' });
   assert.equal(await readActivePointer(f.dataDir), null);
-  assert.equal(f.receipts.some(receipt => receipt.stage === 'switched'), false);
+  assert.equal(f.receipts.some(receipt => ['switched', 'healthy'].includes(receipt.stage)), false);
 });
 
 test('background and manual checks share preparation without interrupting running tasks', async t => {
@@ -710,6 +730,68 @@ test('跨结构候选启动失败保留原库并阻止本轮及重启后启动�
   await assert.rejects(fs.access(path.join(f.dataDir, 'update-database-backups')), { code: 'ENOENT' });
 });
 
+for (const damagedBaseline of [false, true]) test(`跨结构候选在写围栏后中断，可重试同一签名候选，基线损坏=${damagedBaseline}`, async t => {
+  const f = await fixture(t, 'different', 87);
+  if (damagedBaseline) {
+    await f.installOldActive();
+    await f.restart();
+    await fs.writeFile(path.join(f.dataDir, 'baseline', 'baseline-release-manifest.json'), '{');
+  }
+  await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json');
+  const pending = JSON.parse(await fs.readFile(pendingFile, 'utf8'));
+  await fs.mkdir(path.join(f.dataDir, 'releases'), { recursive: true });
+  await fs.rename(path.join(f.dataDir, '.staging', pending.stagingName), path.join(f.dataDir, 'releases', f.manifest.releaseId));
+  await fs.writeFile(pendingFile, JSON.stringify({ ...pending, databaseSchemaVersion: 88 }));
+  const database = new DatabaseSync(path.join(f.dataDir, 'codeflowai.db'));
+  try { database.exec('PRAGMA user_version=87'); } finally { database.close(); }
+  await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  await assert.rejects(fs.access(pendingFile), { code: 'ENOENT' });
+});
+
+test('候选放行后活动指针写入失败，原活动资源正常恢复', async t => {
+  const f = await fixture(t);
+  await f.installBaselineVersion('0.9.0');
+  await f.installOldActive();
+  await f.restart();
+  await f.app.checkForUpdates();
+  const rename = fs.rename.bind(fs);
+  let failed = false;
+  const pointer = path.join(f.dataDir, 'active-release.json');
+  t.mock.method(fs, 'rename', async (...args: Parameters<typeof fs.rename>) => {
+    if (args[1] === pointer && !failed) {
+      failed = true;
+      throw Object.assign(new Error('ACTIVE_POINTER_WRITE_FAILED'), { code: 'EIO' });
+    }
+    return await rename(...args);
+  });
+  await f.restart();
+  assert.equal(failed, true);
+  assert.equal(await readActivePointer(f.dataDir), 'baseline-release');
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, 'restored');
+  assert.ok(f.app.updateCheckFailure);
+});
+
+test('候选 Client 放行失败不能提交健康或丢失重试记录', async t => {
+  const f = await fixture(t, 'different', 87);
+  await f.app.checkForUpdates();
+  f.control.refuseCandidateContinuation = true;
+  await assert.rejects(f.restart(), /DESKTOP_STARTUP_CONTINUATION_FAILED|切换失败/u);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  await fs.access(path.join(f.dataDir, 'pending-release.json'));
+  const pending = JSON.parse(await fs.readFile(path.join(f.dataDir, 'pending-release.json'), 'utf8'));
+  const receipts = createUpdateReceiptJournal(f.dataDir);
+  assert.equal(await receipts.find(f.identity.deviceId, pending.requestId, 'switched'), undefined);
+  assert.equal(await receipts.find(f.identity.deviceId, pending.requestId, 'healthy'), undefined);
+  assert.equal(await receipts.find(f.identity.deviceId, pending.requestId, 'unavailable'), undefined);
+  f.control.refuseCandidateContinuation = false;
+  await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  assert.ok(await receipts.find(f.identity.deviceId, pending.requestId, 'healthy'));
+  await assert.rejects(fs.access(path.join(f.dataDir, 'pending-release.json')), { code: 'ENOENT' });
+});
+
 test('旧版已产生但未提交的数据库快照仍沿原恢复入口收口', async t => {
   const f = await fixture(t);
   const database = path.join(f.dataDir, 'codeflowai.db');
@@ -764,6 +846,57 @@ test('覆盖安装的修复包不兼容时仍保留数据库围栏和旧活动�
   assert.equal(f.actions.includes('start'), false);
   assert.equal(await readActivePointer(f.dataDir), 'baseline-release');
   await fs.access(path.join(f.dataDir, 'pending-release.json'));
+});
+
+test('已提交迁移留下的待更新记录可由兼容新安装基线收口', async t => {
+  const f = await fixture(t, 'different', 87);
+  await f.installOldActive(); await f.restart(); await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json');
+  const pending = JSON.parse(await fs.readFile(pendingFile, 'utf8'));
+  f.control.onCandidateStart = async () => {
+    const database = new DatabaseSync(path.join(f.dataDir, 'codeflowai.db'));
+    try { database.exec('PRAGMA user_version=88'); } finally { database.close(); }
+  };
+  await f.restart();
+  await fs.writeFile(pendingFile, JSON.stringify({ ...pending, databaseSchemaVersion: 88 }));
+  await f.installBaselineVersion('1.0.1', 88);
+  f.host.loadWeb = async () => { throw new Error('REPAIR_WEB_FAILED'); };
+  await assert.rejects(f.restart(), /REPAIR_WEB_FAILED/u);
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  await fs.access(pendingFile);
+  f.host.loadWeb = async () => {};
+  await f.restart();
+  assert.equal((await f.app.getUpdateDetails()).current.bundle?.version, '1.0.1');
+  assert.equal(await readActivePointer(f.dataDir), null);
+  await assert.rejects(fs.access(pendingFile), { code: 'ENOENT' });
+});
+
+test('已损坏的活动资源由基线接管后，同一签名发布可重新启用', async t => {
+  const f = await fixture(t, 'different', 87);
+  await f.installBaselineVersion('0.9.0', 88); await f.restart();
+  await f.app.checkForUpdates(); await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  const entry = path.join(f.dataDir, 'releases', f.manifest.releaseId, 'client', 'dist', 'index.cjs');
+  await fs.unlink(entry);
+  await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), null);
+  await f.app.checkForUpdates(); await f.restart();
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
+  assert.equal(await fs.readFile(entry, 'utf8'), 'client');
+  assert.equal(f.app.updateCheckFailure, null);
+});
+
+test('原活动版本的 Web 启动失败时保留尚未收口的已提交更新记录', async t => {
+  const f = await fixture(t);
+  await f.app.checkForUpdates();
+  const pendingFile = path.join(f.dataDir, 'pending-release.json');
+  const pending = await fs.readFile(pendingFile);
+  await f.restart(); await f.app.flushReceipts();
+  await fs.writeFile(pendingFile, pending);
+  f.host.loadWeb = async () => { throw new Error('ACTIVE_WEB_FAILED'); };
+  await assert.rejects(f.restart(), /ACTIVE_WEB_FAILED/u);
+  assert.deepEqual(await fs.readFile(pendingFile), pending);
+  assert.equal(await readActivePointer(f.dataDir), f.manifest.releaseId);
 });
 
 test('更高结构修复包页面失败保留更高围栏、旧指针和待更新记录', async t => {

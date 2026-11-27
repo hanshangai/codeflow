@@ -64,7 +64,8 @@ export type DesktopHost = {
   registerBridge(bridge: DesktopBridgeApi, window: DesktopWindow): () => void;
   /** 仅在存在运行中会话时确认是否中断并更新。 */
   /** 后台失败由主进程展示或记录；logOnly仅预记首错，不提前展示UI。 */
-  onUpdateError?(error: unknown, context: { requestId: string; deviceId: string; logOnly?: boolean }): void;
+  onUpdateError?(error: unknown, context: { requestId: string; deviceId: string; logOnly?: boolean; phase?: string;
+    releaseId?: string | null; recoveredReleaseId?: string }): void;
   /** 启动或迁移窗口退出失败保留进程 owner，由宿主显式展示错误。 */
   onMigrationError?(error: unknown): void;
   onUpdateRetry?(context: { requestId: string; deviceId: string; retry: number; delayMs: number; error: unknown }): void;
@@ -121,7 +122,8 @@ export function createDesktopApplication(input: {
   onShutdown?: () => void;
   startupContinuation?: { continuationId: string; authorizeReady(facts: DesktopStartupReadyFacts): Promise<void> };
   /** 宿主提供实际profile与main事实；未接宿主时不创建第二更新入口。 */
-  shellUpdate?: { facts: ShellUpdateHostFacts; boundary?: Partial<ShellUpdateOperationBoundary>; timeoutMs?: number };
+  shellUpdate?: ({ facts: ShellUpdateHostFacts } | { readFacts(): Promise<ShellUpdateHostFacts | undefined>; facts?: never })
+    & { boundary?: Partial<ShellUpdateOperationBoundary>; timeoutMs?: number };
   createRuntime?: (entry: string, expectedRelease?: ClientRuntimeExpectation, startup?: DesktopStartupMode) => ClientRuntime;
   /** 固定资源选择完成后创建迁移 owner；换壳接续不改变原授权路径。 */
   createMigration?: (facts: { releaseDir: string; identity: DeviceIdentity }) => LegacyClientMigration | undefined;
@@ -139,12 +141,16 @@ export function createDesktopApplication(input: {
     continuation = { continuationId: mode.continuationId, authorizeReady: descriptors.authorizeReady.value };
   }
   let initialStartup: DesktopStartupMode = continuation ? { mode: "held", continuationId: continuation.continuationId } : { mode: "automatic" };
-  const createRuntime = input.createRuntime ?? ((entry, expectedRelease, startup) => createClientRuntime({ entry, expectedRelease, startup, dataDir: input.dataDir,
-    cliRuntime: typeof input.cliRuntime === "function" ? input.cliRuntime(path.resolve(entry, "../../..")) : input.cliRuntime,
-    onExit: facts => input.onClientExit?.(facts) }));
+  /** 只在资源选定后读取该版本的 CLI 文件，未启动的占位运行时只供前置状态查询。 */
+  const createRuntime = (entry: string, expectedRelease?: ClientRuntimeExpectation, startup?: DesktopStartupMode, resolveCli = true): ClientRuntime =>
+    input.createRuntime ? input.createRuntime(entry, expectedRelease, startup)
+      : createClientRuntime({ entry, expectedRelease, startup, dataDir: input.dataDir,
+        cliRuntime: resolveCli && typeof input.cliRuntime === "function" ? input.cliRuntime(path.resolve(entry, "../../.."))
+          : typeof input.cliRuntime === "function" ? undefined : input.cliRuntime,
+        onExit: facts => input.onClientExit?.(facts) });
   /** Client 保持现有完整 npm 包结构，以复用原生依赖与 worker 相对路径。 */
   const clientEntry = (releaseDir: string): string => path.join(releaseDir, "client", "dist", "index.cjs");
-  let runtime = createRuntime(clientEntry(input.initialReleaseDir), undefined, initialStartup);
+  let runtime = createRuntime(clientEntry(input.initialReleaseDir), undefined, initialStartup, false);
   let window: DesktopWindow | null = null;
   let tray: { destroy(): void } | null = null;
   let unregister: (() => void) | null = null;
@@ -451,14 +457,22 @@ export function createDesktopApplication(input: {
     return compareNumericVersion(candidate, current);
   };
 
-  /** 资源只比较包版本；同一发布的摘要冲突仍作为完整性错误拒绝。 */
+  /** 已验签资源按版本决定是否跳过；同版本重打包的摘要差异留在诊断。 */
   const isCurrentRelease = (manifest: DownloadedRelease["manifest"], requestId: string): boolean => {
+    const current = currentBundleVersion?.version;
+    const order = current ? compareResourceVersions(manifest.version, current, requestId) : 1;
+    if (order <= 0) {
+      if (order === 0 && currentArchiveSha256 !== undefined && manifest.archiveSha256 !== currentArchiveSha256) {
+        input.host.onUpgradeDiagnostic?.({ requestId, releaseId: manifest.releaseId, phase: "version-check", outcome: "success",
+          diagnostic: { code: "DESKTOP_RELEASE_ARCHIVE_DIFFERS", currentReleaseId, version: manifest.version,
+            currentArchiveSha256, candidateArchiveSha256: manifest.archiveSha256 } });
+      }
+      return true;
+    }
     if (manifest.releaseId === currentReleaseId && currentArchiveSha256 !== undefined && manifest.archiveSha256 !== currentArchiveSha256) {
       throw Object.assign(new Error("DESKTOP_RELEASE_CACHE_CONFLICT"), { code: "DESKTOP_RELEASE_CACHE_CONFLICT", requestId });
     }
-    const current = currentBundleVersion?.version;
-    if (!current) return false;
-    return compareResourceVersions(manifest.version, current, requestId) <= 0;
+    return false;
   };
 
   /** 壳只维护当前运行时的一条订阅，事件不在此缓存或重放。 */
@@ -511,9 +525,21 @@ export function createDesktopApplication(input: {
     const currentRuntime = runtime;
     const nativeUpdate = !config.boundary?.spawnHelper;
     let active: ActiveRelease | null;
+    let facts = config.facts;
     try {
       const discovered = await discoverUpdatesInternal({ requestId, signal });
       if (discovered.shellError) throw discovered.shellError;
+      // Windows 进程检查只服务于实际壳候选，资源发现和普通启动不需要它。
+      if (!facts && "readFacts" in config) {
+        if (!discovered.shell.available) {
+          shellDetails = { requestId, target: null, phase: null, result: "none", failure: null };
+          return;
+        }
+        facts = await config.readFacts();
+        signal.throwIfAborted();
+        if (!facts) throw new Error("DESKTOP_SHELL_HOST_UNAVAILABLE");
+      }
+      if (!facts) throw new Error("DESKTOP_SHELL_HOST_UNAVAILABLE");
       active = nativeUpdate ? null : await resolveActiveRelease(input.dataDir, { trustedReleaseKeys: input.trustedReleaseKeys });
     }
     catch (cause) { throw Object.assign(new Error("DESKTOP_SHELL_OPERATION_FAILED", { cause }), { code: "DESKTOP_SHELL_OPERATION_FAILED",
@@ -527,7 +553,7 @@ export function createDesktopApplication(input: {
     let interrupted = false;
     const result = await runShellUpdateOperation({ shellVersion: input.shellVersion, dataDir: input.dataDir, initialReleaseDir: input.initialReleaseDir, identity: identity!,
       configuredServerOrigin: input.configuredServerOrigin!, trustedKeys: input.trustedReleaseKeys ?? {}, requestId, signal,
-      facts: config.facts, boundary: config.boundary, timeoutMs: config.timeoutMs, getClient: () => runtime.snapshot(),
+      facts, boundary: config.boundary, timeoutMs: config.timeoutMs, getClient: () => runtime.snapshot(),
       discovery: async discoveryRequestId => (await discoverUpdatesInternal({ requestId: discoveryRequestId, signal })).shell,
       manual, deferAfterInstaller,
       /** 仅原日志的真实历史可授权人工新周期，ACK过的旧证据仍须存在。 */
@@ -800,10 +826,21 @@ export function createDesktopApplication(input: {
         return item as { available: boolean; manifest?: unknown };
       };
       const resource = availability(response.resource, 'resource'), shell = availability(response.shell, 'shell');
-      const manifest = resource.available ? assertReleaseBundleManifest(resource.manifest) : null;
+      /** 合法响应中的单通道清单错误只影响该通道，保留原始原因和请求。 */
+      const parseManifest = <T>(channel: "resource" | "shell", value: typeof resource, parse: (manifest: unknown) => T): T | null => {
+        if (!value.available) return null;
+        try { return parse(value.manifest); }
+        catch (cause) {
+          const code = channel === "shell" ? "DESKTOP_SHELL_RELEASE_PAYLOAD_INVALID" : "DESKTOP_RELEASE_MANIFEST_INVALID";
+          value.error = Object.assign(new Error(code, { cause }), { code, requestId: options.requestId, updateChannel: channel });
+          return null;
+        }
+      };
+      const manifest = parseManifest("resource", resource, assertReleaseBundleManifest);
+      const shellManifest = parseManifest("shell", shell, assertShellReleaseManifest);
       return { resource: manifest ? { manifest, manifestBytes: Buffer.from(JSON.stringify(manifest), 'utf8') } : null,
-        shell: shell.available ? { ok: true, available: true, deviceId: identity!.deviceId, requestId: options.requestId,
-          manifest: assertShellReleaseManifest(shell.manifest) } : { ok: true, available: false, deviceId: identity!.deviceId, requestId: options.requestId },
+        shell: shellManifest ? { ok: true, available: true, deviceId: identity!.deviceId, requestId: options.requestId,
+          manifest: shellManifest } : { ok: true, available: false, deviceId: identity!.deviceId, requestId: options.requestId },
         ...(resource.error ? { resourceError: resource.error } : {}), ...(shell.error ? { shellError: shell.error } : {}) };
     })();
     checkDiscoveries?.set(options.requestId, flight);
@@ -898,22 +935,27 @@ export function createDesktopApplication(input: {
       phase = "download";
       if (conditional) {
         bundleDetails.phase = "verify";
-        const verified = verifyDownloadManifest({ manifestBytes, trustedReleaseKeys: input.trustedReleaseKeys ?? {}, requestId });
+        let verified: DownloadedRelease["manifest"];
+        try { verified = verifyDownloadManifest({ manifestBytes, trustedReleaseKeys: input.trustedReleaseKeys ?? {}, requestId }); }
+        catch (cause) {
+          const code = safeUpgradeErrorCode(cause);
+          throw Object.assign(new Error(code, { cause }), { code, requestId, updateChannel: "resource" });
+        }
         bundleDetails.requestId = requestId;
         bundleDetails.target = snapshotBundleVersion(verified);
         bundleDetails.result = "unknown";
         options.signal?.throwIfAborted();
+        if (isCurrentRelease(verified, requestId)) {
+          if (operation === "checking") pendingUpdate = undefined;
+          bundleDetails.result = "same";
+          return null;
+        }
         if (retained && requestId !== retained.requestId && manifest.releaseId === retained.manifest.releaseId) {
           if (manifest.archiveSha256 !== retained.manifest.archiveSha256) {
             throw Object.assign(new Error("DESKTOP_RELEASE_CACHE_CONFLICT"), { code: "DESKTOP_RELEASE_CACHE_CONFLICT", requestId });
           }
           requestId = retained.requestId;
           if (!await authorizeReleaseSwitch(retained.manifest, requestId, options.signal)) return null;
-        }
-        if (isCurrentRelease(manifest, requestId)) {
-          if (operation === "checking") pendingUpdate = undefined;
-          bundleDetails.result = "same";
-          return null;
         }
         if (operation === "checking") {
           if (retained?.requestId === requestId && retained.downloaded) return retained.downloaded;
@@ -1007,48 +1049,63 @@ export function createDesktopApplication(input: {
       || Reflect.ownKeys(body).length !== 1 || !ok || !("value" in ok) || ok.value !== true) throw new Error("DESKTOP_STARTUP_CONTINUATION_FAILED");
   };
 
-  /** 启动时独立提交资源候选；本地事实完成才清 pending，远端交付不延长本地事务。 */
+  /** 启动时提交候选，或通知外层在工作台与 Client 就绪后收口已过时的记录。 */
   const activatePendingAtStartup = async (pending: PendingRelease, activeAtStartup: ActiveRelease | null,
     baselineAtStartup: Awaited<ReturnType<typeof resolveBaselineRelease>> | null, restoreToBaseline = false,
-    beforeWebReady?: () => Promise<void>): Promise<void> => {
+    beforeWebReady?: () => Promise<void>, recoveryCandidate?: PreparedRelease): Promise<"discard-pending" | void> => {
     let candidate: PreparedRelease | undefined;
     let databaseMigration = false, candidateStarted = false;
-    let baselineCannotStart = false;
-    let databaseCompatibilityUnknown = false;
+    let baselineCannotStart = pending.databaseSchemaVersion !== undefined;
+    let databaseCompatibilityBlocked = false;
+    let candidateAdmissionFailed = false;
     /** 结构读取失败时禁止落回可能不兼容的 Client。 */
     const readActualSchema = async (): Promise<number> => {
       try { return await readDatabaseSchemaVersion(input.dataDir); }
-      catch (error) { databaseCompatibilityUnknown = true; throw error; }
+      catch (error) { databaseCompatibilityBlocked = true; throw error; }
     };
-    const committedAtStartup = activeAtStartup?.releaseId === pending.releaseId;
+    const committedAtStartup = activeAtStartup?.releaseId === pending.releaseId && activeAtStartup.releaseDir === pending.stagingDir;
+    const installedManifest = activeAtStartup?.manifest ?? baselineAtStartup?.manifest;
     const restoreInitialOnFailure = Boolean(restoreToBaseline && !activeAtStartup && baselineAtStartup);
+    /** 放弃候选前确认没有未收口的数据库迁移，且已安装资源能读取原库。 */
+    const assertCanDiscardPending = async (installed: NonNullable<typeof installedManifest>): Promise<void> => {
+      const actualSchema = await readActualSchema();
+      if (pending.databaseSchemaVersion !== undefined || actualSchema > installed.dbSchemaVersion) {
+        databaseCompatibilityBlocked = true;
+        throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY"), { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY",
+          requestId: pending.requestId, releaseId: pending.releaseId, databaseSchemaVersion: Math.max(pending.databaseSchemaVersion ?? 0, actualSchema),
+          targetDatabaseSchemaVersion: installed.dbSchemaVersion });
+      }
+    };
     try {
       // 活动版本沿启动时已验签的安装事实恢复，不再套用新候选的下载有效期。
-      candidate = committedAtStartup
+      const resumed = committedAtStartup
         ? { requestId: pending.requestId, stagingDir: activeAtStartup!.releaseDir, manifest: activeAtStartup!.manifest }
-        : await coordinator.resume(pending, currentArchiveSha256 === undefined ? undefined
-          : { releaseId: currentReleaseId, archiveSha256: currentArchiveSha256 });
+        : recoveryCandidate ?? await coordinator.resume(pending, installedManifest ? manifest => isCurrentRelease(manifest, pending.requestId) : undefined);
+      candidate = resumed;
+      if (!committedAtStartup && pending.databaseSchemaVersion !== undefined) {
+        const actualSchema = await readActualSchema();
+        const requiredSchema = Math.max(actualSchema, pending.databaseSchemaVersion);
+        if (candidate.manifest.dbSchemaVersion < requiredSchema) {
+          databaseCompatibilityBlocked = true;
+          throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY"), { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY",
+            requestId: pending.requestId, releaseId: pending.releaseId, databaseSchemaVersion: requiredSchema });
+        }
+        // 跨结构接续只能启动原候选。即使此次未迁移，也保留之前已经写入的数据库保护。
+        databaseMigration = true;
+        baselineCannotStart = true;
+      }
       bundleDetails = { requestId: pending.requestId, target: snapshotBundleVersion(candidate.manifest), phase: "prepare", result: "prepared", failure: null };
       // 完整安装已包含候选时只收口旧标记，不能伪造资源切换和健康回执。
-      const alreadyInstalled = !committedAtStartup && isCurrentRelease(candidate.manifest, pending.requestId);
-      if (alreadyInstalled) {
-        if (restoreInitialOnFailure && baselineAtStartup
-          && baselineAtStartup.manifest.dbSchemaVersion < await readActualSchema()) {
-          baselineCannotStart = true;
-          databaseMigration = true;
-        }
-      }
-      if (alreadyInstalled && !baselineCannotStart) {
-        if (!restoreInitialOnFailure) await clearPendingRelease(input.dataDir);
+      if (installedManifest && "alreadyInstalled" in resumed && resumed.alreadyInstalled) {
+        await assertCanDiscardPending(installedManifest);
         preparedUpdate = undefined;
         pendingUpdate = undefined;
         bundleDetails.result = "same";
-        return;
+        return "discard-pending";
       }
       if (committedAtStartup) {
         const current = runtime.snapshot();
         if (current.status !== "ready" || current.health?.database !== "ready") throw new Error("DESKTOP_CURRENT_RUNTIME_NOT_HEALTHY");
-        snapshotDesktopStartupReady(current.startup, startupHeldId!);
         bundleDetails.phase = "activate";
         bundleDetails.result = "healthy";
         if (input.configuredServerOrigin || input.reportReceipt) {
@@ -1074,6 +1131,7 @@ export function createDesktopApplication(input: {
       // 未获切换资格时不得保留会被检查或重启复用的陈旧候选；待更新标记仍留给下次启动重试。
       if (!await authorizeReleaseSwitch(candidate.manifest, pending.requestId, AbortSignal.timeout(30_000))) {
         preparedUpdate = undefined;
+        if (baselineCannotStart) throw new DesktopUpdatePostponed();
         return;
       }
       const active = await coordinator.switch(candidate, {
@@ -1082,7 +1140,7 @@ export function createDesktopApplication(input: {
           const current = runtime.snapshot();
           const currentSchema = current.status === "ready" && current.health
             ? current.health.dbSchemaVersion : await readActualSchema();
-          baselineCannotStart = Boolean(restoreInitialOnFailure && baselineAtStartup
+          baselineCannotStart ||= Boolean(restoreInitialOnFailure && baselineAtStartup
             && baselineAtStartup.manifest.dbSchemaVersion < currentSchema);
           if (baselineCannotStart) databaseMigration = true;
           if (manifest.dbSchemaVersion < currentSchema) throw new Error("DESKTOP_DB_SCHEMA_DOWNGRADE_FORBIDDEN");
@@ -1095,7 +1153,8 @@ export function createDesktopApplication(input: {
           if (databaseMigration) await markPendingDatabaseMigration(input.dataDir, pending, candidate!.manifest.dbSchemaVersion);
           if (runtime.snapshot().status === "ready") await runtime.drain(undefined, { force: true });
           try {
-            if (input.shellUpdate) {
+            // 原生切换不绑定活动资源，历史记录只由仍使用旧交接协议的路径处理。
+            if (input.shellUpdate?.boundary?.spawnHelper && input.shellUpdate.facts) {
               const facts = input.shellUpdate.facts;
               await retireShellUpdateAttempt({ ...facts, dataDir: input.dataDir, executablePath: facts.main.executable,
                 pid: facts.main.pid, parentPid: facts.main.parentPid, argv: [], trustedKeys: input.trustedReleaseKeys,
@@ -1112,10 +1171,18 @@ export function createDesktopApplication(input: {
         /** 启动调用即可能迁移数据库；不能仅凭未收到 ready 推断原库未变。 */
         async restartClient(releaseDir, manifest) { candidateStarted = true; await restartClient(releaseDir, manifest); },
         reloadWeb: (directory, manifest) => reloadWeb(directory, { requestId: pending.requestId, releaseId: manifest.releaseId, beforeReady: beforeWebReady }),
-        /** 不能将下载或进程存在当健康；候选仍持有启动围栏。 */
+        /** 发布活动版本与健康回执前，必须验证候选已完成 Client 放行。 */
         async waitHealthy() {
           const current = runtime.snapshot();
-          snapshotDesktopStartupReady(current.startup, startupHeldId!);
+          if (current.status !== "ready" || current.health?.database !== "ready") return false;
+          try { await continueHeldRuntime(startupHeldId!); }
+          catch (cause) { candidateAdmissionFailed = true; throw cause; }
+          startupHeldId = undefined;
+          return true;
+        },
+        /** 回退 Client 由原启动流程放行，只核对数据库及进程健康。 */
+        async waitRestoredHealthy() {
+          const current = runtime.snapshot();
           return current.status === "ready" && current.health?.database === "ready";
         },
         /** 停候选后保留当前数据库；跨结构失败显式阻止旧 Client 自动回退。 */
@@ -1124,6 +1191,8 @@ export function createDesktopApplication(input: {
           if (databaseMigration && candidateStarted) throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY"),
             { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY", requestId: pending.requestId, releaseId: pending.releaseId });
         },
+        /** 放行失败可按原签名候选重试，保留原错误和待更新记录。 */
+        keepPendingOnFailure: () => candidateAdmissionFailed,
         /** 首次资源升级失败恢复安装包自身的已核验资源。 */
         async restoreInitialRelease() {
           if (input.requireBaseline) await resolveBaselineRelease(baselineReleaseDir, { trustedReleaseKeys: input.trustedReleaseKeys });
@@ -1146,6 +1215,26 @@ export function createDesktopApplication(input: {
           { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY", requestId: pending.requestId, releaseId: pending.releaseId });
         return;
       }
+      const failure = error as NodeJS.ErrnoException | undefined;
+      const invalidStaging = failure?.code === "DESKTOP_RELEASE_MANIFEST_INVALID"
+        || (failure?.code === "ENOENT" && (failure.path === pending.stagingDir || failure.path === path.join(pending.stagingDir, "manifest.json")));
+      // 已验签的同 ID 基线可接管丢失的暂存。诊断保留原错；放行成功后只清待更新记录。
+      if (!candidate && !activeAtStartup && baselineAtStartup?.manifest.releaseId === pending.releaseId && invalidStaging) {
+        try { await assertCanDiscardPending(baselineAtStartup.manifest); }
+        catch (schemaError) {
+          const code = (schemaError as NodeJS.ErrnoException | undefined)?.code === "DESKTOP_DB_SCHEMA_FORWARD_ONLY"
+            ? "DESKTOP_DB_SCHEMA_FORWARD_ONLY" : "DESKTOP_PENDING_SCHEMA_CHECK_FAILED";
+          throw Object.assign(new AggregateError([error, schemaError], code, { cause: schemaError }), { code,
+            requestId: pending.requestId, releaseId: pending.releaseId,
+            databaseSchemaVersion: (schemaError as { databaseSchemaVersion?: number } | undefined)?.databaseSchemaVersion,
+            targetDatabaseSchemaVersion: baselineAtStartup.manifest.dbSchemaVersion });
+        }
+        input.host.onUpdateError?.(error, { requestId: pending.requestId, deviceId: identity!.deviceId, logOnly: true });
+        preparedUpdate = undefined;
+        pendingUpdate = undefined;
+        bundleDetails = { requestId: pending.requestId, target: null, phase: "prepare", result: "restored", failure: null };
+        return "discard-pending";
+      }
       const activeReleaseId = await readActivePointer(input.dataDir);
       if (committedAtStartup) {
         try {
@@ -1156,8 +1245,8 @@ export function createDesktopApplication(input: {
         syncActiveRelease({ releaseId: activeReleaseId, manifest: candidate.manifest });
         await databaseBackup.recover(activeReleaseId);
         preparedUpdate = undefined;
-      } else if (bundleDetails.result === "restored") {
-        if (input.shellUpdate) {
+      } else if (bundleDetails.result === "restored" && !candidateAdmissionFailed) {
+        if (input.shellUpdate?.boundary?.spawnHelper && input.shellUpdate.facts) {
           const facts = input.shellUpdate.facts;
           await retireShellUpdateAttempt({ ...facts, dataDir: input.dataDir, executablePath: facts.main.executable,
             pid: facts.main.pid, parentPid: facts.main.parentPid, argv: [], trustedKeys: input.trustedReleaseKeys,
@@ -1180,7 +1269,8 @@ export function createDesktopApplication(input: {
         }
         if (runtime.snapshot().status === "ready") publishRuntimeFacts();
       }
-      if (databaseCompatibilityUnknown) throw error;
+      if (databaseCompatibilityBlocked || pending.databaseSchemaVersion !== undefined && !candidateStarted && !committedAtStartup) throw error;
+      if (candidateAdmissionFailed && bundleDetails.result === "restored") preparedUpdate = undefined;
       updateCheckFailure = { requestId: pending.requestId, error };
       if (!["healthy", "restored", "unavailable"].includes(bundleDetails.result)) bundleDetails.result = "failure";
       input.host.onUpdateError?.(error, { requestId: pending.requestId, deviceId: identity!.deviceId });
@@ -1192,15 +1282,15 @@ export function createDesktopApplication(input: {
         const fallback = activeAtStartup ?? baselineAtStartup;
         await restartClient(fallback?.releaseDir ?? input.initialReleaseDir, fallback?.manifest ?? initialExpectation);
         await reloadWeb(fallback?.releaseDir ?? input.initialReleaseDir, { requestId: pending.requestId,
-          releaseId: fallback?.manifest.releaseId ?? "installation" });
+          releaseId: fallback?.manifest.releaseId ?? "installation", beforeReady: beforeWebReady });
         publishRuntimeFacts();
       }
     }
   };
 
-  /** 成功空轮次后安排下一次检查；稍后、故障和退出都停止自动调度。 */
+  /** 共用一个定时器继续下一轮；单通道失败仍可重试，用户暂停和退出继续停止调度。 */
   const scheduleUpdateCheck = (): void => {
-    if (!automaticUpdates || updatesSuppressed || stoppingUpdates || updateCheckFailure || shellUpdateFailure || shellOwner) return;
+    if (!automaticUpdates || updatesSuppressed || stoppingUpdates || shellOwner) return;
     updateTimer = setTimeout(() => {
       updateTimer = undefined;
       if (operation !== "idle") { scheduleUpdateCheck(); return; }
@@ -1325,6 +1415,8 @@ export function createDesktopApplication(input: {
       updateCheckFailure = { requestId: failedRequestId, error: failure };
       throw failure;
     }).finally(() => {
+      const seenInManualCheck = manual || updateFlightManualRequested;
+      updateFlightManualRequested = false;
       updateFlight = undefined;
       updateController = undefined;
       networkContext = undefined;
@@ -1332,11 +1424,10 @@ export function createDesktopApplication(input: {
       switchCommitted = false;
       operation = stoppingUpdates ? "exiting" : "idle";
       scheduleUpdateCheck();
+      // 已准备的资源有自己的重启提醒，壳通道失败时仍按原节流规则展示。
+      if (!stoppingUpdates && (preparedUpdate || !shellUpdateFailure && !updateCheckFailure)) void notifyPreparedUpdate(seenInManualCheck);
     }).then(async active => {
       // 原flight先释放，再从唯一退出入口交出main，避免等待自身。
-      const seenInManualCheck = manual || updateFlightManualRequested;
-      updateFlightManualRequested = false;
-      void notifyPreparedUpdate(seenInManualCheck);
       if (shellOwner && !stoppingUpdates) await application.exit();
       if (resourceFailure !== undefined) throw resourceFailure;
       return active;
@@ -1471,6 +1562,7 @@ export function createDesktopApplication(input: {
     async start(): Promise<void> {
       if (operation !== "idle" || window) throw new Error("DESKTOP_ALREADY_STARTED");
       operation = "starting";
+      let recoveryContext: { cause: unknown; requestId: string; releaseId: string | null } | undefined;
       try {
         let resumePreparedShellAfterStartup = false;
         const startupRequestId = crypto.randomUUID();
@@ -1504,7 +1596,8 @@ export function createDesktopApplication(input: {
             getVersions: presenceVersions, getNetworkContext: () => networkContext });
           receiptDelivery = createUpdateReceiptDelivery({ journal: receiptJournal, deviceId: identity.deviceId, transport });
         }
-        const recoveredDatabase = await databaseBackup.recover(await readActivePointer(input.dataDir));
+        const recordedActiveId = await readActivePointer(input.dataDir);
+        const recoveredDatabase = await databaseBackup.recover(recordedActiveId);
         assertStartupRunning();
         // pending 同时持有原库的迁移围栏；所有启动入口必须读取，损坏时禁止启动旧版。
         const recordedPending = await readPendingRelease(input.dataDir);
@@ -1514,25 +1607,40 @@ export function createDesktopApplication(input: {
         assertStartupRunning();
         const releaseTrust = { trustedReleaseKeys: input.trustedReleaseKeys, requireHeldStartup: Boolean(continuation), verification: "installed" as const };
         await reportStartup("正在校验当前版本…");
-        const activeRelease = await resolveActiveRelease(input.dataDir, releaseTrust);
+        let activeFailure: { cause: unknown } | undefined;
+        const activeRelease = await resolveActiveRelease(input.dataDir, releaseTrust).catch(cause => {
+          // 用户已批准用独立可信资源接管。壳交接仍必须恢复原绑定，指针不明时由恢复页处理。
+          if (continuation || !recordedActiveId) throw cause;
+          activeFailure = { cause };
+          return null;
+        });
+        if (!activeFailure && activeRelease?.releaseId !== (recordedActiveId ?? undefined)) {
+          throw new Error("DESKTOP_STARTUP_ARTIFACT_CHANGED");
+        }
         await reportStartup("正在校验安装资源…");
         const needsRepairBaseline = recordedPending?.databaseSchemaVersion !== undefined
           && (activeRelease?.manifest.dbSchemaVersion ?? 0) < recordedPending.databaseSchemaVersion;
+        const migrationFence = recordedPending?.databaseSchemaVersion;
+        // 已入正式目录且尚无不可用终态的原候选，可以独立完成跨结构接续。
+        const canResumeMigration = Boolean(needsRepairBaseline && migrationFence && pending && !activeFailure && !continuation
+          && pending.stagingDir === path.join(path.resolve(input.dataDir), "releases", pending.releaseId)
+          && (await readDatabaseSchemaVersion(input.dataDir)) <= migrationFence
+          && !(await receiptJournal.find(identity.deviceId, pending.requestId, "unavailable")));
         // 完整安装存在基线时参与选择；可信 active 的普通启动仍允许安装基线缺失。
-        const baselineRelease = input.requireBaseline || continuation || needsRepairBaseline || !activeRelease && pending
+        let baselineFailure: { cause: unknown } | undefined;
+        const baselineRelease = input.requireBaseline || continuation || needsRepairBaseline || activeFailure || !activeRelease && pending
           ? await resolveBaselineRelease(baselineReleaseDir, releaseTrust).catch((error: unknown) => {
+            if (activeFailure) throw Object.assign(new AggregateError([activeFailure.cause, error], "DESKTOP_RELEASE_RECOVERY_UNAVAILABLE"), {
+              code: "DESKTOP_RELEASE_RECOVERY_UNAVAILABLE", requestId: startupRequestId, releaseId: recordedActiveId,
+            });
+            if (continuation || (!activeRelease || needsRepairBaseline) && !canResumeMigration) throw error;
             const failure = error as { code?: unknown; path?: unknown };
-            const missing = failure.code === "DESKTOP_RELEASE_BASELINE_MISSING" || failure.code === "ENOENT"
-              && failure.path === path.resolve(baselineReleaseDir);
-            // 延续 active 独立启动；只接受根目录或证明缺失，资源缺文件和验签失败仍原样抛出。
-            if (activeRelease && !continuation && !needsRepairBaseline && missing) return null;
-            throw error;
+            // 允许旧完整安装缺少基线。其他基线故障在确认活动资源可用后保留诊断。
+            if (failure?.code !== "DESKTOP_RELEASE_BASELINE_MISSING" && !(failure?.code === "ENOENT"
+              && failure.path === path.resolve(baselineReleaseDir))) baselineFailure = { cause: error };
+            return null;
           }) : null;
         assertStartupRunning();
-        // 已验签修复基线可接管不兼容旧活动包；磁盘指针等真实健康后再清理。
-        const repairingDatabase = Boolean(recordedPending?.databaseSchemaVersion && baselineRelease
-          && baselineRelease.manifest.dbSchemaVersion >= recordedPending.databaseSchemaVersion
-          && (!activeRelease || activeRelease.manifest.dbSchemaVersion < recordedPending.databaseSchemaVersion));
         // 壳接续只消费原授权绑定；普通完整安装按资源版本接管，不能降低已知数据库结构。
         const newerBaseline = Boolean(!continuation && input.requireBaseline && baselineRelease && activeRelease
           && compareResourceVersions(baselineRelease.manifest.version, activeRelease.manifest.version) > 0);
@@ -1541,15 +1649,36 @@ export function createDesktopApplication(input: {
             releaseId: baselineRelease.manifest.releaseId, activeReleaseId: activeRelease.releaseId,
             databaseSchemaVersion: activeRelease.manifest.dbSchemaVersion, targetDatabaseSchemaVersion: baselineRelease.manifest.dbSchemaVersion });
         }
+        // 新基线也可接管已经提交、来不及清理的同一次迁移。
+        const supersedesCommittedMigration = newerBaseline && activeRelease?.releaseId === recordedPending?.releaseId
+          && activeRelease?.releaseDir === recordedPending?.stagingDir;
+        const repairingDatabase = Boolean(recordedPending?.databaseSchemaVersion && baselineRelease
+          && baselineRelease.manifest.dbSchemaVersion >= recordedPending.databaseSchemaVersion
+          && (supersedesCommittedMigration || !activeRelease || activeRelease.manifest.dbSchemaVersion < recordedPending.databaseSchemaVersion));
         const startupActiveRelease = repairingDatabase || newerBaseline ? null : activeRelease;
         const currentSchema = startupActiveRelease?.manifest.dbSchemaVersion ?? baselineRelease?.manifest.dbSchemaVersion;
+        const resourceRecovery = activeFailure ?? baselineFailure;
+        const resumeInterruptedMigration = canResumeMigration && !repairingDatabase && migrationFence !== undefined
+          && (currentSchema === undefined || currentSchema < migrationFence);
+        if ((resourceRecovery && !resumeInterruptedMigration) || (supersedesCommittedMigration && repairingDatabase)) {
+          const actualSchema = await readDatabaseSchemaVersion(input.dataDir);
+          if (currentSchema === undefined || actualSchema > currentSchema) {
+            throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY", { cause: resourceRecovery?.cause }), {
+              code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY", requestId: startupRequestId, releaseId: recordedActiveId,
+              databaseSchemaVersion: actualSchema, targetDatabaseSchemaVersion: currentSchema,
+            });
+          }
+          // 当前启动先确认替代资源健康，保留候选和迁移记录供原恢复流程处理。
+          if (activeFailure) pending = null;
+        }
         // 修复安装先独立完成，不能改变壳交接已绑定的旧活动资源身份。
-        if (recordedPending?.databaseSchemaVersion && (currentSchema === undefined || currentSchema < recordedPending.databaseSchemaVersion
+        if (migrationFence && ((currentSchema === undefined || currentSchema < migrationFence) && !resumeInterruptedMigration
           || (repairingDatabase && continuation))) {
           throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY：数据库可能已升级，已停止旧版本启动，请使用支持该数据结构的修复版本。"),
             { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY", requestId: recordedPending.requestId, releaseId: recordedPending.releaseId,
               databaseSchemaVersion: recordedPending.databaseSchemaVersion });
         }
+        if (resourceRecovery) recoveryContext = { cause: resourceRecovery.cause, requestId: startupRequestId, releaseId: recordedActiveId };
         if (repairingDatabase) {
           // 修复包也可能继续向前迁移；先延续原记录的最低版本，再启动其 Client。
           await markPendingDatabaseMigration(input.dataDir, recordedPending!, baselineRelease!.manifest.dbSchemaVersion);
@@ -1559,11 +1688,15 @@ export function createDesktopApplication(input: {
           try {
             await reportStartup("正在确认更新兼容性…");
             // 重新检查候选签名、固定入口与 held marker，不重哈希普通资源正文。
-            await resolveBaselineRelease(baselineReleaseDir, { ...releaseTrust, verification: "installed", requireHeldStartup: true });
-            if (startupActiveRelease) await resolveActiveRelease(input.dataDir, { ...releaseTrust, verification: "installed", requireHeldStartup: true });
+            const heldTrust = { ...releaseTrust, requireHeldStartup: true };
+            if (!resumeInterruptedMigration) {
+              if (startupActiveRelease) await resolveActiveRelease(input.dataDir, heldTrust);
+              else await resolveBaselineRelease(baselineReleaseDir, heldTrust);
+            }
             startupHeldId = crypto.randomUUID();
             initialStartup = { mode: "held", continuationId: startupHeldId };
           } catch (error) {
+            if (resumeInterruptedMigration) throw error;
             startupUpdateError = { requestId: pending.requestId, error };
             pending = null;
           }
@@ -1572,9 +1705,20 @@ export function createDesktopApplication(input: {
         const applyingUpdate = Boolean(pending);
         await reportStartup(applyingUpdate ? "正在准备更新…" : "正在启动…");
         const startupArtifacts = continuation ? JSON.stringify([baselineRelease, activeRelease]) : undefined;
-        const releaseDir = startupActiveRelease?.releaseDir ?? baselineRelease?.releaseDir ?? input.initialReleaseDir;
-        if (newerBaseline && baselineRelease) syncActiveRelease({ releaseId: baselineRelease.manifest.releaseId, manifest: baselineRelease.manifest });
-        if (startupActiveRelease || baselineRelease || pending) runtime = createRuntime(clientEntry(releaseDir), startupActiveRelease?.manifest ?? baselineRelease?.manifest, initialStartup);
+        // 跨结构接续的页面与迁移 worker 也只使用已验签的同一候选。
+        const recoveryCandidate = resumeInterruptedMigration && pending ? await coordinator.resume(pending) : undefined;
+        if (recoveryCandidate && migrationFence !== undefined && recoveryCandidate.manifest.dbSchemaVersion < migrationFence) {
+          throw Object.assign(new Error("DESKTOP_DB_SCHEMA_FORWARD_ONLY"), { code: "DESKTOP_DB_SCHEMA_FORWARD_ONLY",
+            requestId: recoveryCandidate.requestId, releaseId: recoveryCandidate.manifest.releaseId, databaseSchemaVersion: migrationFence });
+        }
+        const releaseDir = recoveryCandidate?.stagingDir ?? startupActiveRelease?.releaseDir ?? baselineRelease?.releaseDir ?? input.initialReleaseDir;
+        if (pending || newerBaseline) {
+          if (startupActiveRelease) syncActiveRelease(startupActiveRelease);
+          else if (baselineRelease) syncActiveRelease({ releaseId: baselineRelease.manifest.releaseId, manifest: baselineRelease.manifest });
+        }
+        if ((!recoveryCandidate || input.createRuntime) && (!input.createRuntime || startupActiveRelease || baselineRelease || pending)) {
+          runtime = createRuntime(clientEntry(releaseDir), startupActiveRelease?.manifest ?? baselineRelease?.manifest, initialStartup);
+        }
         bindRuntimeEvents();
         // 托盘入口始终可用；更新源未配置时由渲染器弹框明确提示，而不是把菜单项置灰。
         tray = input.host.createTray(application.openWindow, application.exit, () => {});
@@ -1668,11 +1812,14 @@ export function createDesktopApplication(input: {
         });
         unregister = input.host.registerBridge(bridge, window);
         let pendingActivated = false;
+        let discardPendingAfterStartup = false;
+        const committedPending = pending && startupActiveRelease?.releaseId === pending.releaseId
+          && startupActiveRelease.releaseDir === pending.stagingDir ? pending : null;
         if (pending && !migration) {
-          const selected = startupActiveRelease ?? (baselineRelease ? { releaseId: baselineRelease.manifest.releaseId, manifest: baselineRelease.manifest } : null);
-          if (selected) syncActiveRelease(selected);
-          if (!runtimeStarted && startupActiveRelease?.releaseId === pending.releaseId) await startRuntime();
-          await activatePendingAtStartup(pending, startupActiveRelease, baselineRelease, newerBaseline);
+          if (!committedPending) {
+            discardPendingAfterStartup = await activatePendingAtStartup(
+              pending, startupActiveRelease, baselineRelease, newerBaseline, undefined, recoveryCandidate) === "discard-pending";
+          }
           pendingActivated = true;
           if (!runtimeStarted) await startRuntime();
           if (!startupWebLoaded) await reloadWeb(releaseDir);
@@ -1686,8 +1833,10 @@ export function createDesktopApplication(input: {
           const ready = (async () => {
             await owner.prepare();
             if (pending) {
-              if (!runtimeStarted && startupActiveRelease?.releaseId === pending.releaseId) await startRuntime();
-              await activatePendingAtStartup(pending, startupActiveRelease, baselineRelease, newerBaseline, markMigrationRuntimeReady);
+              if (!committedPending) {
+                discardPendingAfterStartup = await activatePendingAtStartup(
+                  pending, startupActiveRelease, baselineRelease, newerBaseline, markMigrationRuntimeReady, recoveryCandidate) === "discard-pending";
+              }
               pendingActivated = true;
             }
             if (!runtimeStarted) await startRuntime();
@@ -1717,24 +1866,8 @@ export function createDesktopApplication(input: {
           await reloadWeb(releaseDir);
         }
         assertStartupRunning();
-        if ((repairingDatabase || newerBaseline) && (!pendingActivated || bundleDetails.result === "same")) {
-          const current = runtime.snapshot();
-          if (current.status !== "ready" || current.health?.database !== "ready") throw new Error("DESKTOP_CURRENT_RUNTIME_NOT_HEALTHY");
-          // 基线和页面健康后再清旧指针，使后续更新及其恢复都以当前安装资源为准。
-          await clearIncompatibleActiveRelease(input.dataDir, activeRelease?.releaseId ?? null);
-        }
-        if (pending && pendingActivated && newerBaseline && bundleDetails.result === "same") {
-          await clearPendingRelease(input.dataDir);
-        }
-        if (pendingActivated && pending && bundleDetails.result === "healthy" && input.shellUpdate && !updateCheckFailure) {
-          const attempt = await createShellUpdateAttemptStore(input.dataDir).read();
-          resumePreparedShellAfterStartup = attempt?.schemaVersion === 5 && !isShellUpdateHandoffAttempt(attempt)
-            && attempt.phase === "preparing" && attempt.target !== null && attempt.network?.actionKey === "shell-installer"
-            && attempt.network.status === "succeeded" && attempt.network.evidence.kind === "shell-installer"
-            && attempt.network.evidence.sha256 === attempt.target.installerSha256;
-        }
         if (pending && !pendingActivated) {
-          await activatePendingAtStartup(pending, startupActiveRelease, baselineRelease, newerBaseline);
+          discardPendingAfterStartup = await activatePendingAtStartup(pending, startupActiveRelease, baselineRelease, newerBaseline) === "discard-pending";
           if (bundleDetails.result === "healthy" && !updateCheckFailure) {
             input.host.onUpdateApplied?.({ version: formatUpdateNoticeVersion(input.shellVersion, currentBundleVersion?.version) ?? "未标记" });
           }
@@ -1750,6 +1883,29 @@ export function createDesktopApplication(input: {
         if (startupHeldId) {
           await continueHeldRuntime(startupHeldId);
           startupHeldId = undefined;
+        }
+        // 上一轮已提交的更新只在本次工作台和 Client 放行后补回执及清理记录。
+        if (committedPending) await activatePendingAtStartup(committedPending, startupActiveRelease, baselineRelease);
+        if (pendingActivated && pending && bundleDetails.result === "healthy" && input.shellUpdate?.boundary?.spawnHelper && !updateCheckFailure) {
+          const attempt = await createShellUpdateAttemptStore(input.dataDir).read();
+          resumePreparedShellAfterStartup = attempt?.schemaVersion === 5 && !isShellUpdateHandoffAttempt(attempt)
+            && attempt.phase === "preparing" && attempt.target !== null && attempt.network?.actionKey === "shell-installer"
+            && attempt.network.status === "succeeded" && attempt.network.evidence.kind === "shell-installer"
+            && attempt.network.evidence.sha256 === attempt.target.installerSha256;
+        }
+        const retireActivePointer = (activeFailure || repairingDatabase || newerBaseline) && (!pendingActivated || discardPendingAfterStartup);
+        if (retireActivePointer || discardPendingAfterStartup || resourceRecovery) {
+          const current = runtime.snapshot();
+          if (current.status !== "ready" || current.health?.database !== "ready") throw new Error("DESKTOP_CURRENT_RUNTIME_NOT_HEALTHY");
+          if (resourceRecovery) {
+            const error = Object.assign(new Error("DESKTOP_RELEASE_RECOVERED", { cause: resourceRecovery.cause }), {
+              code: "DESKTOP_RELEASE_RECOVERED", requestId: startupRequestId,
+            });
+            input.host.onUpdateError?.(error, { requestId: startupRequestId, deviceId: identity.deviceId, logOnly: true,
+              phase: "startup-resource-recovery", releaseId: activeFailure ? recordedActiveId : undefined, recoveredReleaseId: currentReleaseId });
+          }
+          if (retireActivePointer) await clearIncompatibleActiveRelease(input.dataDir, recordedActiveId);
+          if (discardPendingAfterStartup) await clearPendingRelease(input.dataDir);
         }
         if (continuation) {
           const baselineBeforeAuthorization = await resolveBaselineRelease(baselineReleaseDir, releaseTrust);
@@ -1791,6 +1947,12 @@ export function createDesktopApplication(input: {
           throw error;
         }
         if (error instanceof DesktopStartupCleanupError) throw error;
+        if (recoveryContext) {
+          const { cause, requestId, releaseId } = recoveryContext;
+          error = Object.assign(new AggregateError([cause, error], "DESKTOP_RELEASE_RECOVERY_FAILED"), {
+            code: "DESKTOP_RELEASE_RECOVERY_FAILED", requestId, releaseId,
+          });
+        }
         try {
           await runtime.drain(undefined, { force: true });
           destroyShell();
@@ -1813,6 +1975,7 @@ export function createDesktopApplication(input: {
       if (exitFlight) return await exitFlight;
       if (operation !== "idle" && operation !== "checking" && !(operation === "starting" && (migration || window)) || stoppingUpdates) throw new Error("DESKTOP_OPERATION_IN_PROGRESS");
       stoppingUpdates = true;
+      const restartAutomaticChecks = automaticUpdates;
       if (telemetryTimer) clearTimeout(telemetryTimer);
       telemetryTimer = undefined;
       cancelCloudLinkPreparation();
@@ -1845,10 +2008,17 @@ export function createDesktopApplication(input: {
         } catch (cause) {
           if (!shellOwner) throw cause;
           const failure = await shellOwner.recover(cause, Boolean(window));
+          // 恢复端确认已归还原运行时且没有遗留执行器，解除生命周期所有权。
+          const state = Object.getOwnPropertyDescriptors(failure);
+          if (window && !state.helperOwner?.value && ["restored", "not_needed"].includes(state.recovery?.value)) {
+            shellOwner = undefined;
+            automaticUpdates = restartAutomaticChecks;
+          }
           throw reportShellFailure(failure, readReceiptErrorRequestId(failure) ?? shellUpdateFailure?.requestId ?? "unknown");
         } finally {
           stoppingUpdates = false;
           operation = "idle";
+          if (automaticUpdates) scheduleUpdateCheck();
         }
       })();
       if (startupExitRequested) startupExitFlight = closing;

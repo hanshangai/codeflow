@@ -197,15 +197,22 @@ test('a committed active pointer still skips the package when healthy receipt de
   assert.deepEqual(f.receipts, receipts); assert.deepEqual(f.failures(), failures);
 });
 
-test('same release ID with another signed archive fails without downloading', async t => {
+test('same installed version with another signed archive skips download', async t => {
   const f = await fixture(t); const result = await f.app.downloadReleaseUpdateIfAvailable(); assert.ok(result);
   await f.app.applyRelease(result.directory, { requestId: result.requestId });
   f.control.manifest = f.sign({ archiveSha256: 'a'.repeat(64) }); f.requests.length = 0;
   const requestId = crypto.randomUUID();
-  await assert.rejects(() => f.app.downloadReleaseUpdateIfAvailable({ requestId }), { code: 'DESKTOP_RELEASE_CACHE_CONFLICT', requestId });
+  assert.equal(await f.app.downloadReleaseUpdateIfAvailable({ requestId }), null);
   assert.equal(f.requests.some(url => url.endsWith('/archive')), false);
-  const failures = f.failures(); assert.equal(failures.length, 1);
-  assert.equal(failures[0]!.errorCode, 'DESKTOP_RELEASE_FAILED'); assert.equal(failures[0]!.releaseId, f.manifest.releaseId);
+  assert.deepEqual(f.failures(), []);
+});
+
+test('a newer version sharing the active release ID cannot replace its contents', async t => {
+  const f = await fixture(t); const result = await f.app.downloadReleaseUpdateIfAvailable(); assert.ok(result);
+  await f.app.applyRelease(result.directory, { requestId: result.requestId });
+  f.control.manifest = f.sign({ version: '2.0.1', archiveSha256: 'a'.repeat(64) }); f.requests.length = 0;
+  await assert.rejects(() => f.app.downloadReleaseUpdateIfAvailable(), { code: 'DESKTOP_RELEASE_CACHE_CONFLICT' });
+  assert.equal(f.requests.some(url => url.endsWith('/archive')), false);
 });
 
 const invalidManifests: Array<[string, string, (f: Awaited<ReturnType<typeof fixture>>) => ReleaseBundleManifest]> = [

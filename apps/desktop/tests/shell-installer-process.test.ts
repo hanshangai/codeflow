@@ -302,12 +302,33 @@ test("a signed target already in previous is reused without adding another selec
   assert.equal(await fs.readFile(path.join(f.input.installationDir, "shell-launch.ini"), "utf8"), serializeShellLaunchState(expectedState));
 });
 
-for (const existing of [false, true]) test(`${existing ? "existing" : "new"} candidate with a missing entry explicitly fails and is retained`, async () => {
+for (const existing of [false, true]) test(`${existing ? "existing" : "new"} candidate with a missing entry can be retried without overwriting its remnants`, async t => {
   const f = await fixture();
   const corrupt = async () => { await f.materialize(); await fs.unlink(path.join(f.candidateDirectory, "resources/app.asar")); };
   if (existing) await corrupt();
-  const p = processBoundary(f, async child => { await corrupt(); child.close(); });
-  await assert.rejects(install({ ...f.input, boundary: p.boundary })); assert.equal(p.calls(), existing ? 0 : 1); assert.equal(existsSync(f.candidateDirectory), true);
+  if (!existing) {
+    const failed = processBoundary(f, async child => { await corrupt(); child.close(); });
+    await assert.rejects(install({ ...f.input, boundary: failed.boundary }));
+  }
+  const p = processBoundary(f);
+  const before = await fs.readdir(path.dirname(f.candidateDirectory));
+  const result = await install({ ...f.input, boundary: p.boundary });
+  assert.equal(result.candidateDirectory, f.candidateDirectory);
+  assert.equal(p.calls(), 1);
+  const retired = (await fs.readdir(path.dirname(f.candidateDirectory))).filter(name => !before.includes(name));
+  assert.equal(retired.length, 1);
+  await assert.rejects(fs.access(path.join(path.dirname(f.candidateDirectory), retired[0]!, "new", "resources", "app.asar")), { code: "ENOENT" });
+});
+
+test("an incomplete previous shell is retained even when the target casing differs", async () => {
+  const f = await fixture(), p = processBoundary(f);
+  await f.materialize();
+  await fs.unlink(path.join(f.candidateDirectory, "resources/app.asar"));
+  const expectedState = { ...f.input.expectedState, previousShellId: "NEW" };
+  await fs.writeFile(path.join(f.input.installationDir, "shell-launch.ini"), serializeShellLaunchState(expectedState));
+  await assert.rejects(install({ ...f.input, expectedState, boundary: p.boundary }));
+  assert.equal(p.calls(), 0);
+  await fs.access(f.candidateDirectory);
 });
 
 test("nonzero close preserves only the correlated safe NSIS diagnostic and business request context", async () => {

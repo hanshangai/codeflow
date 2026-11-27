@@ -222,7 +222,7 @@ for (const maintenanceRelease of ["active", "baseline"] as const) for (const nat
 for (const packaged of [false, true]) test(`main reads the installed shell resources and shares one update origin: packaged=${packaged}`, async () => {
   const f = await startupFailure({ ordinary: true, packaged, environmentOrigin: 'https://environment.example', installedOrigin: 'https://installed.example' });
   assert.deepEqual(f.origins, [{ directory: path.resolve(packaged ? 'installed-resources' : 'desktop'), environment: 'https://environment.example' }]);
-  assert.deepEqual(f.applicationOrigins, ['https://installed.example']); assert.deepEqual(f.shellOrigins, ['https://installed.example']);
+  assert.deepEqual(f.applicationOrigins, ['https://installed.example']); assert.deepEqual(f.shellOrigins, []);
 });
 
 test('main invalid installed configuration fails before shell facts with a Chinese message', async () => {

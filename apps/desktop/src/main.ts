@@ -15,7 +15,7 @@ import { createLegacyClientMigration, resolveLegacyClientMigrationWorker, cancel
 import { createDesktopCrashCapture } from "./crashReportCapture.js";
 import type { DesktopBridgeApi } from "./contracts.js";
 import { loadWeb, loadStartupWeb, updateStartupWeb } from "./webLoader.js";
-import { readInstalledUpdateOrigin } from './updateConfiguration.js';
+import { readDesktopRepairDownloadUrl, readInstalledUpdateOrigin } from './updateConfiguration.js';
 import { bindMainFrameEvents } from "./mainFrameEvents.js";
 import { resolveVersionedShellStartup } from "./shellLaunchState.js";
 import { readCandidateShellHealthRequest, executeCandidateShellHealth, assertCandidateShellHealthEnvironment,
@@ -74,6 +74,7 @@ const preloggedDesktopErrors = new WeakSet<Error>();
 type DesktopErrorContext = {
   errorCode: string; requestId: string; deviceId?: string; retry?: number; delayMs?: number;
   shellAttemptRequestId?: string; continuationId?: string; shellId?: string; revision?: number; phase?: string;
+  releaseId?: string | null; recoveredReleaseId?: string;
   maintenanceRequestId?: string; clientId?: string | null; oldDeviceId?: string | null; nextDeviceId?: string; mode?: string; maintenancePhase?: string;
   startupDiagnostic?: boolean; maintenanceStage?: string;
   channel?: string; method?: string;
@@ -739,8 +740,6 @@ if (process.versions.electron) {
       const unsignedLocal = readUnsignedLocalMarker();
       if (unsignedLocal) console.warn(JSON.stringify({ code: "DESKTOP_UNSIGNED_LOCAL_BASELINE_SKIPPED", requestId: startupRequestId }));
       const shellVersion = readRunningShellVersion();
-      const shellFacts = await readShellUpdateHostFacts({ packaged: app.isPackaged, platform: process.platform, configuredServerOrigin,
-        executablePath: process.execPath, pid: process.pid, parentPid: process.ppid, userDataDir, sessionDataDir });
       // 存储位置确定后建立会话标记并安装崩溃钩子；补报只在本次启动完成后进行。
       const capture = createDesktopCrashCapture({
         dataDir, app, shellVersion,
@@ -795,7 +794,11 @@ if (process.versions.electron) {
         onRuntimeFacts: facts => capture.updateRuntimeFacts(facts),
         onClientExit: facts => capture.reportClientExit(facts),
         onShutdown: () => capture.expectExit(),
-        shellUpdate: shellFacts ? { facts: shellFacts } : undefined,
+        shellUpdate: startup && configuredServerOrigin ? {
+          /** 仅壳通道准备候选时读取原生进程身份。 */
+          readFacts: () => readShellUpdateHostFacts({ packaged: app.isPackaged, platform: process.platform, configuredServerOrigin,
+            executablePath: process.execPath, pid: process.pid, parentPid: process.ppid, userDataDir, sessionDataDir }),
+        } : undefined,
         trustedReleaseKeys: readInstalledReleaseTrust(releaseResourcesDir),
         host: {
           createWindow: () => {
@@ -972,9 +975,17 @@ if (process.versions.electron) {
         errorCode: readDesktopErrorCode(error, "DESKTOP_STARTUP_FAILED"), requestId: typeof error?.requestId === "string"
           && /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/u.test(error.requestId) ? error.requestId : startupRequestId };
       showDesktopError(userDataDir, maintenanceRequest ? "CodeFlow 卸载失败" : "CodeFlow 启动失败", error, errorContext);
-      if (app.isPackaged && process.platform === "win32" && !lifecycleRequest && !(error instanceof DesktopStartupCleanupError)
+      if (app.isPackaged && (process.platform === "win32" || process.platform === "darwin")
+        && !lifecycleRequest && !maintenanceRequest && !(error instanceof DesktopStartupCleanupError)
         && (!recoveryOwner || recoveryOwner.released) && (!maintenanceOwner || maintenanceOwner.released)) {
         // 业务/历史状态故障保留内置恢复入口；不创建Client，不依赖Web资源或远端服务。
+        let repairDownloadUrl: string | undefined;
+        try { repairDownloadUrl = readDesktopRepairDownloadUrl(process.resourcesPath, process.platform, process.arch); }
+        catch (configurationError) {
+          showDesktopError(userDataDir, "CodeFlow 修复下载配置不可用", configurationError, {
+            errorCode: readDesktopErrorCode(configurationError, "DESKTOP_UPDATE_CONFIG_INVALID"), requestId: errorContext.requestId,
+          });
+        }
         const recovery = new BrowserWindow({ width: 640, height: 420, show: true,
           webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } });
         const code = errorContext.errorCode ?? "DESKTOP_STARTUP_FAILED";
@@ -982,10 +993,15 @@ if (process.versions.electron) {
         recovery.webContents.on("will-navigate", (event, url) => {
           event.preventDefault();
           if (url === "codeflow-recovery://retry") { quitAllowed = true; relaunchDesktop(); app.exit(0); }
+          else if (url === "codeflow-recovery://download" && repairDownloadUrl) {
+            void shell.openExternal(repairDownloadUrl).catch(cause => showDesktopError(userDataDir, "CodeFlow 无法打开修复下载", cause,
+              { errorCode: "DESKTOP_REPAIR_DOWNLOAD_OPEN_FAILED", requestId: errorContext.requestId }));
+          }
           else if (url === "codeflow-recovery://close") { quitAllowed = true; app.exit(1); }
         });
         recovery.on("closed", () => { quitAllowed = true; app.exit(1); });
-        const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>body{font:16px system-ui;padding:36px;line-height:1.8}a{display:inline-block;margin:16px 20px 0 0}</style><h2>CodeFlow 暂时无法加载工作台</h2><p>壳仍可运行，当前业务资源或本机数据需要修复。可以重新启动，或使用完整安装包修复程序；卸载程序会保留本机数据。</p><p>错误编号：${code}</p><a href="codeflow-recovery://retry">重新启动</a><a href="codeflow-recovery://close">关闭</a>`;
+        const downloadLink = repairDownloadUrl ? '<a href="codeflow-recovery://download">下载完整安装包</a>' : "";
+        const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><style>body{font:16px system-ui;padding:36px;line-height:1.8}a{display:inline-block;margin:16px 20px 0 0}</style><h2>CodeFlow 暂时无法加载工作台</h2><p>可以重新启动，或使用当前环境的完整安装包覆盖修复。</p><p>错误编号：${code}</p><a href="codeflow-recovery://retry">重新启动</a>${downloadLink}<a href="codeflow-recovery://close">关闭</a>`;
         void recovery.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).catch(pageError => {
           showDesktopError(userDataDir, "CodeFlow 恢复页加载失败", new AggregateError([error, pageError], "DESKTOP_RECOVERY_PAGE_FAILED"), errorContext);
           quitAllowed = true; app.exit(1);
@@ -1339,7 +1355,7 @@ function recordDesktopError(dataDir: string, error: unknown, context?: DesktopEr
   const line = `${JSON.stringify({
     at: new Date().toISOString(), errorCode: context?.errorCode ?? readDesktopErrorCode(error, 'DESKTOP_OPERATION_FAILED'), requestId: context?.requestId ?? safe.requestId ?? crypto.randomUUID(),
     channel: context?.channel, method: context?.method, updateRequestId: context?.updateRequestId, registrationRequestId: context?.registrationRequestId,
-    deviceId: context?.deviceId,
+    deviceId: context?.deviceId, releaseId: context?.releaseId, recoveredReleaseId: context?.recoveredReleaseId,
     retry: context?.retry, delayMs: context?.delayMs,
     shellAttemptRequestId: context?.shellAttemptRequestId, continuationId: context?.continuationId,
     shellId: context?.shellId ?? safe.shellId, revision: context?.revision ?? safe.revision, phase: context?.phase ?? safe.phase, installerRequestId: safe.installerRequestId,

@@ -28,6 +28,7 @@ Var argv
 Var rootHandle
 Var journal
 Var oldHandle
+Var oldExited
 Var stateHandle
 Var originalState
 Var baseline
@@ -117,6 +118,59 @@ Function ValidateId
   invalid_id:
     StrCpy $failure ID_INVALID
   id_valid:
+FunctionEnd
+
+; Restart only the exact original selection after the old and candidate processes are gone.
+Function RestartOriginal
+  StrCpy $R5 $failure
+  StrCpy $R6 $win32Error
+  StrCpy $failure ""
+  StrCpy $selectionPath "$root\shell-launch.ini"
+  Call ReadSelection
+  StrCpy $0 "[shell]$\r$\nschema=1$\r$\nactive=$previous$\r$\nprevious=$originalPrevious$\r$\nbaseline=$baseline$\r$\n"
+  StrCmp $failure "" 0 restart_failed
+  StrCmpS $0 $originalState 0 restart_failed
+  StrCpy $checkedPath "$root\shells"
+  StrCpy $expectedType 16
+  Call CheckPath
+  StrCmp $failure "" 0 restart_failed
+  StrCpy $checkedPath "$root\shells\$previous"
+  StrCpy $expectedType 16
+  Call CheckPath
+  StrCmp $failure "" 0 restart_failed
+  StrCpy $checkedPath "$root\shells\$previous\CodeFlowAI.exe"
+  StrCpy $expectedType 0
+  Call CheckPath
+  StrCmp $failure "" 0 restart_failed
+  System::Call 'kernel32::GlobalAlloc(i 0x40, p 84) p.r0'
+  StrCmp $0 0 restart_failed
+  System::Call '*$0(i 68)'
+  IntOp $1 $0 + 68
+  StrCpy $2 '$\"$checkedPath$\" $\"--user-data-dir=$quotedUserData$\" $\"--codeflow-session-data-dir=$quotedSessionData$\"'
+  System::Call 'kernel32::CreateProcessW(w "$checkedPath", w r2, p 0, p 0, i 0, i 0, p 0, w "$root\shells\$previous", p r0, p r1) i.r3 ?e'
+  Pop $cleanupError
+  ${If} $3 != 0
+    System::Call '*$1(p .r4, p .r5)'
+    System::Call 'kernel32::CloseHandle(p r5) i.r1 ?e'
+    Pop $R7
+    System::Call 'kernel32::CloseHandle(p r4) i.r2 ?e'
+    Pop $cleanupError
+    ${If} $1 == 0
+      StrCpy $cleanupError $R7
+    ${ElseIf} $2 != 0
+      StrCpy $cleanupError 0
+    ${EndIf}
+  ${EndIf}
+  System::Free $0
+  StrCmp $3 0 restart_failed restart_done
+  restart_failed:
+    StrCpy $phase restart-failed
+    ${If} $cleanupError == 0
+      StrCpy $cleanupError $win32Error
+    ${EndIf}
+  restart_done:
+    StrCpy $failure $R5
+    StrCpy $win32Error $R6
 FunctionEnd
 
 ; Check ordinary file/directory entities without following reparse points.
@@ -345,6 +399,7 @@ Section
   StrCpy $rootHandle 0
   StrCpy $journal 0
   StrCpy $oldHandle 0
+  StrCpy $oldExited false
   StrCpy $userDataHandle 0
   StrCpy $sessionDataHandle 0
   StrCpy $committed false
@@ -524,6 +579,7 @@ Section
     ${EndIf}
     Goto failed
   old_exited:
+    StrCpy $oldExited true
     Call ReadSelection
     StrCmp $failure "" 0 failed
     StrCpy $0 "[shell]$\r$\nschema=1$\r$\nactive=$previous$\r$\nprevious=$originalPrevious$\r$\nbaseline=$baseline$\r$\n"
@@ -565,13 +621,6 @@ Section
     !insertmacro CheckObject "shells" 16
     !insertmacro CheckObject "shells\$target" 16
     !insertmacro CheckObject "shells\$target\CodeFlowAI.exe" 0
-    System::Call 'kernel32::ReplaceFileW(w "$root\shell-launch.ini", w "$temporary", w "$backup", i 0, p 0, p 0) i.r0 ?e'
-    Pop $win32Error
-    IntCmp $0 0 replace_failed
-    StrCpy $committed true
-    StrCpy $phase committed
-    Call WriteJournal
-    StrCmp $failure "" 0 failed
     System::Call 'kernel32::GlobalAlloc(i 0x40, p 84) p.r0'
     StrCmp $0 0 allocation_failed
     System::Call '*$0(i 68)'
@@ -675,6 +724,18 @@ Section
     ${EndIf}
     Goto failed
   target_ready:
+    ; Keep the old selection until the exact candidate has completed its readiness probe.
+    Call ReadSelection
+    StrCmp $failure "" 0 stop_candidate
+    StrCpy $0 "[shell]$\r$\nschema=1$\r$\nactive=$previous$\r$\nprevious=$originalPrevious$\r$\nbaseline=$baseline$\r$\n"
+    ${If} $0 != $originalState
+      StrCpy $failure STATE_CHANGED
+      Goto stop_candidate
+    ${EndIf}
+    System::Call 'kernel32::ReplaceFileW(w "$root\shell-launch.ini", w "$temporary", w "$backup", i 0, p 0, p 0) i.r0 ?e'
+    Pop $win32Error
+    IntCmp $0 0 replace_failed
+    StrCpy $committed true
     StrCpy $phase started
     Call WriteJournal
     StrCmp $failure "" 0 stop_candidate
@@ -728,7 +789,7 @@ Section
     ${If} $0 != -1
       StrCpy $committed true
     ${EndIf}
-    Goto failed
+    Goto stop_candidate
   allocation_failed:
     StrCpy $failure PROCESS_ALLOCATION_FAILED
     Goto failed
@@ -764,6 +825,11 @@ Section
       ${EndIf}
       StrCpy $failure $R5
       StrCpy $win32Error $R6
+    ${EndIf}
+    ${If} $oldExited == true
+    ${AndIf} $launched != true
+    ${AndIf} $phase != rollback-failed
+      Call RestartOriginal
     ${EndIf}
     ${If} $journal != 0
       Call WriteJournal

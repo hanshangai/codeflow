@@ -137,7 +137,8 @@ for (const kind of ["late-exit", "hang", "wrong-ready-pid", "stale-ready", "forg
     assert.notEqual(result.code, 0, f.root);
     assert.equal(await fs.readFile(path.join(f.root, "shell-launch.ini"), "ascii"), original);
     const journal = await fs.readFile(path.join(f.root, "shell-switch.ini"), "ascii");
-    assert.match(journal, /phase=rolled-back\r\n/u);
+    assert.match(journal, /phase=failed\r\n/u);
+    await waitFor(path.join(f.root, "shells/old/started.txt"));
     assert.match(journal, new RegExp(`requestId=${requestId}\\r\\n`));
     assert.match(journal, /candidatePid=[1-9][0-9]*\r\n/u);
     assert.match(journal, new RegExp(`errorCode=${kind === "late-exit" ? "TARGET_EXITED_EARLY" : kind === "hang" ? "TARGET_READY_TIMEOUT" : kind === "forged-client" ? "TARGET_READY_IDENTITY_INVALID" : "TARGET_READY_RESPONSE_INVALID"}\\r\\n`));
@@ -152,6 +153,21 @@ test("native switch waits beyond three seconds for an explicit shell ready confi
   assert.ok(Date.now() - began >= 3500);
   assert.match(await fs.readFile(path.join(f.root, "shell-switch.ini"), "ascii"), /phase=started\r\n/u);
   await waitFor(path.join(f.root, "shells/new/done.txt"));
+});
+
+test("interrupting the native switch before readiness leaves the original selection", { skip }, async () => {
+  const f = await fixture("hang");
+  const child = spawn(f.executable, f.args, { windowsHide: true, stdio: "ignore" });
+  const closed = new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("close", () => resolve()); });
+  try {
+    await waitFor(path.join(f.root, "shells/new/started.txt"));
+    assert.ok(child.kill());
+    await closed;
+    assert.equal(await fs.readFile(path.join(f.root, "shell-launch.ini"), "ascii"), original);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await closed;
+  }
 });
 
 test("native switch waits for the exact old process, commits selection and starts without business resources", { skip }, async () => {
@@ -183,8 +199,8 @@ for (const kind of ["invalid-target", "early-exit", "replace-failure", "partial-
     const f = await fixture(kind), result = await execute(f.executable, f.args);
     assert.notEqual(result.code, 0, f.root);
     assert.equal(await fs.readFile(path.join(f.root, "shell-launch.ini"), "ascii"), original);
-    assert.match(await fs.readFile(path.join(f.root, "shell-switch.ini"), "ascii"), kind === "replace-failure" ? /phase=failed\r\n/u : /phase=rolled-back\r\n/u);
-    if (kind !== "early-exit") await assert.rejects(fs.access(path.join(f.root, "shells/new/started.txt")), { code: "ENOENT" });
+    assert.match(await fs.readFile(path.join(f.root, "shell-switch.ini"), "ascii"), kind === "partial-replace" ? /phase=rolled-back\r\n/u : /phase=failed\r\n/u);
+    if (kind === "invalid-target") await assert.rejects(fs.access(path.join(f.root, "shells/new/started.txt")), { code: "ENOENT" });
   });
 }
 

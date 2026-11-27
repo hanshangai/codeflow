@@ -121,12 +121,12 @@ export function snapshotShellHandoffErrorContext(input: unknown): {
     const revision = own(value, "revision"); if (result.revision === undefined && Number.isSafeInteger(revision) && (revision as number) >= 0) result.revision = revision as number;
     const diagnostic = own(own(value, "details"), "diagnostic"), diagnosticId = own(diagnostic, "requestId"), stage = own(diagnostic, "stage"), win32Error = own(diagnostic, "win32Error"), shellId = own(diagnostic, "shellId");
     if (!result.diagnostic && own(diagnostic, "errorCode") === "DESKTOP_SHELL_INSTALL_FAILED" && typeof diagnosticId === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(diagnosticId)
-      && typeof shellId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(shellId) && typeof stage === "string" && ["arguments", "root", "create-target", "extract-temp", "extract"].includes(stage)
+      && typeof shellId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(shellId) && typeof stage === "string" && ["arguments", "root", "create-target", "extract-temp", "extract", "publish-target"].includes(stage)
       && Number.isSafeInteger(win32Error) && (win32Error as number) >= 0 && (win32Error as number) <= 0xffff_ffff) {
       const cleanup = own(diagnostic, "cleanupWin32Error");
       const rootCause = own(diagnostic, "rootCause");
       result.diagnostic = { errorCode: "DESKTOP_SHELL_INSTALL_FAILED", requestId: diagnosticId, shellId, stage, win32Error,
-        ...(typeof rootCause === "string" && ["ARGUMENTS_INVALID", "ARGUMENT_PARSE_FAILED", "ARGUMENT_RELEASE_FAILED", "PATH_UNAVAILABLE", "PATH_REPARSE", "PATH_NOT_DIRECTORY", "ROOT_DRIVE_UNSUPPORTED", "ROOT_INVALID", "TARGET_CREATE_FAILED", "PAYLOAD_DIRECTORY_FAILED", "PAYLOAD_WRITE_FAILED", "PAYLOAD_TEMP_FAILED"].includes(rootCause) ? { rootCause } : {}),
+        ...(typeof rootCause === "string" && ["ARGUMENTS_INVALID", "ARGUMENT_PARSE_FAILED", "ARGUMENT_RELEASE_FAILED", "PATH_UNAVAILABLE", "PATH_REPARSE", "PATH_NOT_DIRECTORY", "ROOT_DRIVE_UNSUPPORTED", "ROOT_INVALID", "TARGET_CREATE_FAILED", "PAYLOAD_DIRECTORY_FAILED", "PAYLOAD_WRITE_FAILED", "PAYLOAD_TEMP_FAILED", "TARGET_PUBLISH_FAILED"].includes(rootCause) ? { rootCause } : {}),
         ...(Number.isSafeInteger(cleanup) && (cleanup as number) >= 0 && (cleanup as number) <= 0xffff_ffff ? { cleanupWin32Error: cleanup } : {}) };
     }
     if (value && typeof value === "object" && Object.hasOwn(value, "cause")) pending.push(own(value, "cause"));

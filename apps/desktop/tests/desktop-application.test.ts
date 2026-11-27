@@ -67,6 +67,38 @@ for (const cancelled of [false, true]) test(`one explicit restart preserves the 
   assert.deepEqual(calls, ["native transfer with pending resource"]);
 });
 
+test("successful shell recovery releases the application owner before the next exit", async () => {
+  const source = ts.createSourceFile("desktopApplication.ts",
+    await fs.readFile(new URL("../src/desktopApplication.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  let exit: ts.MethodDeclaration | undefined;
+  /** 运行真实退出入口，只替换执行器和宿主进程。 */
+  const visit = (node: ts.Node): void => {
+    if (ts.isMethodDeclaration(node) && node.name.getText(source) === "exit" && node.getText(source).includes("shellOwner")) exit = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  assert.ok(exit);
+  const failure = Object.assign(new Error("DESKTOP_SHELL_OPERATION_FAILED"), { recovery: "restored" });
+  let quits = 0;
+  const context = {
+    exitFlight: undefined, startupExitFlight: undefined, startupExitRequested: false, window: {}, operation: "idle",
+    stoppingUpdates: false, automaticUpdates: false, telemetryTimer: undefined, updateTimer: undefined,
+    presenceTimer: undefined, presenceTransport: undefined, migration: undefined, updateFlight: undefined,
+    restartRequested: false, shellDrainedRuntime: undefined, shellUpdateFailure: null,
+    shellOwner: { check() { throw failure; }, async recover() { return failure; } },
+    runtime: { async drain() {} }, input: { host: { quit() { quits++; } } },
+    destroyShell() {}, cancelCloudLinkPreparation() {}, readReceiptErrorRequestId: () => "request",
+    reportShellFailure: (error: unknown) => error, scheduleUpdateCheck() {},
+    Error, Object,
+  };
+  const compiled = ts.transpileModule(`({${exit.getText(source)}}).exit;`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const close = vm.runInNewContext(compiled, context);
+  await assert.rejects(close(), error => error === failure);
+  assert.equal(context.shellOwner, undefined);
+  await close();
+  assert.equal(quits, 1);
+});
+
 test("native shell executor failure restarts only its original Client", async () => {
   const file = new URL("../src/desktopApplication.ts", import.meta.url);
   const source = ts.createSourceFile(file.pathname, await fs.readFile(file, "utf8"), ts.ScriptTarget.Latest, true);
@@ -818,20 +850,64 @@ for (const scenario of [
   await app.exit();
 });
 
-for (const corruption of ["signature", "missing-payload"] as const) test(`完整安装存在active仍拒绝损坏基线：${corruption}`, async t => {
+for (const corruption of ["signature", "missing-payload", "previous-pointer"] as const) test(`基线或历史指针损坏时沿用已验证的活动资源：${corruption}`, async t => {
   const f = await heldApplicationFixture(t, { version: "2.0.0" });
   await createHeldRelease(path.join(f.dataDir, "releases", "active-1"), { releaseId: "active-1" });
   await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }), "utf8");
   const proof = path.join(f.baseline, "baseline-release-manifest.json");
   if (corruption === "signature") await fs.writeFile(proof, JSON.stringify({ ...f.manifest, version: "3.0.0" }), "utf8");
-  else if (corruption === "missing-payload") await fs.rm(path.join(f.baseline, "client", "dist", "index.cjs"));
-  else await fs.writeFile(path.join(f.baseline, "client", "dist", "index.cjs"), "tampered", "utf8");
+  if (corruption === "missing-payload") await fs.rm(path.join(f.baseline, "client", "dist", "index.cjs"));
+  if (corruption === "previous-pointer") {
+    await fs.writeFile(path.join(f.dataDir, "previous-release.json"), "{");
+    await fs.rm(proof);
+  }
   const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
     host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
-  await assert.rejects(app.start());
-  assert.equal(f.actions.includes("start"), false);
-  assert.equal(f.actions.includes("load-web"), false);
+  await app.start();
+  assert.equal(f.actions.includes("start"), true);
+  assert.equal((await app.getUpdateDetails()).current.bundle?.releaseId, "active-1");
   assert.equal(await readActivePointer(f.dataDir), "active-1");
+  await app.exit();
+});
+
+for (const state of ["healthy", "web-failed", "database-ahead", "baseline-invalid"] as const) test(`活动资源损坏时按独立签名基线恢复：${state}`, async t => {
+  const f = await heldApplicationFixture(t);
+  const activeDir = path.join(f.dataDir, "releases", "active-1");
+  await createHeldRelease(activeDir, { releaseId: "active-1" });
+  await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }));
+  await fs.unlink(path.join(activeDir, "client", "dist", "index.cjs"));
+  if (state === "baseline-invalid") await fs.unlink(path.join(f.baseline, "baseline-release-manifest.json"));
+  if (state === "database-ahead") {
+    const db = new DatabaseSync(path.join(f.dataDir, "codeflowai.db"));
+    try { db.exec("PRAGMA user_version=89"); } finally { db.close(); }
+  }
+  const diagnostics: unknown[] = [];
+  f.host.onUpdateError = (error, context) => { diagnostics.push({ error, ...context }); };
+  f.host.loadWeb = async (_window, directory) => {
+    assert.equal(directory, f.baseline);
+    assert.equal(await readActivePointer(f.dataDir), "active-1");
+    if (state === "web-failed") throw new Error("REPAIR_WEB_FAILED");
+  };
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys, createRuntime: () => f.runtime });
+  if (state !== "healthy") {
+    const error = state === "web-failed" ? (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors[0].code, "ENOENT");
+      assert.equal(error.errors[1].message, "REPAIR_WEB_FAILED");
+      return true;
+    } : state === "database-ahead"
+      ? /DESKTOP_DB_SCHEMA_FORWARD_ONLY/u : /DESKTOP_RELEASE_RECOVERY_UNAVAILABLE/u;
+    await assert.rejects(app.start(), error);
+    assert.equal(await readActivePointer(f.dataDir), "active-1");
+    if (state !== "web-failed") assert.equal(f.actions.includes("start"), false);
+    return;
+  }
+  await app.start();
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal((await app.getUpdateDetails()).current.bundle?.releaseId, f.manifest.releaseId);
+  assert.equal(diagnostics.length, 1);
+  await app.exit();
 });
 
 test("完整安装用更新基线接管active时不重哈希资源正文", async t => {
@@ -932,6 +1008,102 @@ test("完整安装基线失败保留旧指针，健康后清理再收口旧activ
   assert.equal(await readPendingRelease(f.dataDir), null);
   assert.equal((await app.getUpdateDetails()).bundle.result, "same");
   assert.deepEqual(receipts, []);
+  await app.exit();
+});
+
+for (const stagedState of ["empty", "invalid-manifest", "database-ahead", "no-active", "continue-failed"] as const) test(`pending ${stagedState} follows the signed installation baseline recovery policy`, async t => {
+  const f = await fixture(t);
+  await loadOrCreateDeviceIdentity(f.dataDir);
+  const baseline = path.join(f.dataDir, "installation");
+  const baselineManifest = await createHeldRelease(baseline, { baseline: true, releaseId: "desktop-new", version: "2.0.0" });
+  if (stagedState !== "no-active") {
+    const activeDir = path.join(f.dataDir, "releases", "active-1");
+    await createHeldRelease(activeDir, { releaseId: "active-1", version: "1.0.0" });
+    await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "active-1" }));
+  }
+
+  const stagingDir = path.join(f.dataDir, ".staging", baselineManifest.releaseId);
+  await fs.mkdir(stagingDir, { recursive: true });
+  if (stagedState === "invalid-manifest") await fs.writeFile(path.join(stagingDir, "manifest.json"), "{");
+  const expectedFailureCode = stagedState === "invalid-manifest" ? "DESKTOP_RELEASE_MANIFEST_INVALID" : "ENOENT";
+  await savePendingRelease(f.dataDir, { requestId: crypto.randomUUID(), releaseId: baselineManifest.releaseId, stagingDir });
+  if (stagedState === "database-ahead") {
+    const database = new DatabaseSync(path.join(f.dataDir, "codeflowai.db"));
+    database.exec("PRAGMA user_version = 89");
+    database.close();
+  }
+
+  const loaded: string[] = [];
+  const failures: Array<{ error: unknown; logOnly?: boolean }> = [];
+  const receipts: string[] = [];
+  let migration!: LegacyClientMigration;
+  f.host.loadWeb = async (_window, directory, options) => {
+    loaded.push(directory);
+    await loadWeb({ loadURL: async () => {}, webContents: { executeJavaScript: async () => migration.snapshot().status === "ready" } },
+      "codeflow://desktop/", { requireReady: true, timeoutMs: 100, beforeReady: options?.beforeReady });
+  };
+  f.host.onUpdateError = (error, context) => { failures.push({ error, logOnly: context.logOnly }); };
+  const runtimes: Array<{ entry: string; releaseId?: string; startup?: { mode: string } }> = [];
+  const originalSnapshot = f.runtime.snapshot;
+  let heldId: string | undefined;
+  f.runtime.snapshot = () => ({ ...originalSnapshot(),
+    ...(heldId ? { startup: { continuationId: heldId, admission: "paused" as const } } : {}) });
+  f.runtime.request = async request => {
+    assert.equal(request.method, "runtime.startup.continue");
+    f.actions.push("continue");
+    assert.ok(await readPendingRelease(f.dataDir));
+    if (stagedState === "continue-failed") return { status: 500, body: { ok: false } };
+    return { status: 200, body: { ok: true } };
+  };
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: baseline, requireBaseline: true,
+    host: f.host, trustedReleaseKeys,
+    reportReceipt: async receipt => { receipts.push(receipt.stage); },
+    createRuntime: (entry, expectation, startup) => {
+      runtimes.push({ entry, releaseId: expectation?.releaseId, startup });
+      heldId = startup?.mode === "held" ? startup.continuationId : undefined;
+      return f.runtime;
+    },
+    createMigration: ({ identity }) => (migration = createLegacyClientMigration({ dataDir: f.dataDir, identity, workerEntry: "unused",
+      execute: async () => ({ candidateId: null, workspaceCount: 0 }) })) });
+
+  if (stagedState === "database-ahead") {
+    await assert.rejects(app.start(), (error: { code?: string; databaseSchemaVersion?: number; targetDatabaseSchemaVersion?: number }) => {
+      assert.equal(error.code, "DESKTOP_DB_SCHEMA_FORWARD_ONLY");
+      assert.equal(error.databaseSchemaVersion, 89);
+      assert.equal(error.targetDatabaseSchemaVersion, baselineManifest.dbSchemaVersion);
+      return true;
+    });
+    assert.ok(await readPendingRelease(f.dataDir));
+    assert.equal(await readActivePointer(f.dataDir), "active-1");
+    assert.deepEqual(loaded, [baseline]);
+    assert.equal(f.actions.includes("start"), false);
+    assert.equal(f.actions.includes("continue"), false);
+    return;
+  }
+
+  if (stagedState === "continue-failed") {
+    await assert.rejects(app.start(), /DESKTOP_STARTUP_CONTINUATION_FAILED/u);
+    assert.ok(await readPendingRelease(f.dataDir));
+    assert.equal(await readActivePointer(f.dataDir), "active-1");
+    assert.deepEqual(loaded, [baseline]);
+    return;
+  }
+
+  await app.start();
+  assert.equal(runtimes.at(-1)?.entry, path.join(baseline, "client", "dist", "index.cjs"));
+  assert.equal(runtimes.at(-1)?.releaseId, baselineManifest.releaseId);
+  assert.equal(runtimes.at(-1)?.startup?.mode, "held");
+  assert.deepEqual(loaded, [baseline]);
+  assert.equal((await app.getUpdateDetails()).bundle.result, "restored");
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.equal(await readActivePointer(f.dataDir), null);
+  assert.equal(f.actions.filter(action => action === "continue").length, 1);
+  assert.equal(migration.snapshot().status, "ready");
+  assert.deepEqual(receipts, []);
+  assert.equal(app.updateCheckFailure, null);
+  assert.equal(failures.length, 1);
+  assert.equal((failures[0]?.error as { code?: string }).code, expectedFailureCode);
+  assert.equal(failures[0]?.logOnly, true);
   await app.exit();
 });
 
@@ -1088,7 +1260,7 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
     ...(heldId ? { startup: { continuationId: heldId, admission: "paused" as const } } : {}) });
   const store = createShellUpdateAttemptStore(f.dataDir), identity = await loadOrCreateDeviceIdentity(f.dataDir), errors: unknown[] = [], serverErrors: unknown[] = [];
   const control = { available: true, hotAvailable: hotUpdate, resourceAuthorized: true, busy: false, fail: "", spawned: false, closed: false, drained: false, failHot: false, quitFail: false,
-    shellChannelFailed: false, resourceChannelFailed: false,
+    shellChannelFailed: false, resourceChannelFailed: false, shellManifestInvalid: false, resourceSignatureInvalid: false,
     holdHealth: undefined as (() => Promise<void>) | undefined, holdDrain: undefined as (() => Promise<void>) | undefined };
   let hotManifest = manifest, archive: Buffer = Buffer.alloc(0);
   if (hotUpdate) {
@@ -1112,9 +1284,9 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
     response.end(JSON.stringify(request.url?.endsWith('/update-availability')
       ? { ok: true, deviceId: identity.deviceId, requestId: meta.requestId,
         resource: control.resourceChannelFailed ? { available: false, error: { code: 'DESKTOP_UPDATE_UNAVAILABLE', requestId: meta.requestId } }
-          : control.hotAvailable ? { available: true, manifest: hotManifest } : { available: false },
+          : control.hotAvailable ? { available: true, manifest: control.resourceSignatureInvalid ? { ...hotManifest, signature: Buffer.alloc(64).toString("base64") } : hotManifest } : { available: false },
         shell: control.shellChannelFailed ? { available: false, error: { code: 'DESKTOP_SHELL_ARTIFACT_EXPIRED', requestId: meta.requestId } }
-          : control.available ? { available: true, manifest: shellManifest } : { available: false } }
+          : control.available ? { available: true, manifest: control.shellManifestInvalid ? { ...shellManifest, schemaVersion: 99 } : shellManifest } : { available: false } }
       : { ok: true, available: control.hotAvailable, ...(control.hotAvailable ? { manifest: hotManifest } : {}), deviceId: identity.deviceId, requestId: meta.requestId }));
   })().catch(error => { serverErrors.push(error); response.writeHead(500); response.end("{}"); }); });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -1186,7 +1358,12 @@ async function shellApplicationFixture(t: test.TestContext, hotUpdate = false, r
     /** 替换启动后的Client实例，模拟资源切换后的真实PID生命周期。 */
     setClient(value: typeof client) { client = value; },
     /** 使用同一磁盘尝试重建 owner，模拟下一次正常启动。 */
-    async restart() { await app.exit(); control.drained = false; app = createDesktopApplication(options); await app.start(); } };
+    async restart(native = false) {
+      await app.exit();
+      control.drained = false;
+      app = createDesktopApplication(native ? { ...options, shellUpdate: { facts: { installationDir, userDataDir, sessionDataDir, main } } } : options);
+      await app.start();
+    } };
 }
 
 test('revoking prepared resources does not skip an independently available shell', async t => {
@@ -1698,12 +1875,57 @@ test("normal restart starts business immediately and leaves the prepared shell f
   assert.equal(f.errors.length, 0);
 });
 
-test("shell failure stays separate from hot failure and stops the original automatic timer", async t => {
-  const f = await shellApplicationFixture(t); f.control.fail = "discover";
+test("shell failure leaves the next automatic resource check available", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.fail = "discover"; f.control.hotAvailable = false;
   t.mock.timers.enable({ apis: ["setTimeout"] }); f.app.startAutomaticUpdates(); await assert.rejects(f.app.checkForUpdates());
   assert.equal(f.app.updateCheckFailure, null); assert.ok(f.app.shellUpdateFailure); assert.equal(f.errors.length, 1);
-  const before = f.actions.filter(action => action === "hot-discover").length; t.mock.timers.tick(30 * 60 * 1000);
-  await new Promise(resolve => setImmediate(resolve)); assert.equal(f.actions.filter(action => action === "hot-discover").length, before);
+  f.control.hotAvailable = true;
+  const before = f.actions.filter(action => action === "hot-discover").length;
+  t.mock.timers.tick(30 * 60 * 1000);
+  assert.equal(f.app.shellUpdateFailure, null, "the timer has started the next check");
+  const notices: Array<{ releaseId: string }> = [];
+  f.host.onUpdateNotice = notice => notices.push(notice);
+  const deadline = Date.now() + 10_000;
+  while (!notices.length && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(notices.at(0)?.releaseId, "hot-release", "background resource preparation still notifies after shell failure");
+  assert.equal(f.actions.filter(action => action === "hot-discover").length, before + 1);
+  assert.equal((await f.app.getUpdateDetails()).bundle.result, "prepared");
+  await f.app.exit();
+});
+
+test("native resource activation never reads a damaged legacy shell attempt", async t => {
+  const f = await shellApplicationFixture(t, true); f.control.available = false;
+  await f.app.checkForUpdates();
+  assert.ok(await readPendingRelease(f.dataDir));
+  const attempt = path.join(f.dataDir, "shell-update-attempt.json");
+  await fs.writeFile(attempt, "{");
+  await f.restart(true);
+  assert.equal(await readActivePointer(f.dataDir), "hot-release");
+  assert.equal(await readPendingRelease(f.dataDir), null);
+  assert.equal(await fs.readFile(attempt, "utf8"), "{");
+  assert.equal(f.app.updateCheckFailure, null);
+  await f.app.exit();
+});
+
+test("a shell manifest with an unsupported schema leaves the signed resource update prepared", async t => {
+  const f = await shellApplicationFixture(t, true);
+  f.control.shellManifestInvalid = true;
+  await assert.rejects(f.app.checkForUpdates(), /DESKTOP_SHELL_OPERATION_FAILED/u);
+  assert.equal((await readPendingRelease(f.dataDir))?.releaseId, "hot-release");
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.bundle.result, "prepared");
+  assert.equal(details.shell.result, "failure");
+  await f.app.exit();
+});
+
+test("invalid resource signature does not prevent preparing the signed shell", async t => {
+  const f = await shellApplicationFixture(t, true);
+  f.control.resourceSignatureInvalid = true;
+  await assert.rejects(f.app.checkForUpdates(), /DESKTOP_RELEASE_SIGNATURE_INVALID/u);
+  const details = await f.app.getUpdateDetails();
+  assert.equal(details.bundle.result, "failure");
+  assert.equal(details.shell.result, "prepared");
+  assert.equal(await readPendingRelease(f.dataDir), null);
   await f.app.exit();
 });
 
@@ -2903,9 +3125,16 @@ test("missing trust leaves installation usable but refuses updates and an existi
   await fs.writeFile(path.join(f.dataDir, "active-release.json"), JSON.stringify({ releaseId: "new-release" }), "utf8");
   f.actions.length = 0;
   const restart = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host, createRuntime: () => f.runtime });
-  await assert.rejects(() => restart.start(), /UNTRUSTED_KEY/);
+  await assert.rejects(() => restart.start(), error => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, "DESKTOP_RELEASE_RECOVERY_UNAVAILABLE");
+    assert.match(error.errors[0].message, /DESKTOP_RELEASE_UNTRUSTED_KEY/u);
+    assert.equal(error.errors[1].code, "DESKTOP_RELEASE_BASELINE_MISSING");
+    return true;
+  });
   assert.equal(f.actions.includes("start"), false);
   assert.equal(f.actions.includes("load-web"), false);
+  assert.equal(await readActivePointer(f.dataDir), "new-release");
 });
 
 test("a startup cleanup failure keeps an explicit owner and remains retryable", async (t) => {

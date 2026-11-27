@@ -10,6 +10,7 @@ import { extractReleaseBundle } from "./releaseBundleExtract.js";
 import { createDesktopUpdateReceipt, type DesktopUpdateReceipt } from "@codeflowai/shared/desktop-update-receipt";
 import type { DesktopBundleUpdatePhase, DesktopUpdateResult, DesktopBundleVersion } from "@codeflowai/shared";
 import { writeDurableJson, flushDirectory } from "./durableFile.js";
+import { assertDesktopStoragePath } from "./desktopStorageLocation.js";
 
 export { computeReleasePackageSha256 } from "@codeflowai/shared/desktop-release-signing";
 
@@ -25,7 +26,6 @@ export type PreparedRelease = {
 export type ActiveRelease = {
   releaseId: string;
   releaseDir: string;
-  previousReleaseId: string | null;
   manifest: ReleaseBundleManifest;
 };
 
@@ -35,11 +35,15 @@ export type ReleaseSwitchHooks = {
   restartClient(releaseDir: string, manifest: ReleaseBundleManifest): Promise<void>;
   reloadWeb(releaseDir: string, manifest: ReleaseBundleManifest): Promise<void>;
   waitHealthy(releaseDir: string): Promise<boolean>;
+  /** 回退只检查旧运行时健康，候选专用的放行检查由切换路径负责。 */
+  waitRestoredHealthy?(releaseDir: string): Promise<boolean>;
   restoreInitialRelease(): Promise<void>;
   /** 完整安装基线接管期间，候选回退必须恢复已验签的新基线而非旧活动包。 */
   restoreInitialOnFailure?: boolean;
   /** 候选停止并恢复数据库后，才允许重新启动旧资源。 */
   beforeRestore?(): Promise<void>;
+  /** 保留仍可按同一请求重试的候选，失败日志照常记录。 */
+  keepPendingOnFailure?(): boolean;
 };
 
 /** 用户选择稍后是正常中止切换，不写失败日志或失败回执。 */
@@ -51,7 +55,7 @@ export class DesktopUpdatePostponed extends Error {
 type ReleaseBundleCoordinator = {
   prepare(packageDir: string, options?: { signal?: AbortSignal; requestId?: string }): Promise<PreparedRelease>;
   resume(pending: { requestId: string; releaseId: string; stagingDir: string },
-    installed?: Pick<ReleaseBundleManifest, "releaseId" | "archiveSha256">): Promise<PreparedRelease>;
+    isCurrent?: (manifest: ReleaseBundleManifest) => boolean): Promise<PreparedRelease & { alreadyInstalled?: true }>;
   switch(prepared: PreparedRelease, hooks: ReleaseSwitchHooks): Promise<ActiveRelease>;
 };
 
@@ -76,16 +80,23 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
   };
 
   return {
-    /** 重新验签、检查入口及 held 证明；同包安装只收口旧记录，其余候选仍须未过期。 */
-    async resume(pending, installed): Promise<PreparedRelease> {
+    /** 旧候选只验签和身份；仍需启用的候选继续通过现有有效期和入口校验。 */
+    async resume(pending, isCurrent) {
       const directory = path.resolve(pending.stagingDir);
       if (path.dirname(directory) !== path.join(rootDir, ".staging")
         && directory !== path.join(rootDir, "releases", assertReleaseId(pending.releaseId))) throw new Error("DESKTOP_RELEASE_STAGING_INVALID");
-      const installedIdMatches = installed?.releaseId === pending.releaseId;
-      const manifest = await verifyReleaseBundle(directory, { ...input, requireHeldStartup: true }, !installedIdMatches);
-      if (manifest.releaseId !== pending.releaseId) throw new Error("DESKTOP_PENDING_RELEASE_INVALID");
-      if (installedIdMatches && manifest.archiveSha256 !== installed!.archiveSha256) {
-        throw Object.assign(new Error("DESKTOP_RELEASE_CACHE_CONFLICT"), { code: "DESKTOP_RELEASE_CACHE_CONFLICT", requestId: pending.requestId });
+      const trust = { ...input, requireHeldStartup: true };
+      let inspectedSignature: string | undefined;
+      if (isCurrent) {
+        const manifest = await verifyManifest(directory, trust, false);
+        if (manifest.releaseId !== pending.releaseId) throw new Error("DESKTOP_PENDING_RELEASE_INVALID");
+        if (isCurrent(manifest)) return { requestId: pending.requestId, stagingDir: directory, manifest, alreadyInstalled: true };
+        inspectedSignature = manifest.signature;
+      }
+      const manifest = await verifyReleaseBundle(directory, trust, true);
+      // 仍需启用的候选必须是刚才用来判断版本的同一份签名清单。
+      if (manifest.releaseId !== pending.releaseId || inspectedSignature !== undefined && manifest.signature !== inspectedSignature) {
+        throw Object.assign(new Error("DESKTOP_PENDING_RELEASE_INVALID"), { code: "DESKTOP_PENDING_RELEASE_INVALID", requestId: pending.requestId });
       }
       return { requestId: pending.requestId, stagingDir: directory, manifest };
     },
@@ -199,13 +210,36 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
         await hooks.checkCompatibility(verified);
         setPhase("prepare-directory");
         if (await pathExists(targetDir)) {
-          const existing = await verifyReleaseBundle(targetDir, input);
-          if (JSON.stringify(existing) !== JSON.stringify(verified)) throw new Error(`绑定包版本内容冲突：${releaseId}`);
-          // 已有完整目标时只删除本次暂存副本，避免稍后重试累积整组包。
           const stagingRoot = path.join(rootDir, ".staging");
-          if (path.resolve(prepared.stagingDir) !== targetDir && (path.dirname(path.resolve(prepared.stagingDir)) !== stagingRoot
+          const stagingDir = path.resolve(prepared.stagingDir);
+          if (stagingDir !== targetDir && (path.dirname(stagingDir) !== stagingRoot
             || !(await fs.lstat(stagingRoot)).isDirectory())) throw new Error("DESKTOP_RELEASE_STAGING_INVALID");
-          if (path.resolve(prepared.stagingDir) !== targetDir) await fs.rm(prepared.stagingDir, { recursive: true });
+          let existing: ReleaseBundleManifest | undefined;
+          try { existing = await verifyReleaseBundle(targetDir, input); }
+          catch (cause) {
+            const failure = cause as NodeJS.ErrnoException | undefined;
+            const missing = typeof failure?.path === "string" ? path.relative(targetDir, failure.path) : "";
+            // 只替换非活动目录中缺文件的同一签名版本，保留原目录供诊断。
+            if (stagingDir === targetDir || previousReleaseId === releaseId || failure?.code !== "ENOENT"
+              || !/^(?:client|web)(?:[\\/]|$)/u.test(missing)) throw cause;
+            await assertDesktopStoragePath(targetDir);
+            const damaged = await verifyManifest(targetDir, input, false);
+            if (JSON.stringify(damaged) !== JSON.stringify(verified)) throw new Error(`绑定包版本内容冲突：${releaseId}`, { cause });
+            if (await readActivePointer(rootDir) !== previousReleaseId) throw new Error("DESKTOP_STARTUP_ARTIFACT_CHANGED", { cause });
+            const retired = await fs.mkdtemp(path.join(stagingRoot, "invalid-release-"));
+            try {
+              await fs.rename(targetDir, path.join(retired, releaseId));
+              await fs.rename(stagingDir, targetDir);
+            } catch (replacementError) {
+              throw new AggregateError([cause, replacementError], "DESKTOP_RELEASE_REPAIR_FAILED");
+            }
+            input.onDiagnostic?.({ requestId: prepared.requestId, releaseId, phase: "repair-directory", outcome: "success",
+              errorCode: "DESKTOP_RELEASE_INACTIVE_FILES_MISSING" });
+          }
+          if (existing) {
+            if (JSON.stringify(existing) !== JSON.stringify(verified)) throw new Error(`绑定包版本内容冲突：${releaseId}`);
+            if (stagingDir !== targetDir) await fs.rm(prepared.stagingDir, { recursive: true });
+          }
         } else {
           await fs.mkdir(path.dirname(targetDir), { recursive: true });
           await fs.rename(prepared.stagingDir, targetDir);
@@ -222,7 +256,7 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
         setPhase("activate");
         if (previousReleaseId) await writePointer(rootDir, PREVIOUS_POINTER, { releaseId: previousReleaseId });
         await writePointer(rootDir, ACTIVE_POINTER, { releaseId });
-        activated = { releaseId, releaseDir: targetDir, previousReleaseId, manifest: verified };
+        activated = { releaseId, releaseDir: targetDir, manifest: verified };
         input.onProgress?.({ requestId: prepared.requestId, phase: "activate", result: "healthy", target: versionOf(verified) });
         if (input.reportReceipt) {
           const switched = createReceipt(input.getFailureContext(), prepared.requestId, verified, "switched");
@@ -279,7 +313,7 @@ export function createReleaseBundleCoordinator(input: ReleaseTrustOptions & { ro
             ...(observationFailure ? [observationFailure.cause] : []), logError], "绑定包切换失败且错误日志写入失败");
         }
         // 不确定提交不是终局回退；保留原 attempt 供下次启动核验并补齐阶段事实。
-        if (input.reportReceipt && needsRestore && !activated && !activationUncertain) {
+        if (input.reportReceipt && needsRestore && !activated && !activationUncertain && !hooks.keepPendingOnFailure?.()) {
           const stage = rollbackError ? "unavailable" : "rolled_back";
           try { await input.reportReceipt(createReceipt(input.getFailureContext(), prepared.requestId, prepared.manifest, stage, failureRecord.errorId)); }
           catch (reportError) { receiptError = reportError; }
@@ -332,7 +366,7 @@ export async function clearIncompatibleActiveRelease(rootDir: string, expectedRe
   await flushDirectory(root);
 }
 
-/** 活动版本默认只验签和检查入口；显式 full 保留完整核验。 */
+/** 活动版本只依赖当前指针和签名资源；历史指针用于诊断。 */
 export async function resolveActiveRelease(rootDir: string, options: InstalledReleaseTrustOptions = {}): Promise<ActiveRelease | null> {
   const resolvedRoot = path.resolve(rootDir);
   const releaseId = await readActivePointer(resolvedRoot);
@@ -340,7 +374,7 @@ export async function resolveActiveRelease(rootDir: string, options: InstalledRe
   const releaseDir = path.join(resolvedRoot, "releases", releaseId);
   const manifest = await verifyReleaseBundle(releaseDir, options);
   if (manifest.releaseId !== releaseId) throw new Error("活动绑定包版本标识不匹配");
-  return { releaseId, releaseDir, previousReleaseId: await readPointer(resolvedRoot, PREVIOUS_POINTER), manifest };
+  return { releaseId, releaseDir, manifest };
 }
 
 /** 固定基线只消费自身签名证明；缺少证明显式报修复安装，不借用其他版本。 */
@@ -391,8 +425,15 @@ async function verifyManifest(directory: string, options: InstalledReleaseTrustO
   onManifest?: (manifest: ReleaseBundleManifest) => void, withPayload = false): Promise<ReleaseBundleManifest> {
   if (!(await fs.lstat(directory)).isDirectory()) throw new Error("DESKTOP_RELEASE_ROOT_INVALID");
   const manifestPath = path.join(directory, "manifest.json");
-  if (!(await fs.lstat(manifestPath)).isFile()) throw new Error("DESKTOP_RELEASE_MANIFEST_INVALID");
-  const manifest = assertReleaseBundleManifest(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await fs.readFile(manifestPath))));
+  /** 统一标记本地清单格式错误，文件读取与验签错误沿各自边界返回。 */
+  const invalidManifest = (cause?: unknown) => Object.assign(new Error("DESKTOP_RELEASE_MANIFEST_INVALID", { cause }), {
+    code: "DESKTOP_RELEASE_MANIFEST_INVALID",
+  });
+  if (!(await fs.lstat(manifestPath)).isFile()) throw invalidManifest();
+  const bytes = await fs.readFile(manifestPath);
+  let manifest: ReleaseBundleManifest;
+  try { manifest = assertReleaseBundleManifest(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes))); }
+  catch (cause) { throw invalidManifest(cause); }
   onManifest?.(manifest);
   return withPayload ? await verifyReleaseBundlePayload({ verification: "installed", ...options, directory, manifest, trustedKeys: options.trustedReleaseKeys ?? {}, requireFresh })
     : verifyReleaseBundleSignature(manifest, options.trustedReleaseKeys ?? {}, { ...options, requireFresh });
@@ -418,7 +459,7 @@ async function restorePreviousRelease(rootDir: string, previousReleaseId: string
     if (manifest.releaseId !== previousReleaseId) throw new Error("回退绑定包版本标识不匹配");
     await hooks.restartClient(releaseDir, manifest);
     await hooks.reloadWeb(releaseDir, manifest);
-    if (!await hooks.waitHealthy(releaseDir)) throw new Error("回退绑定包健康检查失败");
+    if (!await (hooks.waitRestoredHealthy ?? hooks.waitHealthy)(releaseDir)) throw new Error("回退绑定包健康检查失败");
     await writePointer(rootDir, ACTIVE_POINTER, { releaseId: previousReleaseId });
     return null;
   } catch (error) {

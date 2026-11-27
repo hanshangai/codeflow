@@ -29,6 +29,7 @@
     !else
       StrCpy $d16InstallExitCode "null"
       StrCpy $d16InstallCause $d16StopFailure
+      StrCpy $d16InstallNativeError $d16StopError
       StrCpy $d16InstallStage "installation-process-stop"
       StrCpy $d16InstallErrorCode DESKTOP_INSTALL_PROCESS_STOP_FAILED
       Call D16FailInstallation

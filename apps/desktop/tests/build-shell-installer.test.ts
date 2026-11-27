@@ -108,11 +108,16 @@ test("builds and actually installs a full small payload only into a new compiled
   await fs.writeFile(path.join(installation, "shell-launch.ini"), "unchanged", "utf8");
   const requestId = crypto.randomUUID();
   const args = ["--codeflow-candidate-install", "--installation-root", installation, "--request-id", requestId];
+  const interrupted = path.join(installation, "shells", ".candidate-" + crypto.randomUUID());
+  await fs.mkdir(interrupted);
+  await fs.writeFile(path.join(interrupted, "partial"), "unfinished");
   const result = await runInstaller(built.executablePath, args, f.root);
   assert.deepEqual(result, { code: 0, stderr: "", stdout: "" });
   for (const [relative, content] of Object.entries(f.files)) {
     assert.equal(await fs.readFile(path.join(installation, "shells/fixture-01", relative), "utf8"), content);
   }
+  assert.equal(await fs.readFile(path.join(interrupted, "partial"), "utf8"), "unfinished");
+  assert.deepEqual((await fs.readdir(path.join(installation, "shells"))).sort(), [path.basename(interrupted), "fixture-01"]);
   assert.equal(await fs.readFile(path.join(installation, "shell-launch.ini"), "utf8"), "unchanged");
   // 逻辑盘表包含失联映射盘，未知盘夹具只使用未分配字母，不探测卷可用性。
   const logicalDrives = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
@@ -128,10 +133,11 @@ test("builds and actually installs a full small payload only into a new compiled
   assert.deepEqual(JSON.parse(unknownDrive.stderr), { errorCode: "DESKTOP_SHELL_INSTALL_FAILED", requestId, shellId: "fixture-01",
     stage: "root", win32Error: 0, rootCause: "ROOT_DRIVE_UNSUPPORTED" });
   await assert.rejects(fs.access(unknownRoot), { code: "ENOENT" });
-  const repeated = await runInstaller(built.executablePath, args, f.root);
+  const repeatedId = crypto.randomUUID();
+  const repeated = await runInstaller(built.executablePath, [...args.slice(0, 4), repeatedId], f.root);
   assert.equal(repeated.code, 1);
-  assert.deepEqual(JSON.parse(repeated.stderr), { errorCode: "DESKTOP_SHELL_INSTALL_FAILED", requestId, shellId: "fixture-01",
-    stage: "create-target", win32Error: 183, rootCause: "TARGET_CREATE_FAILED" });
+  assert.deepEqual(JSON.parse(repeated.stderr), { errorCode: "DESKTOP_SHELL_INSTALL_FAILED", requestId: repeatedId, shellId: "fixture-01",
+    stage: "publish-target", win32Error: 183, rootCause: "TARGET_PUBLISH_FAILED" });
   for (const invalid of [[], [...args, "--updated"], ["--wrong", ...args.slice(1)], [...args.slice(0, 4)],
     [args[0]!, args[1]!, installation, args[3]!, "invalid\"request"]]) {
     const rejected = await runInstaller(built.executablePath, invalid, f.root);

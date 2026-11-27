@@ -3,7 +3,19 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { readInstalledUpdateOrigin } from "../src/updateConfiguration.js";
+import { readDesktopRepairDownloadUrl, readInstalledUpdateOrigin } from "../src/updateConfiguration.js";
+
+test("recovery downloads use the installed environment and a fixed package route for each platform", async t => {
+  const f = await fixture(t);
+  assert.equal(readDesktopRepairDownloadUrl(f.root, "win32", "x64"), undefined);
+  await fs.writeFile(f.file, JSON.stringify({ serverOrigin: "https://updates.example.test" }));
+  for (const [platform, arch, target] of [["win32", "x64", "windows-x64"], ["darwin", "arm64", "darwin-arm64"], ["darwin", "x64", "darwin-x64"]] as const) {
+    assert.equal(readDesktopRepairDownloadUrl(f.root, platform, arch), `https://updates.example.test/api/public/desktop-download/${target}`);
+  }
+  assert.equal(readDesktopRepairDownloadUrl(f.root, "linux", "x64"), undefined);
+  await fs.writeFile(f.file, JSON.stringify({ serverOrigin: "https://updates.example.test/other" }));
+  assert.throws(() => readDesktopRepairDownloadUrl(f.root, "win32", "x64"), { code: "DESKTOP_UPDATE_CONFIG_INVALID" });
+});
 
 /** 每例独占安装资源目录，不读取用户环境或现有安装配置。 */
 async function fixture(t: test.TestContext) {

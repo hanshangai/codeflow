@@ -22,6 +22,7 @@ Var argv
 Var root
 Var requestId
 Var target
+Var finalTarget
 Var checkedPath
 Var failure
 Var stage
@@ -160,6 +161,9 @@ Function ValidateRoot
     StrCmpS $0 ":\" 0 invalid_root
     IntOp $0 $4 + ${MAX_PAYLOAD_PATH}
     StrLen $1 "${SHELL_ID}"
+    ${If} $1 < 47
+      StrCpy $1 47
+    ${EndIf}
     IntOp $0 $0 + $1
     IntOp $0 $0 + 10
     IntCmp $0 ${NSIS_MAX_STRLEN} invalid_root +1 invalid_root
@@ -315,7 +319,9 @@ Section
   Call ValidateRoot
   StrCmp $failure "" 0 failed
   StrCpy $stage "create-target"
-  StrCpy $target "$root\shells\${SHELL_ID}"
+  StrCpy $finalTarget "$root\shells\${SHELL_ID}"
+  ; A fresh request owns only its staging directory until all files are present.
+  StrCpy $target "$root\shells\.candidate-$requestId"
   System::Call 'kernel32::CreateDirectoryW(w "$target", p 0)i.r0 ?e'
   Pop $win32Error
   ${If} $0 == 0
@@ -332,6 +338,13 @@ Section
   IfErrors payload_temp_failed
   StrCpy $stage "extract"
   !include "${PAYLOAD_FILE}"
+  StrCpy $stage "publish-target"
+  System::Call 'kernel32::MoveFileExW(w "$target", w "$finalTarget", i 8)i.r0 ?e'
+  Pop $win32Error
+  ${If} $0 == 0
+    StrCpy $failure "TARGET_PUBLISH_FAILED"
+    Goto failed
+  ${EndIf}
   SetErrorLevel 0
   Quit
   payload_temp_failed:

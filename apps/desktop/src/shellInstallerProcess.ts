@@ -49,14 +49,31 @@ export async function installShellCandidate(input: InstallerInput): Promise<{ ma
     const installationDir = await fs.realpath(input.installationDir), installerPath = await fs.realpath(input.installerPath);
     const directories = await snapshotDirectories(path.join(installationDir, "shells"));
     const candidateDirectory = path.join(installationDir, "shells", manifest.shellId);
-    if (expected.activeShellId === manifest.shellId) fail("TARGET_CONFLICT");
+    const targetId = manifest.shellId.toLowerCase();
+    if (expected.activeShellId.toLowerCase() === targetId) fail("TARGET_CONFLICT");
     await assertLaunch(installationDir, expected); await assertDirectories(directories); input.signal?.throwIfAborted();
     phase = "candidate";
     if (await exists(candidateDirectory)) {
       await assertCandidateRoot(candidateDirectory);
-      const verified = await verifyShellReleaseArtifact({ ...input, manifest, installerPath, candidateDirectory, verification: "installed" });
-      await assertDirectories(directories); await assertLaunch(installationDir, expected); input.signal?.throwIfAborted();
-      return { manifest: verified, candidateDirectory };
+      const original = await fs.lstat(candidateDirectory, { bigint: true });
+      try {
+        const verified = await verifyShellReleaseArtifact({ ...input, manifest, installerPath, candidateDirectory, verification: "installed" });
+        await assertDirectories(directories); await assertLaunch(installationDir, expected); input.signal?.throwIfAborted();
+        return { manifest: verified, candidateDirectory };
+      } catch (cause) {
+        const error = cause as { code?: string; phase?: string; cause?: NodeJS.ErrnoException } | undefined;
+        const missing = error?.cause?.path && path.relative(candidateDirectory, error.cause.path);
+        // 已批准重试旧安装器留下的半包，只隔离缺入口的独立候选，保留活动、回退与基线目录。
+        if (expected.previousShellId?.toLowerCase() === targetId || expected.baselineShellId.toLowerCase() === targetId
+          || error?.phase !== "candidate" || error.code !== "DESKTOP_SHELL_ARTIFACT_IO_FAILED" || error.cause?.code !== "ENOENT"
+          || !missing || !["CodeFlowAI.exe", "resources", path.join("resources", "app.asar"), path.join("resources", "release-trust.json")].includes(missing)) throw cause;
+        await assertDirectories(directories); await assertLaunch(installationDir, expected); input.signal?.throwIfAborted();
+        const current = await fs.lstat(candidateDirectory, { bigint: true });
+        if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== original.dev || current.ino !== original.ino) fail("TARGET_CHANGED");
+        const retired = await fs.mkdtemp(path.join(path.dirname(candidateDirectory), ".incomplete-shell-"));
+        try { await fs.rename(candidateDirectory, path.join(retired, manifest.shellId)); }
+        catch (error) { throw new AggregateError([cause, error], "DESKTOP_SHELL_INCOMPLETE_RETIRE_FAILED"); }
+      }
     }
     phase = "temporary";
     const parent = await fs.realpath(input.temporaryParentDir ?? os.tmpdir());
@@ -207,8 +224,8 @@ function readDiagnostic(owned: Owned, requestId: string, shellId: string): Diagn
   const item = value as Record<string, unknown>, keys = Object.keys(item), optional = Object.hasOwn(item, "cleanupWin32Error");
   const fields = ["errorCode", "requestId", "shellId", "stage", "win32Error", "rootCause", ...(optional ? ["cleanupWin32Error"] : [])];
   if (keys.length !== fields.length || keys.some(key => !fields.includes(key)) || item.errorCode !== "DESKTOP_SHELL_INSTALL_FAILED"
-    || item.requestId !== requestId || item.shellId !== shellId || typeof item.stage !== "string" || !["arguments", "root", "create-target", "extract-temp", "extract"].includes(item.stage)
-    || typeof item.rootCause !== "string" || !["ARGUMENTS_INVALID", "ARGUMENT_PARSE_FAILED", "ARGUMENT_RELEASE_FAILED", "PATH_UNAVAILABLE", "PATH_REPARSE", "PATH_NOT_DIRECTORY", "ROOT_DRIVE_UNSUPPORTED", "ROOT_INVALID", "TARGET_CREATE_FAILED", "PAYLOAD_DIRECTORY_FAILED", "PAYLOAD_WRITE_FAILED", "PAYLOAD_TEMP_FAILED"].includes(item.rootCause)
+    || item.requestId !== requestId || item.shellId !== shellId || typeof item.stage !== "string" || !["arguments", "root", "create-target", "extract-temp", "extract", "publish-target"].includes(item.stage)
+    || typeof item.rootCause !== "string" || !["ARGUMENTS_INVALID", "ARGUMENT_PARSE_FAILED", "ARGUMENT_RELEASE_FAILED", "PATH_UNAVAILABLE", "PATH_REPARSE", "PATH_NOT_DIRECTORY", "ROOT_DRIVE_UNSUPPORTED", "ROOT_INVALID", "TARGET_CREATE_FAILED", "PAYLOAD_DIRECTORY_FAILED", "PAYLOAD_WRITE_FAILED", "PAYLOAD_TEMP_FAILED", "TARGET_PUBLISH_FAILED"].includes(item.rootCause)
     || !win32(item.win32Error) || optional && !win32(item.cleanupWin32Error)) fail("DIAGNOSTIC_INVALID");
   return { errorCode: "DESKTOP_SHELL_INSTALL_FAILED", requestId, shellId, stage: item.stage as string, win32Error: item.win32Error as number,
     rootCause: item.rootCause as string, ...(optional ? { cleanupWin32Error: item.cleanupWin32Error as number } : {}) };

@@ -364,21 +364,25 @@ Function ${D16_STOP_PREFIX}D16StopNativeProcesses
       StrCpy $d16StopFailure PROCESS_WAIT_FAILED
       Goto stop_cleanup
     ${EndIf}
+    StrCpy $d16StopError 0
     StrCpy $0 DESKTOP_INSTALL_PROCESS_FORCED
     Call ${D16_STOP_PREFIX}D16StopDiagnostic
     StrCmp $d16StopFailure "" 0 stop_cleanup
     System::Call 'kernel32::TerminateProcess(p $d16StopHandle, i 0) i.r0 ?e'
     Pop $d16StopError
-    ${If} $0 == 0
-      System::Call 'kernel32::WaitForSingleObject(p $d16StopHandle, i 0) i.r0'
-      ${If} $0 != 0
+    ; A process already exiting can reject termination. Continue only after its retained handle signals exit.
+    System::Call 'kernel32::WaitForSingleObject(p $d16StopHandle, i 5000) i.r3 ?e'
+    Pop $1
+    ${If} $3 != 0
+      ${If} $0 == 0
         StrCpy $d16StopFailure PROCESS_TERMINATION_FAILED
-        Goto stop_cleanup
+      ${ElseIf} $3 == 258
+        StrCpy $d16StopError 0
+        StrCpy $d16StopFailure PROCESS_STOP_TIMEOUT
+      ${Else}
+        StrCpy $d16StopError $1
+        StrCpy $d16StopFailure PROCESS_WAIT_FAILED
       ${EndIf}
-    ${EndIf}
-    System::Call 'kernel32::WaitForSingleObject(p $d16StopHandle, i 5000) i.r0'
-    ${If} $0 != 0
-      StrCpy $d16StopFailure PROCESS_STOP_TIMEOUT
       Goto stop_cleanup
     ${EndIf}
   stop_next:
