@@ -55,6 +55,20 @@ test("windows downloads the registered installer while other systems open the do
   assert.match(String(reported), /installer missing/u);
 });
 
+test("桌面入口使用配置 Server，网页入口保持页面同源", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true,
+    value: { location: { protocol: "https:", origin: "https://site.test" } } });
+  try {
+    const desktop = await resolveDesktopDownloadTarget({ platform: "win32", origin: "wss://codeflow.example", desktop: true, load: async () => info });
+    assert.deepEqual(desktop, { kind: "direct", url: "https://codeflow.example/api/public/desktop-download/windows-x64" });
+    const web = await resolveDesktopDownloadTarget({ platform: "win32", origin: "wss://codeflow.example", load: async () => info });
+    assert.deepEqual(web, { kind: "direct", url: "https://site.test/api/public/desktop-download/windows-x64" });
+  } finally {
+    descriptor ? Object.defineProperty(globalThis, "window", descriptor) : Reflect.deleteProperty(globalThis, "window");
+  }
+});
+
 test("landing entry points use the platform-aware download helper", () => {
   const nav = readFileSync(new URL("../src/features/landing/components/LandingNav.vue", import.meta.url), "utf8");
   const page = readFileSync(new URL("../src/features/landing/components/landing-page.vue", import.meta.url), "utf8");

@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { getDesktopDownload, type DesktopDownloadInfo, type DesktopDownloadPackage } from "../../../api/desktopDownload";
-import { wsOriginToHttpOrigin } from "../../../api/request";
+import { getDesktopDownload, resolveDesktopDownloadBase, type DesktopDownloadInfo, type DesktopDownloadPackage } from "../../../api/desktopDownload";
 import { trackProductEvent } from "../../../analytics/analytics";
 import { useConfigStore } from "../../../store/config";
 import LandingNav from "../../landing/components/LandingNav.vue";
@@ -25,9 +24,9 @@ const windowsPackage = computed<DesktopDownloadPackage | null>(() => info.value?
 const macPackages = computed<Array<DesktopDownloadPackage | null>>(() => (["arm64", "x64"] as const).map(arch => info.value?.packages.find(
   item => item.platform === "darwin" && item.arch === arch) ?? null));
 
-/** 下载地址只由服务端登记的相对路径拼接。 */
+/** 下载地址只由服务端登记的相对路径拼接；浏览器保持页面同源。 */
 function downloadUrl(item: DesktopDownloadPackage): string {
-  return `${wsOriginToHttpOrigin(config.serverWsOrigin)}${item.downloadPath}`;
+  return `${resolveDesktopDownloadBase(config.serverWsOrigin, config.isDesktop)}${item.downloadPath}`;
 }
 /** 保留服务端真实展示号；缺少事实时只展示资源号。 */
 function versionLabel(item: DesktopDownloadPackage): string {

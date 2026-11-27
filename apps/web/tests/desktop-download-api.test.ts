@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getDesktopDownload } from "../src/api/desktopDownload.ts";
+import { getDesktopDownload, resolveDesktopDownloadBase } from "../src/api/desktopDownload.ts";
 
 const windows = { platform: "win32", arch: "x64", version: "1.0.0", publishedAt: 1,
   size: 1234, sha256: "a".repeat(64), downloadPath: "/api/public/desktop-download/windows-x64" };
@@ -41,6 +41,18 @@ test("无发布、网络失败、错误字段和外站下载地址均明确拒�
   }
   probe.mock.mockImplementation(async () => { throw new Error("network failed"); });
   await assert.rejects(getDesktopDownload("wss://downloads.test"), /network failed/u);
+});
+
+test("浏览器下载使用页面同源，桌面继续使用配置 Server", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true,
+    value: { location: { protocol: "https:", origin: "https://site.test" } } });
+  try {
+    assert.equal(resolveDesktopDownloadBase("wss://api.test"), "https://site.test");
+    assert.equal(resolveDesktopDownloadBase("wss://api.test", true), "https://api.test");
+  } finally {
+    descriptor ? Object.defineProperty(globalThis, "window", descriptor) : Reflect.deleteProperty(globalThis, "window");
+  }
 });
 
 test("公开下载保留服务端真实展示号，缺少事实不构造壳号", async t => {

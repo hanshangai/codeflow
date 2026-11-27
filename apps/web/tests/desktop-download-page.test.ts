@@ -31,7 +31,9 @@ async function renderPage(context: test.TestContext, packages: unknown[]): Promi
   const page = loadModule(script.content, id => {
     if (id === "vue") return { ...vue, onMounted: () => {}, onBeforeUnmount: () => {} };
     if (id === "vue-router") return { useRoute: () => ({ hash: "" }), useRouter: () => ({ push: () => {} }) };
-    if (id === "../../../api/desktopDownload") return { getDesktopDownload: async () => ({ packages }) };
+    if (id === "../../../api/desktopDownload") {
+      return { getDesktopDownload: async () => ({ packages }), resolveDesktopDownloadBase: () => "http://downloads.test" };
+    }
     if (id === "../../../api/request") return { wsOriginToHttpOrigin: () => "http://downloads.test" };
     if (id === "../../../analytics/analytics") return { trackProductEvent: () => {} };
     if (id === "../../../store/config") return { useConfigStore: () => vue.reactive({ serverWsOrigin: "ws://downloads.test" }) };

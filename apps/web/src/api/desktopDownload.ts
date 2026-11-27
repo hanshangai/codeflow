@@ -7,6 +7,14 @@ export type DesktopDownloadPackage = {
 
 export type DesktopDownloadInfo = { packages: DesktopDownloadPackage[] };
 
+/** 浏览器从页面同源下载，避免跳到 WS 端口；桌面自定义协议继续使用配置的 Server。 */
+export function resolveDesktopDownloadBase(serverWsOrigin: string, desktop = false): string {
+  if (!desktop && typeof window !== "undefined" && (window.location.protocol === "http:" || window.location.protocol === "https:")) {
+    return window.location.origin;
+  }
+  return wsOriginToHttpOrigin(serverWsOrigin);
+}
+
 const DISPLAY_VERSION = /^\d+\.\d+\.\d{4}(?:\.[1-9]\d*)?$/u;
 const DOWNLOAD_PATH = /^\/api\/public\/desktop-download\/(?:windows-x64|win32-x64|darwin-x64|darwin-arm64)$/u;
 

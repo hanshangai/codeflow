@@ -1,8 +1,7 @@
 import { ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { getDesktopDownload, type DesktopDownloadInfo } from "../../api/desktopDownload";
-import { wsOriginToHttpOrigin } from "../../api/request";
+import { getDesktopDownload, resolveDesktopDownloadBase, type DesktopDownloadInfo } from "../../api/desktopDownload";
 import { trackProductEvent } from "../../analytics/analytics";
 import { useConfigStore } from "../../store/config";
 
@@ -26,6 +25,7 @@ export function detectDesktopDownloadPlatform(
 export async function resolveDesktopDownloadTarget(input: {
   platform: DesktopDownloadPlatform;
   origin: string;
+  desktop?: boolean;
   load: () => Promise<DesktopDownloadInfo>;
   onError?: (error: unknown) => void;
 }): Promise<DesktopDownloadTarget> {
@@ -34,7 +34,7 @@ export async function resolveDesktopDownloadTarget(input: {
     const info = await input.load();
     // 只有登记了 Windows x64 包才直达；仅发布 macOS 时不把 dmg 交给 Windows 用户。
     const target = info.packages.find(item => item.platform === "win32" && item.arch === "x64");
-    return target ? { kind: "direct", url: `${wsOriginToHttpOrigin(input.origin)}${target.downloadPath}` } : { kind: "page" };
+    return target ? { kind: "direct", url: `${resolveDesktopDownloadBase(input.origin, input.desktop)}${target.downloadPath}` } : { kind: "page" };
   } catch (error) {
     input.onError?.(error);
     return { kind: "page" };
@@ -63,6 +63,7 @@ export function useDesktopDownloadEntry(source: string) {
       const target = await resolveDesktopDownloadTarget({
         platform,
         origin: config.serverWsOrigin,
+        desktop: config.isDesktop,
         load: () => getDesktopDownload(config.serverWsOrigin),
         onError: (error) => {
           console.warn("[DESKTOP_DOWNLOAD_ENTRY_RESOLVE_FAILED]", {
