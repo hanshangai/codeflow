@@ -17,6 +17,7 @@ function scrollToDemo(): void {
 <template>
   <section class="hero">
     <div class="hero__copy">
+      <p class="hero__eyebrow">企业级AI协作研发平台</p>
       <h1 class="hero__title">把研发规范变成可执行的工作流</h1>
       <p class="hero__highlight">规格先行，工作流执行。<br />内置 Harness、Loop 与 TDD。</p>
       <p class="hero__desc">从需求与规格出发，选择合适的模型和内置/自定义工作流推进开发；用度量、会话、文件、终端与 Git 记录每一次执行，结果可核对、过程可回看。</p>
@@ -42,9 +43,16 @@ function scrollToDemo(): void {
   flex-direction: column;
   min-width: 0;
 }
+.hero__eyebrow {
+  margin: 0 0 14px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--app-accent, #c96442);
+}
 .hero__title {
   margin: 0 0 16px;
-  font-size: clamp(34px, 3.6vw, 49px);
+  font-size: clamp(30px, 3.2vw, 42px);
   line-height: 1.24;
   letter-spacing: -0.02em;
   font-weight: 700;

@@ -277,8 +277,7 @@ function sendLabel(purpose: "register" | "forgot_password"): string {
         <div class="auth-brand__glow auth-brand__glow--one" />
         <div class="auth-brand__glow auth-brand__glow--two" />
         <div class="auth-brand__logo"><span>Code</span>Flow <i>.</i></div>
-        <h1>让研发协作，<br />回到工作台。</h1>
-        <p>桌面端本地优先，登录后在云端与本机之间无缝同步。</p>
+        <h1>企业级AI协作研发平台</h1>
         <ul class="auth-brand__features">
           <li><ThunderboltOutlined /> 多智能体协作与完整研发闭环</li>
           <li><CloudServerOutlined /> 工作区、会话与任务跨端同步</li>
@@ -495,18 +494,11 @@ function sendLabel(purpose: "register" | "forgot_password"): string {
 .auth-brand h1 {
   position: relative;
   margin: 48px 0 14px;
-  font-size: 28px;
+  font-size: 22px;
   line-height: 1.35;
   font-weight: 700;
   letter-spacing: 0.5px;
-}
-
-.auth-brand p {
-  position: relative;
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.8;
-  color: var(--auth-brand-soft, rgba(74, 36, 27, 0.72));
+  white-space: nowrap;
 }
 
 .auth-brand__features {
