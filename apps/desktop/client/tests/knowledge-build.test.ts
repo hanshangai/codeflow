@@ -1503,10 +1503,31 @@ test("独立复检不采用同一确切草稿后，原任务和轻量草稿状�
   assert.equal(service.preview(review.id).items[0]?.dismissed, true);
   assert.equal(store.detail("a").drafts.length, 0);
   assert.equal(store.snapshot().states[0]?.draftCount, 0);
+  assert.equal(store.snapshot().latestRevisionIds?.a, revisionId, "最新版本不采用后仍保留其身份");
   assert.equal(store.readRun(review.id).dismissals?.[0]?.fingerprint, result.items[0]!.maintenanceFingerprint);
   assert.equal(store.readRevision("a", revisionId).revision.id, revisionId, "版本历史仍保留");
   const newRun = begin(); service.start(newRun.id); await settle(service, newRun.id);
   assert.equal(service.preview(newRun.id).items[0]?.dismissed, false, "新版本不会被连带关闭");
+  assert.equal(store.snapshot().latestRevisionIds?.a, service.view(newRun.id).items[0]?.revisionId);
+});
+
+test("拒绝最新候选后复检回到正式版，旧候选仍可追溯", async t => {
+  const { service, store, begin } = fixture(t, engine([node("a")]));
+  store.saveTree({ schemaVersion: 2, instructions: "", nodes: [node("a")] }, null);
+  const formal = store.saveDocument({ nodeId: "a", expectedHash: null, content: "# 正式正文", origin: "manual", sources: [] });
+  const older = store.saveDocument({ nodeId: "a", expectedHash: store.currentHash("a"), content: "# 较早的草稿", origin: "manual", sources: [], adopt: false });
+  const run = begin({ mode: "batch", selectedNodeIds: ["a"], includeDescendants: false });
+  service.start(run.id);
+  const completed = await settle(service, run.id);
+  assert.equal(completed.phase, "completed", JSON.stringify(completed.error));
+  const latest = completed.items[0]!.revisionId!;
+  const reviews = new KnowledgeReviewStore(store);
+  assert.equal(reviews.snapshot("a", latest).targetRevisionId, latest);
+  await service.dismiss(run.id, "a", latest, "owner", service.preview(run.id).planHash);
+  assert.equal(store.detail("a").drafts.length, 0);
+  assert.equal(store.snapshot().states.find(state => state.nodeId === "a")?.draftCount, 0);
+  assert.equal(store.readRevision("a", older.id).revision.id, older.id);
+  assert.equal(reviews.snapshot("a", formal.id).targetRevisionId, formal.id);
 });
 
 test("自动项目发现遵守同来源不采用回执，人工重新构建仍可明确生成", async t => {

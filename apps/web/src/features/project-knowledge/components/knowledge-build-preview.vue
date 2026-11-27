@@ -10,9 +10,9 @@ import DiffViewer from "../../chat/components/diff-viewer.vue";
 import KnowledgeReviewReport from "./knowledge-review-report.vue";
 import { knowledgeAdoptionSelection, knowledgeSelectedNodes, knowledgeTreeRows } from "../knowledgeTreeModel";
 import type { KnowledgeDocumentContext } from "../knowledgeWorkTreeModel";
-import { knowledgeDocumentReviewActivity, knowledgeItemNeedsReview } from "../knowledgeReviewModel";
+import { knowledgeDocumentReviewActivity, knowledgeItemNeedsReview, knowledgeReviewNeedsSourceRefresh } from "../knowledgeReviewModel";
 
-const props = withDefaults(defineProps<{ workspaceId: string; context: ApiRequestContext; run: KnowledgeGenerationRunView; runs?: KnowledgeGenerationRunView[]; nodes?: KnowledgeAssetNode[]; canWrite: boolean; actionsBusy?: boolean; canStartTask?: boolean; embedded?: boolean; recoveryOnly?: boolean; suppliedPreview?: KnowledgeGenerationPreview | null; restrictionReason?: string | null; allowAdoption?: boolean; scopeNodeId?: string | null; focus?: { nodeId: string; revisionId?: string | null; report: boolean; selectOnly?: boolean } | null }>(), { allowAdoption: true, canStartTask: true });
+const props = withDefaults(defineProps<{ workspaceId: string; context: ApiRequestContext; run: KnowledgeGenerationRunView; runs?: KnowledgeGenerationRunView[]; nodes?: KnowledgeAssetNode[]; canWrite: boolean; actionsBusy?: boolean; canStartTask?: boolean; embedded?: boolean; recoveryOnly?: boolean; suppliedPreview?: KnowledgeGenerationPreview | null; restrictionReason?: string | null; allowAdoption?: boolean; scopeNodeId?: string | null; focus?: { nodeId: string; revisionId?: string | null; selectOnly?: boolean } | null }>(), { allowAdoption: true, canStartTask: true });
 const emit = defineEmits<{ changed: [run: KnowledgeGenerationRunView]; busy: [value: boolean]; openFile: [path: string]; review: [nodeId: string]; refreshSources: [context: KnowledgeDocumentContext]; resumeReview: [context: KnowledgeDocumentContext]; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView, runId: string]; error: [error: unknown, context: { runId: string; nodeId: string | null }] }>();
 const preview = shallowRef<KnowledgeGenerationPreview | null>(null);
 const selected = ref<string[]>([]), selectedId = ref<string | null>(null);
@@ -21,7 +21,7 @@ const reports = shallowRef<KnowledgeReviewReportView[]>([]);
 const reportsLoading = ref(false);
 const reportsReadError = ref<string | null>(null);
 const loading = ref(false), reading = ref(false), saving = ref(false), errorText = ref("");
-const previewTab = ref<"diff" | "document" | "report">(props.embedded ? "diff" : "document");
+const view = defineModel<"diff" | "document" | "report">("view", { default: "document" });
 const updateView = shallowRef<KnowledgeUpdateView | null>(null);
 const maintenanceEnabled = ref(true), maintenanceTime = ref("03:00");
 const maintenancePending = ref(false);
@@ -61,18 +61,19 @@ const currentItem = computed(() => selectedId.value ? items.value.get(selectedId
 const executionItem = computed(() => props.run.items.find(item => item.nodeId === selectedId.value && item.revisionId === document.value?.revision.id));
 const latestReport = computed(() => [...reports.value].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0]);
 /** 生成证据已过期时必须交付新候选，单独复检不能更新不可变版本。 */
-const sourceRefreshRequired = computed(() => Boolean(document.value && !productDocument.value && currentItem.value?.reasonCode === "KNOWLEDGE_ASSET_SOURCE_CHANGED"));
+const sourceRefreshRequired = computed(() => Boolean(document.value && !productDocument.value
+  && (currentItem.value ? currentItem.value.reasonCode === "KNOWLEDGE_ASSET_SOURCE_CHANGED" : knowledgeReviewNeedsSourceRefresh(executionItem.value))));
 const readyToAdopt = computed(() => Boolean(currentItem.value?.canApply && !currentItem.value.applied && !currentItem.value.dismissed));
 const readyMessage = computed(() => latestReport.value?.outcome === "passed_with_warnings" ? "复检通过，可采用此版本；提醒不阻断采用。" : "此版本已就绪，可确认采用。");
 const documentActivity = computed(() => node.value && document.value ? knowledgeDocumentReviewActivity(props.runs ?? [props.run], node.value.id, document.value.revision.id) : null);
 const reviewBusy = computed(() => saving.value || props.actionsBusy || props.run.active || Boolean(documentActivity.value) || Boolean(pendingApply.value));
 /** 重新复检只避开本文档正被处理的情况，原任务处理其他知识时不阻塞。 */
 const restartReviewBusy = computed(() => saving.value || props.actionsBusy || Boolean(documentActivity.value) || Boolean(pendingApply.value));
-const canResumeReview = computed(() => ["build", "batch", "review"].includes(props.run.mode) && Boolean(executionItem.value && knowledgeItemNeedsReview(executionItem.value)));
+const canResumeReview = computed(() => !sourceRefreshRequired.value && ["build", "batch", "review"].includes(props.run.mode) && Boolean(executionItem.value && knowledgeItemNeedsReview(executionItem.value)));
 const canReviewVersion = computed(() => document.value?.revision.id === (detail.value?.drafts[0]?.id ?? detail.value?.current?.revision.id));
 /** 用简短状态指引当前候选的下一步，具体问题保留在复检报告。 */
 const reviewGuidance = computed(() => {
-  if (!document.value || !(currentItem.value?.reason || props.restrictionReason) || currentItem.value?.applied || currentItem.value?.dismissed) return null;
+  if (!document.value || !(currentItem.value?.reason || props.restrictionReason || sourceRefreshRequired.value) || currentItem.value?.applied || currentItem.value?.dismissed) return null;
   if (sourceRefreshRequired.value) return currentItem.value?.reason ?? "生成来源已变化，请更新候选并复检；原版本会保留。";
   if (reportsLoading.value) return "正在读取复检结果…";
   if (reportsReadError.value) return "复检报告读取失败，请重新读取报告。";
@@ -218,7 +219,6 @@ async function selectNode(nodeId: string | null): Promise<void> {
   selectedId.value = nodeId;
   detail.value = null; document.value = null; reports.value = []; reportsReadError.value = null;
   reportsLoading.value = false;
-  previewTab.value = props.focus?.nodeId === nodeId && props.focus.report ? "report" : props.embedded ? "diff" : "document";
   const current = ++detailGeneration, parent = generation, signal = controller?.signal, runId = props.run.id, workspaceId = props.workspaceId;
   if (!nodeId) { reading.value = false; return; }
   reading.value = true;
@@ -475,29 +475,35 @@ defineExpose({ hasRecovery: () => Boolean(pendingApply.value || maintenancePendi
       <div class="preview-content">
         <a-spin v-if="reading" class="preview-loading" />
         <template v-else-if="node">
-          <div class="preview-toolbar"><h3 :title="node.title">{{ node.title }}</h3><p v-if="specificationPaths !== null" class="specification-scope" :title="specificationPaths.join('、')">规格适用范围：{{ specificationPaths.length ? specificationPaths.join('、') : '整个项目' }}</p><span v-if="currentItem?.applied">已采用</span></div>
-          <a-alert v-if="documentActivity || readyToAdopt || (currentItem?.reason || restrictionReason) && !currentItem?.applied" class="review-notice" :type="documentActivity ? 'info' : readyToAdopt ? 'success' : 'warning'" :role="documentActivity || readyToAdopt ? 'status' : 'alert'" :aria-busy="Boolean(documentActivity)" show-icon data-testid="knowledge-review-notice">
+          <div class="preview-toolbar">
+            <h3 :title="node.title">{{ node.title }}</h3>
+            <p v-if="specificationPaths !== null" class="specification-scope" :title="specificationPaths.join('、')">规格适用范围：{{ specificationPaths.length ? specificationPaths.join('、') : '整个项目' }}</p>
+            <span v-if="currentItem?.applied">已采用</span>
+            <a-button v-if="embedded && document && node.contentMode !== 'reference'" size="small" type="link" class="candidate-reading-action" @click="view = view === 'document' ? 'diff' : 'document'">{{ view === 'document' ? '返回对比' : '查看候选全文' }}</a-button>
+          </div>
+          <a-alert v-if="documentActivity || readyToAdopt || (currentItem?.reason || restrictionReason || sourceRefreshRequired) && !currentItem?.applied" class="review-notice" :type="documentActivity ? 'info' : readyToAdopt ? 'success' : 'warning'" :role="documentActivity || readyToAdopt ? 'status' : 'alert'" :aria-busy="Boolean(documentActivity)" show-icon data-testid="knowledge-review-notice">
             <template v-if="documentActivity" #icon><LoadingOutlined spin aria-hidden="true" /></template>
             <template #message>
               <div class="review-notice-row">
                 <span class="review-notice-text" :title="reportsReadError ?? executionItem?.review?.error?.message ?? currentItem?.reason ?? undefined">{{ documentActivity ?? (readyToAdopt ? readyMessage : reviewGuidance ?? currentItem?.reason ?? restrictionReason) }}</span>
-                <a-space v-if="!documentActivity && reviewGuidance && canResumeReview" wrap :size="6">
-                  <a-button v-if="canResumeReview && document" type="primary" size="small" :disabled="!canWrite || reviewBusy || reportsLoading || Boolean(reportsReadError)" @click="emit('resumeReview', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })">{{ executionItem?.review?.status === 'failed' ? '重试复检' : '继续复检' }}</a-button>
+                <a-space v-if="!documentActivity && reviewGuidance && document" wrap :size="6">
+                  <a-button v-if="sourceRefreshRequired && canStartTask" type="primary" size="small" :disabled="!canWrite || reviewBusy" @click="emit('refreshSources', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })">更新候选并复检</a-button>
+                  <a-button v-else-if="canResumeReview" type="primary" size="small" :disabled="!canWrite || reviewBusy || reportsLoading || Boolean(reportsReadError)" @click="emit('resumeReview', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })">{{ executionItem?.review?.status === 'failed' ? '重试复检' : '继续复检' }}</a-button>
                 </a-space>
               </div>
             </template>
           </a-alert>
-          <a-tabs v-if="document && node.contentMode !== 'reference'" v-model:active-key="previewTab" class="preview-tabs" size="small" :tab-bar-gutter="20" :tab-bar-style="{ margin: 0, padding: '0 12px' }" destroy-inactive-tab-pane>
-            <a-tab-pane v-if="embedded" key="diff" tab="变更">
+          <template v-if="document && node.contentMode !== 'reference'">
+            <div v-if="view === 'diff'" class="preview-pane">
               <div class="preview-body showing-diff"><div class="revision-diff"><DiffViewer :original="detail?.current?.content ?? ''" :modified="document.content" :inline="!detail?.current" file-path="knowledge-asset.md" /></div></div>
-            </a-tab-pane>
-            <a-tab-pane key="document" tab="完整内容">
+            </div>
+            <div v-else-if="view === 'document'" class="preview-pane">
               <div class="preview-body"><MarkdownContent :text="document.content" :workspace-id="workspaceId" /></div>
-            </a-tab-pane>
-            <a-tab-pane key="report" tab="复检报告">
-              <div class="preview-body"><a-spin v-if="reportsLoading" aria-label="正在加载复检报告" /><template v-else-if="reportsReadError"><a-alert type="error" show-icon message="复检报告读取失败" :description="reportsReadError" /><a-button size="small" @click="retryReports">重新读取报告</a-button></template><KnowledgeReviewReport v-else :reports="reports" :loading="false" :busy="reviewBusy" :restart-busy="restartReviewBusy || reportsLoading || Boolean(reportsReadError)" :can-write="canWrite" :can-start-task="canStartTask" :can-review-version="canReviewVersion" :can-repair="!productDocument" :source-refresh-required="sourceRefreshRequired" :pending="canResumeReview && executionItem?.review?.status === 'pending'" :failure="executionItem?.review?.error?.message" :generation-thread-id="executionItem?.executionThreadId" @review="emit('review', node.id)" @refresh-sources="emit('refreshSources', { nodeId: node.id, runId: run.id, revisionId: document.revision.id })" @repair="emit('repair', $event)" @repair-issue="(report, issue) => emit('repairIssue', report, issue)" @return-to-generation="emit('returnToGeneration', $event, run.id)" /></div>
-            </a-tab-pane>
-          </a-tabs>
+            </div>
+            <div v-else class="preview-pane">
+              <div class="preview-body"><a-spin v-if="reportsLoading" aria-label="正在加载复检报告" /><template v-else-if="reportsReadError"><a-alert type="error" show-icon message="复检报告读取失败" :description="reportsReadError" /><a-button size="small" @click="retryReports">重新读取报告</a-button></template><KnowledgeReviewReport v-else :reports="reports" :loading="false" :busy="reviewBusy" :restart-busy="restartReviewBusy || reportsLoading || Boolean(reportsReadError)" :can-write="canWrite" :can-start-task="canStartTask" :can-review-version="canReviewVersion" :can-repair="!productDocument" :source-refresh-required="sourceRefreshRequired" :pending="canResumeReview && executionItem?.review?.status === 'pending'" :failure="executionItem?.review?.error?.message" :generation-thread-id="executionItem?.executionThreadId" @review="emit('review', node.id)" @repair="emit('repair', $event)" @repair-issue="(report, issue) => emit('repairIssue', report, issue)" @return-to-generation="emit('returnToGeneration', $event, run.id)" /></div>
+            </div>
+          </template>
           <div v-else class="preview-body">
             <template v-if="node.contentMode === 'reference'"><div class="reference-status"><strong>实时引用 · {{ reference?.state === 'changed' ? '原文已变化' : reference ? '原文未变化' : '原文不可用' }}</strong><code>{{ node.reference?.path }}</code><a-button v-if="reference" type="link" size="small" @click="emit('openFile', reference.path)">打开原文</a-button><span v-if="reference">读取时间：{{ readAt }}</span></div><MarkdownContent v-if="reference" :text="reference.content" :workspace-id="workspaceId" :resource-file-path="reference.path" @open-workspace-file="emit('openFile', $event)" /><a-alert v-else type="error" message="未能读取实时原文，请重新打开预览重试。" /></template>
             <p v-else-if="node.contentMode === 'directory'" class="preview-empty">此目录用于组织知识，无需生成正文。</p>
@@ -522,11 +528,9 @@ defineExpose({ hasRecovery: () => Boolean(pendingApply.value || maintenancePendi
 .preview-tree-scroll, .preview-content { min-height: 0; min-width: 0; }
 .preview-tree-scroll { flex: 1 1 0; overflow: auto; }
 .preview-content { display: flex; flex-direction: column; overflow: hidden; overflow-wrap: anywhere; }
-.preview-content > :not(.preview-body):not(.preview-tabs) { flex-shrink: 0; }
-.preview-tabs { flex: 1 1 0; min-height: 0; min-width: 0; }
-.preview-tabs :deep(.ant-tabs-content-holder) { display: flex; min-height: 0; min-width: 0; overflow: hidden; }
-.preview-tabs :deep(.ant-tabs-content) { height: 100%; min-width: 0; }
-.preview-tabs :deep(.ant-tabs-tabpane) { display: flex; flex-direction: column; height: 100%; min-height: 0; min-width: 0; }
+.preview-content > :not(.preview-body):not(.preview-pane) { flex-shrink: 0; }
+.preview-pane { display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; min-width: 0; }
+.candidate-reading-action { margin-inline-start: auto; }
 .preview-body { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; padding: 12px 16px; }
 .preview-body.showing-diff { display: flex; overflow: hidden; padding: 0; }
 .preview-row { display: flex; align-items: center; gap: 6px; padding: 4px 10px; min-width: 0; }

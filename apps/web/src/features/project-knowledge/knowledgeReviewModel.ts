@@ -27,8 +27,16 @@ export function knowledgeReviewLabel(item: KnowledgeGenerationItem): string {
   return item.review ? { pending: "待复检", repairing: "自动修订中", passed: "复检通过", passed_with_warnings: "复检通过（有提醒）", issues: item.review.round && item.review.maxRounds && item.review.round >= item.review.maxRounds ? `发现问题（已达 ${item.review.maxRounds} 轮）` : "发现问题", failed: "复检失败" }[item.review.status] : "未复检";
 }
 
+/** 识别生成依据过期。复检期间的读取漂移仍可以重试。 */
+export function knowledgeReviewNeedsSourceRefresh(item?: KnowledgeGenerationItem): boolean {
+  return item?.review?.error?.code === "KNOWLEDGE_ASSET_SOURCE_CHANGED"
+    && item.review.error.message.includes("生成时引用的来源已变化");
+}
+
+/** 已保存的候选仅在原复检可以继续时提供续跑。 */
 export function knowledgeItemNeedsReview(item: KnowledgeGenerationItem): boolean {
-  return item.status === "completed" && item.reviewConfig?.enabled !== false && Boolean(item.review && !item.review.stale && (item.review.status === "pending" || item.review.status === "failed"));
+  return item.status === "completed" && !knowledgeReviewNeedsSourceRefresh(item) && item.reviewConfig?.enabled !== false
+    && Boolean(item.review && !item.review.stale && (item.review.status === "pending" || item.review.status === "failed"));
 }
 
 export function knowledgeItemNeedsWork(item: KnowledgeGenerationItem): boolean {

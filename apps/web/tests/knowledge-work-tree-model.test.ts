@@ -75,6 +75,18 @@ test("不采用最后新文档后候选目录退出，正式文件和默认空�
   assert.equal(result.targetCount, 0);
 });
 
+test("同一文件只显示最后保存的候选，采用或不采用后旧版本不会补位", () => {
+  const previous = run([{ ...item("pending", "completed"), revisionId: "previous" }], "2026-09-24");
+  const latest = run([{ ...item("pending", "completed"), revisionId: "latest" }], "2026-09-23");
+  const revisions = { pending: "latest" };
+  assert.deepEqual(knowledgeLibraryTree(nodes, [], [previous, latest], [], revisions).updates.map(update => update.revisionId), ["latest"]);
+  const published = [{ nodeId: "pending", revisionId: "latest", draftCount: 1, error: null }];
+  assert.equal(knowledgeLibraryTree(nodes, published, [previous, latest], [], revisions).targetCount, 0);
+  latest.dismissals = [{ nodeId: "pending", revisionId: "latest", baseHash: null, fingerprint: "latest", userId: "user", createdAt: 1 }];
+  assert.equal(knowledgeLibraryTree(nodes, [], [previous, latest], [], revisions).targetCount, 0);
+  assert.deepEqual(knowledgeLibraryTree(nodes, [], [previous, latest], [], { pending: "previous" }).updates.map(update => update.revisionId), ["previous"]);
+});
+
 test("建议和生成共同计文档数，纯结构更新仍有独立数量和处理入口", () => {
   const directory = { ...node("root"), contentMode: "directory" as const };
   const candidate = { ...run([]), baseTree: { schemaVersion: 3 as const, instructions: "", nodes: [directory] }, proposedTree: { schemaVersion: 3 as const, instructions: "", nodes: [{ ...directory, summary: "新的目录说明" }] } };

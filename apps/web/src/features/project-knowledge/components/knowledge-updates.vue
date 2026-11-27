@@ -10,9 +10,10 @@ import type { KnowledgeDocumentContext, KnowledgeLibraryUpdate } from "../knowle
 import KnowledgeBuildPreview from "./knowledge-build-preview.vue";
 import KnowledgeChangeInbox from "./knowledge-change-inbox.vue";
 
-const props = defineProps<{ workspaceId: string; context: ApiRequestContext; nodes: KnowledgeAssetNode[]; formalNodes: KnowledgeAssetNode[]; runs: KnowledgeGenerationRunView[]; updates: KnowledgeLibraryUpdate[]; scopeNodeId: string | null; canWrite: boolean; actionsBusy?: boolean; indexLoading?: boolean; indexError?: string | null; changeId?: string | null; focusId?: string | null; focusRunId?: string; focusReport?: boolean; recoveryRunId?: string; retryIndex: () => Promise<void>; afterApply: (context: KnowledgeDocumentContext, count: number) => Promise<boolean> }>();
+const props = defineProps<{ workspaceId: string; context: ApiRequestContext; nodes: KnowledgeAssetNode[]; formalNodes: KnowledgeAssetNode[]; runs: KnowledgeGenerationRunView[]; updates: KnowledgeLibraryUpdate[]; scopeNodeId: string | null; canWrite: boolean; actionsBusy?: boolean; indexLoading?: boolean; indexError?: string | null; changeId?: string | null; focusId?: string | null; focusRunId?: string; recoveryRunId?: string; retryIndex: () => Promise<void>; afterApply: (context: KnowledgeDocumentContext, count: number) => Promise<boolean> }>();
+const view = defineModel<"diff" | "document" | "report">("view", { required: true });
 const emit = defineEmits<{ changed: [run?: KnowledgeGenerationRunView]; stopRun: [run: KnowledgeGenerationRunView]; focus: [id: string]; preview: [context: KnowledgeDocumentContext | null]; empty: [value: boolean]; close: []; openFile: [path: string]; recheck: [change: KnowledgeChangeDetail]; review: [nodeId: string]; refreshSources: [context: KnowledgeDocumentContext]; resumeReview: [context: KnowledgeDocumentContext]; repair: [report: KnowledgeReviewReportView]; repairIssue: [report: KnowledgeReviewReportView, issue: KnowledgeReviewIssue]; returnToGeneration: [report: KnowledgeReviewReportView, runId: string]; busy: [value: boolean]; error: [cause: unknown, context: Record<string, unknown>] }>();
-type Row = { id: string; nodeId: string; title: string; body: boolean; structure: boolean; generating: boolean; runId: string | null; revisionId: string | null; changeId: string | null; source: string; createdAt: string; reason: string | null; canApply: boolean };
+type Row = { id: string; nodeId: string; title: string; body: boolean; structure: boolean; generating: boolean; runId: string | null; revisionId: string | null; changeId: string | null; source: string; createdAt: string; orderTime: string; reason: string | null; canApply: boolean };
 const previews = shallowRef(new Map<string, KnowledgeGenerationPreview>());
 const changes = shallowRef<KnowledgeChangeSummary[]>([]);
 const validatedChanges = shallowRef(new Map<string, { hash: string; stale: boolean; reason: string }>());
@@ -32,8 +33,39 @@ let controller = new AbortController();
 const runMap = computed(() => new Map(props.runs.map(run => [run.id, run])));
 const scopeIds = computed(() => props.scopeNodeId ? new Set([props.scopeNodeId, ...knowledgeSelectedNodes(props.nodes, [props.scopeNodeId], true).map(node => node.id)]) : null);
 const scopeIsFile = computed(() => props.nodes.find(node => node.id === props.scopeNodeId)?.contentMode !== "directory" && Boolean(props.scopeNodeId));
+const scopedUpdates = computed(() => props.updates.filter(update => (!props.recoveryRunId || update.runId === props.recoveryRunId) && (!scopeIds.value || scopeIds.value.has(update.nodeId))));
+/** 独立复检沿用原正文的生成时间，避免复检旧版把旧版推到最新位置。 */
+const originTimes = computed(() => {
+  const origins = new Map<string, string>();
+  for (const run of props.runs) if (run.mode !== "review") {
+    for (const item of run.items) if (item.revisionId) {
+      const key = `${item.nodeId}:${item.revisionId}`;
+      const previous = origins.get(key);
+      if (!previous || run.createdAt < previous) origins.set(key, run.createdAt);
+    }
+  }
+  return origins;
+});
+/** 新 Client 提供确切版本时间，旧 Client 使用原生成任务时间。 */
+function updateTime(update: KnowledgeLibraryUpdate): string {
+  return previews.value.get(update.runId)?.items.find(item => item.nodeId === update.nodeId && item.revisionId === update.revisionId)?.revisionCreatedAt
+    ?? originTimes.value.get(`${update.nodeId}:${update.revisionId}`) ?? runMap.value.get(update.runId)?.createdAt ?? "";
+}
+const latestUpdates = computed(() => {
+  const latest = new Map<string, KnowledgeLibraryUpdate>();
+  for (const update of scopedUpdates.value) {
+    const previous = latest.get(update.nodeId);
+    const sameRevision = update.revisionId !== null && previous?.revisionId === update.revisionId;
+    if (!previous || (sameRevision
+      ? runMap.value.get(previous.runId)?.mode === "review" && runMap.value.get(update.runId)?.mode !== "review"
+      : updateTime(update) > updateTime(previous))) {
+      latest.set(update.nodeId, update);
+    }
+  }
+  return [...latest.values()];
+});
 const rows = computed<Row[]>(() => {
-  const generated = props.updates.filter(update => (!props.recoveryRunId || update.runId === props.recoveryRunId) && (!scopeIds.value || scopeIds.value.has(update.nodeId))).map(update => {
+  const generated = latestUpdates.value.map(update => {
     const run = runMap.value.get(update.runId), preview = previews.value.get(update.runId);
     const item = preview?.items.find(item => item.nodeId === update.nodeId);
     const node = props.nodes.find(node => node.id === update.nodeId) ?? preview?.tree.nodes.find(node => node.id === update.nodeId);
@@ -43,30 +75,36 @@ const rows = computed<Row[]>(() => {
     const generationItem = run?.items.find(candidate => candidate.nodeId === update.nodeId && candidate.revisionId === update.revisionId);
     const review = (generationItem?.reviewConfig ?? run?.reviewConfig)?.enabled === false ? null : generationItem?.review;
     const reviewReason = review?.stale ? "复检依据已变化，请重新复检。" : review?.status === "issues" ? "正文尚未通过复检，请查看报告并修订。" : review?.status === "failed" ? "复检失败，请查看报告并重试。" : review?.status === "pending" ? "正文已保存，尚待完成复检。" : null;
+    const orderTime = updateTime(update);
     return { ...update, id: `${update.id}:${update.revisionId ?? 'structure'}`, title: node?.title ?? update.nodeId,
-      changeId: null, source: run?.maintenance ? "自动维护" : run?.mode === "conversation" ? "规格对话" : "生成修订", createdAt: run?.createdAt ? new Date(run.createdAt).toLocaleString() : "",
+      changeId: null, source: run?.maintenance ? "自动维护" : run?.mode === "conversation" ? "规格对话" : "生成修订", orderTime, createdAt: orderTime ? new Date(orderTime).toLocaleString() : "",
       reason: pending ? "有未完成采用，请恢复原清单或终止" : reviewActivity ?? (run?.active ? update.generating ? "生成中" : `${reviewReason ?? ''}本批任务仍在运行，结束或停止后才可采用。` : legacyPlan ? "历史目录计划，请重新构建" : item?.applied ? update.structure ? "正文已采用，结构变化需要重新构建" : "已采用" : item?.dismissed ? "本次不采用" : item?.reason ?? reviewReason ?? (!preview ? "正在核对采用条件" : null)),
       canApply: Boolean(!pending && !legacyPlan && !run?.active && !reviewActivity && item?.canApply && !item.applied && !item.dismissed) };
   }).filter(row => row.reason !== "已采用" && row.reason !== "本次不采用");
   const proposals = changes.value.filter(change => !props.recoveryRunId && (!scopeIds.value || scopeIds.value.has(change.nodeId))).map(change => {
     const check = validatedChanges.value.get(change.id);
     return { id: `change:${change.id}`, nodeId: change.nodeId, title: change.title, body: true, structure: false, generating: false, runId: null, revisionId: null,
-      changeId: change.id, source: change.origin === "workflow" ? "流程会话" : "普通会话", createdAt: new Date(change.createdAt).toLocaleString(),
+      changeId: change.id, source: change.origin === "workflow" ? "流程会话" : "普通会话", orderTime: change.createdAt, createdAt: new Date(change.createdAt).toLocaleString(),
       reason: !check ? "查看内容后核对采用条件" : check.stale ? check.reason : null, canApply: Boolean(check && !check.stale) };
   });
-  return [...generated, ...proposals];
+  const latest = new Map<string, Row>(generated.map(row => [row.nodeId, row]));
+  for (const proposal of proposals) {
+    const previous = latest.get(proposal.nodeId);
+    if (!previous || proposal.changeId === props.changeId || previous.changeId !== props.changeId && proposal.orderTime > previous.orderTime) {
+      latest.set(proposal.nodeId, proposal);
+    }
+  }
+  return [...latest.values()];
 });
 const active = computed(() => operationRow.value ?? rows.value.find(row => row.id === activeId.value));
-const allGenerating = computed(() => rows.value.length > 0 && rows.value.every(row => row.generating));
 const activeRun = computed(() => operationRun.value ?? (active.value?.runId ? runMap.value.get(active.value.runId) : props.recoveryRunId ? runMap.value.get(props.recoveryRunId) : null));
 const activeReviewActivity = computed(() => active.value ? knowledgeDocumentReviewActivity(props.runs, active.value.nodeId, active.value.revisionId) : null);
 const activeIdentity = computed(() => active.value ? JSON.stringify([active.value.nodeId, active.value.revisionId]) : null);
-const activeFocus = computed(() => { const identity = activeIdentity.value ? JSON.parse(activeIdentity.value) as [string, string | null] : null; return identity ? { nodeId: identity[0], revisionId: identity[1], report: Boolean(props.focusReport), selectOnly: true } : null; });
+const activeFocus = computed(() => { const identity = activeIdentity.value ? JSON.parse(activeIdentity.value) as [string, string | null] : null; return identity ? { nodeId: identity[0], revisionId: identity[1], selectOnly: true } : null; });
 const chosen = computed(() => rows.value.filter(row => selected.value.includes(row.id)));
 const documentCount = computed(() => new Set(rows.value.filter(row => row.body && !row.generating).map(row => row.nodeId)).size);
 const generatingCount = computed(() => new Set(rows.value.filter(row => row.body && row.generating).map(row => row.nodeId)).size);
 const structureCount = computed(() => new Set(rows.value.filter(row => row.structure && !row.generating).map(row => row.nodeId)).size);
-const multiple = computed(() => active.value && rows.value.filter(row => row.nodeId === active.value!.nodeId).length > 1);
 /** 单文件隐藏清单时也显示采用阻断原因；运行锁与复检资格分别说明。 */
 const adoptionRestriction = computed(() => {
   if (!props.canWrite) return "当前为只读状态，需要维护权限才能采用。";
@@ -74,7 +112,7 @@ const adoptionRestriction = computed(() => {
   if (locked.value) return "正在处理当前操作，请稍候。";
   if (active.value?.reason && !active.value.canApply) return active.value.reason;
   if (props.actionsBusy) return "任务或会话仍在处理，完成后才能采用。";
-  if (scopeIsFile.value && !active.value) return "请选择一个候选版本后再采用。";
+  if (scopeIsFile.value && !active.value?.canApply) return "当前文档暂无可采用的更新。";
   if (!scopeIsFile.value && !chosen.value.length) return "请勾选可采用的更新。";
   return null;
 });
@@ -89,12 +127,10 @@ function fail(cause: unknown, context: Record<string, unknown> = {}): void {
   emit("error", cause, context);
 }
 
-/** 目录只限定清单；多个同文件候选不自动选择最新版本。 */
+/** 自动勾选可采用的文档，保留用户主动取消的选择。 */
 function defaults(): void {
   const previous = new Set(selected.value);
-  const counts = new Map<string, number>();
-  for (const row of rows.value) counts.set(row.nodeId, (counts.get(row.nodeId) ?? 0) + 1);
-  selected.value = rows.value.filter(row => row.canApply && counts.get(row.nodeId) === 1
+  selected.value = rows.value.filter(row => row.canApply
     && (!touchedNodes.has(row.nodeId) || previous.has(row.id))
     && (row.body || !row.structure || Boolean(row.runId && runMap.value.get(row.runId)?.baseTree?.nodes.some(node => node.id === row.nodeId))))
     .map(row => row.id);
@@ -105,7 +141,7 @@ function focusCandidate(): void {
   if (activeId.value && rows.value.some(row => row.id === activeId.value)) return;
   const requested = props.changeId ? rows.value.find(row => row.changeId === props.changeId) : props.focusRunId ? rows.value.find(row => row.runId === props.focusRunId) : rows.value.find(row => row.id === props.focusId);
   const first = rows.value[0];
-  activeId.value = props.changeId || props.focusId || props.focusRunId ? requested?.id ?? null : first && rows.value.filter(row => row.nodeId === first.nodeId).length === 1 ? first.id : null;
+  activeId.value = requested?.id ?? (props.changeId || props.focusRunId ? null : first?.id ?? null);
 }
 
 /** 先读正文再核对采用条件；只在读取成功后通知空态，失败不伪装成暂无更新。 */
@@ -118,9 +154,9 @@ async function load(): Promise<void> {
   focusCandidate();
   try {
     await nextTick();
-    await buildRef.value?.whenReady();
+    if (scopedUpdates.value.length === 1 && rows.value.length === 1) await buildRef.value?.whenReady();
     if (ticket !== epoch) return;
-    const ids = [...new Set(props.updates.filter(update => (!props.recoveryRunId || update.runId === props.recoveryRunId) && (!scopeIds.value || scopeIds.value.has(update.nodeId))).map(update => update.runId))];
+    const ids = [...new Set(scopedUpdates.value.map(update => update.runId))];
     const plans = await Promise.all(ids.filter(id => !runMap.value.get(id)?.active).map(async id => {
       const result = await requestKnowledgeAsset(props.context, "run.preview", { workspaceId: props.workspaceId, runId: id }, { signal: controller.signal });
       if (!result.ok) throw createApiResultError(result);
@@ -166,7 +202,7 @@ function validateChange(change: { id: string; nodeId: string; hash?: string; sta
   if (!change.hash) return;
   validatedChanges.value = new Map(validatedChanges.value).set(change.id, { hash: change.hash, stale: Boolean(change.stale), reason: change.reason ?? "依据已变化" });
   const row = rows.value.find(row => row.changeId === change.id);
-  if (row && row.canApply && !touchedNodes.has(row.nodeId) && rows.value.filter(candidate => candidate.nodeId === row.nodeId).length === 1 && !locked.value) toggle(row, true, false);
+  if (row?.canApply && !touchedNodes.has(row.nodeId) && !locked.value) toggle(row, true, false);
 }
 
 /** 显式选择才离开失败恢复上下文，保持当前草稿和采用回执可见。 */
@@ -188,7 +224,7 @@ function structureSignature(plan: KnowledgeGenerationPreview, ids: string[]): st
 
 /** 逐组采用后等待页面衔接；失败保留预览，后续组不再提交。 */
 async function applyRows(targets: Row[]): Promise<void> {
-  if (locked.value || !props.canWrite || !targets.length) return;
+  if (loading.value || props.indexLoading || props.indexError || errorText.value || locked.value || !props.canWrite || !targets.length) return;
   const ticket = epoch;
   const frozen = targets.map(row => ({ ...row }));
   const anchor = frozen.find(row => row.id === activeId.value && row.body) ?? frozen.find(row => row.body) ?? frozen.find(row => row.id === activeId.value) ?? frozen[0]!;
@@ -357,6 +393,7 @@ watch(() => props.focusId, id => {
   if (locked.value || !id || id === activeId.value) return;
   operationRow.value = null; operationRun.value = null;
   activeId.value = rows.value.find(row => row.id === id)?.id ?? null;
+  focusCandidate();
 });
 /** 独立复检开始或结束时重新核对资格，阶段变化不打断当前正文。 */
 watch(() => JSON.stringify(props.updates.map(update => [update.id, update.revisionId, update.body, update.structure, update.generating, runMap.value.get(update.runId)?.active, Boolean(knowledgeDocumentReviewActivity(props.runs, update.nodeId, update.revisionId))])), () => { if (!saving.value) void load(); });
@@ -367,25 +404,30 @@ watch(() => !loading.value && !props.indexLoading && !props.indexError && !error
 
 <template>
   <section class="knowledge-updates" data-testid="knowledge-updates">
-    <header class="updates-heading"><div><strong>{{ recoveryRunId ? '恢复未完成操作' : allGenerating ? '生成中' : '待确认更新' }}</strong><span v-if="documentCount">{{ documentCount }} 篇文档</span><span v-if="generatingCount">{{ generatingCount }} 篇文档生成中</span><span v-if="structureCount">另含 {{ structureCount }} 项结构调整</span><span v-if="active" class="candidate-status" :class="{ generating: active.generating }">{{ active.generating ? '生成中' : active.reason === '已采用' ? '已采用，已生效' : '尚未采用，未生效' }}{{ multiple ? ' · 请选择候选版本' : '' }}</span></div></header>
+    <header v-if="recoveryRunId || active?.reason === '已采用'" class="updates-heading">
+      <strong v-if="recoveryRunId">恢复未完成操作</strong>
+      <strong v-else class="candidate-status">已采用，已生效</strong>
+    </header>
     <a-alert v-if="errorText || indexError" type="error" show-icon :message="indexError || errorText"><template #action><a-button size="small" :loading="retrying" :disabled="loading || indexLoading || locked || actionsBusy" @click="retryRead">重新读取</a-button></template></a-alert>
     <a-alert v-if="outcome" :type="errorText ? 'warning' : 'success'" show-icon :message="outcome" />
     <a-spin v-if="(loading || indexLoading) && !active" class="updates-loading" />
-    <div v-else class="updates-layout" :class="{ 'single-file': !rows.length || scopeIsFile && rows.length === 1 }">
-      <aside v-if="rows.length && (!scopeIsFile || rows.length !== 1)" class="update-list" aria-label="待确认更新清单">
+    <div v-else class="updates-layout" :class="{ 'single-file': !rows.length || scopeIsFile }">
+      <aside v-if="rows.length && !scopeIsFile" class="update-list" aria-label="待确认更新清单">
+        <header class="updates-heading"><div><strong v-if="documentCount">{{ documentCount }} 篇文档</strong><span v-if="generatingCount">{{ generatingCount }} 篇文档生成中</span><span v-if="structureCount">{{ documentCount ? '另含 ' : '' }}{{ structureCount }} 项结构调整</span></div></header>
         <label v-for="row in rows" :key="row.id" class="update-row" :class="{ selected: activeId === row.id }"><input type="checkbox" :aria-label="`采用 ${row.title} · ${row.source} · ${row.createdAt}`" :checked="selected.includes(row.id)" :disabled="!canWrite || locked || !row.canApply" @change="toggle(row, ($event.target as HTMLInputElement).checked)"><button type="button" :disabled="locked" @click="selectRow(row)"><strong>{{ row.title }}</strong><small>{{ row.source }} · {{ row.createdAt }} · {{ row.generating ? '生成中' : row.structure ? row.body ? '正文与结构调整' : '结构调整' : '尚未采用' }}</small><span v-if="row.reason" class="row-reason" :class="{ generating: row.generating }">{{ row.reason }}</span></button></label>
       </aside>
       <div class="update-content">
-        <KnowledgeBuildPreview v-if="activeRun && (!activeRun.active || activeReviewActivity || active?.revisionId && !active.generating)" :key="active?.id ?? activeRun.id" ref="buildRef" embedded :recovery-only="!active" :workspace-id="workspaceId" :context="context" :run="activeRun" :runs="runs" :nodes="nodes" :supplied-preview="previews.get(activeRun.id)" :restriction-reason="active?.reason" :can-write="canWrite" :actions-busy="locked || actionsBusy" :can-start-task="formalNodes.some(node => node.id === active?.nodeId)" :scope-node-id="active?.nodeId" :focus="activeFocus" @busy="childLock" @changed="receiveRun" @open-file="emit('openFile', $event)" @review="emit('review', $event)" @refresh-sources="emit('refreshSources', $event)" @resume-review="emit('resumeReview', $event)" @repair="emit('repair', $event)" @repair-issue="(report, issue) => emit('repairIssue', report, issue)" @return-to-generation="(report, runId) => emit('returnToGeneration', report, runId)" @error="(cause, context) => fail(cause, context)" />
-        <KnowledgeChangeInbox v-else-if="active?.changeId" :key="active.changeId" ref="changeRef" embedded :workspace-id="workspaceId" :context="context" :can-write="canWrite" :change-id="active.changeId" @recheck="emit('recheck', $event)" @selected="validateChange" @changed="emit('changed')" />
+        <KnowledgeBuildPreview v-if="activeRun && (!activeRun.active || activeReviewActivity || active?.revisionId && !active.generating)" :key="active?.id ?? activeRun.id" ref="buildRef" v-model:view="view" embedded :recovery-only="!active" :workspace-id="workspaceId" :context="context" :run="activeRun" :runs="runs" :nodes="nodes" :supplied-preview="previews.get(activeRun.id)" :restriction-reason="active?.reason" :can-write="canWrite" :actions-busy="locked || actionsBusy" :can-start-task="formalNodes.some(node => node.id === active?.nodeId)" :scope-node-id="active?.nodeId" :focus="activeFocus" @busy="childLock" @changed="receiveRun" @open-file="emit('openFile', $event)" @review="emit('review', $event)" @refresh-sources="emit('refreshSources', $event)" @resume-review="emit('resumeReview', $event)" @repair="emit('repair', $event)" @repair-issue="(report, issue) => emit('repairIssue', report, issue)" @return-to-generation="(report, runId) => emit('returnToGeneration', report, runId)" @error="(cause, context) => fail(cause, context)" />
+        <KnowledgeChangeInbox v-else-if="active?.changeId" v-show="view !== 'report'" :key="active.changeId" ref="changeRef" embedded :workspace-id="workspaceId" :context="context" :can-write="canWrite" :change-id="active.changeId" @recheck="emit('recheck', $event)" @selected="validateChange" @changed="emit('changed')" />
         <div v-else-if="active && activeRun?.active" class="updates-processing" role="status" aria-live="polite" aria-busy="true"><a-spin size="large" aria-hidden="true" /><span>{{ active.reason }}</span></div>
         <div v-else-if="!rows.length && !errorText && !indexError" class="updates-empty"><h3>暂无待确认更新</h3><p>从项目整理或通过规格对话补充要求后，更新会出现在这里。</p></div>
-        <p v-else-if="rows.length" class="updates-empty">{{ active?.reason || '选择具体更新查看内容与对比。多个版本不会自动取最新。' }}</p>
+        <p v-else-if="rows.length" class="updates-empty">{{ active?.reason || '请选择文档查看最新更新。' }}</p>
+        <p v-if="active?.changeId && view === 'report'" class="updates-empty">这份会话建议暂无复检报告。</p>
       </div>
     </div>
     <footer v-if="rows.length">
-      <div class="adoption-status"><span>已选 {{ chosen.length }} 项</span><span v-if="adoptionRestriction" role="status" data-testid="knowledge-adoption-restriction">{{ adoptionRestriction }}</span></div>
-      <div><a-button v-if="activeRun?.active && canWrite" :disabled="locked" @click="emit('stopRun', activeRun)">停止任务后处理</a-button><a-button :disabled="!canWrite || !active || loading || locked || actionsBusy" @click="dismiss">本次不采用</a-button><a-button v-if="scopeIsFile" type="primary" :title="adoptionRestriction ?? undefined" :disabled="!canWrite || !active?.canApply || loading || locked || actionsBusy" @click="active && applyRows([active])">采用此版本</a-button><a-button v-else type="primary" :title="adoptionRestriction ?? undefined" :disabled="!canWrite || !chosen.length || loading || locked || actionsBusy" :loading="saving" @click="applyRows(chosen)">采用所选内容</a-button></div>
+      <div class="adoption-status"><span v-if="!scopeIsFile">已选 {{ chosen.length }} 项</span><span v-if="adoptionRestriction" role="status" data-testid="knowledge-adoption-restriction">{{ adoptionRestriction }}</span><span v-else-if="scopeIsFile">待确认采用</span></div>
+      <div><a-button v-if="activeRun?.active && canWrite" :disabled="locked" @click="emit('stopRun', activeRun)">停止任务后处理</a-button><a-button :disabled="!canWrite || !active || loading || indexLoading || Boolean(indexError || errorText) || locked || actionsBusy" @click="dismiss">本次不采用</a-button><a-button v-if="scopeIsFile" type="primary" :title="adoptionRestriction ?? undefined" :disabled="Boolean(adoptionRestriction)" @click="active && applyRows([active])">采用此版本</a-button><a-button v-else type="primary" :title="adoptionRestriction ?? undefined" :disabled="loading || indexLoading || Boolean(indexError || errorText) || !canWrite || !chosen.length || locked || actionsBusy" :loading="saving" @click="applyRows(chosen)">采用所选内容</a-button></div>
     </footer>
   </section>
 </template>
@@ -404,8 +446,7 @@ watch(() => !loading.value && !props.indexLoading && !props.indexError && !error
 .update-row button { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 4px; text-align: left; border: 0; padding: 0; background: none; color: var(--app-text); cursor: pointer; overflow-wrap: anywhere; }
 .update-row strong { font-size: 12px; }.update-row small { color: var(--app-muted); font-size: 10px; }.row-reason { color: var(--app-warning); font-size: 11px; }
 .update-content { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
-.updates-heading .candidate-status { color: var(--app-warning); }
-.updates-heading .candidate-status.generating, .row-reason.generating { color: var(--app-accent); }
+.row-reason.generating { color: var(--app-accent); }
 .updates-processing { display: flex; flex-direction: column; align-items: center; gap: 16px; margin: auto; padding: 24px; color: var(--app-text); font-size: 16px; font-weight: 500; line-height: 1.6; text-align: center; }
 .updates-empty { margin: auto; padding: 20px; color: var(--app-muted); font-size: 12px; line-height: 1.7; }.updates-loading { margin: auto; }
 .updates-empty h3 { color: var(--app-text); margin: 0 0 8px; font-size: 16px; }.updates-empty p { margin: 0; }

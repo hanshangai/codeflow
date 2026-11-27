@@ -148,8 +148,8 @@ export function knowledgeDocumentSession(runs: KnowledgeGenerationRunView[], con
   return sessions[0] ?? null;
 }
 
-/** 复用任务事实区分生成与待确认；正式名称、位置和范围在采用前始终优先。 */
-export function knowledgeLibraryTree(nodes: KnowledgeAssetNode[], states: KnowledgeAssetNodeState[], runs: KnowledgeGenerationRunView[], changes: KnowledgePendingChangeNode[]) {
+/** 正式结构优先；已处理的最新正文仍占据版本位置，旧版不会回到待确认。 */
+export function knowledgeLibraryTree(nodes: KnowledgeAssetNode[], states: KnowledgeAssetNodeState[], runs: KnowledgeGenerationRunView[], changes: KnowledgePendingChangeNode[], latestRevisionIds?: Record<string, string>) {
   const official = new Map(nodes.filter(node => !node.archived).map(node => [node.id, node]));
   const all = new Map(official), updates: KnowledgeLibraryUpdate[] = [];
   const resultRuns = knowledgeResultRuns(runs).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -178,6 +178,8 @@ export function knowledgeLibraryTree(nodes: KnowledgeAssetNode[], states: Knowle
       && run.proposedTree?.nodes.some(candidate => candidate.id === node.id)) all.set(node.id, node);
     for (const target of result.targets) {
       const revisionId = run.items.find(item => item.nodeId === target.nodeId)?.revisionId ?? null;
+      const latestRevisionId = latestRevisionIds && Object.hasOwn(latestRevisionIds, target.nodeId) ? latestRevisionIds[target.nodeId] : undefined;
+      if (revisionId && latestRevisionId && revisionId !== latestRevisionId && !generatingUpdates.has(`${run.id}:${target.nodeId}`)) continue;
       const candidateNode = run.proposedTree?.nodes.find(node => node.id === target.nodeId);
       const baseline = run.baseTree?.nodes.find(node => node.id === target.nodeId) ?? nodes.find(node => node.id === target.nodeId);
       const structureChanged = Boolean(candidateNode && baseline && JSON.stringify(candidateNode) !== JSON.stringify(baseline)

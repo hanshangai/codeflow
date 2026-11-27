@@ -191,10 +191,11 @@ export class KnowledgeAssetStore {
     return manifest;
   }
 
+  /** 搜索优先使用尚待处理的最新版本，已处理时回到正式正文。 */
   private searchRevisionId(nodeId: string, includeDrafts: boolean): string | null {
     const pointer = this.pointer(nodeId);
     if (!includeDrafts) return pointer?.revisionId ?? null;
-    return this.pendingRevisions(this.revisions(nodeId).filter(revision => revision.id !== pointer?.revisionId))[0]?.id ?? pointer?.revisionId ?? null;
+    return this.pendingRevision(this.revisions(nodeId)[0], pointer?.revisionId)?.id ?? pointer?.revisionId ?? null;
   }
 
   /**
@@ -202,8 +203,8 @@ export class KnowledgeAssetStore {
    * 这里把 assets 目录一次读入内存，并在同一目录内读取 revision 元数据，
    * 保留越界校验，避免大树上成千上万次 lstat/realpath 往返。
    */
-  private readSnapshotStates(): { states: Map<string, KnowledgeAssetNodeState>; rootError: KnowledgeAssetNodeState["error"] } {
-    const result = new Map<string, KnowledgeAssetNodeState>();
+  private readSnapshotStates(): { states: Map<string, KnowledgeAssetNodeState & { latestRevisionId?: string }>; rootError: KnowledgeAssetNodeState["error"] } {
+    const result = new Map<string, KnowledgeAssetNodeState & { latestRevisionId?: string }>();
     const empty = (nodeId: string): KnowledgeAssetNodeState => ({ nodeId, revisionId: null, draftCount: 0, error: null });
     let assetsRoot: string;
     try { assetsRoot = this.files.resolve(`${this.root}/assets`); }
@@ -229,8 +230,8 @@ export class KnowledgeAssetStore {
     return { states: result, rootError: null };
   }
 
-  /** 从当前根的资产目录汇总正式版本及有效草稿。 */
-  private readSnapshotState(assetsRoot: string, nodeId: string): KnowledgeAssetNodeState {
+  /** 汇总正式版本、有效草稿数和最近保存的版本身份。 */
+  private readSnapshotState(assetsRoot: string, nodeId: string): KnowledgeAssetNodeState & { latestRevisionId?: string } {
     const assetRoot = path.join(assetsRoot, nodeId);
     const currentPath = path.join(assetRoot, "current.json");
     let pointer: { revisionId: string; revisionHash: string } | null = null;
@@ -255,9 +256,11 @@ export class KnowledgeAssetStore {
         revisions.push(revision);
       }
     }
-    const candidates = this.pendingRevisions(revisions.filter(revision => revision.id !== pointer?.revisionId));
+    const latest = revisions.reduce<KnowledgeAssetRevision | undefined>((previous, revision) =>
+      !previous || (revision.createdAt.localeCompare(previous.createdAt) || revision.id.localeCompare(previous.id)) > 0 ? revision : previous, undefined);
+    const candidate = this.pendingRevision(latest, pointer?.revisionId);
     // 只有存在候选版本时才读取正文和来源计算 currentHash。
-    const currentHash = pointer && candidates.length
+    const currentHash = pointer && candidate
       ? knowledgeHash(Buffer.concat([
         this.readSnapshotBytes(currentPath),
         this.readSnapshotBytes(path.join(revisionsRoot, pointer.revisionId, "revision.json")),
@@ -265,7 +268,7 @@ export class KnowledgeAssetStore {
         this.readSnapshotBytes(path.join(revisionsRoot, pointer.revisionId, "sources.json")),
       ]))
       : null;
-    return { nodeId, revisionId: pointer?.revisionId ?? null, draftCount: candidates.filter(revision => revision.baseHash === currentHash).length, error: null };
+    return { nodeId, revisionId: pointer?.revisionId ?? null, draftCount: candidate && candidate.baseHash === currentHash ? 1 : 0, error: null, latestRevisionId: latest?.id };
   }
 
   /** 快照批量读取：直接按绝对路径读，返回前按 LF 归一化行尾，保证这里的哈希与 currentHash 同口径。 */
@@ -315,12 +318,19 @@ export class KnowledgeAssetStore {
     const cached = this.snapshotCache.get(cacheKey);
     if (cached && cached.stamp === stamp && cached.expiresAt > Date.now()) return cached.value;
     const { tree, hash, knowledgeId: id } = this.readTree();
-    const { states: statesById, rootError } = includeStates ? this.readSnapshotStates() : { states: new Map<string, KnowledgeAssetNodeState>(), rootError: null };
+    const { states: statesById, rootError } = includeStates ? this.readSnapshotStates() : { states: new Map(), rootError: null };
+    const latestRevisionIds: Record<string, string> = Object.create(null);
+    const states = new Map<string, KnowledgeAssetNodeState>();
+    for (const [nodeId, { latestRevisionId, ...state }] of statesById) {
+      states.set(nodeId, state);
+      if (latestRevisionId) latestRevisionIds[nodeId] = latestRevisionId;
+    }
     const value: KnowledgeAssetsSnapshot = {
       initialized: hash !== null, knowledgeId: id, root: this.root, tree, treeHash: hash, canWrite,
       states: includeStates ? tree.nodes.map(node => node.contentMode === "directory" || node.contentMode === "reference"
         ? { nodeId: node.id, revisionId: null, draftCount: 0, error: null }
-        : statesById.get(node.id) ?? { nodeId: node.id, revisionId: null, draftCount: 0, error: rootError }) : [],
+        : states.get(node.id) ?? { nodeId: node.id, revisionId: null, draftCount: 0, error: rootError }) : [],
+      ...(includeStates ? { latestRevisionIds } : {}),
     };
     this.snapshotCache.set(cacheKey, { stamp, expiresAt: Date.now() + 250, value });
     return value;
@@ -600,18 +610,13 @@ export class KnowledgeAssetStore {
     }
     return null;
   }
-  /** 处理回执与任务最新交付决定待处理集合；不可变历史版本仍可显式读取。 */
-  private pendingRevisions(revisions: KnowledgeAssetRevision[]): KnowledgeAssetRevision[] {
-    const runs = new Map<string, KnowledgeGenerationRun>();
-    const dismissed = this.dismissedRevisions();
-    return revisions.filter(revision => {
-      if (dismissed.has(`${revision.nodeId}:${revision.id}`)) return false;
-      if (!revision.runId || !this.files.exists(`${this.root}/runs/${revision.runId}/plan.json`)) return true;
-      let run = runs.get(revision.runId);
-      if (!run) { run = this.readRun(revision.runId); runs.set(revision.runId, run); }
-      const latest = run.items.find(item => item.nodeId === revision.nodeId);
-      return !["build", "batch"].includes(run.mode) || !latest?.revisionId || latest.revisionId === revision.id;
-    });
+  /** 核对最近保存的版本是否待处理；处理回执只关闭对应版本。 */
+  private pendingRevision(revision: KnowledgeAssetRevision | undefined, currentId?: string): KnowledgeAssetRevision | undefined {
+    if (!revision || revision.id === currentId || this.dismissedRevisions().has(`${revision.nodeId}:${revision.id}`)) return;
+    if (!revision.runId || !this.files.exists(`${this.root}/runs/${revision.runId}/plan.json`)) return revision;
+    const run = this.readRun(revision.runId);
+    const latest = run.items.find(item => item.nodeId === revision.nodeId);
+    if (!["build", "batch"].includes(run.mode) || !latest?.revisionId || latest.revisionId === revision.id) return revision;
   }
   /** 同一确切正文可能经独立复检处理；该版本的回执对所有引用它的任务一致生效。 */
   dismissedRevisions(): Set<string> {
@@ -632,7 +637,7 @@ export class KnowledgeAssetStore {
     const sources = this.parseSources(this.files.json(`${root}/sources.json`), false);
     return { revision, content: content.toString("utf8"), sources, path: `${root}/content.md` };
   }
-  /** 返回正式正文或实时引用；引用读取失败直接交由调用边界报告，不返回历史缓存。 */
+  /** 返回正式正文或实时引用，以及仍可处理的最新草稿。 */
   detail(nodeId: string): KnowledgeAssetDetail {
     const tree = this.readTree().tree;
     const target = this.node(nodeId, tree);
@@ -656,7 +661,8 @@ export class KnowledgeAssetStore {
     const revisions = this.revisions(nodeId);
     const sourceRevision = current?.revision.origin === "manual"
       ? this.sourceRevision(nodeId, current.revision, revisions) : null;
-    return { node, current, sourceRevision, currentHash, drafts: this.pendingRevisions(revisions.filter(r => r.id !== pointer?.revisionId && r.baseHash === currentHash)), effectiveInstructions: this.effectiveInstructions(nodeId, tree), freshness };
+    const candidate = this.pendingRevision(revisions[0], pointer?.revisionId);
+    return { node, current, sourceRevision, currentHash, drafts: candidate && candidate.baseHash === currentHash ? [candidate] : [], effectiveInstructions: this.effectiveInstructions(nodeId, tree), freshness };
   }
 
   /** 保存完整版本；人工无变化保存复用正式版本，先校验基线，保留既有来源和生成要求。 */
@@ -760,8 +766,8 @@ export class KnowledgeAssetStore {
         if (this.ancestry(node.id).some(n => n.archived)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", `归档节点不能采用：${node.title}`);
         const pointer = this.pointer(node.id);
         const expectedHash = this.currentHash(node.id);
-        const revision = this.revisions(node.id).find(item => item.id !== pointer?.revisionId && item.baseHash === expectedHash);
-        if (!revision) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", `知识没有可采用的待采用版本：${node.title}`);
+        const revision = this.pendingRevision(this.revisions(node.id)[0], pointer?.revisionId);
+        if (!revision || revision.baseHash !== expectedHash) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", `知识没有可采用的待采用版本：${node.title}`);
         const document = this.readRevision(node.id, revision.id);
         this.assertStandaloneAdoption(document.revision);
         if (document.revision.baseHash !== expectedHash) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", `知识基础正文已变化，请重新生成：${node.title}`);

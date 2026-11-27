@@ -209,6 +209,8 @@ export type KnowledgeAssetsSnapshot = {
   tree: KnowledgeAssetTree;
   treeHash: string | null;
   states: KnowledgeAssetNodeState[];
+  /** 最近保存的正文身份，包含已采用、不采用及尚未入树的候选。 */
+  latestRevisionIds?: Record<string, string>;
   canWrite: boolean;
 };
 export type KnowledgeConversationSummary = {
@@ -228,7 +230,7 @@ export type KnowledgeGenerationMode = "tree" | "conversation" | "batch" | "revie
 export type KnowledgeGenerationSelection = { nodeId: string; revisionId: string | null };
 export type KnowledgeGenerationPreview = {
   runId: string; tree: KnowledgeAssetTree; treeHash: string | null; planHash: string;
-  items: Array<KnowledgeGenerationSelection & { canApply: boolean; reason: string | null; reasonCode?: string; applied: boolean; dismissed?: boolean }>;
+  items: Array<KnowledgeGenerationSelection & { revisionCreatedAt?: string; canApply: boolean; reason: string | null; reasonCode?: string; applied: boolean; dismissed?: boolean }>;
 };
 export type KnowledgeGenerationApplyInput = { requestId: string; treeHash: string | null; planHash: string; selections: KnowledgeGenerationSelection[] };
 /** 原任务中的采用清单先于正式写入保存，用于逐文件恢复。 */

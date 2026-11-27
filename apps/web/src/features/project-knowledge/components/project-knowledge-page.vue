@@ -34,7 +34,7 @@ import KnowledgeOverview from "./knowledge-overview.vue";
 import KnowledgeChangeInbox from "./knowledge-change-inbox.vue";
 import { knowledgeNodeHasBody, knowledgeSelectedNodes } from "../knowledgeTreeModel";
 import { knowledgeDocumentSession, knowledgeLibraryTree, type KnowledgeDocumentContext } from "../knowledgeWorkTreeModel";
-import { knowledgeDocumentReviewActivity, knowledgeItemNeedsReview, knowledgeItemNeedsRunWork, knowledgeReviewLabel } from "../knowledgeReviewModel";
+import { knowledgeDocumentReviewActivity, knowledgeItemNeedsReview, knowledgeItemNeedsRunWork, knowledgeReviewLabel, knowledgeReviewNeedsSourceRefresh } from "../knowledgeReviewModel";
 import { clearKnowledgePageCache, readKnowledgeNode, readKnowledgeSnapshot, rememberKnowledgeNode, rememberKnowledgeSnapshot } from "../knowledgePageCache";
 
 defineOptions({ name: "ProjectKnowledgePage" });
@@ -150,6 +150,7 @@ const nodeReports = ref<KnowledgeReviewReportView[]>([]);
 // 不需要让 Vue 为每个运行项建立深层响应式代理。
 const taskList = shallowRef<KnowledgeGenerationRunView[]>([]);
 const viewTab = ref<"node" | "sources" | "review">("node");
+const candidateView = ref<"diff" | "document" | "report">("diff");
 const activeRun = ref<KnowledgeGenerationRunView | null>(null);
 const executionSession = ref<{ threadId: ThreadId; title: string; kind: "知识工作会话" | "复检会话" } | null>(null);
 const executionSessionLoading = ref(false);
@@ -280,7 +281,7 @@ const snapshotStatesReady = computed(() => {
   const current = snapshot.value;
   return Boolean(current && (current.tree.nodes.length === 0 || current.states.length === current.tree.nodes.length));
 });
-const visibleWorkTree = computed(() => knowledgeLibraryTree(snapshot.value?.tree.nodes ?? [], snapshot.value?.states ?? [], taskList.value, pendingChangeNodes.value));
+const visibleWorkTree = computed(() => knowledgeLibraryTree(snapshot.value?.tree.nodes ?? [], snapshot.value?.states ?? [], taskList.value, pendingChangeNodes.value, snapshot.value?.latestRevisionIds));
 const visibleTreeNodes = computed(() => visibleWorkTree.value.nodes);
 const nodeMap = computed(() => new Map(visibleTreeNodes.value.map(item => [item.id, item])));
 /** 生成范围只接受正式树节点，待采用候选保留阅读和原任务修订入口。 */
@@ -349,18 +350,18 @@ function adjustableRunItems(run: KnowledgeGenerationRunView): KnowledgeGeneratio
   const ids = new Set(nodes.filter(node => !node.archived && knowledgeNodeHasBody(node)).map(node => node.id));
   const pending = run.items.filter(item => ids.has(item.nodeId) && item.status !== "completed");
   if (pending.length) return pending;
-  return run.items.filter(item => ids.has(item.nodeId) && item.status === "completed"
+  return run.items.filter(item => ids.has(item.nodeId) && item.status === "completed" && !knowledgeReviewNeedsSourceRefresh(item)
     && (item.reviewConfig ?? run.reviewConfig)?.enabled !== false
     && (item.review?.status === "pending" || item.review?.status === "failed"
       || knowledgeItemNeedsRunWork(item, run.mode as "batch" | "review" | "build", run.reviewConfig)));
 }
 /** 仅对可续跑的批任务展示恢复动作，已完成版本不重复执行。 */
 const summaryUnfinished = computed(() => summaryRun.value && ["batch", "review", "build"].includes(summaryRun.value.mode) && !summaryRun.value.active
-  && (["planned", "partial", "interrupted", "failed"].includes(summaryRun.value.phase ?? "")
+  && ((!summaryRun.value.items.length || summaryRun.value.items.some(item => !knowledgeReviewNeedsSourceRefresh(item))) && ["planned", "partial", "interrupted", "failed"].includes(summaryRun.value.phase ?? "")
     || summaryRun.value.items.some(item => knowledgeItemNeedsRunWork(item, summaryRun.value!.mode as "batch" | "review" | "build", summaryRun.value!.reviewConfig))));
 /** 调整入口仅面向原任务中确实存在的未完成知识。 */
 const summaryAdjustable = computed(() => Boolean(summaryRun.value && summaryUnfinished.value && adjustableRunItems(summaryRun.value).length));
-const summaryFailed = computed(() => summaryRun.value?.items.some(item => item.status === "failed" || item.review?.status === "failed") ?? false);
+const summaryFailed = computed(() => summaryRun.value?.items.some(item => !knowledgeReviewNeedsSourceRefresh(item) && (item.status === "failed" || item.review?.status === "failed")) ?? false);
 const readyCount = computed(() => snapshot.value?.tree.nodes.filter(item => !item.archived && (statesById.value.get(item.id)?.revisionId || item.contentMode === "reference")).length ?? 0);
 const draftCount = computed(() => visibleWorkTree.value.pendingCount);
 const emptyCount = computed(() => {
@@ -872,8 +873,7 @@ async function readNode(id: string, preferCurrent = false): Promise<boolean> {
     if (!isCurrent(epoch, scope) || requestEpoch !== nodeEpoch || readingNodeId.value !== id || editing.value) return false;
     detail.value = loaded;
     if (!knowledgeNodeHasBody(loaded.node)) { previewDocument.value = null; previewRevisionId.value = null; nodeReports.value = []; return true; }
-    const revisions = [loaded.current?.revision, ...loaded.drafts].filter(item => item != null);
-    const target = preferCurrent ? loaded.current?.revision.id ?? null : revisions.some(item => item.id === previewRevisionId.value) ? previewRevisionId.value : loaded.current?.revision.id ?? (loaded.drafts.length === 1 ? loaded.drafts[0]!.id : null);
+    const target = loaded.current?.revision.id ?? (preferCurrent ? null : loaded.drafts[0]?.id ?? null);
     await Promise.all([viewRevision(target, false), readReports(id)]);
     return isCurrent(epoch, scope) && requestEpoch === nodeEpoch && readingNodeId.value === id && !reportsReadError.value && (!target || previewDocument.value?.revision.id === target);
   } catch (error) {
@@ -1052,6 +1052,7 @@ async function openUpdates(scopeNodeId: string | null = selectedId.value): Promi
   showProjectConversation.value = keepDiscussion;
   overviewOpen.value = false;
   updatesTarget.value = { scopeNodeId }; selectedChangeId.value = null;
+  candidateView.value = "diff";
   if (narrowScreen.value) { treeOpen.value = false; if (!keepDiscussion) assistantOpen.value = false; }
   return true;
 }
@@ -1065,13 +1066,19 @@ async function closeUpdates(): Promise<void> {
   overviewOpen.value = route.query.view === "overview" || route.query.view !== "assets" && !readingNodeId.value;
 }
 
-/** 主工作区Tab保留文档选择，在文档与待确认清单间切换。 */
-async function setWorkspaceView(view: "document" | "updates"): Promise<void> {
-  if (view === "updates") {
-    if (!showUpdates.value) await openUpdates(selectedId.value);
+/** 主栏直接切换文档、候选对比和对应的复检报告。 */
+async function setWorkspaceView(view: "document" | "diff" | "report"): Promise<void> {
+  if (view === "report" && !showUpdates.value && !currentUpdatesCount.value) {
+    await setContentView("review");
+    return;
+  }
+  if (view !== "document") {
+    if (!showUpdates.value && !await openUpdates(selectedId.value)) return;
+    candidateView.value = view;
     return;
   }
   if (showUpdates.value) await closeUpdates();
+  if (!showUpdates.value && viewTab.value === "review") await setContentView("node");
 }
 
 /** Tab列表使用左右方向键循环切换，并与点击复用相同的编辑保护。 */
@@ -1296,7 +1303,7 @@ function preserveSelectedTree(current: KnowledgeAssetsSnapshot | null, loaded: K
   if (!current || current.root !== loaded.root || !intent || !current.tree.nodes.some(item => item.id === intent && !item.archived) || loaded.tree.nodes.some(item => item.id === intent && !item.archived)) return null;
   const loadedStates = new Map(loaded.states.map(state => [state.nodeId, state]));
   const currentStates = new Map(current.states.map(state => [state.nodeId, state]));
-  return { ...current, canWrite: loaded.canWrite, states: current.tree.nodes.map(item => loadedStates.get(item.id) ?? currentStates.get(item.id) ?? { nodeId: item.id, revisionId: null, draftCount: 0, error: null }) };
+  return { ...current, canWrite: loaded.canWrite, latestRevisionIds: loaded.latestRevisionIds ?? current.latestRevisionIds, states: current.tree.nodes.map(item => loadedStates.get(item.id) ?? currentStates.get(item.id) ?? { nodeId: item.id, revisionId: null, draftCount: 0, error: null }) };
 }
 /** 更新项目快照；只有选中资产的版本状态变化时才重读正文，避免轮询清空预览。 */
 async function refreshSnapshot(): Promise<void> {
@@ -1306,8 +1313,10 @@ async function refreshSnapshot(): Promise<void> {
   snapshotStatesError.value = null;
   const previousState = readingNodeId.value ? snapshot.value?.states.find(state => state.nodeId === readingNodeId.value) : null;
   const nextState = readingNodeId.value ? loaded.states.find(state => state.nodeId === readingNodeId.value) : null;
-  const nodeStateChanged = JSON.stringify(previousState ?? null) !== JSON.stringify(nextState ?? null);
-  if (snapshot.value && snapshot.value.root === loaded.root && snapshot.value.treeHash === loaded.treeHash && snapshot.value.canWrite === loaded.canWrite && JSON.stringify(snapshot.value.states) === JSON.stringify(loaded.states)) return;
+  const nodeStateChanged = JSON.stringify(previousState ?? null) !== JSON.stringify(nextState ?? null)
+    || (readingNodeId.value && snapshot.value?.latestRevisionIds?.[readingNodeId.value] !== loaded.latestRevisionIds?.[readingNodeId.value]);
+  if (snapshot.value && snapshot.value.root === loaded.root && snapshot.value.treeHash === loaded.treeHash && snapshot.value.canWrite === loaded.canWrite
+    && JSON.stringify(snapshot.value.states) === JSON.stringify(loaded.states) && JSON.stringify(snapshot.value.latestRevisionIds) === JSON.stringify(loaded.latestRevisionIds)) return;
   const preserved = preserveSelectedTree(snapshot.value, loaded);
   if (preserved) { snapshot.value = preserved; return; }
   snapshot.value = loaded;
@@ -1330,7 +1339,7 @@ async function refreshSnapshotStates(scope: WorkspaceId, epoch: number, expected
   try {
     const loaded = unwrap(await requestKnowledgeAsset(ctx(), "snapshot", { workspaceId: scope, includeStates: true }));
     if (!isCurrent(epoch, scope) || !snapshot.value) return;
-    if (loaded.treeHash === expectedTreeHash) snapshot.value = { ...snapshot.value, states: loaded.states, canWrite: loaded.canWrite };
+    if (loaded.treeHash === expectedTreeHash) snapshot.value = { ...snapshot.value, states: loaded.states, latestRevisionIds: loaded.latestRevisionIds, canWrite: loaded.canWrite };
     else {
       const preserved = preserveSelectedTree(snapshot.value, loaded);
       if (preserved) { snapshot.value = preserved; return; }
@@ -1493,6 +1502,7 @@ async function load(): Promise<void> {
   if (scope && selectedNodeIntentWorkspace && selectedNodeIntentWorkspace !== scope) selectedNodeIntent.value = null;
   hydratingPageState = true;
   const restoredPage = restorePageState();
+  candidateView.value = restoredPage?.updatesTarget?.report ? "report" : "diff";
   pendingRouteThreadId = null;
   readController?.abort(); stopPoll(); if (snapshotStatesTimer) clearTimeout(snapshotStatesTimer); snapshotStatesTimer = null; runRequestVersion += 1; pollInFlight = false; nodeEpoch += 1; revisionEpoch += 1; importEpoch += 1;
   snapshot.value = null; snapshotStatesError.value = null; detail.value = null; selectedId.value = null; activeRun.value = null;
@@ -2242,6 +2252,13 @@ async function submitBatch(): Promise<void> {
 /** 继续或重试使用原任务 ID；指定节点时仅恢复该范围，失败保留结果与重试入口。 */
 async function resumeGeneration(run: KnowledgeGenerationRunView, retryFailed = false, nodeIds?: string[]): Promise<void> {
   if (!canWrite.value || busy.value || updatesBusy.value || run.active || threadRunning.value || executionThreadRunning.value) return;
+  if (run.items.some(knowledgeReviewNeedsSourceRefresh)) {
+    const requested = nodeIds ? new Set(nodeIds) : null;
+    nodeIds = run.items.filter(item => !knowledgeReviewNeedsSourceRefresh(item)
+      && (requested?.has(item.nodeId) ?? knowledgeItemNeedsRunWork(item, run.mode as "batch" | "review" | "build", run.reviewConfig))
+      && (!retryFailed || item.status === "failed" || item.review?.status === "failed")).map(item => item.nodeId);
+    if (!nodeIds.length) return;
+  }
   const scope = workspaceId.value, epoch = scopeEpoch, flight = ++knowledgeActionFlight;
   busy.value = true;
   try {
@@ -2597,10 +2614,11 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 
       <main class="main">
         <div class="workspace-tabs" role="tablist" aria-label="知识库工作区" @keydown="moveTabFocus">
-          <button id="knowledge-document-tab" type="button" role="tab" aria-controls="knowledge-workspace-panel" :aria-selected="!showUpdates" :tabindex="showUpdates ? -1 : 0" :class="{ active: !showUpdates }" @click="setWorkspaceView('document')">文档</button>
-          <button id="knowledge-updates-tab" type="button" role="tab" aria-controls="knowledge-workspace-panel" :aria-selected="showUpdates" :tabindex="showUpdates ? 0 : -1" :class="{ active: showUpdates }" @click="setWorkspaceView('updates')">待确认更新 <a-badge :count="visibleWorkTree.targetCount" :show-zero="true" :overflow-count="99" color="var(--app-muted)" /></button>
+          <button id="knowledge-document-tab" type="button" role="tab" aria-controls="knowledge-workspace-panel" :aria-selected="!showUpdates && viewTab !== 'review'" :tabindex="!showUpdates && viewTab !== 'review' ? 0 : -1" :class="{ active: !showUpdates && viewTab !== 'review' }" @click="setWorkspaceView('document')">文档</button>
+          <button id="knowledge-updates-tab" type="button" role="tab" aria-controls="knowledge-workspace-panel" :aria-selected="showUpdates && candidateView !== 'report'" :tabindex="showUpdates && candidateView !== 'report' ? 0 : -1" :class="{ active: showUpdates && candidateView !== 'report' }" @click="setWorkspaceView('diff')">变更</button>
+          <button v-if="showUpdates || (node && knowledgeNodeHasBody(node))" id="knowledge-review-tab" type="button" role="tab" aria-controls="knowledge-workspace-panel" :aria-selected="showUpdates ? candidateView === 'report' : viewTab === 'review'" :tabindex="(showUpdates ? candidateView === 'report' : viewTab === 'review') ? 0 : -1" :class="{ active: showUpdates ? candidateView === 'report' : viewTab === 'review' }" @click="setWorkspaceView('report')">复检报告</button>
         </div>
-        <div id="knowledge-workspace-panel" class="workspace-panel" role="tabpanel" :aria-labelledby="showUpdates ? 'knowledge-updates-tab' : 'knowledge-document-tab'">
+        <div id="knowledge-workspace-panel" class="workspace-panel" role="tabpanel" :aria-labelledby="(showUpdates ? candidateView === 'report' : viewTab === 'review') ? 'knowledge-review-tab' : showUpdates ? 'knowledge-updates-tab' : 'knowledge-document-tab'">
         <div v-if="summaryRun && ((!selectedId && !showUpdates && !readingPending) || summaryRun.active || summaryUnfinished || summaryRun.id === maintenanceRunId || summaryRun.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled))" class="task-summary" role="status">
           <div><strong>{{ summaryRun.active ? '文档生成中' : summaryRun.id === maintenanceRunId ? '内容已采用，维护设置尚未保存' : summaryRun.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled) ? '有未完成采用，需恢复或终止' : '文档生成需要处理' }}</strong><span>{{ summaryIssue ?? (summaryRun.mode === 'conversation' ? `已交付 ${summaryRun.items.filter(item => item.status === 'completed').length} 份文档` : `已保存 ${summaryRun.items.filter(item => item.status === 'completed').length} / ${summaryRun.items.length} 篇`) }}</span></div>
           <a-button v-if="summaryRun.id === maintenanceRunId || summaryRun.adoptions?.some(receipt => !receipt.completed && !receipt.cancelled)" size="small" :disabled="busy || updatesBusy" @click="openRecovery(summaryRun)">恢复未完成操作</a-button>
@@ -2621,7 +2639,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           <section class="reading-document">
         <!-- 采用至结果定位完成前持续加载，保留组件执行请求和失败恢复。 -->
         <div v-if="showUpdates && updatesBusy" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
-        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesScopeNodeId" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-run-id="updatesTarget?.focusRunId" :focus-report="updatesTarget?.report" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @stop-run="stopGeneration($event)" @focus="rememberUpdateFocus" @preview="updatePreview = $event" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @refresh-sources="refreshCandidateSources" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
+        <KnowledgeUpdates v-if="showUpdates" v-show="!updatesBusy" :workspace-id="workspaceId" :context="ctx()" :nodes="visibleTreeNodes" :formal-nodes="snapshot?.tree.nodes ?? []" :runs="taskList" :updates="visibleWorkTree.updates" :index-loading="resultsLoading" :index-error="resultsLoadError" :scope-node-id="updatesScopeNodeId" :change-id="updatesTarget?.changeId" :focus-id="updatesTarget?.focusId" :focus-run-id="updatesTarget?.focusRunId" v-model:view="candidateView" :recovery-run-id="updatesTarget?.recoveryRunId" :retry-index="retryUpdatesIndex" :after-apply="afterApply" @stop-run="stopGeneration($event)" @focus="rememberUpdateFocus" @preview="updatePreview = $event" :can-write="canWrite" :actions-busy="busy || threadRunning || executionThreadRunning || Boolean(pendingBatch)" @recheck="recheckKnowledgeChange" @review="openReview([$event], false)" @refresh-sources="refreshCandidateSources" @resume-review="resumeCandidateReview" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" @close="closeUpdates" @changed="updatesChanged" @open-file="openWorkspaceFile" @busy="handleUpdatesBusy" @error="(cause, context) => errorText = reportError(cause, 'KNOWLEDGE_UPDATES_FAILED', context)" />
         <KnowledgeOverview v-else-if="overviewOpen" :snapshot="snapshot" :runs="taskList" :changes="pendingChangeNodes" :loading="loading || Boolean(snapshot && !snapshotStatesReady && !snapshotStatesError)" :state-error="snapshotStatesError" :run-error="resultsLoadError" :can-write="canWrite" :busy="busy || updatesBusy || buildStarting || binding || conversationLoading || taskList.some(run => run.active)" @improve="openQuickGenerate" @discuss="openSpecificationConversation" @updates="openUpdates(null)" @select="selectTreeNode" @retry="retryOverview" @policy="policyOpen = true" />
         <!-- 尚未确定正式正文或候选预览时保持加载，避免先渲染普通正文页。 -->
         <div v-else-if="documentReadError" class="empty" role="alert"><h3>文档读取失败</h3><p>{{ documentReadError.message }}</p><a-button :disabled="busy || updatesBusy" @click="retryReadDocument">重新读取文档</a-button></div>
@@ -2638,14 +2656,14 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
               <a-dropdown :trigger="['click']"><a-button size="small" :aria-label="`${node.title}更多操作`">更多</a-button><template #overlay><a-menu><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="startBuild([node!.id])">重新生成此文档</a-menu-item><a-menu-item :disabled="!canWrite || busy || !formalNodeIds.has(node.id)" @click="openReview([node!.id], false)">复检此文档</a-menu-item></a-menu></template></a-dropdown>
             </div>
           </div>
-          <div class="document-view-tabs" role="tablist" :aria-label="`${node.title}文档视图`" @keydown="moveTabFocus">
-            <button v-for="tab in [{ key: 'node', title: '正文' }, { key: 'sources', title: '来源依据' }, { key: 'review', title: '复检报告' }]" :id="`knowledge-document-tab-${tab.key}`" :key="tab.key" type="button" role="tab" aria-controls="knowledge-document-view-panel" :aria-selected="viewTab === tab.key" :tabindex="viewTab === tab.key ? 0 : -1" :class="{ active: viewTab === tab.key }" @click="setContentView(tab.key as 'node' | 'sources' | 'review')">{{ tab.title }}</button>
+          <div v-if="viewTab !== 'review'" class="document-view-tabs" role="tablist" :aria-label="`${node.title}文档视图`" @keydown="moveTabFocus">
+            <button v-for="tab in [{ key: 'node', title: '正文' }, { key: 'sources', title: '来源依据' }]" :id="`knowledge-document-tab-${tab.key}`" :key="tab.key" type="button" role="tab" aria-controls="knowledge-document-view-panel" :aria-selected="viewTab === tab.key" :tabindex="viewTab === tab.key ? 0 : -1" :class="{ active: viewTab === tab.key }" @click="setContentView(tab.key as 'node' | 'sources')">{{ tab.title }}</button>
           </div>
-          <div id="knowledge-document-view-panel" role="tabpanel" :aria-labelledby="`knowledge-document-tab-${viewTab}`" class="content" :class="{ 'editing-content': editing && viewTab === 'node', 'document-loading': documentLoading }">
+          <div id="knowledge-document-view-panel" :role="viewTab === 'review' ? undefined : 'tabpanel'" :aria-labelledby="viewTab === 'review' ? undefined : `knowledge-document-tab-${viewTab}`" class="content" :class="{ 'editing-content': editing && viewTab === 'node', 'document-loading': documentLoading }">
             <div v-if="documentLoading" class="node-loading" role="status" aria-live="polite" aria-busy="true"><a-spin aria-hidden="true" /><span>加载中</span></div>
             <template v-else>
-            <div v-if="detail?.drafts.length && !currentUpdatesCount" class="revision-bar">
-              <label><span>查看版本</span><select :value="previewRevisionId ?? ''" aria-label="选择知识版本" :disabled="revisionLoading" @change="viewRevision(($event.target as HTMLSelectElement).value)"><option v-if="detail.current" :value="detail.current.revision.id">正式文档</option><option v-for="draft in detail.drafts" :key="draft.id" :value="draft.id">待采用 · {{ dayjs(draft.createdAt).format('YYYY-MM-DD HH:mm:ss') }}</option></select></label>
+            <div v-if="previewIsDraft && !currentUpdatesCount" class="revision-bar">
+              <span v-if="previewDocument">待采用 · {{ dayjs(previewDocument.revision.createdAt).format('YYYY-MM-DD HH:mm:ss') }}</span>
               <span class="revision-review-status">{{ previewReviewStatus }}</span>
               <a-button v-if="previewIsDraft" size="small" :disabled="!canWrite || busy || revisionLoading || reportsLoading" @click="adopt(previewRevisionId!)">采用此版本</a-button>
             </div>
@@ -2662,9 +2680,9 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
             </div>
             <div v-else-if="viewTab === 'node' && !nodeLoading && !revisionLoading" class="empty node-empty">
               <span class="empty-symbol" aria-hidden="true">▤</span>
-              <h3>{{ node.contentMode === 'reference' ? '实时原文不可用' : '这份知识还没有内容' }}</h3>
-              <p>{{ node.contentMode === 'reference' ? '原文读取失败，请检查错误信息后重试。' : '生成前会先判断内容价值，已有资料足够时直接引用。' }}</p>
-              <div class="quick-actions"><a-button v-if="node.contentMode === 'reference'" @click="readNode(node.id)">重新读取</a-button><a-button v-else :disabled="!canWrite || !snapshotStatesReady" @click="startBuild([node.id])">生成这份知识</a-button></div>
+              <h3>{{ currentUpdatesCount ? '已有待确认变更' : node.contentMode === 'reference' ? '实时原文不可用' : '这份知识还没有内容' }}</h3>
+              <p v-if="!currentUpdatesCount">{{ node.contentMode === 'reference' ? '原文读取失败，请检查错误信息后重试。' : '生成前会先判断内容价值，已有资料足够时直接引用。' }}</p>
+              <div class="quick-actions"><a-button v-if="currentUpdatesCount" @click="setWorkspaceView('diff')">查看变更</a-button><a-button v-else-if="node.contentMode === 'reference'" @click="readNode(node.id)">重新读取</a-button><a-button v-else :disabled="!canWrite || !snapshotStatesReady" @click="startBuild([node.id])">生成这份知识</a-button></div>
             </div>
             <KnowledgeReviewReport v-else-if="viewTab === 'review'" :reports="previewReports" :loading="reportsLoading" :busy="busy || Boolean(activeRun?.active)" :restart-busy="busy || Boolean(readingReviewActivity) || reportsLoading || Boolean(reportsReadError)" :can-write="canWrite && Boolean(previewDocument)" :can-repair="ancestors(node)[0]?.category !== 'product'" :pending="Boolean(previewReviewItem && knowledgeItemNeedsReview(previewReviewItem) && previewReviewItem.review?.status === 'pending')" :failure="reportsReadError ?? (previewReviewItem?.reviewConfig?.enabled === false ? null : previewReviewItem?.review?.error?.message)" :generation-thread-id="previewReviewItem?.executionThreadId ?? null" :generation-title="node.title" @review="openReview([node.id], false)" @repair="repairReport" @repair-issue="repairIssue" @return-to-generation="returnToGeneration" />
             <div v-else class="sources">
@@ -2734,7 +2752,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
                 <template #composer-notice><a-alert v-if="executionInputRestriction" class="execution-input-restriction" type="info" show-icon :message="executionInputRestriction" data-testid="knowledge-session-restriction"><template v-if="executionActiveRun && canWrite" #action><a-button size="small" :loading="busy" :disabled="updatesBusy" @click="stopGeneration(executionActiveRun)">停止任务后继续</a-button></template></a-alert></template>
               </ChatPanel>
             </template>
-            <div v-else class="conversation-start"><p>{{ showUpdates && !updatePreview ? '请选择一个候选版本，查看对应工作会话。' : '当前文件版本尚无可用的生成会话记录。' }}</p></div>
+            <div v-else class="conversation-start"><p>{{ showUpdates && !updatePreview && !updatesScopeNodeId ? '选择文档可查看对应的工作会话。' : '当前文件版本尚无可用的生成会话记录。' }}</p></div>
           </template>
           <ChatPanel v-else-if="assistantThreadId" ref="assistantPanel" :workspace-id="workspaceId" :thread-id="assistantThreadId" :interaction-active="assistantOpen" assistant-mode preserve-draft-on-disable :allow-queue="false" :composer-disabled="!canWrite || !bindingReady || binding" @model-prefs-change="rememberConversationPrefs">
             <template #toolbar-before-model="{ disabled }">
@@ -2963,9 +2981,6 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .document.document-editing { display: flex; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
 .document-editor { flex: 1; min-height: 0; resize: none; }
 .revision-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 8px; font-size: 12px; }
-.revision-bar label { display: flex; align-items: center; flex: 1 1 180px; gap: 8px; min-width: 0; }
-.revision-bar label > span { flex-shrink: 0; color: var(--app-muted); }
-.revision-bar select { box-sizing: border-box; min-width: 0; max-width: 100%; flex: 1; padding: 6px 8px; border: 1px solid var(--app-border); border-radius: 6px; color: var(--app-text); background: var(--app-bg); }
 .revision-review-status { color: var(--app-muted); }
 .draft-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px; margin-bottom: 20px; border: 1px solid color-mix(in srgb, var(--app-warning) 25%, var(--app-border)); background: color-mix(in srgb, var(--app-warning) 6%, var(--app-bg)); border-radius: 8px; font-size: 12px; }
 .draft-banner > div { flex: 1; min-width: 160px; }
@@ -3059,7 +3074,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .conversation-connect > .ant-btn { flex: 1; }
 .conversation-welcome .read-only-note { margin: 0; }
 .read-only-note { font-size: 12px; line-height: 1.8; color: var(--app-muted); }
-.import-layout { height: min(560px, calc(100dvh - 256px)); display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; min-height: 0; }
+.import-layout { height: min(560px, calc(100dvh - 260px)); display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; min-height: 0; }
 .import-settings { display: flex; flex-direction: column; gap: 20px; overflow: auto; min-height: 0; padding-right: 20px; border-right: 1px solid var(--app-divider); }
 .import-layout h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; }
 .import-categories { display: flex; flex-direction: column; gap: 12px; }

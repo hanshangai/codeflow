@@ -367,11 +367,20 @@ export class KnowledgeGenerationService {
       const dismissed = !isApplied && (revisionId ? dismissedRevisions.has(`${nodeId}:${revisionId}`) : !!run.dismissals?.some(receipt => receipt.nodeId === nodeId && receipt.revisionId === null));
       let reason = outdatedStructure ? "知识库已完成归类，此旧结构候选已失效；请不采用后重新构建" : reasons.get(nodeId) ?? null;
       let reasonCode: string | undefined;
+      let revisionCreatedAt: string | undefined;
       if (!isApplied && !dismissed && !reason) {
-        try { this.validateSelection(run, nodeId, revisionId, tree, false, scoped); }
-        catch (error) { const failure = this.failure(error, id); reason = failure.message; reasonCode = failure.code; this.log(error, id, item?.id ?? nodeId, "preview_validation"); }
+        try {
+          const document = revisionId ? scoped.readRevision(nodeId, revisionId) : undefined;
+          revisionCreatedAt = document?.revision.createdAt;
+          this.validateSelection(run, nodeId, revisionId, tree, false, scoped, document);
+        } catch (error) {
+          const failure = this.failure(error, id);
+          reason = failure.message;
+          reasonCode = failure.code;
+          this.log(error, id, item?.id ?? nodeId, "preview_validation");
+        }
       }
-      return { nodeId, revisionId, applied: isApplied, dismissed, canApply: !isApplied && !dismissed && !reason, reason, ...(reasonCode ? { reasonCode } : {}) };
+      return { nodeId, revisionId, revisionCreatedAt, applied: isApplied, dismissed, canApply: !isApplied && !dismissed && !reason, reason, ...(reasonCode ? { reasonCode } : {}) };
     });
     const byId = new Map(items.map(item => [item.nodeId, item]));
     // 新目录只承载待处理内容；后代草稿均不采用时，不留下空目录阻塞后续维护。
@@ -387,12 +396,12 @@ export class KnowledgeGenerationService {
       const dependency = this.store.ancestry(item.nodeId, tree).slice(0, -1).map(node => byId.get(node.id)).find(parent => parent && !parent.applied && !parent.canApply);
       if (dependency) { item.canApply = false; item.reason = `上层目录尚不可采用：${this.store.node(dependency.nodeId, tree).title}`; }
     }
-    const planHash = knowledgeHash(knowledgeJson({ runId: id, treeHash: current.hash, tree, items }));
+    const planHash = knowledgeHash(knowledgeJson({ runId: id, treeHash: current.hash, tree, items: items.map(({ revisionCreatedAt: _createdAt, ...item }) => item) }));
     return { runId: id, treeHash: current.hash, tree, planHash, items };
   }
 
   /** 采用前重验基线与生成证据；复检不能替换旧来源，同版本结论使用最新报告。 */
-  private validateSelection(run: KnowledgeGenerationRun, nodeId: string, revisionId: string | null, tree: KnowledgeAssetTree, recovering = false, scoped = this.store.forRun(run.id, tree)): void {
+  private validateSelection(run: KnowledgeGenerationRun, nodeId: string, revisionId: string | null, tree: KnowledgeAssetTree, recovering = false, scoped = this.store.forRun(run.id, tree), previewDocument?: ReturnType<KnowledgeAssetStore["readRevision"]>): void {
     const node = this.store.node(nodeId, tree);
     const item = run.items.find(item => item.nodeId === nodeId);
     const baseNode = run.baseTree?.nodes.find(node => node.id === nodeId);
@@ -412,7 +421,7 @@ export class KnowledgeGenerationService {
     }
     if (unchangedMove) return;
     if (!item || item.status !== "completed" || !revisionId || item.revisionId !== revisionId) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_CONFLICT", "该知识尚未生成可采用正文");
-    const document = scoped.readRevision(nodeId, revisionId);
+    const document = previewDocument ?? scoped.readRevision(nodeId, revisionId);
     if (document.revision.origin === "ai" && this.isProductDocument(run, nodeId)) throw new KnowledgeAssetError("KNOWLEDGE_ASSET_PERMISSION_DENIED", "产品文档保留原文，不允许采用 AI 正文", 403);
     const alreadyWritten = recovering && scoped.detail(nodeId).current?.revision.id === revisionId;
     // 新节点的准备指针尚未发布，不能当作已采用事实覆盖历史不采用回执。
