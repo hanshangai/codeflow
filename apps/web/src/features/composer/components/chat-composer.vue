@@ -4262,8 +4262,9 @@ defineExpose({ prefill, appendText, attachTextFile, sendExternalText, canAcceptE
           @click="handlePrimaryAction"
         >
           <template v-if="props.surface === 'h5'">
-            <StopOutlined v-if="primaryActionIsStop" />
-            <SendOutlined v-else />
+            <!-- 加载态由 antd 单独渲染 spinner；再保留发送/停止图标会挤出第二个圆形按钮。 -->
+            <StopOutlined v-if="primaryActionIsStop && !primaryActionLoading" />
+            <SendOutlined v-else-if="!primaryActionLoading" />
           </template>
           <template v-else>{{ primaryActionLabel }}</template>
         </a-button>

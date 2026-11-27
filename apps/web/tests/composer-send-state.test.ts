@@ -90,6 +90,11 @@ function fixture(opts: { clearFailures?: number } = {}) {
     label: () => context.buttonLabel() as string, sending: () => context.isSending() as boolean };
 }
 
+test("H5 发送中不再叠加发送图标，避免出现两个圆形按钮", () => {
+  const source = readFileSync(new URL("../src/features/composer/components/chat-composer.vue", import.meta.url), "utf8");
+  assert.match(source, /<StopOutlined v-if="primaryActionIsStop && !primaryActionLoading" \/>\s*<SendOutlined v-else-if="!primaryActionLoading" \/>/u);
+});
+
 test("直发等待受理期间收到运行事件，文案保持发送中，回包后才清理草稿", async () => {
   const f = fixture(), sending = f.send();
   await new Promise(resolve => setImmediate(resolve));
