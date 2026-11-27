@@ -293,14 +293,30 @@ onUnmounted(() => {
 
 <style scoped>
 .upgrade-page {
+  --landing-bg: var(--app-bg);
+  --landing-panel: color-mix(in srgb, var(--app-panel-bg) 82%, transparent);
+  --landing-panel-solid: var(--app-panel-bg);
+  --landing-surface: color-mix(in srgb, var(--app-panel-bg) 78%, var(--app-bg));
+  --landing-surface-soft: linear-gradient(135deg, color-mix(in srgb, var(--app-panel-bg) 72%, var(--app-bg)) 0%, color-mix(in srgb, var(--app-panel-bg) 92%, var(--app-bg)) 100%);
+  --landing-accent-wash: color-mix(in srgb, var(--app-accent) 12%, transparent);
+  --landing-nav-bg: linear-gradient(180deg, color-mix(in srgb, var(--app-bg) 88%, transparent), color-mix(in srgb, var(--app-bg) 52%, transparent) 72%, transparent);
+  --landing-border: var(--app-border);
+  --landing-border-soft: color-mix(in srgb, var(--app-border) 80%, transparent);
+  --landing-card-border: color-mix(in srgb, var(--app-border) 72%, transparent);
+  --landing-accent-border: color-mix(in srgb, var(--app-accent) 36%, transparent);
+  --landing-text: var(--app-text);
+  --landing-muted: var(--app-muted);
+  --landing-muted-soft: color-mix(in srgb, var(--app-muted) 76%, transparent);
+  --landing-warning: color-mix(in srgb, var(--app-accent) 72%, var(--app-text));
+  --landing-shadow-soft: 0 16px 38px color-mix(in srgb, #000 10%, transparent);
   min-height: 100vh;
   overflow-y: auto;
   scrollbar-gutter: stable;
   background:
-    radial-gradient(circle at 8% 14%, rgba(39, 199, 153, 0.13), transparent 24%),
-    radial-gradient(circle at 94% 12%, rgba(223, 143, 56, 0.18), transparent 30%),
-    linear-gradient(180deg, #faf9f4 0%, #f2ede2 44%, #faf8f1 100%);
-  color: #1a1814;
+    radial-gradient(circle at 8% 14%, color-mix(in srgb, var(--app-accent) 13%, transparent), transparent 24%),
+    radial-gradient(circle at 94% 12%, color-mix(in srgb, var(--app-warning) 18%, transparent), transparent 30%),
+    linear-gradient(180deg, var(--app-bg) 0%, var(--app-bg-secondary) 44%, var(--app-bg) 100%);
+  color: var(--landing-text);
 }
 
 .upgrade-page__main {
@@ -325,9 +341,9 @@ onUnmounted(() => {
 .upgrade-page__sidebar-inner {
   padding: 18px;
   border-radius: 22px;
-  border: 1px solid rgba(113, 98, 79, 0.16);
-  background: rgba(255, 255, 255, 0.86);
-  box-shadow: 0 16px 38px rgba(46, 33, 16, 0.08);
+  border: 1px solid var(--landing-border);
+  background: var(--landing-panel);
+  box-shadow: var(--landing-shadow-soft);
   max-height: calc(100vh - 120px);
   overflow-y: auto;
 }
@@ -337,7 +353,7 @@ onUnmounted(() => {
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  color: rgba(31, 26, 22, 0.6);
+  color: var(--landing-muted);
   text-transform: uppercase;
 }
 
@@ -353,7 +369,7 @@ onUnmounted(() => {
 .upgrade-page__sidebar-empty {
   padding: 8px 10px;
   font-size: 12px;
-  color: rgba(31, 26, 22, 0.5);
+  color: var(--landing-muted-soft);
   line-height: 1.6;
 }
 
@@ -372,20 +388,20 @@ onUnmounted(() => {
 }
 
 .upgrade-page__version-btn:hover {
-  background: rgba(209, 121, 52, 0.1);
-  color: #8c5620;
+  background: var(--landing-accent-wash);
+  color: var(--landing-warning);
 }
 
 .upgrade-page__version-num {
   font-size: 13px;
   font-weight: 700;
-  color: #1f1a16;
+  color: var(--landing-text);
   font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
 }
 
 .upgrade-page__version-date {
   font-size: 11px;
-  color: rgba(31, 26, 22, 0.56);
+  color: var(--landing-muted-soft);
 }
 
 .upgrade-page__feed {
@@ -397,11 +413,9 @@ onUnmounted(() => {
 .upgrade-page__card {
   padding: 24px;
   border-radius: 22px;
-  border: 1px solid rgba(113, 98, 79, 0.16);
-  background:
-    radial-gradient(circle at right top, rgba(255, 255, 255, 0.78), transparent 44%),
-    linear-gradient(160deg, #fffdf8 0%, #f8f3e8 58%, #f6efdf 100%);
-  box-shadow: 0 16px 38px rgba(46, 33, 16, 0.08);
+  border: 1px solid var(--landing-border);
+  background: var(--landing-surface-soft);
+  box-shadow: var(--landing-shadow-soft);
 }
 
 .upgrade-page__card-header {
@@ -410,14 +424,14 @@ onUnmounted(() => {
   align-items: baseline;
   gap: 10px 16px;
   padding-bottom: 14px;
-  border-bottom: 1px dashed rgba(113, 98, 79, 0.22);
+  border-bottom: 1px dashed var(--landing-border-soft);
   margin-bottom: 14px;
 }
 
 .upgrade-page__card-version {
   font-size: 22px;
   font-weight: 700;
-  color: #8f5317;
+  color: var(--app-accent);
   font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
 }
 
@@ -426,19 +440,19 @@ onUnmounted(() => {
   align-items: baseline;
   gap: 12px;
   flex-wrap: wrap;
-  color: rgba(26, 24, 20, 0.7);
+  color: var(--landing-muted);
 }
 
 .upgrade-page__card-date {
   font-size: 13px;
-  color: rgba(31, 26, 22, 0.56);
+  color: var(--landing-muted-soft);
 }
 
 .upgrade-page__card-scope {
   padding: 2px 9px;
   border-radius: 999px;
-  background: rgba(143, 83, 23, 0.1);
-  color: #7a4818;
+  background: var(--landing-accent-wash);
+  color: var(--landing-warning);
   font-size: 12px;
   font-weight: 600;
 }
@@ -446,7 +460,7 @@ onUnmounted(() => {
 .upgrade-page__card-title {
   font-size: 15px;
   font-weight: 600;
-  color: #1f1a16;
+  color: var(--landing-text);
 }
 
 .upgrade-page__card-body :deep(h2) {
@@ -454,7 +468,7 @@ onUnmounted(() => {
   margin-bottom: 8px;
   font-size: 16px;
   font-weight: 700;
-  color: #1f1a16;
+  color: var(--landing-text);
 }
 
 .upgrade-page__card-body :deep(h2):first-child {
@@ -469,21 +483,21 @@ onUnmounted(() => {
 .upgrade-page__card-body :deep(li) {
   margin-bottom: 4px;
   line-height: 1.7;
-  color: rgba(26, 24, 20, 0.85);
+  color: color-mix(in srgb, var(--landing-text) 86%, transparent);
   font-size: 14px;
 }
 
 .upgrade-page__card-body :deep(p) {
   margin: 0 0 8px;
   line-height: 1.7;
-  color: rgba(26, 24, 20, 0.85);
+  color: color-mix(in srgb, var(--landing-text) 86%, transparent);
   font-size: 14px;
 }
 
 .upgrade-page__card-loading {
   padding: 16px 0;
   font-size: 13px;
-  color: rgba(31, 26, 22, 0.5);
+  color: var(--landing-muted-soft);
 }
 
 .upgrade-page__card-error {
@@ -492,22 +506,22 @@ onUnmounted(() => {
   gap: 12px;
   padding: 12px 0;
   font-size: 13px;
-  color: #b14926;
+  color: var(--app-danger);
 }
 
 .upgrade-page__retry {
   padding: 4px 12px;
   border-radius: 999px;
-  border: 1px solid rgba(177, 73, 38, 0.4);
+  border: 1px solid color-mix(in srgb, var(--app-danger) 40%, transparent);
   background: transparent;
-  color: #b14926;
+  color: var(--app-danger);
   font-size: 12px;
   cursor: pointer;
   transition: background 0.15s ease;
 }
 
 .upgrade-page__retry:hover {
-  background: rgba(177, 73, 38, 0.08);
+  background: color-mix(in srgb, var(--app-danger) 8%, transparent);
 }
 
 .upgrade-page__sentinel {
@@ -515,17 +529,17 @@ onUnmounted(() => {
   padding: 14px;
   text-align: center;
   font-size: 12px;
-  color: rgba(31, 26, 22, 0.5);
+  color: var(--landing-muted-soft);
 }
 
 .upgrade-page__footnote {
   margin-top: 8px;
   padding: 14px 18px;
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 1px dashed rgba(113, 98, 79, 0.22);
+  background: var(--landing-panel);
+  border: 1px dashed var(--landing-border-soft);
   font-size: 12px;
-  color: rgba(31, 26, 22, 0.6);
+  color: var(--landing-muted-soft);
   line-height: 1.7;
 }
 
@@ -533,16 +547,16 @@ onUnmounted(() => {
   margin-top: 22px;
   padding: 36px;
   border-radius: 22px;
-  border: 1px solid rgba(113, 98, 79, 0.16);
-  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid var(--landing-border);
+  background: var(--landing-panel);
   text-align: center;
   font-size: 14px;
-  color: rgba(31, 26, 22, 0.6);
+  color: var(--landing-muted);
 }
 
 .upgrade-page__placeholder--error {
-  border-color: rgba(201, 100, 66, 0.3);
-  color: #b14926;
+  border-color: color-mix(in srgb, var(--app-danger) 30%, transparent);
+  color: var(--app-danger);
 }
 
 @media (max-width: 900px) {
