@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, reactive, watch } from "vue";
+import { ref, computed, reactive, watch, onBeforeUnmount } from "vue";
 import { Modal, message } from "ant-design-vue";
 import {
   EyeOutlined, CodeOutlined, ColumnWidthOutlined, ColumnHeightOutlined,
@@ -26,8 +26,9 @@ import { trackProductEvent } from "../../../analytics/analytics";
 import { isSharedWorkspaceSelectionId } from "../../../utils/workspaceId";
 import { usePreviewZoom, type PreviewZoomKind } from "../usePreviewZoom";
 import { loadWorkspaceFilePreview } from "../workspaceFilePreview";
-import { canEditFilePreview, discardFileEditorDraft, ensureFileEditorDraft, isFileEditorDirty,
+import { canEditFilePreview, discardFileEditorDraft, ensureFileEditorDraft, isFileEditorDirty, removeFileEditorDraft,
   saveFileEditorDraft, updateFileEditorContent, type FileEditorDraft, type FileEditorSource } from "../fileEditorState";
+import { previewWindowEditorScope } from "../previewWindowEditor";
 
 defineOptions({ name: "ExplorerPreviewWindow" });
 
@@ -111,7 +112,7 @@ const canCopyPreviewContent = computed(() =>
 const editorPreview = computed<FileEditorSource | null>(() => {
   if (props.win.content == null) return null;
   return { content: props.win.content, size: props.win.size ?? 0, mtimeMs: props.win.mtimeMs ?? null,
-    truncated: props.win.truncated ?? false, encoding: props.win.encoding ?? "utf8" };
+    truncated: props.win.truncated ?? false, encoding: props.win.encoding ?? null };
 });
 const editablePreview = computed(() => !isMobile.value && !showDiff.value && Boolean(props.win.workspaceId)
   && canEditFilePreview({ workspaceId: props.win.workspaceId!, previewType: props.win.previewType,
@@ -120,11 +121,16 @@ const editorDraft = ref<FileEditorDraft | null>(null);
 const editorDirty = computed(() => isFileEditorDirty(editorDraft.value));
 const editorContent = computed(() => editorDraft.value?.content ?? props.win.content ?? "");
 
-/** Markdown 原文与代码文件共用同一草稿；只读预览不建立草稿。 */
+/** 每个窗口使用独立草稿作用域，关闭窗口不会影响内嵌预览的未保存修改。 */
+const editorScope = computed(() => previewWindowEditorScope(props.win.id));
 watch([editorPreview, editablePreview], () => {
   if (!editablePreview.value || !props.win.workspaceId || !editorPreview.value) { editorDraft.value = null; return; }
-  editorDraft.value = ensureFileEditorDraft(props.win.workspaceId, props.win.filePath, editorPreview.value);
+  editorDraft.value = ensureFileEditorDraft(props.win.workspaceId, props.win.filePath, editorPreview.value, editorScope.value);
 }, { immediate: true });
+
+onBeforeUnmount(() => {
+  if (editorDraft.value) removeFileEditorDraft(editorDraft.value);
+});
 
 function onEditorChange(value: string): void {
   if (editorDraft.value) updateFileEditorContent(editorDraft.value, value);
@@ -150,12 +156,11 @@ function discardEdits(): void {
   if (editorDraft.value) discardFileEditorDraft(editorDraft.value);
 }
 
-/** 关闭前确认丢弃未保存修改，避免直接丢失编辑内容。 */
+/** 关闭前确认丢弃本窗口未保存修改；草稿按窗口隔离，不影响内嵌预览。 */
 function closeWindow(): void {
-  const draft = editorDraft.value;
-  if (draft && isFileEditorDirty(draft)) {
-    Modal.confirm({ title: "有未保存的修改", content: "关闭后这些修改将丢失。", okText: "放弃修改并关闭", cancelText: "继续编辑",
-      onOk: () => { discardFileEditorDraft(draft); ui.closePreviewWindow(props.win.id); } });
+  if (editorDirty.value) {
+    Modal.confirm({ title: "有未保存的修改", content: "关闭后本窗口的修改将丢失。", okText: "放弃修改并关闭", cancelText: "继续编辑",
+      onOk: () => ui.closePreviewWindow(props.win.id) });
     return;
   }
   ui.closePreviewWindow(props.win.id);

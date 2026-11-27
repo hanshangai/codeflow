@@ -208,7 +208,8 @@ async function savePreviewEdits(): Promise<void> {
   if (!draft || !path) return;
   try {
     const result = await saveFileEditorDraft(ctx.value, draft, props.workspaceId, path);
-    if (explorer.preview) {
+    // 保存期间可能已切换文件；只允许写回仍选中的路径。
+    if (explorer.selectedPath === path && explorer.preview) {
       explorer.preview = { ...explorer.preview, content: draft.content, size: result.size, mtimeMs: result.mtimeMs, truncated: false };
     }
     message.success("已保存");

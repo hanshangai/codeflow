@@ -700,7 +700,7 @@ export async function readFileAsync(workspacePath: string, relPath: string, maxB
   }
 }
 
-const EDIT_MAX_BYTES = 5 * 1024 * 1024;
+const EDIT_MAX_BYTES = 512 * 1024;
 const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
 
 /** 只覆盖工作区内已存在的 UTF-8 文本文件；冲突、编码或目标异常显式失败。 */
@@ -723,12 +723,18 @@ export function writeFile(workspacePath: string, relPath: string, content: strin
   const bytes = Buffer.from(content, "utf8");
   if (bytes.byteLength > EDIT_MAX_BYTES) throw Object.assign(new Error("文件内容过大，无法保存"), { code: "FS_WRITE_TOO_LARGE" });
   const original = fs.readFileSync(abs);
-  const { encoding } = decodeTextBuffer(original);
+  let encoding: ReturnType<typeof decodeTextBuffer>["encoding"];
+  try { encoding = decodeTextBuffer(original).encoding; }
+  catch (cause) {
+    throw Object.assign(new Error("该文件不是可编辑的 UTF-8 文本"), { code: "FS_WRITE_ENCODING_UNSUPPORTED", cause });
+  }
   if (encoding !== "utf8") throw Object.assign(new Error("该文件不是 UTF-8 编码，暂不支持编辑"), { code: "FS_WRITE_ENCODING_UNSUPPORTED" });
   const payload = original.subarray(0, 3).equals(UTF8_BOM) ? Buffer.concat([UTF8_BOM, bytes]) : bytes;
   const temporary = path.join(path.dirname(abs), `.${path.basename(abs)}.codeflow-edit-${randomUUID()}.tmp`);
   try {
     fs.writeFileSync(temporary, payload, { mode: stat.mode & 0o777, flag: "wx" });
+    // umask 可能削减创建模式，显式恢复原文件权限。
+    fs.chmodSync(temporary, stat.mode & 0o777);
     fs.renameSync(temporary, abs);
   } catch (error) {
     try { fs.rmSync(temporary, { force: true }); }

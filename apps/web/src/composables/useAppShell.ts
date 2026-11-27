@@ -13,6 +13,7 @@ import { createCancelledRequestError, isCancelledRequestError, requestJson, type
 import { pushLoginRoute as navigateToLoginRoute } from "../features/account/loginRedirect";
 import { isDesktopLoginPromptDismissed } from "../features/account/desktopLoginPrompt";
 import { desktopAuthModalOpen } from "../features/account/desktopAuthPromptState";
+import { clearFileEditorDrafts } from "../features/explorer/fileEditorState";
 import { resetQuickPhraseSync, syncQuickPhrasesToAccount } from "../features/composer/quickPhraseSync";
 import { resolveAccountH5DeepLink } from "../features/office-h5/accountH5DeepLink";
 import { getThreadIdFromUrl, THREAD_URL_CHANGED_EVENT } from "../features/threads/thread-url";
@@ -1168,6 +1169,8 @@ export function useAppShell() {
     reminders.reset();
     sharedWorkspaces.$reset();
     explorer.resetForWorkspace();
+    // 草稿含文件内容，退出账号/断开会话时必须清除；普通工作区切换保留各自草稿。
+    if (reason === "disconnect") clearFileEditorDrafts();
     admin.$reset();
     terminalStore.$reset();
     presence.$reset();

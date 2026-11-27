@@ -3,8 +3,8 @@ import type { FsWriteFileResponseBody, WorkspaceId } from "@codeflowai/shared";
 import type { ApiRequestContext } from "../../api/request";
 import { isSharedWorkspaceSelectionId } from "../../utils/workspaceId";
 
-/** 与 Client 编辑上限一致；超限或不满足条件的文件保持只读。 */
-export const FILE_EDIT_MAX_BYTES = 5 * 1024 * 1024;
+/** 与 Client 编辑上限及预览读取上限一致；更大的文件不进入编辑器。 */
+export const FILE_EDIT_MAX_BYTES = 512 * 1024;
 
 export type FileEditorSource = {
   content: string;
@@ -26,9 +26,9 @@ export type FileEditorDraft = {
 
 const drafts = reactive(new Map<string, FileEditorDraft>());
 
-/** 同一工作区同一路径在弹窗和内嵌预览之间共享草稿。 */
-export function fileEditorKey(workspaceId: WorkspaceId, filePath: string): string {
-  return `${workspaceId}\u0000${filePath}`;
+/** 内嵌预览按路径共享草稿；独立窗口使用各自作用域，避免关闭窗口丢弃别处编辑。 */
+export function fileEditorKey(workspaceId: WorkspaceId, filePath: string, scope = "panel"): string {
+  return `${workspaceId}\u0000${scope}\u0000${filePath}`;
 }
 
 type EditablePreviewFacts = Omit<FileEditorSource, "content"> & { content: string | null; isBinary?: boolean };
@@ -45,13 +45,14 @@ export function canEditFilePreview(input: {
   if (!preview || preview.content == null || preview.isBinary) return false;
   const editableType = input.previewType === "code" || (input.previewType === "markdown" && input.rawMarkdown === true);
   if (!editableType) return false;
-  return preview.encoding !== "gb18030" && !preview.truncated
+  // 编码未知（旧窗口快照）不能假定 UTF-8，必须由读取结果明确确认。
+  return preview.encoding === "utf8" && !preview.truncated
     && Number(preview.size ?? 0) <= FILE_EDIT_MAX_BYTES && preview.mtimeMs != null;
 }
 
 /** 读取共享草稿；未初始化时按当前预览建立基线。 */
-export function ensureFileEditorDraft(workspaceId: WorkspaceId, filePath: string, source: FileEditorSource): FileEditorDraft {
-  const key = fileEditorKey(workspaceId, filePath);
+export function ensureFileEditorDraft(workspaceId: WorkspaceId, filePath: string, source: FileEditorSource, scope = "panel"): FileEditorDraft {
+  const key = fileEditorKey(workspaceId, filePath, scope);
   const existing = drafts.get(key);
   if (existing) {
     // 未修改时同步外部重新加载的内容；有草稿时保留用户输入与原基线用于冲突检测。
@@ -69,8 +70,13 @@ export function ensureFileEditorDraft(workspaceId: WorkspaceId, filePath: string
   return drafts.get(key)!;
 }
 
-export function getFileEditorDraft(workspaceId: WorkspaceId, filePath: string): FileEditorDraft | null {
-  return drafts.get(fileEditorKey(workspaceId, filePath)) ?? null;
+export function getFileEditorDraft(workspaceId: WorkspaceId, filePath: string, scope = "panel"): FileEditorDraft | null {
+  return drafts.get(fileEditorKey(workspaceId, filePath, scope)) ?? null;
+}
+
+/** 关闭独立窗口时移除其私有草稿；内嵌预览草稿不受影响。 */
+export function removeFileEditorDraft(draft: FileEditorDraft): void {
+  drafts.delete(draft.key);
 }
 
 export function isFileEditorDirty(draft: FileEditorDraft | null | undefined): boolean {

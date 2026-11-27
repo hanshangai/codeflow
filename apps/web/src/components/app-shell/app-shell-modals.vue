@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, ref, watch } from "vue";
-import { message } from "ant-design-vue";
+import { message, Modal } from "ant-design-vue";
 import { CloseOutlined } from "@ant-design/icons-vue";
 import type {
   AuditLogFilters,
@@ -17,6 +17,7 @@ import ClientManagementModal from "../../features/settings/components/client-man
 import AccountDrawer from "../../features/account/components/account-drawer.vue";
 import EnterpriseDrawer from "../../features/account/components/enterprise-drawer.vue";
 import type { AppShellBindings } from "../../composables/useAppShell";
+import { hasDirtyPreviewWindows, isDirtyPreviewWindow } from "../../features/explorer/previewWindowEditor";
 import { captureAccountSession, useAccountStore } from "../../store/account";
 import { isDesktopWorkspace } from "../../services/desktop";
 import { createApiResultError, createCancelledRequestError, isCancelledRequestError } from "../../api/request";
@@ -50,6 +51,27 @@ const connectionGuideMessage = computed(() =>
   shell.connectError || "Web 正在连接服务，恢复后会自动加载工作区与 Client 状态。",
 );
 const connectionGuideDescription = "当前账号会话会保留，系统会自动重试连接；如需人工排查，可先查看接入说明。";
+
+/** 任务栏关闭与窗口内关闭使用同一未保存确认，避免绕过草稿保护。 */
+function closePreviewTab(target: (typeof shell.ui.explorerPreviewWindows)[number]): void {
+  if (isDirtyPreviewWindow(target)) {
+    Modal.confirm({ title: "有未保存的修改", content: "关闭后本窗口的修改将丢失。", okText: "放弃修改并关闭", cancelText: "继续编辑",
+      onOk: () => shell.ui.closePreviewWindow(target.id) });
+    return;
+  }
+  shell.ui.closePreviewWindow(target.id);
+}
+
+function closeAllPreviewTabs(): void {
+  const windows = shell.ui.explorerPreviewWindows;
+  const dirtyCount = windows.filter(isDirtyPreviewWindow).length;
+  if (dirtyCount > 0) {
+    Modal.confirm({ title: "有未保存的修改", content: `有 ${dirtyCount} 个预览窗口包含未保存修改，全部关闭后将丢失。`,
+      okText: "全部放弃并关闭", cancelText: "取消", onOk: () => shell.ui.closeAllPreviewWindows() });
+    return;
+  }
+  shell.ui.closeAllPreviewWindows();
+}
 
 function showResultToast(result: { ok: boolean; message?: string }, successMessage: string) {
   if (result.ok) {
@@ -458,9 +480,9 @@ async function handleExportEnterpriseAudit(filters: AuditLogFilters) {
         @click="shell.ui.bringPreviewWindowToFront(pw.id)"
       >
         <span class="preview-taskbar__tab-name" :title="pw.filePath">{{ shell.previewWindowFileName(pw.filePath) }}</span>
-        <span class="preview-taskbar__tab-close" @click.stop="shell.ui.closePreviewWindow(pw.id)">&times;</span>
+        <span class="preview-taskbar__tab-close" @click.stop="closePreviewTab(pw)">&times;</span>
       </div>
-      <div class="preview-taskbar__close-all" @click="shell.ui.closeAllPreviewWindows()">全部关闭</div>
+      <div class="preview-taskbar__close-all" @click="closeAllPreviewTabs">全部关闭</div>
     </div>
   </Teleport>
 

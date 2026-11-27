@@ -94,6 +94,7 @@ import { getSoftwareUpdateStatus, npmInstall } from "../../../api/software";
 import { canLoadSoftwareUpdateStatus, resolveSoftwareUpdateWorkspaceId } from "../../settings/softwareUpdateScope";
 import { isSharedWorkspaceSelectionId } from "../../../utils/workspaceId";
 import ImagePreview from "../../../shared/components/ImagePreview.vue";
+import { hasDirtyPreviewWindows } from "../../explorer/previewWindowEditor";
 import HtmlPreview from "../../explorer/components/html-preview.vue";
 import MarkdownPreview from "../../explorer/components/markdown-preview.vue";
 import { useComposerAttachments } from "../useComposerAttachments";
@@ -611,9 +612,10 @@ function onComposerInput(): void {
   void refreshComposerPickersAfterInput();
 }
 
-/** 输入框获得焦点时关闭全局文件预览，避免预览窗口遮挡当前输入区域。 */
+/** 输入框获得焦点时关闭全局文件预览；有未保存修改时保留窗口，避免静默丢失编辑。 */
 function closePreviewWindowsOnComposerFocus(): void {
   if (!ui.explorerPreviewWindows.length) return;
+  if (hasDirtyPreviewWindows(ui.explorerPreviewWindows)) return;
   ui.closeAllPreviewWindows();
 }
 

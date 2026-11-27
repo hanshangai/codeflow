@@ -24,6 +24,7 @@ test("只有本地 UTF-8 文本/代码和 Markdown 原文可编辑", () => {
   assert.equal(canEditFilePreview({ workspaceId: "shared:abc" as never, previewType: "code", preview: preview() }), false);
   assert.equal(canEditFilePreview({ workspaceId: local, previewType: "html", preview: preview() }), false);
   assert.equal(canEditFilePreview({ workspaceId: local, previewType: "code", preview: preview({ encoding: "gb18030" }) }), false);
+  assert.equal(canEditFilePreview({ workspaceId: local, previewType: "code", preview: preview({ encoding: undefined }) }), false);
   assert.equal(canEditFilePreview({ workspaceId: local, previewType: "code", preview: preview({ truncated: true }) }), false);
   assert.equal(canEditFilePreview({ workspaceId: local, previewType: "code", preview: preview({ mtimeMs: null }) }), false);
   assert.equal(canEditFilePreview({ workspaceId: local, previewType: "code", preview: preview({ size: 6 * 1024 * 1024 }) }), false);
@@ -48,6 +49,12 @@ test("草稿在未保存、放弃和外部刷新之间保持正确基线", () =>
   assert.equal(draft.content, "reloaded\n");
   assert.equal(draft.baseMtimeMs, 3000);
   assert.equal(getFileEditorDraft(workspace, "src/a.ts"), draft);
+  // 独立窗口使用单独作用域；窗口草稿不能影响内嵌预览草稿。
+  const windowDraft = ensureFileEditorDraft(workspace, "src/a.ts", preview(), "window:w1");
+  updateFileEditorContent(windowDraft, "window-edit\n");
+  assert.equal(draft.content, "reloaded\n");
+  assert.equal(isFileEditorDirty(draft), false);
+  assert.equal(isFileEditorDirty(windowDraft), true);
 });
 
 test("预览窗口和内嵌面板都通过共享草稿保存并确认关闭", () => {

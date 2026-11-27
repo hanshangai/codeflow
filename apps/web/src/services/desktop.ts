@@ -503,7 +503,7 @@ export function resolveDesktopApiRequest(input: { method: string; path: string; 
   }
   const fsExtraMethods = {
     "/api/fs/tree": "fs.tree", "/api/fs/search": "fs.search", "/api/fs/reindex": "fs.reindex",
-    "/api/fs/stat": "fs.stat", "/api/fs/downloadFile": "fs.downloadFile",
+    "/api/fs/stat": "fs.stat", "/api/fs/downloadFile": "fs.downloadFile", "/api/fs/writeFile": "fs.writeFile",
     "/api/fs/uploadBegin": "fs.uploadBegin", "/api/fs/uploadChunk": "fs.uploadChunk",
     "/api/fs/uploadComplete": "fs.uploadComplete", "/api/fs/uploadCancel": "fs.uploadCancel",
   } as const;
