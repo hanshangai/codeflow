@@ -19,11 +19,11 @@ import {
   toEngineModelInfoFromCustomModel,
 } from "../../packages/shared/src/engineCatalog.ts";
 
-test("Claude Fable 5 defaults to the 200K model entry", () => {
+test("Claude Fable 5.2 is the default 1M model", () => {
   const defaultModel = getDefaultEngineModel("claude");
-  assert.equal(defaultModel?.id, "claude-fable-5");
-  assert.equal(defaultModel?.displayName, "Claude Fable 5");
-  assert.equal(defaultModel?.contextWindow, 200_000);
+  assert.equal(defaultModel?.id, "claude-fable-5-2");
+  assert.equal(defaultModel?.displayName, "Claude Fable 5.2");
+  assert.equal(defaultModel?.contextWindow, 1_000_000);
   assert.equal(defaultModel?.defaultReasoningEffort, "high");
 });
 
@@ -68,18 +68,6 @@ test("Claude Opus 5.5 is exposed as an opt-in native 1M model", () => {
   assert.throws(() => assertReasoningEffortSupportedForModel("claude", "claude-opus-5-5", "ultra"), /不支持/);
 });
 
-test("Claude Fable 5 1M is exposed as a separate fixed model entry", () => {
-  const baseModel = getEngineModelInfo("claude", "claude-fable-5");
-  const oneMillionModel = getEngineModelInfo("claude", "claude-fable-5[1m]");
-  assert.equal(baseModel?.contextWindow, 200_000);
-  assert.deepEqual(baseModel?.supportedReasoningEfforts?.map((item) => item.reasoningEffort), ["low", "medium", "high", "xhigh", "max"]);
-  assert.equal(oneMillionModel?.displayName, "Claude Fable 5 1M");
-  assert.equal(oneMillionModel?.contextWindow, 1_000_000);
-  assert.equal(oneMillionModel?.defaultReasoningEffort, "high");
-  assert.equal(oneMillionModel?.supports1MContext ?? false, false);
-  assert.equal(oneMillionModel?.maxContextWindow ?? null, null);
-});
-
 test("Claude Opus 5 is exposed as fixed 200K and 1M entries", () => {
   const baseModel = getEngineModelInfo("claude", "claude-opus-5");
   const oneMillionModel = getEngineModelInfo("claude", "claude-opus-5[1m]");
@@ -94,49 +82,20 @@ test("Claude Opus 5 is exposed as fixed 200K and 1M entries", () => {
   assert.equal(oneMillionModel?.maxContextWindow ?? null, null);
 });
 
-test("Claude Opus 4.8 1M is exposed as a separate fixed model entry", () => {
-  const oneMillionModel = getEngineModelInfo("claude", "claude-opus-4-8[1m]");
-  assert.equal(oneMillionModel?.displayName, "Claude Opus 4.8 1M");
-  assert.equal(oneMillionModel?.contextWindow, 1_000_000);
-  assert.equal(oneMillionModel?.defaultReasoningEffort, "high");
-  assert.equal(oneMillionModel?.supports1MContext ?? false, false);
-  assert.equal(oneMillionModel?.maxContextWindow ?? null, null);
+test("Claude catalog retains the two latest releases in each Anthropic model family", () => {
+  assert.deepEqual(CLAUDE_MODELS.filter((model) => model.providerId === "anthropic").map((model) => model.id), [
+    "claude-fable-5-2", "claude-fable-5-1",
+    "claude-opus-5-5", "claude-opus-5", "claude-opus-5[1m]",
+    "claude-sonnet-5-5", "claude-sonnet-5",
+    "claude-haiku-5-5", "claude-haiku-4-5-20251001",
+  ]);
 });
 
-test("Claude Opus 4.7 1M is exposed as a separate fixed model entry", () => {
-  const oneMillionModel = getEngineModelInfo("claude", "claude-opus-4-7[1m]");
-  assert.equal(oneMillionModel?.displayName, "Claude Opus 4.7 1M");
-  assert.equal(oneMillionModel?.contextWindow, 1_000_000);
-  assert.equal(oneMillionModel?.supports1MContext ?? false, false);
-  assert.equal(oneMillionModel?.maxContextWindow ?? null, null);
-});
-
-test("Claude Opus 4.6 1M is exposed as a separate fixed model entry", () => {
-  const baseModel = getEngineModelInfo("claude", "claude-opus-4-6");
-  const oneMillionModel = getEngineModelInfo("claude", "claude-opus-4-6[1m]");
-  assert.equal(baseModel?.contextWindow, 200_000);
-  assert.equal(baseModel?.supports1MContext ?? false, false);
-  assert.equal(baseModel?.maxContextWindow ?? null, null);
-  assert.equal(oneMillionModel?.displayName, "Claude Opus 4.6 1M");
-  assert.equal(oneMillionModel?.contextWindow, 1_000_000);
-  assert.equal(oneMillionModel?.supportedReasoningEfforts?.map((item) => item.reasoningEffort).includes("max"), true);
-  assert.equal(oneMillionModel?.supports1MContext ?? false, false);
-  assert.equal(oneMillionModel?.maxContextWindow ?? null, null);
-});
-
-test("Claude catalog defaults resolve to Fable 5 200K without an implicit 1M override", () => {
+test("Claude catalog defaults resolve to Fable 5.2 with a 1M window", () => {
   const defaults = resolveCatalogDefaultThreadPrefs("claude");
-  assert.equal(defaults.model, "claude-fable-5");
-  assert.equal(defaults.contextWindow, 200_000);
+  assert.equal(defaults.model, "claude-fable-5-2");
+  assert.equal(defaults.contextWindow, 1_000_000);
   assert.equal(defaults.effort, "high");
-});
-
-test("Claude Fable 5 reasoning efforts include the max tier", () => {
-  const fable5 = CLAUDE_MODELS.find((item) => item.id === "claude-fable-5");
-  assert.deepEqual(
-    fable5?.supportedReasoningEfforts?.map((item) => item.reasoningEffort),
-    ["low", "medium", "high", "xhigh", "max"],
-  );
 });
 
 test("Claude catalog exposes supported DeepSeek models without retired Flash entries", () => {
@@ -199,17 +158,15 @@ test("Sonnet 5 exposes native 1M, images and the advanced effort ladder", () => 
   assert.throws(() => assertReasoningEffortSupportedForModel("claude", "claude-sonnet-5", "ultra"), /不支持/);
 });
 
-test("Kimi K2.7 Code variants expose vision and 256K without unsupported effort controls", () => {
-  for (const modelId of ["kimi-k2.7-code", "kimi-k2.7-code-highspeed"]) {
+test("Kimi catalog includes K3.1 Pro variants and K3", () => {
+  assert.deepEqual(CLAUDE_MODELS.filter((model) => model.providerId === "moonshot").map((model) => model.id), [
+    "kimi-k3.1-pro", "kimi-k3.1-pro-highspeed", "kimi-k3",
+  ]);
+  for (const modelId of ["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed", "kimi-k3"]) {
     const model = getEngineModelInfo("claude", modelId);
-    assert.equal(model?.providerId, "moonshot");
-    assert.equal(model?.contextWindow, 256_000);
+    assert.equal(model?.contextWindow, 1_000_000);
     assert.deepEqual(model?.inputModalities, ["text", "image"]);
-    assert.deepEqual(model?.supportedReasoningEfforts, []);
-    assert.equal(model?.defaultReasoningEffort, null);
-    assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: modelId, effort: "max" }).effort, null);
-    assert.throws(() => assertReasoningEffortSupportedForModel("claude", modelId, "max"), /不支持/);
-    assert.doesNotThrow(() => assertReasoningEffortSupportedForModel("claude", modelId, null));
+    assert.equal(model?.defaultReasoningEffort, "max");
   }
 });
 
@@ -226,39 +183,21 @@ test("GLM 5.3 models expose 1M and documented efforts with vision limited to Fla
   }
 });
 
-test("Claude 4.5 and 4.6 models expose only their documented effort ladders", () => {
-  assert.deepEqual(
-    getEngineModelInfo("claude", "claude-sonnet-4-6")?.supportedReasoningEfforts?.map((item) => item.reasoningEffort),
-    ["low", "medium", "high", "max"],
-  );
-  assert.equal(getEngineModelInfo("claude", "claude-sonnet-4-6")?.defaultReasoningEffort, "medium");
-  for (const modelId of ["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"]) {
-    assert.deepEqual(getEngineModelInfo("claude", modelId)?.supportedReasoningEfforts, []);
-    assert.equal(getEngineModelInfo("claude", modelId)?.defaultReasoningEffort, null);
-  }
+test("Haiku 4.5 remains available without adjustable reasoning effort", () => {
+  const model = getEngineModelInfo("claude", "claude-haiku-4-5-20251001");
+  assert.deepEqual(model?.supportedReasoningEfforts, []);
+  assert.equal(model?.defaultReasoningEffort, null);
 });
 
-test("Claude catalog exposes official Claude-compatible provider models", () => {
-  const kimiK3 = getEngineModelInfo("claude", "kimi-k3");
-  assert.equal(kimiK3?.providerId, "moonshot");
-  assert.equal(kimiK3?.contextWindow, 1_000_000);
-  assert.deepEqual(kimiK3?.inputModalities, ["text", "image"]);
-  assert.deepEqual(kimiK3?.supportedReasoningEfforts?.map((item) => item.reasoningEffort), ["low", "high", "max"]);
-  assert.equal(kimiK3?.defaultReasoningEffort, "max");
-
-  const kimi = getEngineModelInfo("claude", "kimi-k2.6");
-  assert.equal(kimi?.providerId, "moonshot");
-  assert.equal(kimi?.contextWindow, 256_000);
-  assert.deepEqual(kimi?.supportedReasoningEfforts?.map((item) => item.reasoningEffort), []);
-
-  assert.equal(getEngineModelInfo("claude", "glm-5.1")?.providerId, "zai");
-  assert.equal(getEngineModelInfo("claude", "glm-5.1")?.contextWindow, 200_000);
-  assert.equal(getEngineModelInfo("claude", "glm-5-turbo")?.providerId, "zai");
-  assert.equal(getEngineModelInfo("claude", "glm-4.7")?.providerId, "zai");
-
-  assert.equal(getEngineModelInfo("claude", "qwen3.7-max")?.providerId, "qwen");
-  assert.equal(getEngineModelInfo("claude", "qwen3.7-max")?.contextWindow, 991_000);
-  assert.equal(getEngineModelInfo("claude", "qwen3.6-flash")?.contextWindow, 1_000_000);
+test("GLM and Qwen expose the two latest compatible versions", () => {
+  assert.deepEqual(CLAUDE_MODELS.filter((model) => model.providerId === "zai").map((model) => model.id), [
+    "glm-5.4", "glm-5.3", "glm-5.3-flash",
+  ]);
+  assert.deepEqual(CLAUDE_MODELS.filter((model) => model.providerId === "qwen").map((model) => model.id), [
+    "qwen4-max", "qwen3.8-max", "qwen3.8-flash",
+  ]);
+  assert.equal(getEngineModelInfo("claude", "glm-5.4")?.contextWindow, 1_000_000);
+  assert.equal(getEngineModelInfo("claude", "qwen4-max")?.contextWindow, 983_616);
 });
 
 test("model catalogs declare provider metadata for grouped selectors", () => {
@@ -306,7 +245,7 @@ test("provider helpers map model ids and key providers by engine", () => {
   );
   assert.deepEqual(
     filterEngineModelsByProviderIds(CLAUDE_MODELS, ["qwen"]).map((item) => item.id),
-    ["qwen3.7-max", "qwen3.6-flash"],
+    ["qwen4-max", "qwen3.8-max", "qwen3.8-flash"],
   );
 });
 
@@ -317,57 +256,24 @@ test("Claude catalog does not expose deprecated DeepSeek compatibility aliases",
   assert.equal(getEngineModelInfo("claude", "deepseek-reasoner"), null);
 });
 
-test("retired Kimi models stay out of the built-in catalog while K2.6 remains supported", () => {
-  assert.deepEqual(CLAUDE_MODELS.filter((model) => model.providerId === "moonshot").map((model) => model.id), [
-    "kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6",
-  ]);
-  for (const modelId of ["kimi-k2.5", "kimi-k2-thinking", "kimi-k2-0905-preview", "moonshot-v1-128k"]) {
-    assert.equal(getEngineModelInfo("claude", modelId), null);
-  }
-});
-
-test("Codex defaults to GPT-5.6 Sol", () => {
+test("Codex defaults to GPT-6.2 Sol with an 872K window, xhigh and standard tier", () => {
   const defaultModel = getDefaultEngineModel("codex");
-  assert.equal(defaultModel?.id, "gpt-5.6-sol");
-  assert.equal(defaultModel?.displayName, "GPT-5.6 Sol");
-  assert.equal(defaultModel?.contextWindow, 372_000);
-});
-
-test("Codex catalog defaults resolve to GPT-5.6 Sol with xhigh reasoning and standard tier", () => {
+  assert.equal(defaultModel?.id, "gpt-6.2-sol");
+  assert.equal(defaultModel?.contextWindow, 500_000);
   const defaults = resolveCatalogDefaultThreadPrefs("codex");
-  assert.equal(defaults.model, "gpt-5.6-sol");
+  assert.equal(defaults.model, "gpt-6.2-sol");
   assert.equal(defaults.effort, "xhigh");
   assert.equal(defaults.autoCompactPct, 95);
-  assert.equal(defaults.contextWindow, 372_000);
+  assert.equal(defaults.contextWindow, 872_000);
   assert.equal(defaults.serviceTier, null);
 });
 
-test("Codex catalog tracks supported GPT model slugs", () => {
-  assert.deepEqual(
-    CODEX_MODELS.map((item) => item.id),
-    [
-      "gpt-6-astra",
-      "gpt-6.1-sol",
-      "gpt-6-sol",
-      "gpt-6-luna",
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-    ],
-  );
-  assert.equal(getEngineModelInfo("codex", "gpt-5.4"), null);
-  assert.equal(getEngineModelInfo("codex", "gpt-5.4-mini"), null);
-  for (const removedModelId of [
-    "gpt-5.4-pro",
-    "gpt-5.3-codex",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex",
-    "codex-mini-latest",
-  ]) {
-    assert.equal(getEngineModelInfo("codex", removedModelId), null);
+test("Codex catalog lists GPT-6.2 and excludes GPT-5.5 and GPT-5.6", () => {
+  assert.deepEqual(CODEX_MODELS.map((item) => item.id), [
+    "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+  ]);
+  for (const modelId of ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini"]) {
+    assert.equal(getEngineModelInfo("codex", modelId), null);
   }
 });
 
@@ -454,15 +360,13 @@ test("Codex Fast mode is exposed as a model capability for eligible GPT models",
   assert.equal(getEngineModelInfo("codex", "gpt-6.1-sol")?.supportsFastMode, true);
   assert.equal(getEngineModelInfo("codex", "gpt-6-sol")?.supportsFastMode, true);
   assert.equal(getEngineModelInfo("codex", "gpt-6-luna")?.supportsFastMode, true);
-  assert.equal(getEngineModelInfo("codex", "gpt-5.6-sol")?.supportsFastMode, true);
-  assert.equal(getEngineModelInfo("codex", "gpt-5.6-terra")?.supportsFastMode, true);
-  assert.equal(getEngineModelInfo("codex", "gpt-5.6-luna")?.supportsFastMode, true);
-  assert.equal(getEngineModelInfo("codex", "gpt-5.5")?.supportsFastMode, true);
+  assert.equal(getEngineModelInfo("codex", "gpt-6.2-sol")?.supportsFastMode, true);
+  assert.equal(getEngineModelInfo("codex", "gpt-6.2-astra")?.supportsFastMode, true);
 });
 
 test("Codex service tier is kept only for Fast-capable Codex models", () => {
   assert.equal(
-    resolveThreadPrefsWithCatalogDefaults("codex", { model: "gpt-5.6-sol", serviceTier: "fast" }).serviceTier,
+    resolveThreadPrefsWithCatalogDefaults("codex", { model: "gpt-6.2-sol", serviceTier: "fast" }).serviceTier,
     "fast",
   );
   assert.equal(
@@ -493,25 +397,13 @@ test("GPT 默认使用标准档，仅在显式开启且模型支持时保留 Fas
   assert.equal(resolveThreadPrefsWithCatalogDefaults("codex", { model: models[0]!.id }, models).serviceTier, null);
 });
 
-test("GPT-5.6 reasoning efforts expose current Codex ladders", () => {
-  const sol = CODEX_MODELS.find((item) => item.id === "gpt-5.6-sol");
-  const terra = CODEX_MODELS.find((item) => item.id === "gpt-5.6-terra");
-  const luna = CODEX_MODELS.find((item) => item.id === "gpt-5.6-luna");
-  assert.deepEqual(
-    sol?.supportedReasoningEfforts?.map((item) => item.reasoningEffort),
-    ["low", "medium", "high", "xhigh", "max", "ultra"],
-  );
-  assert.equal(sol?.defaultReasoningEffort, "xhigh");
-  assert.deepEqual(
-    terra?.supportedReasoningEfforts?.map((item) => item.reasoningEffort),
-    ["low", "medium", "high", "xhigh", "max", "ultra"],
-  );
-  assert.equal(terra?.defaultReasoningEffort, "xhigh");
-  assert.deepEqual(
-    luna?.supportedReasoningEfforts?.map((item) => item.reasoningEffort),
-    ["low", "medium", "high", "xhigh", "max"],
-  );
-  assert.equal(luna?.defaultReasoningEffort, "xhigh");
+test("GPT-6.2 Sol and Astra expose the supported reasoning ladder and 872K windows", () => {
+  for (const modelId of ["gpt-6.2-sol", "gpt-6.2-astra"]) {
+    const model = getEngineModelInfo("codex", modelId);
+    assert.deepEqual(model?.supportedReasoningEfforts?.map((item) => item.reasoningEffort), ["low", "medium", "high", "xhigh", "max", "ultra"]);
+    assert.deepEqual(model?.inputModalities, ["text", "image"]);
+    assert.equal(resolveThreadPrefsWithCatalogDefaults("codex", { model: modelId }).contextWindow, 872_000);
+  }
 });
 
 test("新旧会话统一使用模型最大窗口，历史覆盖值不再生效", () => {
@@ -537,7 +429,7 @@ test("仅声明最大容量的旧自定义模型不被缺省容量抬高", () =>
 test("provider effort options follow engine/provider capabilities", () => {
   assert.deepEqual(
     getSupportedReasoningEffortsForProvider("codex", "openai").map((item) => item.reasoningEffort),
-    ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
   );
   assert.deepEqual(
     getSupportedReasoningEffortsForProvider("claude", "deepseek").map((item) => item.reasoningEffort),
@@ -547,15 +439,14 @@ test("provider effort options follow engine/provider capabilities", () => {
     getSupportedReasoningEffortsForProvider("claude", "anthropic").map((item) => item.reasoningEffort),
     ["low", "medium", "high", "xhigh", "max"],
   );
-  assert.deepEqual(getSupportedReasoningEffortsForProvider("claude", "moonshot").map((item) => item.reasoningEffort), ["low", "high", "max"]);
+  assert.deepEqual(getSupportedReasoningEffortsForProvider("claude", "moonshot").map((item) => item.reasoningEffort), ["low", "medium", "high", "max"]);
   assert.deepEqual(getSupportedReasoningEffortsForProvider("claude", "zai").map((item) => item.reasoningEffort), ["low", "high", "max"]);
   assert.deepEqual(getSupportedReasoningEffortsForProvider("claude", "qwen"), []);
 });
 
 test("thread prefs resolver repairs stale or unsupported historical effort values", () => {
   assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: "kimi-k3", effort: "medium" }).effort, "max");
-  assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: "kimi-k2.6", effort: "high" }).effort, null);
-  assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: "qwen3.7-max", effort: "max" }).effort, null);
+  assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: "qwen4-max", effort: "max" }).effort, null);
   assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: "deepseek-v4-pro", effort: "medium" }).effort, "high");
 });
 
@@ -568,7 +459,7 @@ test("explicit effort validation rejects unsupported model tiers without changin
   assert.doesNotThrow(() => assertReasoningEffortSupportedForModel("claude", "deepseek-v4-flash", "max"));
   assert.doesNotThrow(() => assertReasoningEffortSupportedForModel("claude", "deepseek-v4-pro", "max"));
   assert.doesNotThrow(() => assertReasoningEffortSupportedForModel("claude", "deepseek-v4-pro[1m]", "max"));
-  assert.doesNotThrow(() => assertReasoningEffortSupportedForModel("claude", "claude-sonnet-4-6[1m]", "max"));
+  assert.doesNotThrow(() => assertReasoningEffortSupportedForModel("claude", "claude-sonnet-5-5", "max"));
   assert.throws(
     () => assertReasoningEffortSupportedForModel("claude", "deepseek-v4-pro", "medium"),
     /模型「deepseek-v4-pro」不支持思考强度「medium」/,
@@ -578,12 +469,8 @@ test("explicit effort validation rejects unsupported model tiers without changin
     /模型「deepseek-v4-pro」不支持思考强度「medium」/,
   );
   assert.throws(
-    () => assertReasoningEffortSupportedForModel("claude", "claude-sonnet-4-5-20250929", "high"),
-    /模型「claude-sonnet-4-5-20250929」不支持思考强度「high」/,
-  );
-  assert.throws(
-    () => assertReasoningEffortSupportedForModel("claude", "claude-sonnet-4-5-20250929[1m]", "high"),
-    /模型「claude-sonnet-4-5-20250929」不支持思考强度「high」/,
+    () => assertReasoningEffortSupportedForModel("claude", "claude-haiku-4-5-20251001", "high"),
+    /不支持思考强度「high」/,
   );
   assert.throws(
     () => assertReasoningEffortSupportedForModel("claude", "deepseek-v4-pro", "extreme"),
