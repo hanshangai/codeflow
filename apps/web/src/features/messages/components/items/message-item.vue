@@ -7,6 +7,7 @@ import type { ConversationMessage, EngineType, TurnId, TextFileAttachment, Works
 import { copyToClipboard } from "@/composables/useClipboard";
 import { useApiContext } from "@/composables/useApiContext";
 import MarkdownContent from "../../../markdown/MarkdownContent.vue";
+import { formatAssistantMessageText } from "../../assistantMessageText";
 import HtmlPreview from "../../../explorer/components/html-preview.vue";
 import MarkdownPreview from "../../../explorer/components/markdown-preview.vue";
 import { loadWorkspaceFilePreview, type WorkspaceFilePreviewResult } from "../../../explorer/workspaceFilePreview";
@@ -42,6 +43,9 @@ const emit = defineEmits<{
   (e: "rollback", turnId: TurnId): void;
   (e: "deleteMessage", itemId: string): void;
 }>();
+const displayText = computed(() => props.item.role === "assistant"
+  ? formatAssistantMessageText(props.item.text, props.item.format === "plain")
+  : props.item.text);
 const showDelete = computed(() => props.canDelete && !String(props.item.id).startsWith("local_user_"));
 const config = useConfigStore();
 const workspaces = useWorkspacesStore();
@@ -82,7 +86,7 @@ async function copyMessageText(): Promise<void> {
   if (copying.value) return;
   copying.value = true;
   try {
-    await copyToClipboard(props.item.text ?? "");
+    await copyToClipboard(displayText.value);
     message.success("已复制");
   } catch (e) {
     message.error(e instanceof Error ? e.message : "复制失败");
@@ -288,13 +292,13 @@ function formatMessageTime(ts: number | null | undefined, mode: "short" | "full"
     <div class="msg msg--message" :class="[item.role === 'user' ? 'msg--user' : 'msg--assistant']">
       <!-- 消息内容区 -->
       <div v-if="item.role === 'assistant' && item.format === 'plain'" class="msg__content msg__content--plain">
-        <span>{{ item.text }}</span><span class="msg__cursor">▍</span>
+        <span>{{ displayText }}</span><span class="msg__cursor">▍</span>
       </div>
       <template v-else-if="item.role === 'assistant'">
         <div v-if="showRaw" class="msg__content msg__content--raw">{{ item.text }}</div>
         <MarkdownContent
           v-else
-          :text="item.text"
+          :text="displayText"
           :workspace-id="props.workspaceId ?? null"
           :workspace-root-path="workspaceRootPath"
           @open-workspace-file="openWorkspaceFilePreview"

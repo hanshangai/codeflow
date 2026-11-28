@@ -1005,7 +1005,7 @@ function openInAppNotice(notice: ActiveInAppNoticeItem): void {
           @click="toggleKnowledgeEntry"
         >
           <BookOutlined style="font-size: 13px" />
-          规格库
+          规格
         </button>
 
         <button
