@@ -284,6 +284,16 @@ const submit = async () => {
   if (disabled.value || busy.value) return;
   await submitAnswers(collectAnswers());
 };
+
+/** 输入框按 Enter 直接提交；输入法组合态与带修饰键时保留原始输入行为。 */
+function onAnswerEnter(event: KeyboardEvent): void {
+  if (disabled.value || busy.value) return;
+  if (event.isComposing || event.keyCode === 229) return;
+  if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+  // 阻止多行输入框在提交同时插入换行；提交失败时保留原文本便于重试。
+  event.preventDefault();
+  void submit();
+}
 </script>
 
 <template>
@@ -398,16 +408,18 @@ const submit = async () => {
                   :disabled="disabled"
                   style="margin-top: 8px"
                   placeholder="其他（可选）"
+                  @press-enter="onAnswerEnter"
                 />
               </div>
               <div v-else style="margin-top: 8px">
-                <a-textarea v-model:value="freeText[q.id]" :disabled="disabled" :auto-size="{ minRows: 2, maxRows: 4 }" placeholder="请输入您的回答" />
+                <a-textarea v-model:value="freeText[q.id]" :disabled="disabled" :auto-size="{ minRows: 2, maxRows: 4 }" placeholder="请输入您的回答" @press-enter="onAnswerEnter" />
               </div>
             </div>
           </template>
         </div>
 
         <footer class="uir-dialog__footer">
+          <span v-if="item.state === 'pending'" class="uir-dialog__hint">Enter 提交，Shift+Enter 换行</span>
           <a-button :size="isMobileViewport ? 'large' : 'small'" @click="dialogOpen = false">关闭</a-button>
           <a-button
             v-if="item.state === 'pending'"
@@ -450,7 +462,10 @@ const submit = async () => {
 
 .uir-dialog {
   pointer-events: auto;
-  width: min(1120px, calc(100vw - 48px));
+  /* 宽度随内容收缩，同时限制最小可读宽度和桌面最大宽度。 */
+  width: fit-content;
+  min-width: min(420px, calc(100vw - 48px));
+  max-width: min(1120px, calc(100vw - 48px));
   max-height: 72vh;
   border: 1px solid var(--app-border, #e5e7eb);
   border-radius: 16px;
@@ -463,6 +478,9 @@ const submit = async () => {
 
 .uir-dialog--mobile {
   width: min(100%, 760px);
+  min-width: 0;
+  /* 移动端层内边距为 12px，覆盖桌面端 48px 的最大宽度限制。 */
+  max-width: calc(100vw - 24px);
   max-height: 82vh;
   border-radius: 18px 18px 0 0;
 }
@@ -486,6 +504,7 @@ const submit = async () => {
   font-size: 14px;
   line-height: 1.4;
   color: var(--app-text);
+  overflow-wrap: anywhere;
 }
 
 .uir-dialog__subtitle {
@@ -583,6 +602,7 @@ const submit = async () => {
 .uir-dialog__hint {
   color: var(--app-muted);
   font-size: 12px;
+  margin-right: auto;
 }
 
 .uir-option {
@@ -648,6 +668,10 @@ const submit = async () => {
 @media (max-width: 767px) {
   .uir-dialog-layer {
     padding: 12px 12px 0;
+  }
+
+  .uir-dialog__hint {
+    display: none;
   }
 
   .uir-dialog__footer > .ant-btn {

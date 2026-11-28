@@ -20,7 +20,7 @@ function fixture(t: test.TestContext, delivery?: "async", surface?: { active?: b
   const apiCalls: unknown[] = [];
   const modules: Record<string, unknown> = {
     vue: { ...vue, inject: () => null, onBeforeUnmount() {}, onDeactivated() {} },
-    "ant-design-vue": { message: {}, Modal: {} }, "@ant-design/icons-vue": {},
+    "ant-design-vue": { message: { success() {}, error() {} }, Modal: {} }, "@ant-design/icons-vue": {},
     "@/composables/useClipboard": { copyToClipboard() {} },
     "../../../../api/request": { createApiResultError: (result: any) => new Error(result.message) },
     "../../../../composables/useApiContext": { useApiContext: () => ({ ctx: vue.ref({}) }) },
@@ -86,6 +86,29 @@ test("隐藏容器激活后也不自动弹框", async t => {
   f.props.active = true;
   await vue.nextTick();
   assert.equal(f.state.dialogOpen.value, false);
+});
+
+test("输入框回车直接提交，输入法组合态与修饰键不提交", async t => {
+  const source = fs.readFileSync("apps/web/src/features/messages/components/items/user-input-request-item.vue", "utf8");
+  assert.equal((source.match(/@press-enter="onAnswerEnter"/gu) ?? []).length, 2, "两个输入入口都绑定回车提交");
+  const f = fixture(t);
+  f.state.dialogOpen.value = true;
+  f.state.freeText.q = "自定义回答";
+  for (const event of [{ shiftKey: true }, { ctrlKey: true }, { altKey: true }, { metaKey: true }, { isComposing: true }, { keyCode: 229 }]) {
+    f.state.onAnswerEnter(event as KeyboardEvent);
+  }
+  assert.deepEqual(f.apiCalls, [], "修饰键与输入法组合态不能提交");
+  let prevented = 0;
+  f.state.onAnswerEnter({ preventDefault: () => { prevented += 1; } } as unknown as KeyboardEvent);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(prevented, 1, "提交时必须阻止输入框默认换行");
+  assert.equal(f.apiCalls.length, 1, "普通 Enter 直接提交");
+  assert.deepEqual((f.apiCalls[0] as { answers: Record<string, { answers: string[] }> }).answers.q.answers, ["自定义回答"]);
+  assert.equal(f.state.dialogOpen.value, false, "提交成功后关闭弹框");
+  f.props.item = { ...f.props.item, state: "submitted" };
+  await vue.nextTick();
+  f.state.onAnswerEnter({} as KeyboardEvent);
+  assert.equal(f.apiCalls.length, 1, "非待填写状态不再提交");
 });
 
 test("问题提交事件关闭残留表单，同编号的新问题不继承旧弹框", async t => {
