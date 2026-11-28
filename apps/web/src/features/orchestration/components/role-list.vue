@@ -462,18 +462,18 @@ function isRoleAvailable(role: unknown): boolean {
             <span v-for="tag in roleCapabilityTags(role)" :key="tag">{{ tag }}</span>
           </div>
         </div>
-        <button
-          v-if="props.canCopyBuiltin && role.kind === 'builtin'"
-          type="button"
-          class="role-list__item-menu role-list__item-copy"
-          :disabled="props.copyingBuiltinAssetId === role.id"
-          title="复制为个人资产"
-          :aria-label="`复制 ${role.name} 为个人资产`"
-          @click.stop="emit('copy-builtin', role.id)"
-        >
-          <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === role.id" spin />
-          <CopyOutlined v-else />
-        </button>
+        <a-tooltip v-if="props.canCopyBuiltin && role.kind === 'builtin'" title="复制为个人资产" placement="bottom">
+          <button
+            type="button"
+            class="role-list__item-menu role-list__item-copy"
+            :disabled="props.copyingBuiltinAssetId === role.id"
+            :aria-label="`复制 ${role.name} 为个人资产`"
+            @click.stop="emit('copy-builtin', role.id)"
+          >
+            <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === role.id" spin />
+            <CopyOutlined v-else />
+          </button>
+        </a-tooltip>
         <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.role.includes(role.id) && role.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="role-list__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>

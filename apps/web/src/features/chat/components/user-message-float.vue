@@ -98,45 +98,49 @@ const hiddenImageCount = computed(() => Math.max(0, (props.images?.length ?? 0) 
     </div>
 
     <div class="chat-user-msg-float__actions">
-      <button
-        type="button"
-        class="chat-user-msg-float__action"
-        title="定位到该消息"
-        aria-label="定位到该消息"
-        :disabled="!text"
-        @click="emit('locate')"
-      >
-        <AimOutlined />
-      </button>
-      <button
-        type="button"
-        class="chat-user-msg-float__action"
-        title="上一条用户消息"
-        aria-label="上一条用户消息"
-        :disabled="!text"
-        @click="emit('prev')"
-      >
-        <UpOutlined />
-      </button>
-      <button
-        type="button"
-        class="chat-user-msg-float__action"
-        title="下一条用户消息"
-        aria-label="下一条用户消息"
-        :disabled="!text"
-        @click="emit('next')"
-      >
-        <DownOutlined />
-      </button>
-      <button
-        type="button"
-        class="chat-user-msg-float__action"
-        title="收起浮窗"
-        aria-label="收起浮窗"
-        @click="emit('toggleCollapse')"
-      >
-        <MinusOutlined />
-      </button>
+      <a-tooltip title="定位到该消息" placement="bottom">
+        <button
+          type="button"
+          class="chat-user-msg-float__action"
+          aria-label="定位到该消息"
+          :disabled="!text"
+          @click="emit('locate')"
+        >
+          <AimOutlined />
+        </button>
+      </a-tooltip>
+      <a-tooltip title="上一条用户消息" placement="bottom">
+        <button
+          type="button"
+          class="chat-user-msg-float__action"
+          aria-label="上一条用户消息"
+          :disabled="!text"
+          @click="emit('prev')"
+        >
+          <UpOutlined />
+        </button>
+      </a-tooltip>
+      <a-tooltip title="下一条用户消息" placement="bottom">
+        <button
+          type="button"
+          class="chat-user-msg-float__action"
+          aria-label="下一条用户消息"
+          :disabled="!text"
+          @click="emit('next')"
+        >
+          <DownOutlined />
+        </button>
+      </a-tooltip>
+      <a-tooltip title="收起浮窗" placement="bottom">
+        <button
+          type="button"
+          class="chat-user-msg-float__action"
+          aria-label="收起浮窗"
+          @click="emit('toggleCollapse')"
+        >
+          <MinusOutlined />
+        </button>
+      </a-tooltip>
     </div>
   </section>
 </template>

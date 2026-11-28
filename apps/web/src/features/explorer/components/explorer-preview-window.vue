@@ -399,16 +399,17 @@ function onWindowMousedown(e: MouseEvent) {
             <SaveOutlined />
           </a-button>
         </template>
-        <a-button
-          v-if="canCopyPreviewContent"
-          size="small"
-          type="text"
-          title="复制"
-          :disabled="copyingContent"
-          @click="doCopy"
-        >
-          <CopyOutlined />
-        </a-button>
+        <a-tooltip v-if="canCopyPreviewContent" title="复制" placement="bottom" :overlay-style="{ zIndex: modalZIndex + 1 }">
+          <a-button
+            size="small"
+            type="text"
+            aria-label="复制"
+            :disabled="copyingContent"
+            @click="doCopy"
+          >
+            <CopyOutlined />
+          </a-button>
+        </a-tooltip>
         <a-button
           v-if="isMarkdownPreview"
           size="small"

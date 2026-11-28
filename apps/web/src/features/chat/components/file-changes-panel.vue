@@ -517,11 +517,21 @@ function cancelPreviewRequest(reason: AbortKind): void {
                   </span>
                   <span class="fc-table__dir mono" :title="it.path">{{ fileDir(it.path) }}</span>
                   <span class="fc-table__actions">
-                    <span class="fc-table__action" title="预览文件" @click.stop="openPreview(it)"><LoadingOutlined v-if="previewLoadingPath === it.path" /><EyeOutlined v-else /></span>
-                    <span class="fc-table__action" title="查看差异" @click.stop="openView(it)"><LoadingOutlined v-if="viewLoadingPath === it.path" /><SwapOutlined v-else /></span>
-                    <span v-if="it.isAccepted" class="fc-table__action fc-table__action--accepted" title="已接受"><CheckCircleOutlined /></span>
-                    <span v-else class="fc-table__action fc-table__action--commit" :class="{ 'fc-table__action--disabled': props.disabled }" title="接受变更" @click.stop="!props.disabled && handleAccept(it.path)"><CheckCircleOutlined /></span>
-                    <span v-if="!it.isAccepted" class="fc-table__action fc-table__action--danger" :class="{ 'fc-table__action--disabled': props.disabled || !it.canUndo }" title="撤销" @click.stop="!props.disabled && it.canUndo && confirmUndo([it.path])"><UndoOutlined /></span>
+                    <a-tooltip title="预览文件" placement="top">
+                      <span class="fc-table__action" aria-label="预览文件" @click.stop="openPreview(it)"><LoadingOutlined v-if="previewLoadingPath === it.path" /><EyeOutlined v-else /></span>
+                    </a-tooltip>
+                    <a-tooltip title="查看差异" placement="top">
+                      <span class="fc-table__action" aria-label="查看差异" @click.stop="openView(it)"><LoadingOutlined v-if="viewLoadingPath === it.path" /><SwapOutlined v-else /></span>
+                    </a-tooltip>
+                    <a-tooltip v-if="it.isAccepted" title="已接受" placement="top">
+                      <span class="fc-table__action fc-table__action--accepted" aria-label="已接受"><CheckCircleOutlined /></span>
+                    </a-tooltip>
+                    <a-tooltip v-else title="接受变更" placement="top">
+                      <span class="fc-table__action fc-table__action--commit" :class="{ 'fc-table__action--disabled': props.disabled }" aria-label="接受变更" @click.stop="!props.disabled && handleAccept(it.path)"><CheckCircleOutlined /></span>
+                    </a-tooltip>
+                    <a-tooltip v-if="!it.isAccepted" title="撤销" placement="top">
+                      <span class="fc-table__action fc-table__action--danger" :class="{ 'fc-table__action--disabled': props.disabled || !it.canUndo }" aria-label="撤销" @click.stop="!props.disabled && it.canUndo && confirmUndo([it.path])"><UndoOutlined /></span>
+                    </a-tooltip>
                   </span>
                 </template>
               </div>
@@ -556,11 +566,19 @@ function cancelPreviewRequest(reason: AbortKind): void {
               <component :is="viewFullscreen ? FullscreenExitOutlined : FullscreenOutlined" />
             </a-button>
           </a-tooltip>
-          <a-button v-if="viewData && !viewData.isBinary" size="small" type="text" title="复制" :disabled="copyingDiff" @click="copyDiffContent"><CopyOutlined /></a-button>
+          <a-tooltip v-if="viewData && !viewData.isBinary" title="复制" placement="bottom">
+            <a-button size="small" type="text" aria-label="复制" :disabled="copyingDiff" @click="copyDiffContent"><CopyOutlined /></a-button>
+          </a-tooltip>
           <a-switch v-if="!viewAccepted" v-model:checked="inlineDiff" size="small" checked-children="单列" un-checked-children="对比" />
-          <a-button size="small" type="text" title="缩小" :disabled="!canZoomOut" @click="zoomOut"><MinusOutlined /></a-button>
-          <a-button size="small" type="text" title="重置缩放" @click="resetZoom">{{ scaleLabel }}</a-button>
-          <a-button size="small" type="text" title="放大" :disabled="!canZoomIn" @click="zoomIn"><PlusOutlined /></a-button>
+          <a-tooltip title="缩小" placement="bottom">
+            <a-button size="small" type="text" aria-label="缩小" :disabled="!canZoomOut" @click="zoomOut"><MinusOutlined /></a-button>
+          </a-tooltip>
+          <a-tooltip title="重置缩放" placement="bottom">
+            <a-button size="small" type="text" aria-label="重置缩放" @click="resetZoom">{{ scaleLabel }}</a-button>
+          </a-tooltip>
+          <a-tooltip title="放大" placement="bottom">
+            <a-button size="small" type="text" aria-label="放大" :disabled="!canZoomIn" @click="zoomIn"><PlusOutlined /></a-button>
+          </a-tooltip>
         </div>
       </div>
     </template>
@@ -596,14 +614,22 @@ function cancelPreviewRequest(reason: AbortKind): void {
               <component :is="previewFullscreen ? FullscreenExitOutlined : FullscreenOutlined" />
             </a-button>
           </a-tooltip>
-          <a-button v-if="previewData && (previewData.type === 'code' || previewData.type === 'markdown' || previewData.type === 'html')" size="small" type="text" title="复制" :disabled="copyingPreview" @click="copyPreviewContent"><CopyOutlined /></a-button>
+          <a-tooltip v-if="previewData && (previewData.type === 'code' || previewData.type === 'markdown' || previewData.type === 'html')" title="复制" placement="bottom">
+            <a-button size="small" type="text" aria-label="复制" :disabled="copyingPreview" @click="copyPreviewContent"><CopyOutlined /></a-button>
+          </a-tooltip>
           <a-tooltip v-if="previewData?.type === 'markdown'" :title="previewShowRaw ? '渲染预览' : '查看源码'">
             <span class="fc-table__action" style="cursor: pointer; font-size: 16px;" @click="previewShowRaw = !previewShowRaw"><CodeOutlined /></span>
           </a-tooltip>
           <template v-if="canZoom">
-            <a-button size="small" type="text" title="缩小" :disabled="!canZoomOut" @click="zoomOut"><MinusOutlined /></a-button>
-            <a-button size="small" type="text" title="重置缩放" @click="resetZoom">{{ scaleLabel }}</a-button>
-            <a-button size="small" type="text" title="放大" :disabled="!canZoomIn" @click="zoomIn"><PlusOutlined /></a-button>
+            <a-tooltip title="缩小" placement="bottom">
+              <a-button size="small" type="text" aria-label="缩小" :disabled="!canZoomOut" @click="zoomOut"><MinusOutlined /></a-button>
+            </a-tooltip>
+            <a-tooltip title="重置缩放" placement="bottom">
+              <a-button size="small" type="text" aria-label="重置缩放" @click="resetZoom">{{ scaleLabel }}</a-button>
+            </a-tooltip>
+            <a-tooltip title="放大" placement="bottom">
+              <a-button size="small" type="text" aria-label="放大" :disabled="!canZoomIn" @click="zoomIn"><PlusOutlined /></a-button>
+            </a-tooltip>
           </template>
         </div>
       </div>

@@ -372,18 +372,18 @@ function confirmDelete(bundleId: KnowledgeBundleId, name: string, event?: Event)
           </div>
           <div class="kb-sidebar__item-meta">{{ bundle.scope }} · {{ bundle.sourceRefs.length }} 个来源</div>
         </div>
-        <button
-          v-if="props.canCopyBuiltin && bundle.kind === 'builtin'"
-          type="button"
-          class="kb-sidebar__item-menu kb-sidebar__item-copy"
-          :disabled="props.copyingBuiltinAssetId === bundle.id"
-          title="复制为个人资产"
-          :aria-label="`复制 ${bundle.name} 为个人资产`"
-          @click.stop="emit('copy-builtin', bundle.id)"
-        >
-          <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === bundle.id" spin />
-          <CopyOutlined v-else />
-        </button>
+        <a-tooltip v-if="props.canCopyBuiltin && bundle.kind === 'builtin'" title="复制为个人资产" placement="bottom">
+          <button
+            type="button"
+            class="kb-sidebar__item-menu kb-sidebar__item-copy"
+            :disabled="props.copyingBuiltinAssetId === bundle.id"
+            :aria-label="`复制 ${bundle.name} 为个人资产`"
+            @click.stop="emit('copy-builtin', bundle.id)"
+          >
+            <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === bundle.id" spin />
+            <CopyOutlined v-else />
+          </button>
+        </a-tooltip>
         <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.knowledge_bundle.includes(bundle.id) && bundle.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="kb-sidebar__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>

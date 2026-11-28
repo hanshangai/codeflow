@@ -406,7 +406,9 @@ function formatMessageTime(ts: number | null | undefined, mode: "short" | "full"
             {{ previewFile.name }}
           </div>
         </div>
-        <a-button size="small" type="text" title="复制" :disabled="copyingFile" @click="copyFileText"><CopyOutlined /></a-button>
+        <a-tooltip title="复制" placement="bottom">
+          <a-button size="small" type="text" aria-label="复制" :disabled="copyingFile" @click="copyFileText"><CopyOutlined /></a-button>
+        </a-tooltip>
       </div>
       <div v-if="previewFileKind === 'markdown' || previewFileKind === 'html'" class="message-attachment-preview__rendered">
         <MarkdownPreview

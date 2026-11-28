@@ -439,18 +439,18 @@ function isWorkflowAvailable(workflow: unknown): boolean {
           </div>
           <div class="wf-sidebar__item-meta">v{{ wf.version }} · {{ wf.nodes.filter(n => n.type === 'role').length }} 个执行节点</div>
         </div>
-        <button
-          v-if="props.canCopyBuiltin && wf.kind === 'builtin'"
-          type="button"
-          class="wf-sidebar__item-menu wf-sidebar__item-copy"
-          :disabled="props.copyingBuiltinAssetId === wf.id"
-          title="复制为个人资产"
-          :aria-label="`复制 ${wf.name} 为个人资产`"
-          @click.stop="emit('copy-builtin', wf.id)"
-        >
-          <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === wf.id" spin />
-          <CopyOutlined v-else />
-        </button>
+        <a-tooltip v-if="props.canCopyBuiltin && wf.kind === 'builtin'" title="复制为个人资产" placement="bottom">
+          <button
+            type="button"
+            class="wf-sidebar__item-menu wf-sidebar__item-copy"
+            :disabled="props.copyingBuiltinAssetId === wf.id"
+            :aria-label="`复制 ${wf.name} 为个人资产`"
+            @click.stop="emit('copy-builtin', wf.id)"
+          >
+            <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === wf.id" spin />
+            <CopyOutlined v-else />
+          </button>
+        </a-tooltip>
         <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.workflow.includes(wf.id) && wf.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="wf-sidebar__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>

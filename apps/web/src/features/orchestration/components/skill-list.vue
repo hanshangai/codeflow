@@ -602,18 +602,18 @@ function yamlDoubleQuoted(value: string): string {
           </div>
           <div class="skill-sidebar__item-meta">{{ targetEnginesLabel(skill.targetEngines) }} · {{ skill.trigger || "未填写触发条件" }}</div>
         </div>
-        <button
-          v-if="props.canCopyBuiltin && skill.kind === 'builtin'"
-          type="button"
-          class="skill-sidebar__item-menu skill-sidebar__item-copy"
-          :disabled="props.copyingBuiltinAssetId === skill.id"
-          title="复制为个人资产"
-          :aria-label="`复制 ${skill.name} 为个人资产`"
-          @click.stop="emit('copy-builtin', skill.id)"
-        >
-          <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === skill.id" spin />
-          <CopyOutlined v-else />
-        </button>
+        <a-tooltip v-if="props.canCopyBuiltin && skill.kind === 'builtin'" title="复制为个人资产" placement="bottom">
+          <button
+            type="button"
+            class="skill-sidebar__item-menu skill-sidebar__item-copy"
+            :disabled="props.copyingBuiltinAssetId === skill.id"
+            :aria-label="`复制 ${skill.name} 为个人资产`"
+            @click.stop="emit('copy-builtin', skill.id)"
+          >
+            <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === skill.id" spin />
+            <CopyOutlined v-else />
+          </button>
+        </a-tooltip>
         <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.skill.includes(skill.id) && skill.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="skill-sidebar__item-menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>

@@ -160,9 +160,11 @@ function onSheetChange(event: Event): void {
       <template #title>
         <div class="spreadsheet-preview__cell-title">
           <span>{{ preview.sheetName }} · {{ selectedCell?.address }}</span>
-          <a-button size="small" type="text" title="复制" :disabled="copyingCell" @click="copySelectedCell">
-            <CopyOutlined />
-          </a-button>
+          <a-tooltip title="复制" placement="bottom" :overlay-style="{ zIndex: CELL_DETAIL_MODAL_Z_INDEX + 1 }">
+            <a-button size="small" type="text" aria-label="复制" :disabled="copyingCell" @click="copySelectedCell">
+              <CopyOutlined />
+            </a-button>
+          </a-tooltip>
         </div>
       </template>
       <textarea

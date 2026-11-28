@@ -274,35 +274,36 @@ async function pauseNow(): Promise<void> {
                 </div>
               </div>
               <span class="tq-bar__actions">
-                <a-popover
-                  trigger="click"
-                  placement="leftTop"
-                  overlay-class-name="tq-bar__detail-popover"
-                  :get-popup-container="getDetailPopupContainer"
-                >
-                  <template #title>队列详情</template>
-                  <template #content>
-                    <div class="tq-bar__detail-content">
-                      <div class="tq-bar__detail-label">完整内容</div>
-                      <div class="tq-bar__detail-text">{{ item.text || "（仅附件）" }}</div>
-                      <div v-if="formatAttachmentDetail(item)" class="tq-bar__detail-line">
-                        附件：{{ formatAttachmentDetail(item) }}
-                      </div>
-                      <div v-if="formatSendOptions(item)" class="tq-bar__detail-line">
-                        入队选项：{{ formatSendOptions(item) }}
-                      </div>
-                    </div>
-                  </template>
-                  <button
-                    type="button"
-                    class="fc-table__action tq-bar__icon-btn"
-                    title="查看详情"
-                    aria-label="查看队列详情"
-                    @click.stop
+                <a-tooltip title="查看详情" placement="top">
+                  <a-popover
+                    trigger="click"
+                    placement="leftTop"
+                    overlay-class-name="tq-bar__detail-popover"
+                    :get-popup-container="getDetailPopupContainer"
                   >
-                    <EyeOutlined />
-                  </button>
-                </a-popover>
+                    <template #title>队列详情</template>
+                    <template #content>
+                      <div class="tq-bar__detail-content">
+                        <div class="tq-bar__detail-label">完整内容</div>
+                        <div class="tq-bar__detail-text">{{ item.text || "（仅附件）" }}</div>
+                        <div v-if="formatAttachmentDetail(item)" class="tq-bar__detail-line">
+                          附件：{{ formatAttachmentDetail(item) }}
+                        </div>
+                        <div v-if="formatSendOptions(item)" class="tq-bar__detail-line">
+                          入队选项：{{ formatSendOptions(item) }}
+                        </div>
+                      </div>
+                    </template>
+                    <button
+                      type="button"
+                      class="fc-table__action tq-bar__icon-btn"
+                      aria-label="查看队列详情"
+                      @click.stop
+                    >
+                      <EyeOutlined />
+                    </button>
+                  </a-popover>
+                </a-tooltip>
                 <a-tooltip title="上移">
                   <button
                     type="button"

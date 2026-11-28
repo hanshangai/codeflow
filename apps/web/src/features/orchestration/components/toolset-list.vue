@@ -376,18 +376,18 @@ function confirmDelete(toolsetId: ToolsetId, name: string, event?: Event) {
           </div>
           <div class="tool-sidebar__item-meta">{{ toolset.tools.length }} 个工具 · {{ toolset.description || "无描述" }}</div>
         </div>
-        <button
-          v-if="props.canCopyBuiltin && toolset.kind === 'builtin'"
-          type="button"
-          class="tool-sidebar__menu tool-sidebar__copy"
-          :disabled="props.copyingBuiltinAssetId === toolset.id"
-          title="复制为个人资产"
-          :aria-label="`复制 ${toolset.name} 为个人资产`"
-          @click.stop="emit('copy-builtin', toolset.id)"
-        >
-          <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === toolset.id" spin />
-          <CopyOutlined v-else />
-        </button>
+        <a-tooltip v-if="props.canCopyBuiltin && toolset.kind === 'builtin'" title="复制为个人资产" placement="bottom">
+          <button
+            type="button"
+            class="tool-sidebar__menu tool-sidebar__copy"
+            :disabled="props.copyingBuiltinAssetId === toolset.id"
+            :aria-label="`复制 ${toolset.name} 为个人资产`"
+            @click.stop="emit('copy-builtin', toolset.id)"
+          >
+            <Loading3QuartersOutlined v-if="props.copyingBuiltinAssetId === toolset.id" spin />
+            <CopyOutlined v-else />
+          </button>
+        </a-tooltip>
         <a-dropdown v-if="!props.maintenanceForbidden && !orch.assetListHostIds.toolset.includes(toolset.id) && toolset.kind !== 'builtin'" :trigger="['click']">
           <button type="button" class="tool-sidebar__menu" aria-label="更多" @click.stop>⋯</button>
           <template #overlay>
