@@ -1189,7 +1189,10 @@ export async function handleApiRequest(ctx: ApiHandlerContext, req: ApiRequestMe
       ctx.onApiFailureLogged?.();
     }
     const availabilityCode = e instanceof WorkspaceOperationGateError ? e.code : threadAvailabilityErrorCode(e);
+    const approvalContextCode = typeof (e as { code?: unknown } | null)?.code === "string" ? (e as { code: string }).code : null;
     const responseCode = availabilityCode
+      ?? (approvalContextCode === "APPROVAL_CLEAR_CONTEXT_INTERRUPT_FAILED" || approvalContextCode === "APPROVAL_CLEAR_CONTEXT_SETTLE_TIMEOUT"
+        ? approvalContextCode : null)
       ?? (description.code === "WORKSPACE_EXECUTION_PROFILE_STORAGE_FAILED" ? "WORKSPACE_EXECUTION_PROFILE_STORAGE_FAILED" : null)
       ?? projectionError?.code
       ?? (requirementAnalysisScopeConflict ? "FORBIDDEN" : intakeError || requirementAnalysisError || frozenScopeError ? "INTERNAL_ERROR" : null)
@@ -2984,13 +2987,15 @@ async function continueThreadTurnWithManagedServices(
       input.threadId,
       input.executionProfileContext?.userId ?? "",
     ));
-    const workspaceKnowledge = knowledgeTurn
+    // 自动知识注入仅限普通研发会话；节点讨论等子类型保持原有不注入边界。
+    const autoKnowledgeEnabled = thread?.threadType === "chat" && thread.threadSubtype == null;
+    const workspaceKnowledge = knowledgeTurn || !autoKnowledgeEnabled
       ? { systemRule: null, requiredWorkspaceSkills: [], knowledgeAssetTools: null, specifications: undefined }
       : resolveWorkspaceKnowledgeChatContext({
         workspacePath: input.workspacePath,
         engine: input.engine,
-        enabled: thread?.knowledgeEnabled === true,
         paths: input.specificationPaths,
+        logContext: { requestId: input.requestId, turnId: input.turnId, workspaceId: input.workspaceId, threadId: input.threadId },
       });
     const toolRegistry = mergeExecutableToolRegistries(
       roleRuntime?.toolRegistry,

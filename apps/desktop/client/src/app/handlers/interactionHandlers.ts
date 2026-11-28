@@ -6,7 +6,8 @@ import { describeWorkspaceApiFailure, isWorkspaceApiRequestFailure, WorkspaceApi
 import { emitTurnTerminalWithAssistantReconcile } from "../../engines/turnTerminalEmitter.js";
 import { logger } from "../../logger.js";
 import { engineDiagnosticCause, engineDiagnosticField, isEngineWorkspaceLogFailure } from "../../engines/threadSession.js";
-import { trackOrdinaryTurnExecution, type OrdinaryTurnExecutionControl } from "../ordinaryTurnExecution.js";
+import { listOrdinaryTurnExecutions, trackOrdinaryTurnExecution, waitForOrdinaryTurnExecution,
+  type OrdinaryTurnExecutionControl } from "../ordinaryTurnExecution.js";
 import { buildDefaultChatSystemPrompt } from "../defaultChatSystemPrompt.js";
 import { resolveWorkspaceKnowledgeChatContext } from "../workspaceKnowledgeChatContext.js";
 import { createKnowledgeSpecificationTurn } from "../../knowledge/knowledgeSpecificationTurn.js";
@@ -280,8 +281,50 @@ function settleRunningTurnsBeforeFollowUp(
   return runningTurns.length;
 }
 
+/** 清空上下文前结束全部在途回合；删除门禁要求普通写租约已释放。 */
+async function settleActiveTurnForFollowUp(ctx: ApiHandlerContext, input: { workspaceId: WorkspaceId; threadId: ThreadId }): Promise<void> {
+  const activeTurnId = ctx.sessions.getActiveTurnId(input.threadId);
+  const turnIds = new Set(listOrdinaryTurnExecutions(ctx.sessions)
+    .filter(execution => execution.threadId === input.threadId).map(execution => execution.turnId));
+  if (activeTurnId) turnIds.add(activeTurnId);
+  if (!turnIds.size) return;
+  if (activeTurnId) {
+    let interrupted: boolean;
+    try { interrupted = await ctx.sessions.interrupt(input.threadId, activeTurnId); }
+    catch (error) {
+      throw Object.assign(new Error(`清空上下文前无法停止原回合：threadId=${input.threadId}, turnId=${activeTurnId}`), {
+        code: "APPROVAL_CLEAR_CONTEXT_INTERRUPT_FAILED", cause: error, threadId: input.threadId, turnId: activeTurnId,
+      });
+    }
+    if (!interrupted && ctx.sessions.getActiveTurnId(input.threadId) === activeTurnId) {
+      throw Object.assign(new Error(`清空上下文前无法停止原回合：threadId=${input.threadId}, turnId=${activeTurnId}`), {
+        code: "APPROVAL_CLEAR_CONTEXT_INTERRUPT_FAILED", threadId: input.threadId, turnId: activeTurnId,
+      });
+    }
+  }
+  for (const turnId of turnIds) {
+    try {
+      await waitForOrdinaryTurnExecution(ctx.sessions, { workspaceId: input.workspaceId, threadId: input.threadId, turnId },
+        { timeoutMs: 15_000 });
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code === "ORDINARY_TURN_EXECUTION_TIMEOUT" || code === "ORDINARY_TURN_EXECUTION_TIMEOUT_INVALID") {
+        throw Object.assign(new Error(`清空上下文前原回合尚未收口：threadId=${input.threadId}, turnId=${turnId}`), {
+          code: "APPROVAL_CLEAR_CONTEXT_SETTLE_TIMEOUT", cause: error, threadId: input.threadId, turnId,
+        });
+      }
+      // 原回合自身失败时租约已释放；记录后继续清空，用户明确选择的清空动作优先。
+      logger.warn("approval", "clear context turn settled with failure", {
+        threadId: input.threadId, turnId, errorCode: typeof code === "string" ? code : null,
+        rootCause: engineDiagnosticCause(error),
+      });
+    }
+  }
+}
+
 /** 清理审批续跑前的本地历史，并释放旧引擎会话。 */
 async function clearThreadForFollowUp(ctx: ApiHandlerContext, input: { workspaceId: WorkspaceId; threadId: ThreadId }): Promise<void> {
+  await settleActiveTurnForFollowUp(ctx, input);
   const release = ctx.sessions.beginThreadDeletion([input.threadId]);
   try {
   await ctx.flushLocalEvents?.(input.workspaceId, input.threadId);
@@ -373,8 +416,11 @@ async function startThreadFollowUpTurn(ctx: ApiHandlerContext, input: {
     turnId, engine: thread.engine, model: persistedThread?.model ?? null, effort: persistedThread?.effort ?? null,
     prompt: input.text, isActive, sharedContext: input.sharedContext, trustedActor: input.trustedActor,
   }));
-   const workspaceKnowledge = knowledgeTurn ? { systemRule: null, requiredWorkspaceSkills: [], knowledgeAssetTools: null, specifications: undefined } : resolveWorkspaceKnowledgeChatContext({
-    workspacePath, engine: thread.engine, enabled: persistedThread?.knowledgeEnabled === true,
+   // 审批续跑沿用普通研发会话边界；节点讨论等子类型不自动注入知识。
+   const autoKnowledgeEnabled = persistedThread?.threadType === "chat" && persistedThread.threadSubtype == null;
+   const workspaceKnowledge = knowledgeTurn || !autoKnowledgeEnabled ? { systemRule: null, requiredWorkspaceSkills: [], knowledgeAssetTools: null, specifications: undefined } : resolveWorkspaceKnowledgeChatContext({
+    workspacePath, engine: thread.engine,
+    logContext: { turnId, workspaceId: input.workspaceId, threadId: input.threadId },
   });
   const knowledgeToolRegistry = knowledgeTurn?.registry ?? workspaceKnowledge.knowledgeAssetTools ?? null;
    const specificationTurn = workspaceKnowledge.specifications ? createKnowledgeSpecificationTurn({

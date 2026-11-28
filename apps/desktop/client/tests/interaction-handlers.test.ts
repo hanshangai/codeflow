@@ -10,9 +10,9 @@ import { handleApprovalsRespond, handleUserInputRespond } from "../src/app/handl
 import type { ApiHandlerContext, ApiRequestMessage } from "../src/app/handleApiRequest.ts";
 import { openClientDb } from "../src/db/clientDb.ts";
 import { ThreadStore } from "../src/threads/threadStore.ts";
-import { KnowledgeAssetStore } from "../src/knowledge/knowledgeAssetStore.ts";
+import { KnowledgeAssetStore, knowledgeCategoryNodes } from "../src/knowledge/knowledgeAssetStore.ts";
 import type { SendMessageInput } from "../src/engines/threadSession.ts";
-import { waitForOrdinaryTurnExecution } from "../src/app/ordinaryTurnExecution.ts";
+import { trackOrdinaryTurnExecution, waitForOrdinaryTurnExecution } from "../src/app/ordinaryTurnExecution.ts";
 
 const WORKSPACE_ID = "client-test:approval-follow-up" as WorkspaceId;
 const THREAD_ID = "thread-approval-follow-up" as ThreadId;
@@ -56,7 +56,7 @@ async function waitFor(predicate: () => boolean, message: string): Promise<void>
 }
 
 /** 构造审批续跑的真实 SQLite 夹具，并同步模拟 canonical 事件索引。 */
-function setupApprovalFollowUpHarness(options: { knowledgeEnabled?: boolean; toolTransport?: "native-dynamic" | "protocol"; staleDynamicBinding?: boolean } = {}) {
+function setupApprovalFollowUpHarness(options: { adoptedSpecifications?: boolean; toolTransport?: "native-dynamic" | "protocol"; staleDynamicBinding?: boolean } = {}) {
   const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), "codeflowai-approval-follow-up-"));
   const application = openClientDb({ dbPath: path.join(workspacePath, "client.db") });
   application.workspaces.upsert({ id: WORKSPACE_ID, title: "审批续跑测试", path: workspacePath });
@@ -71,9 +71,13 @@ function setupApprovalFollowUpHarness(options: { knowledgeEnabled?: boolean; too
   const transportRequirements: SendMessageInput["platformToolTransportRequirement"][] = [];
   const engine = options.staleDynamicBinding ? "codex" : "claude";
 
-  db.threads.create({ id: THREAD_ID, workspaceId: WORKSPACE_ID, engine, title: "审批续跑", prefs: { knowledgeEnabled: options.knowledgeEnabled === true } });
-  if (options.knowledgeEnabled) {
-    new KnowledgeAssetStore(workspacePath).saveTree({ schemaVersion: 1, instructions: "", nodes: [{ id: "feature", parentId: null, title: "已初始化知识", orderKey: "1", summary: "", tags: [], instructions: "", sourceScope: [] }] }, null);
+  db.threads.create({ id: THREAD_ID, workspaceId: WORKSPACE_ID, engine, title: "审批续跑", prefs: {} });
+  if (options.adoptedSpecifications) {
+    const store = new KnowledgeAssetStore(workspacePath);
+    store.saveTree({ schemaVersion: 3, instructions: "", nodes: [...knowledgeCategoryNodes(), {
+      id: "spec-global", parentId: "knowledge-specifications", title: "全局规格", orderKey: "0", summary: "", tags: [], instructions: "", sourceScope: [], contentMode: "generated",
+    }] }, null);
+    store.saveDocument({ nodeId: "spec-global", content: "已采用规格：按项目约束实现与验证。", sources: [], origin: "manual", expectedHash: null });
   }
   db.engineCustomModels.insert({
     engine,
@@ -162,6 +166,8 @@ function setupApprovalFollowUpHarness(options: { knowledgeEnabled?: boolean; too
       beginThreadDeletion() { return () => {}; },
       /** provider 等待期保留普通写租约，续跑清理前释放。 */
       beginThreadOperation() { return () => {}; },
+      getActiveTurnId() { return null; },
+      async interrupt() { return true; },
       getOrCreate() {
         getOrCreateCalls += 1;
         return getOrCreateCalls === 1 ? approvalSession : followUpSession;
@@ -263,8 +269,115 @@ test("审批 clearContextAndSend 先收口旧 turn，再启动 follow-up", async
   }
 });
 
-test("普通会话审批后续跑沿用开启的知识库工具和 required 传输", async () => {
-  const harness = setupApprovalFollowUpHarness({ knowledgeEnabled: true });
+test("审批清空上下文先停止并等待原回合写租约释放，再取删除门禁", async () => {
+  const harness = setupApprovalFollowUpHarness();
+  const events: string[] = [];
+  let releaseTurn!: () => void;
+  const turnGate = new Promise<void>(resolve => { releaseTurn = resolve; });
+  trackOrdinaryTurnExecution(harness.ctx.sessions, { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, turnId: OLD_TURN_ID }, async () => {
+    events.push("turn-start");
+    await turnGate;
+    events.push("turn-end");
+  });
+  await waitFor(() => events.includes("turn-start"), "原回合未开始");
+  (harness.ctx.sessions as any).getActiveTurnId = () => OLD_TURN_ID;
+  (harness.ctx.sessions as any).interrupt = async (threadId: ThreadId, turnId: TurnId) => {
+    assert.equal(threadId, THREAD_ID); assert.equal(turnId, OLD_TURN_ID);
+    events.push("interrupt"); return true;
+  };
+  (harness.ctx.sessions as any).beginThreadDeletion = () => { events.push("delete"); return () => {}; };
+  try {
+    const pending = handleApprovalsRespond(harness.ctx, {
+      t: "api.req", id: "req-approval-settle", method: "approvals.respond", path: "/approvals/respond",
+      body: { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, requestId: "approval-settle", decision: "accept" },
+    } as ApiRequestMessage);
+    await waitFor(() => events.includes("interrupt"), "未停止原回合");
+    assert.equal(events.includes("delete"), false, "原回合未收口前不得开始删除");
+    releaseTurn();
+    await pending;
+    assert.deepEqual(events, ["turn-start", "interrupt", "turn-end", "delete"]);
+    await waitFor(() => harness.followUpTurnId !== null, "follow-up 未启动");
+    harness.completeFollowUp();
+    await waitFor(() => harness.db.turns.get(harness.followUpTurnId!)?.status === "completed", "follow-up 未完成");
+  } finally { harness.cleanup(); }
+});
+
+test("审批清空上下文在无可报告回合时仍等待在途执行 owner", async () => {
+  const harness = setupApprovalFollowUpHarness();
+  const events: string[] = [];
+  let releaseTurn!: () => void;
+  const turnGate = new Promise<void>(resolve => { releaseTurn = resolve; });
+  trackOrdinaryTurnExecution(harness.ctx.sessions, { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, turnId: OLD_TURN_ID }, async () => {
+    events.push("turn-start");
+    await turnGate;
+    events.push("turn-end");
+  });
+  await waitFor(() => events.includes("turn-start"), "原回合未开始");
+  (harness.ctx.sessions as any).getActiveTurnId = () => null;
+  (harness.ctx.sessions as any).interrupt = async () => { events.push("interrupt"); return true; };
+  (harness.ctx.sessions as any).beginThreadDeletion = () => { events.push("delete"); return () => {}; };
+  try {
+    const pending = handleApprovalsRespond(harness.ctx, {
+      t: "api.req", id: "req-approval-owner", method: "approvals.respond", path: "/approvals/respond",
+      body: { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, requestId: "approval-owner", decision: "accept" },
+    } as ApiRequestMessage);
+    assert.equal(events.includes("interrupt"), false);
+    assert.equal(events.includes("delete"), false);
+    releaseTurn();
+    await pending;
+    assert.deepEqual(events, ["turn-start", "turn-end", "delete"]);
+    await waitFor(() => harness.followUpTurnId !== null, "follow-up 未启动");
+    harness.completeFollowUp();
+    await waitFor(() => harness.db.turns.get(harness.followUpTurnId!)?.status === "completed", "follow-up 未完成");
+  } finally { harness.cleanup(); }
+});
+
+test("审批清空上下文在原回合自身失败后仍继续清理", async () => {
+  const harness = setupApprovalFollowUpHarness();
+  const events: string[] = [];
+  let failTurn!: (error: unknown) => void;
+  const turnGate = new Promise<void>((_resolve, reject) => { failTurn = reject; });
+  trackOrdinaryTurnExecution(harness.ctx.sessions, { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, turnId: OLD_TURN_ID }, async () => {
+    events.push("turn-start");
+    await turnGate;
+  });
+  await waitFor(() => events.includes("turn-start"), "原回合未开始");
+  (harness.ctx.sessions as any).getActiveTurnId = () => null;
+  (harness.ctx.sessions as any).interrupt = async () => true;
+  (harness.ctx.sessions as any).beginThreadDeletion = () => { events.push("delete"); return () => {}; };
+  try {
+    const pending = handleApprovalsRespond(harness.ctx, {
+      t: "api.req", id: "req-approval-failed-turn", method: "approvals.respond", path: "/approvals/respond",
+      body: { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, requestId: "approval-failed-turn", decision: "accept" },
+    } as ApiRequestMessage);
+    failTurn(Object.assign(new Error("turn failed"), { code: "TURN_FAILED" }));
+    await pending;
+    assert.equal(events.includes("delete"), true, "原回合失败后租约已释放，应继续清理");
+    await waitFor(() => harness.followUpTurnId !== null, "follow-up 未启动");
+    harness.completeFollowUp();
+    await waitFor(() => harness.db.turns.get(harness.followUpTurnId!)?.status === "completed", "follow-up 未完成");
+  } finally { harness.cleanup(); }
+});
+
+test("审批清空上下文停止原回合失败时显式失败且不删除", async () => {
+  const harness = setupApprovalFollowUpHarness();
+  const events: string[] = [];
+  (harness.ctx.sessions as any).getActiveTurnId = () => OLD_TURN_ID;
+  (harness.ctx.sessions as any).interrupt = async () => {
+    throw Object.assign(new Error("interrupt failed"), { code: "claude_interrupt_unconfirmed" });
+  };
+  (harness.ctx.sessions as any).beginThreadDeletion = () => { events.push("delete"); return () => {}; };
+  try {
+    await assert.rejects(handleApprovalsRespond(harness.ctx, {
+      t: "api.req", id: "req-approval-interrupt", method: "approvals.respond", path: "/approvals/respond",
+      body: { workspaceId: WORKSPACE_ID, threadId: THREAD_ID, requestId: "approval-interrupt", decision: "accept" },
+    } as ApiRequestMessage), { code: "APPROVAL_CLEAR_CONTEXT_INTERRUPT_FAILED" });
+    assert.equal(events.includes("delete"), false);
+  } finally { harness.cleanup(); }
+});
+
+test("普通会话审批后续跑自动沿用已采用规格和 required 传输", async () => {
+  const harness = setupApprovalFollowUpHarness({ adoptedSpecifications: true });
   try {
     await handleApprovalsRespond(harness.ctx, {
       t: "api.req", id: "req-approval-knowledge", method: "approvals.respond", path: "/approvals/respond",
@@ -285,7 +398,7 @@ test("普通会话审批后续跑沿用开启的知识库工具和 required 传�
 });
 
 test("普通会话审批后知识工具不可用时回合明确失败，不发送提示词", async () => {
-  const harness = setupApprovalFollowUpHarness({ knowledgeEnabled: true, toolTransport: "protocol" });
+  const harness = setupApprovalFollowUpHarness({ adoptedSpecifications: true, toolTransport: "protocol" });
   try {
     await assert.rejects(handleApprovalsRespond(harness.ctx, {
       t: "api.req", id: "req-approval-unavailable", method: "approvals.respond", path: "/approvals/respond",
@@ -300,7 +413,7 @@ test("普通会话审批后知识工具不可用时回合明确失败，不发�
 });
 
 test("普通 Codex 审批续跑缺少知识工具绑定时提示新建会话", async () => {
-  const harness = setupApprovalFollowUpHarness({ knowledgeEnabled: true, staleDynamicBinding: true });
+  const harness = setupApprovalFollowUpHarness({ adoptedSpecifications: true, staleDynamicBinding: true });
   try {
     await handleApprovalsRespond(harness.ctx, {
       t: "api.req", id: "req-approval-stale", method: "approvals.respond", path: "/approvals/respond",
