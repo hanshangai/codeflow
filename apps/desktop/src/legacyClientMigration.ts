@@ -13,7 +13,9 @@ export type LegacyMigrationRequest = {
 };
 export type LegacyMigrationResult = {
   candidateId: string | null; workspaceCount: number; migrationId?: string;
-  completed?: boolean; resume?: boolean; canDefer?: boolean; deferred?: boolean; accountSource?: AccountSource;
+  completed?: boolean; resume?: boolean; canDefer?: boolean; deferred?: boolean;
+  targetInUse?: { reason: string; table?: string; workspaceCount?: number };
+  accountSource?: AccountSource;
 };
 type Progress = {
   stage: string; completed: number; total: number | null; workspaceCount?: number;
@@ -90,6 +92,40 @@ export function createLegacyClientMigration(input: {
       sourceClientId: source?.sourceClientId ?? null, targetClientId: record.targetClientId, stage,
       context,
       rootCause: redact(error instanceof Error ? error.message : String(error)).slice(0, 1000) }) + "\n", "utf8");
+  };
+  /** 不适用只记录一次判别事实；日志写入失败降级到 stderr，不阻断正常启动。 */
+  const logTargetInUse = (evidence: NonNullable<LegacyMigrationResult["targetInUse"]>): void => {
+    try {
+      const logDir = path.join(input.dataDir, "logs");
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.appendFileSync(path.join(logDir, "legacy-client-migration.jsonl"), JSON.stringify({
+        time: new Date().toISOString(), errorCode: "TARGET_IN_USE", requestId: "legacy-discovery",
+        migrationId: null, sourceClientId: null, targetClientId: record.targetClientId, stage: "discover",
+        targetInUse: { reason: evidence.reason, ...(evidence.table ? { table: evidence.table } : {}),
+          ...(evidence.workspaceCount === undefined ? {} : { workspaceCount: evidence.workspaceCount }) },
+        event: { category: "desktop", action: "legacy_client_migration", outcome: "not_applicable" },
+      }) + "\n", "utf8");
+    } catch (error) {
+      process.stderr.write(`${JSON.stringify({ errorCode: "TARGET_IN_USE_LOG_WRITE_FAILED",
+        rootCause: { type: error instanceof Error ? error.name : typeof error } })}\n`);
+    }
+  };
+  /** 目标已使用统一收口：清理失效编号、记录一次、放行启动；记录写入失败只记录不阻断。 */
+  const settleTargetInUse = (evidence: NonNullable<LegacyMigrationResult["targetInUse"]>): void => {
+    logTargetInUse(evidence);
+    if (record.migrationId) {
+      const next = { ...record, migrationId: null };
+      try { writeAccountRecord(accountPath, next); }
+      catch (error) {
+        process.stderr.write(`${JSON.stringify({ errorCode: "TARGET_IN_USE_ACCOUNT_RECORD_WRITE_FAILED",
+          rootCause: { type: error instanceof Error ? error.name : typeof error } })}\n`);
+      }
+      record = next;
+    }
+    state = { ...state, status: "running", stage: "runtime_starting", migrationId: null, candidateId: null,
+      workspaceCount: 0, completed: 0, total: null, errorCode: "TARGET_IN_USE",
+      message: "检测到新桌面已有使用数据，旧 Client 数据迁移不适用；新桌面将继续启动。" };
+    publish(); release();
   };
   /** Worker 状态来自计数，任何无效计数均拒绝，不能制造完成百分比。 */
   const progress = (value: Progress): void => {
@@ -192,6 +228,8 @@ export function createLegacyClientMigration(input: {
           else if (result.resume) {
             state = { ...state, status: "available" };
             await owner.start(result.candidateId!);
+          } else if (result.targetInUse) {
+            settleTargetInUse(result.targetInUse);
           } else if (!result.candidateId) { state = { ...state, status: "running", stage: "runtime_starting" }; release(); }
           else state = { ...state, status: "available" };
           publish();
@@ -236,7 +274,19 @@ export function createLegacyClientMigration(input: {
           source = result.accountSource;
           state = { ...state, stage: "runtime_starting" }; publish(); release();
         } catch (error) {
-          log(error, errorCode(error, "MIGRATION_DATA_FAILED"), state.stage);
+          const code = errorCode(error, "MIGRATION_DATA_FAILED");
+          // 发现后目标才被使用：与正常判定一致放行，不再要求用户手动暂缓。
+          if (code === "TARGET_IN_USE") {
+            const context = (error as { context?: Record<string, unknown> | null }).context;
+            const workspaceCount = context?.workspaceCount;
+            settleTargetInUse({
+              reason: typeof context?.reason === "string" ? context.reason : "target_in_use",
+              ...(typeof context?.table === "string" ? { table: context.table } : {}),
+              ...(Number.isSafeInteger(workspaceCount) ? { workspaceCount: workspaceCount as number } : {}),
+            });
+            return;
+          }
+          log(error, code, state.stage);
           let failure = error;
           try {
             if (!stopped && hasJournal()) {
@@ -415,7 +465,7 @@ function migrationDiagnosticFields(value: unknown): Record<string, string | numb
     if (typeof field === "string" && /^[A-Za-z0-9_:.\/-]{1,256}$/.test(field)) result[key] = field;
   }
   for (const key of ["status", "expectedSize", "actualSize", "storedSize", "processed", "elapsedMs", "workspaceIndex",
-    "threadIndex", "threadCount"]) {
+    "threadIndex", "threadCount", "workspaceCount"]) {
     const field = input?.[key];
     if (typeof field === "number" && Number.isSafeInteger(field)) result[key] = field;
   }
@@ -436,6 +486,12 @@ function assertMigrationResult(value: LegacyMigrationResult): void {
     || value.resume !== undefined && typeof value.resume !== "boolean"
     || value.canDefer !== undefined && typeof value.canDefer !== "boolean"
     || value.deferred !== undefined && typeof value.deferred !== "boolean"
+    || value.targetInUse !== undefined && (!value.targetInUse || typeof value.targetInUse !== "object"
+      || typeof value.targetInUse.reason !== "string" || !/^[A-Za-z0-9_]{1,64}$/.test(value.targetInUse.reason)
+      || value.targetInUse.table !== undefined && (typeof value.targetInUse.table !== "string" || !/^[A-Za-z0-9_]{1,128}$/.test(value.targetInUse.table))
+      || value.targetInUse.workspaceCount !== undefined && (!Number.isSafeInteger(value.targetInUse.workspaceCount) || value.targetInUse.workspaceCount < 0))
+    || value.targetInUse && (value.candidateId !== null || value.migrationId !== undefined
+      || value.completed || value.resume || value.deferred || value.accountSource)
     || value.deferred && (!value.migrationId || value.completed || value.resume || value.accountSource || value.candidateId !== null)
     || value.canDefer && (!value.resume || value.completed || value.deferred || !value.migrationId)
     || value.resume && !value.candidateId

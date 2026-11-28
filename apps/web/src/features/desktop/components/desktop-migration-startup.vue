@@ -21,7 +21,10 @@ const accountNoticeDismissed = ref(false);
 const canDeferMigration = computed(() => (state.value?.status === "available" || state.value?.status === "failed")
   && state.value.canDefer === true && Boolean(bridge?.deferMigration));
 const deferredMigrationNotice = computed(() => localReady.value && state.value?.status === "ready"
-  && state.value.errorCode === "SOURCE_ACCOUNT_UNRESOLVED" ? state.value.message : null);
+  && (state.value.errorCode === "SOURCE_ACCOUNT_UNRESOLVED" || state.value.errorCode === "TARGET_IN_USE")
+  ? state.value.message : null);
+/** 目标已使用时仅提示迁移不适用，不展示与本次状态无关的登录入口。 */
+const showLoginAction = computed(() => state.value?.errorCode !== "TARGET_IN_USE");
 /** 已有有效登录时不再提醒恢复；保存失败仍明确展示，关闭只影响本次界面。 */
 const showAccountNotice = computed(() => localReady.value && !accountNoticeDismissed.value
   && (Boolean(actionError.value) || Boolean(deferredMigrationNotice.value)
@@ -155,7 +158,7 @@ onBeforeUnmount(() => { unsubscribe?.(); });
     <aside v-if="showAccountNotice" class="desktop-migration__account" aria-live="polite">
       <Alert type="warning" show-icon closable close-text="关闭"
         :message="actionError || deferredMigrationNotice || '本地数据已迁移，账号未登录。'" @close="dismissAccountNotice">
-        <template #action><Button size="small" @click="openAccountLogin">去登录</Button></template>
+        <template #action><Button v-if="showLoginAction" size="small" @click="openAccountLogin">去登录</Button></template>
       </Alert>
     </aside>
     <main v-else-if="!workbenchReady" class="desktop-migration" :aria-busy="!state || state.status === 'checking' || state.status === 'running'">

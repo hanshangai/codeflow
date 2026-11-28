@@ -51,6 +51,30 @@ function fixture(t: test.TestContext, initialize: (db: SqliteDb) => void = migra
     open(file: string) { const opened = openSqliteDb(file, { fileMustExist: true }); connections.push(opened); return opened; } };
 }
 
+/** 在目标目录构造已被正常使用的应用库，用于验证迁移不适用判定。 */
+function usedTarget(f: ReturnType<typeof fixture>, mutate?: (db: SqliteDb) => void): void {
+  const filename = path.join(f.dataDir, 'codeflowai.db');
+  fs.writeFileSync(filename, '');
+  const target = f.open(filename);
+  migrateClientDb(target);
+  target.prepare("INSERT INTO meta(key,value) VALUES('client_id',?)").run(targetClientId);
+  target.prepare("INSERT INTO workspaces(id,title,path,is_deleted,created_at,updated_at) VALUES(?,'默认工作区',?,0,1,1)")
+    .run(`${targetClientId}:default`, path.join(f.dataDir, 'workspace'));
+  if (mutate) mutate(target);
+  target.close();
+  fs.writeFileSync(path.join(f.dataDir, 'config.json'), JSON.stringify({ clientId: targetClientId, apiKey: '', serverWs: 'ws://localhost:39280/ws/client' }));
+  fs.writeFileSync(path.join(f.dataDir, 'codeflowai.db.meta.json'), JSON.stringify({ schemaVersion: 3, storageMode: 'plain_sqlite', ownership: 'local_os_user', initializationState: 'ready' }));
+}
+
+/** 固定引擎配置即代表目标已被正常使用，证据可脱敏回传。 */
+function useEngine(target: SqliteDb): void {
+  target.prepare("INSERT INTO engine_keys(id,label,engine,api_key,is_active,created_at,updated_at) VALUES('k','引擎','codex','',0,1,1)").run();
+}
+
+function targetInUseMarker(f: ReturnType<typeof fixture>): string {
+  return path.join(f.dataDir, 'legacy-client-migration', 'target-in-use.json');
+}
+
 /** 冻结真实 v83 DDL，让浅克隆 CI 也能验证历史库而不依赖 Git 旧对象。 */
 function initializeLegacy83(db: SqliteDb): void {
   db.exec(fs.readFileSync(new URL('./fixtures/legacy-client-schema-83.sql', import.meta.url), 'utf8'));
@@ -1048,6 +1072,99 @@ test('稍后生成的空默认桌面库可以归档接管，包含历史时仍�
   await migrateLegacyClientMigration({ ...f.input, candidateId: result.candidateId!, migrationId }, f.dependencies);
   assert.equal(fs.existsSync(path.join(f.dataDir, 'legacy-client-migration', migrationId, 'original-empty-application.db')), true);
   assert.equal((f.open(path.join(f.dataDir, 'codeflowai.db')).prepare('SELECT title FROM workspaces').get() as { title: string }).title, '中文项目');
+});
+
+test('目标已被正常使用时发现阶段判定不适用，写标记且不覆盖目标', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  usedTarget(f, useEngine);
+  const target = path.join(f.dataDir, 'codeflowai.db'), before = fs.readFileSync(target);
+  let calls = 0;
+  const result = await discoverLegacyClientMigration(f.input,
+    { homeDir: f.homeDir, resolveNamespace: async () => { calls++; return namespace; } });
+  assert.equal(result.candidateId, null); assert.equal(result.workspaceCount, 0);
+  assert.deepEqual(result.targetInUse, { reason: 'business_data', table: 'engine_keys' });
+  assert.equal(calls, 0, '目标已使用时不得联网探测旧来源');
+  assert.deepEqual(fs.readFileSync(target), before);
+  const marker = JSON.parse(fs.readFileSync(targetInUseMarker(f), 'utf8'));
+  assert.equal(marker.schemaVersion, 1); assert.equal(marker.targetClientId, targetClientId);
+  assert.equal(marker.reason, 'business_data'); assert.equal(marker.table, 'engine_keys');
+  assert.ok(!fs.readFileSync(targetInUseMarker(f), 'utf8').includes(apiKey));
+});
+
+test('不适用标记命中后不再扫描旧数据，也不重复返回提示', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  usedTarget(f, useEngine);
+  let calls = 0;
+  const dependencies = { homeDir: f.homeDir, resolveNamespace: async () => { calls++; return namespace; } };
+  const first = await discoverLegacyClientMigration(f.input, dependencies);
+  assert.equal(first.targetInUse?.reason, 'business_data'); assert.equal(calls, 0);
+  const second = await discoverLegacyClientMigration(f.input, dependencies);
+  assert.equal(second.candidateId, null); assert.equal(second.workspaceCount, 0);
+  assert.equal(second.targetInUse, undefined); assert.equal(calls, 0);
+});
+
+test('不适用标记损坏时重新判定并覆盖，不阻断迁移判定', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  usedTarget(f, useEngine);
+  fs.mkdirSync(path.dirname(targetInUseMarker(f)), { recursive: true });
+  fs.writeFileSync(targetInUseMarker(f), '{broken');
+  const result = await discoverLegacyClientMigration(f.input, f.dependencies);
+  assert.deepEqual(result.targetInUse, { reason: 'business_data', table: 'engine_keys' });
+  assert.equal(JSON.parse(fs.readFileSync(targetInUseMarker(f), 'utf8')).schemaVersion, 1);
+});
+
+test('目标库损坏或身份不符仍显式失败且不写不适用标记', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  fs.writeFileSync(path.join(f.dataDir, 'codeflowai.db'), 'not a sqlite database');
+  await assert.rejects(discoverLegacyClientMigration(f.input, f.dependencies), { code: 'TARGET_CONFLICT' });
+  assert.equal(fs.existsSync(targetInUseMarker(f)), false);
+});
+
+test('仅修改常用词集合版本时也判定目标已使用', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  usedTarget(f, db => db.prepare('UPDATE local_quick_phrase_collection SET revision=1 WHERE id=1').run());
+  const result = await discoverLegacyClientMigration(f.input, f.dependencies);
+  assert.deepEqual(result.targetInUse, { reason: 'business_data', table: 'local_quick_phrase_collection' });
+});
+
+test('config已登录但目标库尚未生成时同样判定不适用', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  fs.writeFileSync(path.join(f.dataDir, 'config.json'), JSON.stringify({ clientId: targetClientId, apiKey: 'fixture-secret', serverWs: 'ws://localhost:39280/ws/client' }));
+  const result = await discoverLegacyClientMigration(f.input, f.dependencies);
+  assert.deepEqual(result.targetInUse, { reason: 'config_api_key' });
+  assert.ok(!fs.readFileSync(targetInUseMarker(f), 'utf8').includes('fixture-secret'));
+  const repeated = await discoverLegacyClientMigration(f.input, f.dependencies);
+  assert.equal(repeated.targetInUse, undefined);
+});
+
+test('发现目标已被使用后的新迁移显式失败，不写journal也不覆盖目标', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration } = await service();
+  const candidate = await discoverLegacyClientMigration(f.input, f.dependencies);
+  usedTarget(f, useEngine);
+  const target = path.join(f.dataDir, 'codeflowai.db'), before = fs.readFileSync(target);
+  await assert.rejects(migrateLegacyClientMigration({ ...f.input, candidateId: candidate.candidateId!, migrationId: crypto.randomUUID() }, f.dependencies),
+    { code: 'TARGET_IN_USE' });
+  assert.deepEqual(fs.readFileSync(target), before);
+  assert.equal(fs.existsSync(path.join(f.dataDir, 'legacy-client-migration-journal.json')), false);
+  assert.equal(fs.existsSync(targetInUseMarker(f)), true, '竞态失败也要留下不适用标记');
+});
+
+test('目标已使用但旧来源不可达时仍判定不适用，不再被来源错误阻塞', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  usedTarget(f, useEngine);
+  let calls = 0;
+  const result = await discoverLegacyClientMigration(f.input, { homeDir: f.homeDir,
+    resolveNamespace: async () => { calls++; throw Object.assign(new Error('offline'), { code: 'SOURCE_ACCOUNT_UNRESOLVED' }); } });
+  assert.deepEqual(result.targetInUse, { reason: 'business_data', table: 'engine_keys' });
+  assert.equal(calls, 0);
+});
+
+test('不适用标记命中后目标损坏仍显式失败', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  usedTarget(f, useEngine);
+  await discoverLegacyClientMigration(f.input, f.dependencies);
+  fs.writeFileSync(path.join(f.dataDir, 'codeflowai.db'), 'not a sqlite database');
+  await assert.rejects(discoverLegacyClientMigration(f.input, f.dependencies), { code: 'TARGET_CONFLICT' });
 });
 
 test('rename已完成但journal提交未完成时，通过目标摘要恢复原任务', async t => {

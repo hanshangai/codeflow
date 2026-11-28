@@ -267,6 +267,87 @@ test("目标已有数据导致迁移失败后仍可进入桌面，不修改现�
   assert.equal(record.migrationId, null);
 });
 
+test("目标已使用时自动放行并只提示一次，不恢复旧账号", async t => {
+  const f = await fixture(t, async request => {
+    if (request.action === "discover") return { candidateId: null, workspaceCount: 0,
+      targetInUse: { reason: "business_data", table: "engine_keys" } };
+    throw new Error("unexpected migration request");
+  });
+  await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-account.json"), JSON.stringify({
+    schemaVersion: 1, targetClientId: "local_fixture", migrationId: f.identity.deviceId, nonce: f.identity.deviceId, cancelled: false, delivered: false }));
+  let restores = 0;
+  const owner = createLegacyClientMigration({ ...f, restoreAccount: async () => { restores++; throw new Error("unexpected restore"); } });
+  const waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  assert.equal(owner.snapshot().status, "running");
+  assert.equal(owner.snapshot().errorCode, "TARGET_IN_USE");
+  assert.ok(owner.snapshot().message);
+  assert.equal(owner.snapshot().migrationId, null);
+  assert.equal(owner.snapshot().canDefer, false);
+  await waiting; await owner.runtimeReady();
+  assert.equal(owner.snapshot().status, "ready");
+  assert.equal(owner.snapshot().errorCode, "TARGET_IN_USE");
+  assert.equal(restores, 0); assert.equal(await owner.takeAccount(), null);
+  const record = JSON.parse(await fs.readFile(path.join(f.dataDir, "legacy-client-migration-account.json"), "utf8"));
+  assert.equal(record.migrationId, null);
+  const log = await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8");
+  assert.ok(log.includes('"errorCode":"TARGET_IN_USE"'));
+  assert.ok(log.includes('"outcome":"not_applicable"'));
+});
+
+test("发现后目标被使用时迁移也自动放行", async t => {
+  const f = await fixture(t, async request => {
+    if (request.action === "discover") return { candidateId: "source-1", workspaceCount: 1 };
+    throw Object.assign(new Error("TARGET_IN_USE"), { code: "TARGET_IN_USE",
+      context: { reason: "business_data", table: "engine_keys" } });
+  });
+  const owner = createLegacyClientMigration(f), waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  assert.equal(owner.snapshot().status, "available");
+  await owner.start("source-1");
+  await waiting; await owner.runtimeReady();
+  assert.equal(owner.snapshot().status, "ready");
+  assert.equal(owner.snapshot().errorCode, "TARGET_IN_USE");
+  assert.equal(owner.snapshot().migrationId, null);
+  const log = await fs.readFile(path.join(f.dataDir, "logs", "legacy-client-migration.jsonl"), "utf8");
+  assert.ok(log.includes('"errorCode":"TARGET_IN_USE"'));
+});
+
+test("不适用标记命中的无候选结果不显示提示", async t => {
+  const f = await fixture(t, async () => ({ candidateId: null, workspaceCount: 0 }));
+  const owner = createLegacyClientMigration(f), waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  assert.equal(owner.snapshot().status, "running");
+  assert.equal(owner.snapshot().errorCode, null);
+  await waiting; await owner.runtimeReady();
+  assert.equal(owner.snapshot().status, "ready");
+  assert.equal(owner.snapshot().errorCode, null);
+  assert.equal(owner.snapshot().message, null);
+});
+
+test("迁移结果允许旧壳忽略的新字段，但拒绝与候选互斥的不适用结果", async t => {
+  const compatible = await fixture(t, async () => {
+    const result = { candidateId: null, workspaceCount: 0, targetInUse: { reason: "business_data" }, futureField: true };
+    return result;
+  });
+  const owner = createLegacyClientMigration(compatible), waiting = owner.prepare();
+  t.after(async () => { await owner.stop(); await waiting; });
+  await owner.whenDiscovered();
+  assert.equal(owner.snapshot().errorCode, "TARGET_IN_USE");
+  await waiting; await owner.stop();
+
+  const invalid = await fixture(t, async () => ({ candidateId: "source-1", workspaceCount: 1,
+    targetInUse: { reason: "business_data" } }));
+  const rejected = createLegacyClientMigration(invalid), pending = rejected.prepare();
+  t.after(async () => { await rejected.stop(); await pending.catch(() => {}); });
+  await rejected.whenDiscovered();
+  assert.equal(rejected.snapshot().status, "failed");
+  assert.equal(rejected.snapshot().errorCode, "MIGRATION_DISCOVERY_FAILED");
+});
+
 test("重启后只有迁移编号没有提交日志时仍可稍后进入，不再锁死", async t => {
   const f = await fixture(t, async () => ({ candidateId: "source-1", workspaceCount: 1 }));
   await fs.writeFile(path.join(f.dataDir, "legacy-client-migration-account.json"), JSON.stringify({

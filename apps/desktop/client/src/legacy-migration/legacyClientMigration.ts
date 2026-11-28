@@ -24,7 +24,8 @@ import { ensureWorkspaceCodeflowaiDirectory, inspectExistingWorkspaceCodeflowaiD
   assertWorkspaceCodeflowaiDirectory } from '../codeflowai/workspaceCodeflowaiDirectory.js';
 import { resolveWorkspaceReadPath } from '../fs/fsHelpers.js';
 import { parseLegacyClientMigrationRequest, type LegacyClientMigrationRequest, type LegacyClientMigrationProgress,
-  type LegacyClientMigrationResult, type LegacyClientMigrationContext } from './legacyClientMigrationProtocol.js';
+  type LegacyClientMigrationResult, type LegacyClientMigrationContext,
+  type LegacyClientMigrationTargetInUse } from './legacyClientMigrationProtocol.js';
 
 type Input = Omit<LegacyClientMigrationRequest, 'action'>;
 type Row = Record<string, any>;
@@ -53,8 +54,18 @@ export type LegacyClientMigrationDependencies = {
   afterPublish?: (file: { target: string }) => void;
 };
 const JOURNAL = 'legacy-client-migration-journal.json';
+const LEGACY_MIGRATION_DIR = 'legacy-client-migration';
+const TARGET_IN_USE_MARKER = 'target-in-use.json';
 const WORKFLOW_SCOPE_REPAIR = 'workflow-scope-repair.json';
 const MIGRATION_SKIPPED_RECORDS = 'migration-skipped-records.json';
+type TargetInUseReason = 'business_data' | 'workspaces' | 'workspace_deleted' | 'workspace_path' | 'workspace_database'
+  | 'event_seq' | 'meta_key' | 'config_api_key';
+const TARGET_IN_USE_REASONS = new Set<string>(['business_data', 'workspaces', 'workspace_deleted', 'workspace_path',
+  'workspace_database', 'event_seq', 'meta_key', 'config_api_key']);
+type TargetInspection = { state: 'empty'; initialization: Journal['targetInitialization'] }
+  | { state: 'in_use'; evidence: LegacyClientMigrationTargetInUse & { reason: TargetInUseReason } };
+type TargetInUseMarker = { schemaVersion: 1; targetClientId: string; reason: TargetInUseReason;
+  table?: string; workspaceCount?: number; decidedAt: string };
 const SIDECARS = ['-wal', '-shm', '-journal'];
 const PROFILE_TABLES = ['workspace_execution_profiles', 'workspace_prefs', 'scheduled_task_configs', 'scheduled_task_runs',
   'scheduled_task_account_configs', 'scheduled_task_runtime_states'];
@@ -81,6 +92,17 @@ export async function discoverLegacyClientMigration(input: Input, dependencies: 
     return { candidateId: journal.candidateId, workspaceCount: journal.source.workspaces.length, migrationId: journal.migrationId,
       resume: true, canDefer: canDeferJournal(journal) };
   }
+  const marker = readTargetInUseMarker(input);
+  // 标记命中且目标仍在使用时直接跳过：不再扫描旧数据、不联网、不重复提示。
+  if (marker?.targetClientId === input.targetClientId && targetStillInUse(input)) {
+    return { candidateId: null, workspaceCount: 0 };
+  }
+  const inspection = inspectTarget(input);
+  if (inspection.state === 'in_use') {
+    persistTargetInUseMarker(input, inspection.evidence);
+    return { candidateId: null, workspaceCount: 0, targetInUse: inspection.evidence };
+  }
+  if (marker) removeTargetInUseMarker(input);
   const source = await discoverSource(input, dependencies);
   return { candidateId: source?.candidateId ?? null, workspaceCount: source?.workspaces.length ?? 0 };
 }
@@ -117,15 +139,24 @@ function canDeferJournal(journal: Journal): boolean {
 
 /** 卸载清本安装已完成或已暂缓的私有归档凭据，保留历史，原Client及项目不写。 */
 export function clearLegacyMigrationCredentials(input: Input): void {
-  const root = path.join(input.dataDir, 'legacy-client-migration'), journal = readJournal(input);
-  if (!journal) { if (exists(root)) fail('MIGRATION_ARCHIVE_OWNER_MISSING'); return; }
+  const root = path.join(input.dataDir, LEGACY_MIGRATION_DIR), journal = readJournal(input);
+  if (!journal) {
+    if (!exists(root)) return;
+    // 临时目录可能经短路径打开，这里只核物理目录类型，不做 realpath 等值比较。
+    const stat = fs.lstatSync(root);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) fail('SOURCE_PATH_UNSAFE');
+    const names = fs.readdirSync(root);
+    // 目标已使用但没有迁移归档时，目录内只允许去重标记；空目录仍视为无主归档。
+    if (!names.length || names.some(name => name !== TARGET_IN_USE_MARKER)) fail('MIGRATION_ARCHIVE_OWNER_MISSING');
+    return;
+  }
   validateInput(input);
   if (journal.deferred) { if (!isPrepublication(journal)) fail('MIGRATION_DEFER_UNSAFE'); }
   else { if (!journal.completed) fail('MIGRATION_NOT_COMPLETED'); validateCompleted(input, journal); }
   if (!exists(root)) return;
   assertDirectory(root);
   const archive = archiveDirectory(input, journal);
-  if (fs.readdirSync(root).some(name => name !== journal.migrationId)) fail('MIGRATION_ARCHIVE_UNKNOWN_ENTRY');
+  if (fs.readdirSync(root).some(name => name !== journal.migrationId && name !== TARGET_IN_USE_MARKER)) fail('MIGRATION_ARCHIVE_UNKNOWN_ENTRY');
   if (!exists(archive)) return;
   const databases: string[] = [], temporary: string[] = [];
   /** 归档只允许已生成的两层目录和固定文件；收齐清单后才打开可写库。 */
@@ -1229,34 +1260,137 @@ function referenceHighWater(db: SqliteDb): number {
   return maximum;
 }
 
-/** 新安装只能接收空目标；已持久身份允许复用，已有业务及 sidecar 一律冲突。 */
-function assertEmptyTarget(input: Input): Journal['targetInitialization'] {
-  const config = path.join(input.dataDir, 'config.json');
-  if (exists(config) && (readObject(config).clientId !== input.targetClientId || readObject(config).apiKey)) fail('TARGET_IDENTITY_CONFLICT');
+/** 标记命中时仅核对目标身份与结构；全量完整性由正常 Client 负责，不重复扫描。 */
+function targetStillInUse(input: Input): boolean {
+  const configPath = path.join(input.dataDir, 'config.json');
+  const config = exists(configPath) ? readObject(configPath) : null;
+  if (config && config.clientId !== input.targetClientId) fail('TARGET_IDENTITY_CONFLICT');
   const target = path.join(input.dataDir, 'codeflowai.db'), metaPath = `${target}.meta.json`;
   if (!exists(target)) {
     for (const suffix of [...SIDECARS, '.meta.json']) if (exists(`${target}${suffix}`)) fail('TARGET_CONFLICT');
-    return null;
+    return Boolean(config?.apiKey);
   }
+  assertFile(target);
   if (!exists(metaPath) || !plainHeader(target)) fail('TARGET_CONFLICT');
   const meta = readObject(metaPath);
   if (meta.schemaVersion !== 3 || meta.ownership !== 'local_os_user' || meta.storageMode !== 'plain_sqlite' || meta.initializationState !== 'ready') fail('TARGET_CONFLICT');
   withDatabase(target, true, db => {
     if (metaValue(db, 'client_id') !== input.targetClientId || db.pragma('user_version', { simple: true }) !== CLIENT_DB_SCHEMA_VERSION) fail('TARGET_CONFLICT');
+  });
+  return true;
+}
+
+/** 只读分类目标库：真实损坏/身份不符仍失败，已被正常使用则返回可脱敏证据。 */
+function inspectTarget(input: Input): TargetInspection {
+  const configPath = path.join(input.dataDir, 'config.json');
+  const config = exists(configPath) ? readObject(configPath) : null;
+  if (config && config.clientId !== input.targetClientId) fail('TARGET_IDENTITY_CONFLICT');
+  const target = path.join(input.dataDir, 'codeflowai.db'), metaPath = `${target}.meta.json`;
+  if (!exists(target)) {
+    for (const suffix of [...SIDECARS, '.meta.json']) if (exists(`${target}${suffix}`)) fail('TARGET_CONFLICT');
+    return config?.apiKey ? { state: 'in_use', evidence: { reason: 'config_api_key' } } : { state: 'empty', initialization: null };
+  }
+  if (!exists(metaPath) || !plainHeader(target)) fail('TARGET_CONFLICT');
+  const meta = readObject(metaPath);
+  if (meta.schemaVersion !== 3 || meta.ownership !== 'local_os_user' || meta.storageMode !== 'plain_sqlite' || meta.initializationState !== 'ready') fail('TARGET_CONFLICT');
+  const evidence = withDatabase(target, true, db => {
+    if (metaValue(db, 'client_id') !== input.targetClientId || db.pragma('user_version', { simple: true }) !== CLIENT_DB_SCHEMA_VERSION) fail('TARGET_CONFLICT');
     integrity(db); assertKnownTables(db);
     for (const table of listTables(db)) {
-      if (['meta', 'workspaces', 'local_quick_phrase_collection'].includes(table) || table.includes('_fts_')) continue;
-      if (tableCount(db, table)) fail('TARGET_CONFLICT');
+      if (['meta', 'workspaces'].includes(table) || table.includes('_fts_')) continue;
+      if (table === 'local_quick_phrase_collection') {
+        // 初始化为 revision=0；用户改过集合即视为已使用，即使已删空词条。
+        const revision = (db.prepare('SELECT revision FROM local_quick_phrase_collection WHERE id=1').get() as Row | undefined)?.revision;
+        if (Number(revision) > 0) return { reason: 'business_data' as const, table };
+        continue;
+      }
+      if (tableCount(db, table)) return { reason: 'business_data' as const, table };
     }
     const workspaces = new WorkspaceRepo(db).list({ includeDeleted: true });
-    if (workspaces.length > 1 || workspaces.some(work => work.isDeleted || !samePath(work.path, path.join(input.dataDir, 'workspace')))) fail('TARGET_CONFLICT');
-    if (exists(path.join(input.dataDir, 'workspace', '.codeflow', 'workspace.db'))) fail('TARGET_CONFLICT');
+    if (workspaces.length > 1) return { reason: 'workspaces' as const, workspaceCount: workspaces.length };
+    if (workspaces.some(work => work.isDeleted)) return { reason: 'workspace_deleted' as const, workspaceCount: workspaces.length };
+    if (workspaces.some(work => !samePath(work.path, path.join(input.dataDir, 'workspace')))) return { reason: 'workspace_path' as const };
+    if (exists(path.join(input.dataDir, 'workspace', '.codeflow', 'workspace.db'))) return { reason: 'workspace_database' as const };
     for (const row of db.prepare('SELECT key,value FROM meta').all() as Row[]) {
-      if (!['client_id', 'event_seq', 'conversation_presentation_schema_version'].includes(row.key)
-        || row.key === 'event_seq' && row.value !== '0') fail('TARGET_CONFLICT');
+      if (!['client_id', 'event_seq', 'conversation_presentation_schema_version'].includes(row.key)) return { reason: 'meta_key' as const };
+      if (row.key === 'event_seq' && row.value !== '0') return { reason: 'event_seq' as const };
     }
+    return config?.apiKey ? { reason: 'config_api_key' as const } : null;
   });
-  return { dbSha256: sha256File(target), metaSha256: sha256File(metaPath) };
+  return evidence ? { state: 'in_use', evidence }
+    : { state: 'empty', initialization: { dbSha256: sha256File(target), metaSha256: sha256File(metaPath) } };
+}
+
+/** 迁移入口仍要求空目标；目标已被正常使用时返回可追踪的显式错误。 */
+function assertEmptyTarget(input: Input): Journal['targetInitialization'] {
+  const inspection = inspectTarget(input);
+  if (inspection.state === 'in_use') {
+    // 迁移竞态同样落标记，下一次启动不再重复探测。
+    persistTargetInUseMarker(input, inspection.evidence);
+    fail('TARGET_IN_USE', {
+      reason: inspection.evidence.reason,
+      ...(inspection.evidence.table ? { table: inspection.evidence.table } : {}),
+      ...(inspection.evidence.workspaceCount === undefined ? {} : { workspaceCount: inspection.evidence.workspaceCount }),
+    });
+  }
+  return inspection.initialization;
+}
+
+function targetInUseMarkerPath(input: Input): string {
+  return path.join(input.dataDir, LEGACY_MIGRATION_DIR, TARGET_IN_USE_MARKER);
+}
+
+/** 标记只用于去重提示，不承载迁移正确性；损坏时记录并重新判定。 */
+function readTargetInUseMarker(input: Input): TargetInUseMarker | null {
+  const filename = targetInUseMarkerPath(input);
+  try {
+    if (!exists(filename)) return null;
+    const value = readObject(filename);
+    if (value.schemaVersion !== 1 || typeof value.targetClientId !== 'string' || !/^local_[0-9a-f-]{36}$/i.test(value.targetClientId)
+      || !TARGET_IN_USE_REASONS.has(String(value.reason)) || typeof value.decidedAt !== 'string'
+      || value.table !== undefined && (typeof value.table !== 'string' || !/^[A-Za-z0-9_]{1,128}$/.test(value.table))
+      || value.workspaceCount !== undefined && (!Number.isSafeInteger(value.workspaceCount) || value.workspaceCount < 0)) {
+      logTargetInUseDiagnostic('LEGACY_MIGRATION_TARGET_IN_USE_MARKER_INVALID');
+      removeTargetInUseMarker(input);
+      return null;
+    }
+    return value as TargetInUseMarker;
+  } catch (error) {
+    logTargetInUseDiagnostic('LEGACY_MIGRATION_TARGET_IN_USE_MARKER_INVALID', error);
+    removeTargetInUseMarker(input);
+    return null;
+  }
+}
+
+/** 原子写入不适用事实；失败只会导致下次重复提示，记录后继续启动。 */
+function persistTargetInUseMarker(input: Input, evidence: LegacyClientMigrationTargetInUse): void {
+  try {
+    writeAtomic(targetInUseMarkerPath(input), {
+      schemaVersion: 1, targetClientId: input.targetClientId, reason: evidence.reason,
+      ...(evidence.table ? { table: evidence.table } : {}),
+      ...(evidence.workspaceCount === undefined ? {} : { workspaceCount: evidence.workspaceCount }),
+      decidedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    logTargetInUseDiagnostic('LEGACY_MIGRATION_TARGET_IN_USE_MARKER_WRITE_FAILED', error);
+  }
+}
+
+/** 目标重置或身份变化时移除失效标记；失败下次启动重试。 */
+function removeTargetInUseMarker(input: Input): void {
+  const filename = targetInUseMarkerPath(input);
+  try {
+    if (!exists(filename)) return;
+    assertFile(filename); fs.unlinkSync(filename); syncDirectory(path.dirname(filename));
+  } catch (error) {
+    logTargetInUseDiagnostic('LEGACY_MIGRATION_TARGET_IN_USE_MARKER_REMOVE_FAILED', error);
+  }
+}
+
+/** 标记异常只影响提示去重；保留可检索事件且不输出路径、文件内容或凭据。 */
+function logTargetInUseDiagnostic(event: string, error?: unknown): void {
+  process.stderr.write(`${JSON.stringify({ event, errorCode: event,
+    rootCause: { type: error instanceof Error ? error.name : typeof error } })}\n`);
 }
 
 /** 接管仅限已证明没有业务的默认初始化库，原字节和sidecar先归档。 */
@@ -1304,7 +1438,7 @@ function readJournal(input: Input): Journal | null {
 /** 所有迁移事实使用同目录临时文件 + fsync + rename 持久化。 */
 function writeJournal(input: Input, journal: Journal): void { writeAtomic(path.join(input.dataDir, JOURNAL), journal); }
 /** 临时归档只由固定迁移编号派生，不能接受页面路径。 */
-function archiveDirectory(input: Input, journal: Journal): string { return path.join(input.dataDir, 'legacy-client-migration', journal.migrationId); }
+function archiveDirectory(input: Input, journal: Journal): string { return path.join(input.dataDir, LEGACY_MIGRATION_DIR, journal.migrationId); }
 /** 每次未封存快照重试创建新代，保留前次原始归档且绝不拼接不同时刻的库。 */
 function snapshotDirectory(input: Input, journal: Journal): string { if (!journal.snapshotGeneration) fail('MIGRATION_SNAPSHOT_MISSING'); return path.join(archiveDirectory(input, journal), journal.snapshotGeneration); }
 /** 原 Client 命名空间替换为稳定桌面身份，未知第三方前缀显式失败。 */

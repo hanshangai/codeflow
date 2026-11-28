@@ -72,6 +72,48 @@ for (const scenario of ["allowed", "denied", "old-shell", "bound", "running", "u
   });
 }
 
+test("目标已使用时只展示不适用说明且不提供登录入口", async t => {
+  const source = fs.readFileSync(new URL("../src/features/desktop/components/desktop-migration-startup.vue", import.meta.url), "utf8");
+  const { descriptor } = parse(source);
+  const script = compileScript(descriptor, { id: "migration-target-in-use" });
+  const template = compileTemplate({ source: descriptor.template!.content, filename: "desktop-migration-startup.vue",
+    id: "migration-target-in-use", compilerOptions: { bindingMetadata: script.bindings } });
+  assert.deepEqual(template.errors, []);
+  const snapshot: DesktopMigrationState = { status: "ready", stage: "completed", migrationId: null, candidateId: null,
+    workspaceCount: 0, completed: 0, total: null, errorCode: "TARGET_IN_USE",
+    message: "检测到新桌面已有使用数据，旧 Client 数据迁移不适用；新桌面将继续启动。",
+    account: { status: "not_requested", errorCode: null, message: null } };
+  let mounted!: () => Promise<void>;
+  let ready = 0;
+  const config = vue.reactive({ serverWsOrigin: "", isAccountSession: false, hasActiveSession: false });
+  const bridge = { getMigrationState: async () => snapshot, onMigrationState: () => () => {} };
+  const scope = vue.effectScope();
+  t.after(() => scope.stop());
+  const page = loadModule(script.content, id => {
+    if (id === "vue") return { ...vue, inject: () => vue.ref(false), onMounted: (callback: typeof mounted) => { mounted = callback; }, onBeforeUnmount: () => {} };
+    if (id === "ant-design-vue") return Object.fromEntries(["Alert", "Button", "ConfigProvider", "Progress", "Space"].map(name => [name,
+      vue.defineComponent({ inheritAttrs: false, setup: (_props: unknown, { slots, attrs }: any) => () => name === "Alert"
+        ? vue.h("div", null, [String(attrs.message ?? ""), slots.default?.(), slots.action?.()])
+        : vue.h(name === "Button" ? "button" : "div", attrs, slots.default?.()) })]));
+    if (id.endsWith("services/desktop")) return { getDesktopBridge: () => bridge };
+    if (id.endsWith("store/config")) return { useConfigStore: () => config };
+    if (id.endsWith("desktopAuthPromptState")) return { desktopAuthModalOpen: vue.ref(false) };
+    throw new Error(`unexpected migration page import: ${id}`);
+  }).default;
+  const state = scope.run(() => page.setup({}, { expose: () => {}, emit: (event: string) => { if (event === "ready") ready++; } }))!;
+  await mounted();
+  const render = loadModule(template.code, id => { assert.equal(id, "vue"); return vue; }).render;
+  const app = vue.createSSRApp({ setup: () => () => render({}, [], {}, vue.proxyRefs(state), {}, {}) });
+  const html = await renderToString(app);
+  assert.ok(html.includes(snapshot.message!), html);
+  assert.equal(html.includes("去登录"), false, "不适用提示不展示登录入口");
+  assert.equal(ready, 1, "正常启动仍需发布工作台就绪");
+  // 正向对照：账号恢复类提示仍保留登录入口，证明上一条断言有效。
+  await state.accept({ ...snapshot, errorCode: "SOURCE_ACCOUNT_UNRESOLVED", message: "旧数据已保留" });
+  const restored = await renderToString(vue.createSSRApp({ setup: () => () => render({}, [], {}, vue.proxyRefs(state), {}, {}) }));
+  assert.ok(restored.includes("去登录"), restored);
+});
+
 test("启动页不显示已用时提示", () => {
   const source = fs.readFileSync(new URL("../src/features/desktop/components/desktop-migration-startup.vue", import.meta.url), "utf8");
   assert.doesNotMatch(source, /已用时/);

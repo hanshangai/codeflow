@@ -512,6 +512,33 @@ for (const reopened of [false, true]) for (const journalExists of [false, true])
   } finally { await app.exit(); await started; }
 });
 
+test("目标已使用判定不阻塞启动并开放正常账号IPC", { timeout: 5_000 }, async t => {
+  const f = await fixture(t);
+  let bridge!: DesktopBridgeApi;
+  f.host.registerBridge = value => { bridge = value; return () => {}; };
+  f.runtime.request = async request => {
+    assert.equal(request.method, "runtime.cloudAccount.status");
+    return { status: 200, body: { ok: true, currentAccount: "desktop-account" } };
+  };
+  const app = createDesktopApplication({ dataDir: f.dataDir, initialReleaseDir: f.dataDir, host: f.host,
+    createRuntime: () => f.runtime,
+    createMigration: ({ identity }) => createLegacyClientMigration({ dataDir: f.dataDir, identity, workerEntry: "unused",
+      execute: async request => request.action === "discover"
+        ? { candidateId: null, workspaceCount: 0, targetInUse: { reason: "business_data", table: "engine_keys" } }
+        : (() => { throw new Error("unexpected migration request"); })() }) });
+  let started: Promise<void> | undefined;
+  try {
+    started = app.start();
+    await started;
+    assert.equal(f.actions.includes("load-web"), true);
+    assert.equal(f.actions.includes("start"), true);
+    assert.equal((await bridge.getMigrationState!()).status, "ready");
+    assert.equal((await bridge.getMigrationState!()).errorCode, "TARGET_IN_USE");
+    assert.deepEqual(await bridge.request({ method: "runtime.cloudAccount.status" }),
+      { status: 200, body: { ok: true, currentAccount: "desktop-account" } });
+  } finally { await app.exit(); if (started) await started.catch(() => {}); }
+});
+
 test("迁移与标准页面就绪并行，页面可等待迁移及Client真正完成启动", { timeout: 5_000 }, async t => {
   const f = await fixture(t);
   let migration!: LegacyClientMigration;

@@ -16,7 +16,13 @@ export type LegacyClientMigrationContext = {
   requestId?: string; phase?: string; method?: string; endpoint?: string; status?: number; retryAfter?: string;
   remoteCode?: string; transportCode?: string; serverRequestId?: string;
   workspaceId?: string; threadId?: string; table?: string; recordId?: string; blobId?: string; expectedSize?: number; actualSize?: number;
-  storedSize?: number; reason?: string;
+  storedSize?: number; reason?: string; workspaceCount?: number;
+};
+/** 目标库已被正常使用时，只返回可脱敏的判定证据，不回显路径或业务正文。 */
+export type LegacyClientMigrationTargetInUse = {
+  reason: string;
+  table?: string;
+  workspaceCount?: number;
 };
 export type LegacyClientMigrationResult = {
   candidateId: string | null;
@@ -26,6 +32,7 @@ export type LegacyClientMigrationResult = {
   resume?: boolean;
   canDefer?: boolean;
   deferred?: boolean;
+  targetInUse?: LegacyClientMigrationTargetInUse;
   accountSource?: { sourceClientId: string; apiKey: string; serverWs: string };
 };
 export type LegacyClientMigrationMessage =
@@ -42,7 +49,7 @@ export function legacyClientMigrationErrorContext(error: unknown): LegacyClientM
     const value = source?.[key];
     if (typeof value === 'string' && /^[A-Za-z0-9_:.\/-]{1,256}$/.test(value)) result[key] = value;
   }
-  for (const key of ['status', 'expectedSize', 'actualSize', 'storedSize'] as const) {
+  for (const key of ['status', 'expectedSize', 'actualSize', 'storedSize', 'workspaceCount'] as const) {
     const value = source?.[key];
     if (Number.isSafeInteger(value)) result[key] = value as number;
   }
