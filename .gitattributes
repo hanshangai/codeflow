@@ -6,3 +6,7 @@ codeflow-docs/规格知识库/** text eol=lf
 apps/desktop/client/assets/orchestration-builtin/** text eol=lf
 apps/desktop/client/assets/orchestration-builtin.manifest.json text eol=lf
 apps/server/tests/fixtures/orchestration/** text eol=lf
+# SEO 生成物由 scripts/generate-site-seo.mjs 固定写 LF，避免 Windows 检出 CRLF 后构建产生假性修改。
+apps/web/public/robots.txt text eol=lf
+apps/web/public/sitemap.xml text eol=lf
+apps/web/seo/public-urls.json text eol=lf

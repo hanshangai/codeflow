@@ -184,4 +184,12 @@ watch(() => props.content, (value) => {
   height: 100%;
   min-height: 300px;
 }
+
+/*
+ * Monaco tooltip（.context-view）的指针箭头会伸入查找按钮区域，导致
+ * hover 闪烁循环。pointer-events: none 让 tooltip 不截获鼠标。
+ */
+.code-preview :deep(.context-view) {
+  pointer-events: none !important;
+}
 </style>
