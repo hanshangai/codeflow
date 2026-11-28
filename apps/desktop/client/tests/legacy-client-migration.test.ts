@@ -7,7 +7,7 @@ import { createServer } from 'node:http';
 import test from 'node:test';
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { canonicalizeOrchAssetJson, type ChatWorkflowTask, type NodeFinalAnswerPayload, type OrchestrationId } from '@codeflowai/shared';
+import { canonicalizeOrchAssetJson, type ChatWorkflowTask, type NodeFinalAnswerPayload, type OrchestrationId, type WorkspaceId } from '@codeflowai/shared';
 import { CLIENT_DB_SCHEMA_VERSION, migrateClientDb, ensureWorkspaceCoreQueueTables, ensureWorkspaceAdditionalTables } from '../src/db/migrateClientDb.js';
 import { openSqliteDb, type SqliteDb } from '../src/db/sqliteDb.js';
 import { buildClientProcessLockPath } from '../src/startup/clientStartupGuards.js';
@@ -17,11 +17,15 @@ import { serializeCodeAttributionOutboxPayload, hashCodeAttributionOutboxPayload
 import { OrchInstanceSummaryProjectionReader, parseOrchInstanceSummarySourceRow, upsertOrchInstanceSummaryProjection } from '../src/db/orchInstanceSummaryProjection.js';
 import { OrchInstanceRepo } from '../src/db/repos/orchInstanceRepo.js';
 import { OrchIntakeListStateRepo } from '../src/db/repos/orchIntakeListStateRepo.js';
+import { OrchIntakeRepo } from '../src/db/repos/orchIntakeRepo.js';
+import { OrchProposalRepo } from '../src/db/repos/orchProposalRepo.js';
+import { OrchRequirementAnalysisSessionRepo } from '../src/db/repos/orchRequirementAnalysisSessionRepo.js';
 import { ChatWorkflowRepo } from '../src/db/repos/chatWorkflowRepo.js';
 import { OrchArtifactRepo } from '../src/db/repos/orchArtifactRepo.js';
 import { OrchArtifactFileRepo } from '../src/db/repos/orchArtifactFileRepo.js';
 import { createLegacyClientMigration, type LegacyMigrationExecutor, type LegacyMigrationResult } from '../../src/legacyClientMigration.js';
 import { runDesktopUninstallCleanup, runDesktopReinstallLocalTasks } from '../src/desktopUninstallWorker.js';
+import { migrateLegacyWorkspaceRuntimeDirectory } from '../src/workspace-migration/workspaceRuntimeDirectoryMigration.js';
 
 const clientId = 'old-client';
 const targetClientId = 'local_11111111-1111-4111-8111-111111111111';
@@ -459,28 +463,43 @@ test('Attempt和代码归因结构化引用重算原有摘要规则，投递保�
 test('工作流本机执行范围随 workspace ID 改写，共享执行范围保持原值', async t => {
   const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration } = await service();
   orchestrationHistory(f.db);
-  f.db.prepare("UPDATE orch_instances SET runtime_config_json=? WHERE id='instance'")
-    .run(JSON.stringify({ executionProfileScope: { scopeType: 'local_workspace', scopeId: 'old-client:one' }, keep: 'value' }));
+  const localScope = { scopeType: 'local_workspace', scopeId: 'old-client:one' };
+  const sharedScope = { scopeType: 'shared_workspace', scopeId: localScope.scopeId };
+  const intake = { id: 'intake', title: '历史任务', workspaceId: localScope.scopeId, workspaceScope: localScope };
+  f.db.prepare("INSERT INTO orch_intakes(id,workspace_id,intake_json,created_at,updated_at) VALUES('intake',?,?,1,2)")
+    .run(localScope.scopeId, JSON.stringify(intake));
+  f.db.prepare("INSERT INTO orch_proposals(id,workspace_id,intake_id,proposal_json,created_at,updated_at) VALUES('proposal',?,'intake',?,1,2)")
+    .run(localScope.scopeId, JSON.stringify({ id: 'proposal', workspaceId: localScope.scopeId, intakeId: 'intake', intakeSnapshot: intake }));
+  f.db.prepare(`INSERT INTO orch_requirement_analysis_sessions(id,workspace_id,title,workspace_scope_json,last_message_at,created_at,updated_at)
+    VALUES('requirement',?,'历史需求',?,1,1,2)`).run(localScope.scopeId, JSON.stringify(localScope));
+  f.db.prepare("UPDATE orch_instances SET intake_snapshot_json=?,runtime_config_json=? WHERE id='instance'")
+    .run(JSON.stringify(intake), JSON.stringify({ executionProfileScope: localScope, keep: 'value' }));
+  new OrchIntakeListStateRepo(f.db, new OrchInstanceSummaryProjectionReader(f.db))
+    .refreshIntake({ workspaceId: localScope.scopeId as WorkspaceId, intakeId: intake.id });
   f.db.prepare(`INSERT INTO orch_instances(id,workspace_id,workflow_id,workflow_snapshot_json,intake_snapshot_json,runtime_config_json,status,created_at,updated_at)
     VALUES('shared-instance','old-client:one','workflow',?,?,?,'completed',1,2)`)
     .run(JSON.stringify({ id: 'workflow', nodes: [], edges: [] }),
-      JSON.stringify({ id: 'shared-intake', title: '共享流程', workspaceId: 'old-client:one' }),
-      JSON.stringify({ executionProfileScope: { scopeType: 'shared_workspace', scopeId: 'shared-workspace-7' } }));
+      JSON.stringify({ id: 'shared-intake', title: '共享流程', workspaceId: localScope.scopeId, workspaceScope: sharedScope }),
+      JSON.stringify({ executionProfileScope: sharedScope }));
   upsertOrchInstanceSummaryProjection(f.db, parseOrchInstanceSummarySourceRow(
     f.db.prepare("SELECT * FROM orch_instances WHERE id='shared-instance'").get() as Record<string, unknown>));
   const candidate = await discoverLegacyClientMigration(f.input, f.dependencies);
   await migrateLegacyClientMigration({ ...f.input, candidateId: candidate.candidateId!, migrationId: crypto.randomUUID() }, f.dependencies);
-  const targetId = `${targetClientId}:one`, work = f.open(path.join(f.workspacePath, '.codeflow', 'workspace.db'));
+  const targetId = `${targetClientId}:one` as WorkspaceId, work = f.open(path.join(f.workspacePath, '.codeflow', 'workspace.db'));
+  const summaries = new OrchInstanceSummaryProjectionReader(work), listStates = new OrchIntakeListStateRepo(work, summaries);
   const rows = work.prepare('SELECT id,workspace_id,runtime_config_json FROM orch_instances ORDER BY id').all() as Array<Record<string, string>>;
   const local = JSON.parse(rows.find(row => row.id === 'instance')!.runtime_config_json);
   const shared = JSON.parse(rows.find(row => row.id === 'shared-instance')!.runtime_config_json);
   assert.equal(rows.every(row => row.workspace_id === targetId), true);
   assert.deepEqual(local, { executionProfileScope: { scopeType: 'local_workspace', scopeId: targetId }, keep: 'value' });
-  assert.deepEqual(shared.executionProfileScope, { scopeType: 'shared_workspace', scopeId: 'shared-workspace-7' });
+  assert.deepEqual(shared.executionProfileScope, sharedScope);
+  assert.equal(new OrchIntakeRepo(work, listStates).listByWorkspace(targetId)[0]?.workspaceScope?.scopeId, targetId);
+  assert.equal(new OrchProposalRepo(work).listByWorkspace(targetId, { strictScope: true })[0]?.intakeSnapshot.workspaceScope?.scopeId, targetId);
+  assert.equal(new OrchRequirementAnalysisSessionRepo(work).listWorkspaceScopeRows(targetId)[0]?.workspaceScope?.scopeId, targetId);
   for (const row of rows) {
-    const strict = new OrchInstanceRepo(work, new OrchIntakeListStateRepo(work, new OrchInstanceSummaryProjectionReader(work)),
-      new OrchInstanceSummaryProjectionReader(work)).get(row.id as OrchestrationId, { strictScope: true });
+    const strict = new OrchInstanceRepo(work, listStates, summaries).get(row.id as OrchestrationId, { strictScope: true });
     assert.equal(strict?.workspaceId, targetId);
+    assert.equal(strict.intakeSnapshot.workspaceScope?.scopeId, row.id === 'instance' ? targetId : sharedScope.scopeId);
   }
 });
 
@@ -498,7 +517,7 @@ test('严格工作流归属验收在发布前拒绝无法映射的本机范围',
   assert.equal((f.db.prepare("SELECT workspace_id FROM orch_instances WHERE id='instance'").get() as { workspace_id: string }).workspace_id, 'old-client:one');
 });
 
-test('已完成迁移会先备份并可重复修复遗留本机执行范围', async t => {
+for (const layout of ['legacy', 'current', 'both']) test(`已完成迁移会先备份并可重复修复实际工作区库（${layout}）`, async t => {
   const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration, clearLegacyMigrationCredentials } = await service();
   orchestrationHistory(f.db);
   f.db.prepare("UPDATE orch_instances SET runtime_config_json=? WHERE id='instance'")
@@ -509,10 +528,18 @@ test('已完成迁移会先备份并可重复修复遗留本机执行范围', as
   fs.renameSync(f.workspacePath, movedWorkspace);
   const app = f.open(path.join(f.dataDir, 'codeflowai.db'));
   app.prepare('UPDATE workspaces SET path=? WHERE id=?').run(movedWorkspace, `${targetClientId}:one`);
-  const workspaceDb = path.join(movedWorkspace, '.codeflow', 'workspace.db'), work = f.open(workspaceDb);
+  if (layout !== 'legacy') migrateLegacyWorkspaceRuntimeDirectory(movedWorkspace);
+  const workspaceDb = path.join(movedWorkspace, layout === 'legacy' ? '.codeflow' : '.codeflowai', 'workspace.db');
+  const work = f.open(workspaceDb);
   work.prepare("UPDATE orch_instances SET runtime_config_json=? WHERE id='instance'")
     .run(JSON.stringify({ executionProfileScope: { scopeType: 'local_workspace', scopeId: 'old-client:one' }, keep: 'untouched' }));
   work.close();
+  const legacyCopy = path.join(movedWorkspace, '.codeflow', 'workspace.db');
+  const before = fs.readFileSync(workspaceDb);
+  if (layout === 'both') {
+    fs.mkdirSync(path.dirname(legacyCopy));
+    fs.copyFileSync(workspaceDb, legacyCopy);
+  }
 
   const completed = await discoverLegacyClientMigration(f.input, f.dependencies);
   assert.equal(completed.completed, true);
@@ -523,13 +550,67 @@ test('已完成迁移会先备份并可重复修复遗留本机执行范围', as
   const backup = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
   assert.deepEqual(backup.fixes, [{ workspaceId: `${targetClientId}:one`, instanceId: 'instance', previousScopeId: 'old-client:one' }]);
 
+  const repairedBytes = fs.readFileSync(workspaceDb);
   await discoverLegacyClientMigration(f.input, f.dependencies);
+  assert.deepEqual(fs.readFileSync(workspaceDb), repairedBytes);
+  if (layout === 'both') assert.deepEqual(fs.readFileSync(legacyCopy), before);
   assert.deepEqual(JSON.parse(fs.readFileSync(backupFile, 'utf8')), backup);
   const scope = new OrchInstanceRepo(repaired, new OrchIntakeListStateRepo(repaired, new OrchInstanceSummaryProjectionReader(repaired)),
     new OrchInstanceSummaryProjectionReader(repaired)).get('instance' as OrchestrationId, { strictScope: true });
   assert.equal(scope?.workspaceId, `${targetClientId}:one`);
   clearLegacyMigrationCredentials(f.input);
   assert.deepEqual(JSON.parse(fs.readFileSync(backupFile, 'utf8')), backup, '卸载凭据清理需识别并保留无凭据修复备份');
+});
+
+test('当前目录分库保留工作流历史，发布中断后可按原日志续迁', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration } = await service();
+  const workspaceDb = path.join(f.workspacePath, '.codeflowai', 'workspace.db');
+  fs.mkdirSync(path.dirname(workspaceDb));
+  fs.writeFileSync(workspaceDb, '');
+  const source = f.open(workspaceDb);
+  migrateClientDb(source, { scope: 'workspace' });
+  ensureWorkspaceCoreQueueTables(source); ensureWorkspaceAdditionalTables(source);
+  orchestrationHistory(source);
+  source.prepare("UPDATE orch_instances SET runtime_config_json=? WHERE id='instance'")
+    .run(JSON.stringify({ executionProfileScope: { scopeType: 'local_workspace', scopeId: 'old-client:one' } }));
+  source.close();
+  const candidate = await discoverLegacyClientMigration(f.input, f.dependencies);
+  const request = { ...f.input, candidateId: candidate.candidateId!, migrationId: crypto.randomUUID() };
+  await assert.rejects(migrateLegacyClientMigration(request, { ...f.dependencies, afterPublish: ({ target }) => {
+    assert.equal(target, workspaceDb);
+    throw new Error('interrupted after workspace publish');
+  } }), /interrupted after workspace publish/u);
+  assert.equal((await discoverLegacyClientMigration(f.input, f.dependencies)).resume, true);
+  assert.equal((await migrateLegacyClientMigration(request, f.dependencies)).completed, true);
+  assert.equal((await discoverLegacyClientMigration(f.input, f.dependencies)).completed, true);
+  const active = f.open(workspaceDb), projection = new OrchInstanceSummaryProjectionReader(active);
+  const instance = new OrchInstanceRepo(active, new OrchIntakeListStateRepo(active, projection), projection)
+    .get('instance' as OrchestrationId, { strictScope: true });
+  assert.equal(instance?.runtimeConfig?.executionProfileScope?.scopeId, `${targetClientId}:one`);
+  assert.equal(fs.existsSync(path.join(f.workspacePath, '.codeflow', 'workspace.db')), false);
+});
+
+test('冻结快照后来源分库被搬迁，续迁显式失败并保留当前库', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration, migrateLegacyClientMigration } = await service();
+  const legacyDb = path.join(f.workspacePath, '.codeflow', 'workspace.db');
+  fs.mkdirSync(path.dirname(legacyDb));
+  fs.writeFileSync(legacyDb, '');
+  const source = f.open(legacyDb);
+  migrateClientDb(source, { scope: 'workspace' });
+  ensureWorkspaceCoreQueueTables(source); ensureWorkspaceAdditionalTables(source);
+  history(source); source.close();
+  const candidate = await discoverLegacyClientMigration(f.input, f.dependencies);
+  const request = { ...f.input, candidateId: candidate.candidateId!, migrationId: crypto.randomUUID() };
+  await assert.rejects(migrateLegacyClientMigration(request, { ...f.dependencies, onProgress: value => {
+    if (value.stage === 'convert') throw new Error('interrupted after snapshots');
+  } }), /interrupted after snapshots/u);
+  migrateLegacyWorkspaceRuntimeDirectory(f.workspacePath);
+  const currentDb = path.join(f.workspacePath, '.codeflowai', 'workspace.db'), before = fs.readFileSync(currentDb);
+  await assert.rejects(migrateLegacyClientMigration(request, f.dependencies), (error: any) =>
+    error?.code === 'TARGET_CONFLICT' && error?.context?.reason === 'workspace_database_location_changed');
+  assert.deepEqual(fs.readFileSync(currentDb), before);
+  assert.equal(fs.existsSync(legacyDb), false);
+  assert.equal(fs.existsSync(path.join(f.dataDir, 'codeflowai.db')), false);
 });
 
 test('Attempt原始摘要损坏不能在重算中被洗成有效历史', async t => {
@@ -1091,6 +1172,58 @@ test('目标已被正常使用时发现阶段判定不适用，写标记且不�
   assert.ok(!fs.readFileSync(targetInUseMarker(f), 'utf8').includes(apiKey));
 });
 
+for (const initialized of [false, true]) test(`默认工作区空分库可迁移，有业务数据后判定目标已使用（应用库${initialized ? '存在' : '缺失'}）`, async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  if (initialized) usedTarget(f);
+  const filename = path.join(f.dataDir, 'workspace', '.codeflowai', 'workspace.db');
+  fs.mkdirSync(path.dirname(filename), { recursive: true });
+  fs.writeFileSync(filename, '');
+  const workspace = f.open(filename);
+  migrateClientDb(workspace, { scope: 'workspace' });
+  workspace.close();
+  assert.ok((await discoverLegacyClientMigration(f.input, f.dependencies)).candidateId);
+  const usedWorkspace = f.open(filename);
+  usedWorkspace.prepare("INSERT INTO workspace_prefs VALUES (?,'codex','general',1,12000,NULL)").run(`${targetClientId}:default`);
+  usedWorkspace.close();
+  const before = fs.readFileSync(filename);
+  const dependencies = { ...f.dependencies, resolveNamespace: async () => assert.fail('目标已使用时不得探测旧来源') };
+  const result = await discoverLegacyClientMigration(f.input, dependencies);
+  assert.equal(result.candidateId, null);
+  assert.deepEqual(result.targetInUse, { reason: 'workspace_database' });
+  assert.deepEqual(await discoverLegacyClientMigration(f.input, dependencies), { candidateId: null, workspaceCount: 0 });
+  assert.deepEqual(fs.readFileSync(filename), before);
+});
+
+test('默认工作区分库损坏时显式冲突，配置已登录时优先判定不适用', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  const filename = path.join(f.dataDir, 'workspace', '.codeflowai', 'workspace.db');
+  fs.mkdirSync(path.dirname(filename), { recursive: true });
+  fs.writeFileSync(filename, '');
+  await assert.rejects(discoverLegacyClientMigration(f.input, f.dependencies), (error: any) =>
+    error?.code === 'TARGET_CONFLICT' && error?.context?.reason === 'workspace_database_unreadable');
+  fs.writeFileSync(path.join(f.dataDir, 'config.json'), JSON.stringify({ clientId: targetClientId, apiKey: 'fixture-secret',
+    serverWs: 'ws://localhost:39280/ws/client' }));
+  const result = await discoverLegacyClientMigration(f.input, f.dependencies);
+  assert.deepEqual(result.targetInUse, { reason: 'config_api_key' });
+});
+
+test('默认工作区仅含系统内置资产时仍允许迁移', async t => {
+  const f = fixture(t), { discoverLegacyClientMigration } = await service();
+  usedTarget(f);
+  const filename = path.join(f.dataDir, 'workspace', '.codeflowai', 'workspace.db');
+  fs.mkdirSync(path.dirname(filename), { recursive: true });
+  fs.writeFileSync(filename, '');
+  const workspace = f.open(filename);
+  migrateClientDb(workspace, { scope: 'workspace' });
+  ensureWorkspaceCoreQueueTables(workspace);
+  ensureWorkspaceAdditionalTables(workspace);
+  workspace.prepare("INSERT INTO orch_roles(id,workspace_id,name,definition_json,kind,created_at,updated_at) VALUES('bundle-role-fixture',?,'内置','{}','builtin',1,1)")
+    .run(`${targetClientId}:default`);
+  workspace.close();
+  const result = await discoverLegacyClientMigration(f.input, f.dependencies);
+  assert.ok(result.candidateId);
+});
+
 test('不适用标记命中后不再扫描旧数据，也不重复返回提示', async t => {
   const f = fixture(t), { discoverLegacyClientMigration } = await service();
   usedTarget(f, useEngine);
@@ -1248,6 +1381,7 @@ for (const interrupted of [false, true]) test(`真实owner暂缓后启动正常C
       dataDir: f.dataDir, clientId: normalClientId, oldDeviceId: targetDeviceId, nextDeviceId });
     assert.equal((await discoverLegacyClientMigration({ dataDir: f.dataDir, targetClientId: normalClientId, targetDeviceId: nextDeviceId }, f.dependencies)).deferred, true);
   } else {
+    // 正常 Client 只生成空默认分库时仍允许迁移，用户选择后按实际身份续跑。
     assert.equal(reopened.snapshot().status, 'available');
     await reopened.start(reopened.snapshot().candidateId!); await next;
     assert.deepEqual(ids.slice(1), [normalClientId, normalClientId]);
@@ -1269,8 +1403,15 @@ test('分库全局事件序号冲突会失败而不是发布两个互相重叠�
   assert.equal(fs.existsSync(path.join(f.dataDir, 'codeflowai.db')), false);
 });
 
-test('宿主与已构建Worker迁移后真实Client读取历史，重开不重复导入', { timeout: 40_000 }, async t => {
+test('已构建Worker修复实际分库，真实Client重开仍能读取历史、需求和实例', { timeout: 40_000 }, async t => {
   const f = fixture(t, initializeLegacy83); history(f.db);
+  const legacyScope = { scopeType: 'local_workspace', scopeId: `${clientId}:one` };
+  f.db.prepare(`INSERT INTO orch_instances(id,workspace_id,workflow_id,workflow_snapshot_json,intake_snapshot_json,runtime_config_json,status,created_at,updated_at)
+    VALUES('instance',?,'workflow',?,?,?,'completed',1,2)`)
+    .run(legacyScope.scopeId, JSON.stringify({ id: 'workflow', nodes: [], edges: [] }),
+      JSON.stringify({ id: 'intake', title: '历史任务', workspaceId: legacyScope.scopeId, workspaceScope: legacyScope }),
+      JSON.stringify({ executionProfileScope: legacyScope }));
+  upsertOrchInstanceSummaryProjection(f.db, parseOrchInstanceSummarySourceRow(f.db.prepare("SELECT * FROM orch_instances WHERE id='instance'").get()));
   const workerEntry = fileURLToPath(new URL('../dist/legacyClientMigrationWorker.cjs', import.meta.url));
   assert.equal(fs.existsSync(workerEntry), true, `Worker缺失：${workerEntry}；测试模块：${import.meta.url}；先运行 node scripts/build-bundle.mjs`);
   const requests: string[] = [], children = new Map<ChildProcess, Promise<number | null>>();
@@ -1336,17 +1477,36 @@ test('宿主与已构建Worker迁移后真实Client读取历史，重开不重�
       await response(value => value.t === 'desktop.ready' && value.requestId === requestId ? true : undefined);
       if (opening === 0) { await owner.runtimeReady(); assert.equal(owner.snapshot().account.status, 'failed'); await owner.stop(); }
       /** 仅经运行中的业务 API 读取，不用直接查目标 SQLite 代替可用性。 */
-      const api = async (method: string, body?: Record<string, unknown>): Promise<any> => {
+      const request = async (method: string, body?: Record<string, unknown>): Promise<any> => {
         const id = crypto.randomUUID(), pending = response(value => value.t === 'desktop.api.res' && value.requestId === requestId && value.id === id ? value.response : undefined);
         child.send({ t: 'desktop.api.req', requestId, id, request: { method, ...(body ? { body } : {}) } });
-        const result = await pending; assert.equal(result.status, 200, JSON.stringify(result.body)); return result.body;
+        return await pending;
+      };
+      const api = async (method: string, body?: Record<string, unknown>): Promise<any> => {
+        const deadline = Date.now() + 8_000;
+        let result = await request(method, body);
+        // 首次只读请求等待 ready 后的本地事件恢复，其他响应仍立即断言。
+        while (method === 'workspaces.list' && result.status === 503 && result.body?.code === 'DESKTOP_RUNTIME_NOT_READY' && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 25));
+          result = await request(method, body);
+        }
+        assert.equal(result.status, 200, JSON.stringify(result.body)); return result.body;
       };
       const workspaceId = `${migratedClientId}:one`, scope = { workspaceId, threadId: 'thread' };
       assert.ok((await api('workspaces.list')).workspaces.some((work: any) => work.id === workspaceId));
       assert.deepEqual((await api('threads.list', { workspaceId, scope: 'current' })).threads.map((thread: any) => thread.id), ['thread']);
       assert.deepEqual((await api('threads.load', scope)).events.map((event: any) => event.seq), [700]);
       assert.deepEqual((await api('threads.events', scope)).events.map((event: any) => event.seq), [701]);
+      const scopeId = (await api('orch.instances.get', { workspaceId, instanceId: 'instance' })).instance.runtimeConfig.executionProfileScope.scopeId;
+      assert.equal(scopeId, workspaceId);
+      await api('orch.intakes.list', { workspaceId });
       child.send({ t: 'desktop.shutdown', requestId }); assert.equal(await bounded(closed, 'CLIENT_CLOSE_TIMEOUT'), 0, stderr); children.delete(child);
+      if (opening === 0) {
+        const workspace = f.open(path.join(f.workspacePath, '.codeflowai', 'workspace.db'));
+        workspace.prepare("UPDATE orch_instances SET runtime_config_json=? WHERE id='instance'")
+          .run(JSON.stringify({ executionProfileScope: legacyScope }));
+        workspace.close();
+      }
       const reopened = createLegacyClientMigration({ dataDir: f.dataDir, workerEntry, identity, execute, restoreAccount });
       const next = reopened.prepare(); await reopened.whenDiscovered();
       assert.notEqual(reopened.snapshot().status, 'failed', JSON.stringify(reopened.snapshot()));

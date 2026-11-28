@@ -20,8 +20,8 @@ import { OrchInstanceSummaryProjectionReader } from '../db/orchInstanceSummaryPr
 import { scheduledTaskAccountRuntimeKey } from '../db/repos/scheduledTaskRuntimeStateRepo.js';
 import { ConversationEventRepo, RawEngineEventRepo, readWorkspaceEventSeqFloor, recordWorkspaceEventSeqFloor } from '../db/repos/eventRepo.js';
 import { acquireClientProcessLock, buildClientProcessLockPath, type ClientProcessLock } from '../startup/clientStartupGuards.js';
-import { ensureWorkspaceCodeflowaiDirectory, inspectExistingWorkspaceCodeflowaiDirectory, inspectWorkspaceCodeflowaiFile,
-  assertWorkspaceCodeflowaiDirectory } from '../codeflowai/workspaceCodeflowaiDirectory.js';
+import { ensureWorkspaceCodeflowaiDirectory, inspectExistingWorkspaceCodeflowaiDirectory, inspectWorkspaceCodeflowaiFiles,
+  assertWorkspaceCodeflowaiDirectory, WORKSPACE_CODEFLOWAI_DIRECTORY, WORKSPACE_RUNTIME_DIRECTORY } from '../codeflowai/workspaceCodeflowaiDirectory.js';
 import { resolveWorkspaceReadPath } from '../fs/fsHelpers.js';
 import { parseLegacyClientMigrationRequest, type LegacyClientMigrationRequest, type LegacyClientMigrationProgress,
   type LegacyClientMigrationResult, type LegacyClientMigrationContext,
@@ -296,6 +296,7 @@ export async function migrateLegacyClientMigration(input: Input, dependencies: L
     }
     for (const [index, file] of journal.files.entries()) {
       checkpoint(dependencies);
+      assertWorkspacePublishLocation(journal, file);
       if (!file.published && (exists(file.staged) ? sha256File(file.staged) !== file.sha256
         : !exists(file.target) || sha256File(file.target) !== file.sha256)) fail('MIGRATION_STAGING_CHANGED');
       progress(dependencies, 'verify', index + 1, journal.files.length, journal);
@@ -310,8 +311,8 @@ export async function migrateLegacyClientMigration(input: Input, dependencies: L
     withDatabase(path.join(input.dataDir, 'codeflowai.db'), true, db => {
       for (const source of journal.source.workspaces) if (!new WorkspaceRepo(db).getIncludingDeleted(mappedWorkspaceId(source.id, journal.source.sourceClientId, input.targetClientId) as WorkspaceId)) fail('MIGRATION_REGISTRATION_INCOMPLETE');
     });
-    journal.completed = true; journal.stage = 'completed'; journal.errorCode = null; writeJournal(input, journal);
     validateCompleted(input, journal);
+    journal.completed = true; journal.stage = 'completed'; journal.errorCode = null; writeJournal(input, journal);
     return await journalResult(journal, dependencies);
   } catch (error) {
     failure = error; journal.errorCode = errorCode(error); writeJournal(input, journal); throw error;
@@ -404,11 +405,30 @@ function refreshFrozenSource(source: Source): void {
 /** 已注册物理工作区及其分库必须能证明归属；同路径不明数据不能认领。 */
 function inspectSourceWorkspace(work: PersistedWorkspace): Source['workspaces'][number] {
   assertDirectory(work.path);
-  const directory = inspectExistingWorkspaceCodeflowaiDirectory(work.path, '.codeflow');
-  const workspaceDbPath = directory ? inspectWorkspaceCodeflowaiFile(directory, 'workspace.db')?.path ?? null : null;
-  if (directory && !workspaceDbPath && SIDECARS.some(suffix => inspectWorkspaceCodeflowaiFile(directory, `workspace.db${suffix}`))) fail('SOURCE_ORPHAN_SIDECAR');
+  const candidates = ([WORKSPACE_CODEFLOWAI_DIRECTORY, WORKSPACE_RUNTIME_DIRECTORY] as const).flatMap(name => {
+    const directory = inspectExistingWorkspaceCodeflowaiDirectory(work.path, name);
+    if (!directory) return [];
+    const [file, ...sidecars] = inspectWorkspaceCodeflowaiFiles(directory, ['workspace.db', ...SIDECARS.map(suffix => `workspace.db${suffix}`)]);
+    if (!file && sidecars.some(Boolean)) fail('SOURCE_ORPHAN_SIDECAR', { workspaceId: work.id });
+    return file ? [file.path] : [];
+  });
+  if (candidates.length > 1) fail('SOURCE_WORKSPACE_DATABASE_CONFLICT', { workspaceId: work.id });
+  const workspaceDbPath = candidates[0] ?? null;
   if (workspaceDbPath) withDatabase(workspaceDbPath, true, workspace => { assertWorkspaceDbReadOnlySchema(workspace); assertWorkspaceOwnership(workspace, work.id); integrity(workspace); });
   return { ...work, workspaceDbPath };
+}
+
+/** 从冻结来源推导发布位置。无来源分库的历史日志沿用旧目录。 */
+function workspaceMigrationDestination(work: Source['workspaces'][number]) {
+  if (!work || typeof work.path !== 'string' || !path.isAbsolute(work.path)) fail('MIGRATION_JOURNAL_INVALID');
+  // 旧 journal 可能没有该字段；按无来源分库兼容，非字符串仍显式失败。
+  const workspaceDbPath = work.workspaceDbPath ?? null;
+  for (const directoryName of [WORKSPACE_RUNTIME_DIRECTORY, WORKSPACE_CODEFLOWAI_DIRECTORY] as const) {
+    const target = path.join(work.path, directoryName, 'workspace.db');
+    if ((workspaceDbPath === null && directoryName === WORKSPACE_RUNTIME_DIRECTORY)
+      || (typeof workspaceDbPath === 'string' && samePath(workspaceDbPath, target))) return { directoryName, target };
+  }
+  fail('MIGRATION_JOURNAL_INVALID');
 }
 
 /** 只读既有账号命名空间入口；失败不暴露远端正文或回显 Key。 */
@@ -508,8 +528,8 @@ async function convertSnapshots(input: Input, journal: Journal, dependencies: Le
       const source = journal.source.workspaces[index]!, id = mapping.get(source.id)!;
       workspaceIndex = index;
       report('workspace_schema', undefined, 0, undefined, undefined, journal.source.workspaces.length);
-      const target = path.join(source.path, '.codeflow', 'workspace.db');
-      const directory = ensureWorkspaceCodeflowaiDirectory(source.path, '.codeflow');
+      const { directoryName, target } = workspaceMigrationDestination(source);
+      const directory = ensureWorkspaceCodeflowaiDirectory(source.path, directoryName);
       const staged = path.join(directory.directoryPath, `legacy-migration-${journal.migrationId}.db`);
       removeOwnedTemporary(staged);
       const workspace = openSqliteDb(staged);
@@ -765,10 +785,7 @@ async function rewriteBusinessReferences(db: SqliteDb, mapping: Map<string, stri
             if (value && mapping.has(value.workspaceId)) value.workspaceId = mapping.get(value.workspaceId);
           } else {
             rewriteJson(value, mapping);
-            if (table === 'orch_instances' && column === 'runtime_config_json') {
-              const scope = value?.executionProfileScope;
-              if (scope?.scopeType === 'local_workspace' && mapping.has(scope.scopeId)) scope.scopeId = mapping.get(scope.scopeId);
-            }
+            rewriteLocalOrchestrationScope(table, column, value, mapping);
           }
           const changed = JSON.stringify(value);
           if (changed !== JSON.stringify(JSON.parse(raw))) {
@@ -794,6 +811,16 @@ async function rewriteBusinessReferences(db: SqliteDb, mapping: Map<string, stri
     if (hasTable(db, 'scheduled_task_configs')) db.prepare('UPDATE scheduled_task_configs SET workspace_scope_id=? WHERE workspace_scope_id=?').run(newId, oldId);
     if (hasTable(db, 'workspace_execution_profiles')) db.prepare("UPDATE workspace_execution_profiles SET scope_id=? WHERE scope_type='local_workspace' AND scope_id=?").run(newId, oldId);
   }
+}
+
+/** 只按编排持久化字段改写本机范围；共享范围和自由业务 JSON 中的 scopeId 保持原值。 */
+function rewriteLocalOrchestrationScope(table: string, column: string, value: any, mapping: Map<string, string>): void {
+  let scope;
+  if (table === 'orch_instances' && column === 'runtime_config_json') scope = value?.executionProfileScope;
+  else if (table === 'orch_instances' && column === 'intake_snapshot_json' || table === 'orch_intakes' && column === 'intake_json') scope = value?.workspaceScope;
+  else if (table === 'orch_proposals' && column === 'proposal_json') scope = value?.intakeSnapshot?.workspaceScope;
+  else if (table === 'orch_requirement_analysis_sessions' && column === 'workspace_scope_json') scope = value;
+  if (scope?.scopeType === 'local_workspace' && mapping.has(scope.scopeId)) scope.scopeId = mapping.get(scope.scopeId);
 }
 
 /** 仅递归已声明的业务 ID 键及 ID 数组，不替换文本内容或原始协议载荷。 */
@@ -995,8 +1022,23 @@ function removeRemoteMetadata(db: SqliteDb, workspace: boolean): void {
   }
 }
 
+/** 冻结快照后分库搬迁或出现另一套库时中止，避免发布到 Client 不会使用的位置。 */
+function assertWorkspacePublishLocation(journal: Journal, file: PublishedFile): void {
+  if (path.basename(file.target) !== 'workspace.db') return;
+  const directory = path.dirname(file.target);
+  const workspacePath = path.dirname(directory);
+  const alternate = path.basename(directory) === WORKSPACE_CODEFLOWAI_DIRECTORY ? WORKSPACE_RUNTIME_DIRECTORY : WORKSPACE_CODEFLOWAI_DIRECTORY;
+  const alternateDb = path.join(workspacePath, alternate, 'workspace.db');
+  if (['', ...SIDECARS].some(suffix => exists(`${alternateDb}${suffix}`))
+    || file.originalSha256 !== null && !exists(file.target)) {
+    const workspaceId = journal.source.workspaces.find(work => samePath(work.path, workspacePath))?.id;
+    fail('TARGET_CONFLICT', { workspaceId, reason: 'workspace_database_location_changed' });
+  }
+}
+
 /** 发布前复核归档与原目标；rename 后崩溃可由相同摘要认领，其他目标永不覆盖。 */
 function publishFile(input: Input, journal: Journal, file: PublishedFile): void {
+  assertWorkspacePublishLocation(journal, file);
   if (file.published) { if (!exists(file.target) || sha256File(file.target) !== file.sha256) fail('MIGRATION_PUBLISHED_FILE_CHANGED'); return; }
   if (!exists(file.staged) && exists(file.target) && sha256File(file.target) === file.sha256) { file.published = true; writeJournal(input, journal); return; }
   if (exists(file.target)) {
@@ -1009,7 +1051,7 @@ function publishFile(input: Input, journal: Journal, file: PublishedFile): void 
         fs.unlinkSync(sidecar);
       }
     } else if (path.basename(file.target) === 'workspace.db') {
-      const index = journal.source.workspaces.findIndex(work => samePath(path.join(work.path, '.codeflow', 'workspace.db'), file.target));
+      const index = journal.source.workspaces.findIndex(work => samePath(workspaceMigrationDestination(work).target, file.target));
       const archived = path.join(snapshotDirectory(input, journal), `source-workspace-${index}.db`);
       if (index < 0 || !exists(archived)) fail('MIGRATION_ARCHIVE_MISSING');
       withDatabase(archived, true, integrity);
@@ -1047,13 +1089,16 @@ function repairCompletedWorkflowScopes(input: Input, journal: Journal): void {
   const mapping = new Map(journal.source.workspaces.map(work => [work.id, mappedWorkspaceId(work.id, journal.source.sourceClientId, input.targetClientId)]));
   const applicationDb = path.join(input.dataDir, 'codeflowai.db');
   const migratedIds = new Set(mapping.values());
-  /** 用当前注册定位仍可访问的迁移库，软删除的库恢复注册后也能被修复。 */
+  /** 用当前注册定位迁移库，优先选 Client 实际读取的目录，兼容首次启动前的旧位置。 */
   const findTargets = () => withDatabase(applicationDb, true, db => new WorkspaceRepo(db).list({ includeDeleted: true }).flatMap(work => {
     if (!migratedIds.has(work.id)) return [];
-    const dbPath = path.join(work.path, '.codeflow', 'workspace.db');
-    if (!exists(dbPath)) return [];
-    assertFile(dbPath);
-    return [{ workspaceId: work.id, dbPath }];
+    for (const directory of [WORKSPACE_CODEFLOWAI_DIRECTORY, WORKSPACE_RUNTIME_DIRECTORY]) {
+      const dbPath = path.join(work.path, directory, 'workspace.db');
+      if (!exists(dbPath)) continue;
+      assertFile(dbPath);
+      return [{ workspaceId: work.id, dbPath }];
+    }
+    return [];
   }));
   if (!collectWorkflowScopeRepairs(findTargets(), mapping).length) return;
 
@@ -1260,7 +1305,53 @@ function referenceHighWater(db: SqliteDb): number {
   return maximum;
 }
 
-/** 标记命中时仅核对目标身份与结构；全量完整性由正常 Client 负责，不重复扫描。 */
+/** 用户可产生的业务表；系统内置资产、默认模板与实验配置不阻止迁移。 */
+const WORKSPACE_USER_DATA_TABLES = new Set([
+  'threads', 'thread_turns', 'turn_file_changes', 'conversation_events', 'raw_engine_events',
+  'conversation_diff_snapshots', 'conversation_message_deletions', 'knowledge_conversations', 'thread_drafts',
+  'thread_draft_attachments', 'thread_message_queue', 'thread_message_queue_attachments', 'thread_queue_states',
+  'thread_reminder_states', 'thread_rollbacks', 'thread_state_bindings', 'file_blobs', 'thread_groups',
+  'reminder_receipts', 'reminder_ignores', 'dingtalk_reminder_notifications', 'wecom_reminder_notifications',
+  'code_attribution_outbox', 'code_attribution_retention_tasks', 'terminal_configs', 'workspace_execution_profiles',
+  'workspace_prefs', 'scheduled_task_configs', 'scheduled_task_runs', 'scheduled_task_account_configs',
+  'scheduled_task_runtime_states', 'chat_workflow_tasks', 'chat_workflow_actions', 'chat_workflow_settings',
+  'orch_requirement_analysis_sessions', 'orch_requirement_analysis_messages', 'orch_requirement_candidate_drafts',
+  'orch_intakes', 'orch_proposals', 'orch_intake_list_states', 'orch_instances', 'orch_instance_summaries',
+  'orch_artifacts', 'orch_artifact_files', 'orch_artifact_fields', 'orch_events', 'orch_feedback_records',
+  'orch_gate_evaluation_runs', 'orch_prompt_snapshots', 'orch_node_context_resolutions', 'orch_node_attempts',
+  'orch_node_work_item_boards', 'orch_node_work_items', 'orch_node_work_item_events', 'orch_asset_drafts',
+  'orch_asset_generation_jobs', 'orch_asset_job_events',
+]);
+const WORKSPACE_ASSET_DEFINITION_TABLES = ['orch_roles', 'orch_workflows', 'orch_knowledge_bundles', 'orch_skills', 'orch_toolsets'];
+
+/** 默认工作区有用户业务或已提交事件时保护目标；系统内置资产和空分库仍允许迁移。 */
+function hasDefaultWorkspaceData(input: Input): boolean {
+  return [WORKSPACE_CODEFLOWAI_DIRECTORY, WORKSPACE_RUNTIME_DIRECTORY].some(directory => {
+    const filename = path.join(input.dataDir, 'workspace', directory, 'workspace.db');
+    if (!exists(filename)) return false;
+    try {
+      return withDatabase(filename, true, db => {
+        assertWorkspaceDbReadOnlySchema(db);
+        const floor = hasTable(db, 'meta')
+          ? db.prepare("SELECT value FROM meta WHERE key='event_seq_floor'").get() as { value: string } | undefined : undefined;
+        if (validCounter(floor?.value ?? '0') > 0) return true;
+        for (const table of WORKSPACE_USER_DATA_TABLES) {
+          if (hasTable(db, table) && db.prepare(`SELECT 1 FROM ${quote(table)} LIMIT 1`).get()) return true;
+        }
+        for (const table of WORKSPACE_ASSET_DEFINITION_TABLES) {
+          if (hasTable(db, table) && columns(db, table).includes('kind')
+            && db.prepare(`SELECT 1 FROM ${quote(table)} WHERE kind<>'builtin' LIMIT 1`).get()) return true;
+        }
+        return false;
+      });
+    } catch (error) {
+      // 默认分库损坏或结构不支持属于目标异常，统一为可检索的迁移冲突。
+      throw migrationError('TARGET_CONFLICT', error, { reason: 'workspace_database_unreadable' });
+    }
+  });
+}
+
+/** 标记命中时核对目标身份和结构；应用库消失时检查仍在磁盘上的业务证据。 */
 function targetStillInUse(input: Input): boolean {
   const configPath = path.join(input.dataDir, 'config.json');
   const config = exists(configPath) ? readObject(configPath) : null;
@@ -1268,7 +1359,7 @@ function targetStillInUse(input: Input): boolean {
   const target = path.join(input.dataDir, 'codeflowai.db'), metaPath = `${target}.meta.json`;
   if (!exists(target)) {
     for (const suffix of [...SIDECARS, '.meta.json']) if (exists(`${target}${suffix}`)) fail('TARGET_CONFLICT');
-    return Boolean(config?.apiKey);
+    return Boolean(config?.apiKey) || hasDefaultWorkspaceData(input);
   }
   assertFile(target);
   if (!exists(metaPath) || !plainHeader(target)) fail('TARGET_CONFLICT');
@@ -1288,7 +1379,9 @@ function inspectTarget(input: Input): TargetInspection {
   const target = path.join(input.dataDir, 'codeflowai.db'), metaPath = `${target}.meta.json`;
   if (!exists(target)) {
     for (const suffix of [...SIDECARS, '.meta.json']) if (exists(`${target}${suffix}`)) fail('TARGET_CONFLICT');
-    return config?.apiKey ? { state: 'in_use', evidence: { reason: 'config_api_key' } } : { state: 'empty', initialization: null };
+    if (config?.apiKey) return { state: 'in_use', evidence: { reason: 'config_api_key' } };
+    if (hasDefaultWorkspaceData(input)) return { state: 'in_use', evidence: { reason: 'workspace_database' } };
+    return { state: 'empty', initialization: null };
   }
   if (!exists(metaPath) || !plainHeader(target)) fail('TARGET_CONFLICT');
   const meta = readObject(metaPath);
@@ -1310,7 +1403,7 @@ function inspectTarget(input: Input): TargetInspection {
     if (workspaces.length > 1) return { reason: 'workspaces' as const, workspaceCount: workspaces.length };
     if (workspaces.some(work => work.isDeleted)) return { reason: 'workspace_deleted' as const, workspaceCount: workspaces.length };
     if (workspaces.some(work => !samePath(work.path, path.join(input.dataDir, 'workspace')))) return { reason: 'workspace_path' as const };
-    if (exists(path.join(input.dataDir, 'workspace', '.codeflow', 'workspace.db'))) return { reason: 'workspace_database' as const };
+    if (hasDefaultWorkspaceData(input)) return { reason: 'workspace_database' as const };
     for (const row of db.prepare('SELECT key,value FROM meta').all() as Row[]) {
       if (!['client_id', 'event_seq', 'conversation_presentation_schema_version'].includes(row.key)) return { reason: 'meta_key' as const };
       if (row.key === 'event_seq' && row.value !== '0') return { reason: 'event_seq' as const };
@@ -1421,11 +1514,12 @@ function readJournal(input: Input): Journal | null {
     || journal.deferred !== undefined && typeof journal.deferred !== 'boolean'
     || (journal.schemaVersion === 2) !== (journal.deferred === true)) fail('MIGRATION_JOURNAL_INVALID');
   parseLegacyClientMigrationRequest({ action: 'discover', dataDir: input.dataDir, targetClientId: journal.targetClientId, targetDeviceId: journal.targetDeviceId });
+  const workspaceTargets = journal.source.workspaces.map(work => workspaceMigrationDestination(work).target);
+  const targets = [path.join(input.dataDir, 'codeflowai.db'), path.join(input.dataDir, 'config.json'), path.join(input.dataDir, 'codeflowai.db.meta.json'),
+    ...workspaceTargets];
   for (const file of journal.files) {
-    const targets = [path.join(input.dataDir, 'codeflowai.db'), path.join(input.dataDir, 'config.json'), path.join(input.dataDir, 'codeflowai.db.meta.json'),
-      ...journal.source.workspaces.map(work => path.join(work.path, '.codeflow', 'workspace.db'))];
-    const workspaceTarget = journal.source.workspaces.find(work => samePath(path.join(work.path, '.codeflow', 'workspace.db'), file.target));
-    const staged = workspaceTarget ? path.join(workspaceTarget.path, '.codeflow', `legacy-migration-${journal.migrationId}.db`)
+    const workspaceTarget = workspaceTargets.find(target => samePath(target, file.target));
+    const staged = workspaceTarget ? path.join(path.dirname(workspaceTarget), `legacy-migration-${journal.migrationId}.db`)
       : path.join(archiveDirectory(input, journal), path.basename(file.target) === 'config.json' ? 'target-config.json'
         : path.basename(file.target) === 'codeflowai.db.meta.json' ? 'target-meta.json' : 'target-application.db');
     if (!targets.some(target => samePath(target, file.target)) || !samePath(staged, file.staged)

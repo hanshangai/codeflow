@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
 import { openSqliteDb } from "../src/db/sqliteDb.js";
 import { migrateClientDb } from "../src/db/migrateClientDb.js";
+import { WORKSPACE_CODEFLOWAI_DIRECTORY } from "../src/codeflowai/workspaceCodeflowaiDirectory.js";
 
 import {
   WorkspaceMigrationFileClientError,
@@ -92,9 +93,9 @@ function seedWorkspace(fixture: Fixture): void {
 
 test("D18 snapshot 固定容器下真实 SQLite 复制保持数据与只读校验", async t => {
   const fixture = createFixture(t);
-  fs.mkdirSync(path.join(fixture.source, ".codeflow")); fs.mkdirSync(fixture.target);
-  fs.mkdirSync(path.join(fixture.target, ".codeflow"));
-  const source = openSqliteDb(path.join(fixture.source, ".codeflow", "workspace.db"));
+  fs.mkdirSync(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY)); fs.mkdirSync(fixture.target);
+  fs.mkdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY));
+  const source = openSqliteDb(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"));
   try { migrateClientDb(source, { scope: "workspace" }); source.prepare("INSERT INTO workspace_prefs VALUES ('ws','codex','general',1,88,NULL)").run(); }
   finally { source.close(); }
   const worker = new WorkspaceMigrationFileWorkerClient();
@@ -108,12 +109,12 @@ test("D18 snapshot 固定容器下真实 SQLite 复制保持数据与只读校�
     const result = await worker.snapshotWorkspaceDb(context).promise;
     assert.equal(result.evidence.state, "ready");
     await worker.verifyWorkspaceDb({ ...context, purpose: "precommit", evidence: result.evidence }).promise;
-    const writable = openSqliteDb(path.join(fixture.target, ".codeflow", "workspace.db"), { fileMustExist: true });
+    const writable = openSqliteDb(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"), { fileMustExist: true });
     try { writable.prepare("UPDATE workspace_prefs SET context_window = 99").run(); }
     finally { writable.close(); }
     await worker.verifyWorkspaceDb({ ...context, purpose: "committed", evidence: result.evidence }).promise;
     await assert.rejects(worker.verifyWorkspaceDb({ ...context, purpose: "precommit", evidence: result.evidence }).promise);
-    const target = openSqliteDb(path.join(fixture.target, ".codeflow", "workspace.db"), { readonly: true, fileMustExist: true });
+    const target = openSqliteDb(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"), { readonly: true, fileMustExist: true });
     try { assert.equal((target.prepare("SELECT context_window FROM workspace_prefs").get() as { context_window: number }).context_window, 99); }
     finally { target.close(); }
     assert.ok(events.length > 0);
@@ -121,23 +122,23 @@ test("D18 snapshot 固定容器下真实 SQLite 复制保持数据与只读校�
 });
 
 test("D18 snapshot 缺库只允许完整 absent，pending 未知副本禁止 cleanup", async t => {
-  const fixture = createFixture(t); fs.mkdirSync(fixture.target); fs.mkdirSync(path.join(fixture.target, ".codeflow"));
+  const fixture = createFixture(t); fs.mkdirSync(fixture.target); fs.mkdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY));
   const worker = new WorkspaceMigrationFileWorkerClient();
   const context = { sourceRoot: fixture.source, targetRoot: fixture.target, operationId: "absent", workspaceId: "ws", requestId: "absent" };
   const result = await worker.snapshotWorkspaceDb(context).promise;
   assert.equal(result.evidence.state, "absent");
   await worker.verifyWorkspaceDb({ ...context, purpose: "precommit", evidence: result.evidence }).promise;
-  fs.writeFileSync(path.join(fixture.target, ".codeflow", "workspace.db"), "unknown");
+  fs.writeFileSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"), "unknown");
   await assert.rejects(worker.verifyWorkspaceDb({ ...context, purpose: "cleanup", evidence: { formatVersion: 1, state: "pending" } }).promise);
-  assert.equal(fs.readFileSync(path.join(fixture.target, ".codeflow", "workspace.db"), "utf8"), "unknown");
+  assert.equal(fs.readFileSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"), "utf8"), "unknown");
 });
 
 test("D18 snapshot wx 竞态不得删除外来同名临时文件", async t => {
   const fixture = createFixture(t);
-  fs.mkdirSync(path.join(fixture.source, ".codeflow")); fs.mkdirSync(path.join(fixture.target, ".codeflow"), { recursive: true });
-  const database = openSqliteDb(path.join(fixture.source, ".codeflow", "workspace.db"));
+  fs.mkdirSync(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY)); fs.mkdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY), { recursive: true });
+  const database = openSqliteDb(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"));
   try { migrateClientDb(database, { scope: "workspace" }); } finally { database.close(); }
-  const temporary = path.join(fixture.target, ".codeflow", workspaceDbSnapshotTemporaryName("race"));
+  const temporary = path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, workspaceDbSnapshotTemporaryName("race"));
   const originalOpen = fs.promises.open.bind(fs.promises);
   t.mock.method(fs.promises, "open", async (...args: Parameters<typeof fs.promises.open>) => {
     if (String(args[0]) === temporary) fs.writeFileSync(temporary, "external-owner", "utf8");
@@ -150,10 +151,10 @@ test("D18 snapshot wx 竞态不得删除外来同名临时文件", async t => {
 
 test("D18 snapshot copy fsync 后 close 期间临时文件换代必须保留外来文件", async t => {
   const fixture = createFixture(t);
-  fs.mkdirSync(path.join(fixture.source, ".codeflow")); fs.mkdirSync(path.join(fixture.target, ".codeflow"), { recursive: true });
-  const database = openSqliteDb(path.join(fixture.source, ".codeflow", "workspace.db"));
+  fs.mkdirSync(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY)); fs.mkdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY), { recursive: true });
+  const database = openSqliteDb(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"));
   try { migrateClientDb(database, { scope: "workspace" }); } finally { database.close(); }
-  const temporary = path.join(fixture.target, ".codeflow", workspaceDbSnapshotTemporaryName("replace"));
+  const temporary = path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, workspaceDbSnapshotTemporaryName("replace"));
   const originalOpen = fs.promises.open.bind(fs.promises);
   t.mock.method(fs.promises, "open", async (...args: Parameters<typeof fs.promises.open>) => {
     const handle = await originalOpen(...args);
@@ -172,8 +173,8 @@ test("D18 snapshot copy fsync 后 close 期间临时文件换代必须保留外�
 for (const secondary of ["close", "cleanup"] as const) {
   test(`D18 真实 Worker 保留 fsync 与 ${secondary} 安全双因且等待 exit`, async t => {
     const fixture = createFixture(t);
-    fs.mkdirSync(path.join(fixture.source, ".codeflow")); fs.mkdirSync(path.join(fixture.target, ".codeflow"), { recursive: true });
-    const database = openSqliteDb(path.join(fixture.source, ".codeflow", "workspace.db"));
+    fs.mkdirSync(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY)); fs.mkdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY), { recursive: true });
+    const database = openSqliteDb(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"));
     try { migrateClientDb(database, { scope: "workspace" }); } finally { database.close(); }
     const workerPath = path.join(fixture.root, "fault-worker.ts");
     fs.writeFileSync(path.join(fixture.root, "package.json"), '{"type":"module"}\n');
@@ -212,18 +213,18 @@ await tsImport(${JSON.stringify(pathToFileURL(path.join(CLIENT_ROOT, "src/worksp
       assert.equal(closed, true);
       return true;
     });
-    const temporary = path.join(fixture.target, ".codeflow", workspaceDbSnapshotTemporaryName(secondary));
+    const temporary = path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, workspaceDbSnapshotTemporaryName(secondary));
     assert.equal(fs.existsSync(temporary), true);
-    assert.equal(fs.existsSync(path.join(fixture.target, ".codeflow", "workspace.db")), false);
-    const source = openSqliteDb(path.join(fixture.source, ".codeflow", "workspace.db"), { fileMustExist: true });
+    assert.equal(fs.existsSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db")), false);
+    const source = openSqliteDb(path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"), { fileMustExist: true });
     try { source.exec("BEGIN EXCLUSIVE"); source.exec("ROLLBACK"); } finally { source.close(); }
   });
 }
 
 for (const invalid of ["-wal", "-shm", "-journal", "bad-schema", "corrupt", "hardlink"] as const) {
   test(`D18 snapshot 拒绝源 ${invalid} 且保持源与目标事实`, async t => {
-    const fixture = createFixture(t), sourceFile = path.join(fixture.source, ".codeflow", "workspace.db");
-    fs.mkdirSync(path.dirname(sourceFile)); fs.mkdirSync(path.join(fixture.target, ".codeflow"), { recursive: true });
+    const fixture = createFixture(t), sourceFile = path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db");
+    fs.mkdirSync(path.dirname(sourceFile)); fs.mkdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY), { recursive: true });
     const database = openSqliteDb(sourceFile);
     try { migrateClientDb(database, { scope: "workspace" }); if (invalid === "bad-schema") database.exec("DROP TABLE workspace_prefs"); }
     finally { database.close(); }
@@ -235,13 +236,13 @@ for (const invalid of ["-wal", "-shm", "-journal", "bad-schema", "corrupt", "har
       operationId: invalid, workspaceId: "ws", requestId: `invalid-${invalid}` });
     await assert.rejects(task.promise); await task.closed;
     assert.deepEqual(fs.readFileSync(sourceFile), before);
-    assert.deepEqual(fs.readdirSync(path.join(fixture.target, ".codeflow")), []);
+    assert.deepEqual(fs.readdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY)), []);
   });
 }
 
 for (const invalid of ["missing", "replaced", "bad-schema", "corrupt", "hardlink"] as const) {
   test(`D18 committed 目标 ${invalid} 不能用源库或空库替代`, async t => {
-    const fixture = createFixture(t), sourceFile = path.join(fixture.source, ".codeflow", "workspace.db"), targetFile = path.join(fixture.target, ".codeflow", "workspace.db");
+    const fixture = createFixture(t), sourceFile = path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db"), targetFile = path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db");
     fs.mkdirSync(path.dirname(sourceFile)); fs.mkdirSync(path.dirname(targetFile), { recursive: true });
     const database = openSqliteDb(sourceFile); try { migrateClientDb(database, { scope: "workspace" }); } finally { database.close(); }
     const worker = new WorkspaceMigrationFileWorkerClient();
@@ -260,8 +261,8 @@ for (const invalid of ["missing", "replaced", "bad-schema", "corrupt", "hardlink
 }
 
 test("D18 snapshot rename 失败只清本次副本并释放源库只读锁", async t => {
-  const fixture = createFixture(t), sourceFile = path.join(fixture.source, ".codeflow", "workspace.db");
-  fs.mkdirSync(path.dirname(sourceFile)); fs.mkdirSync(path.join(fixture.target, ".codeflow"), { recursive: true });
+  const fixture = createFixture(t), sourceFile = path.join(fixture.source, WORKSPACE_CODEFLOWAI_DIRECTORY, "workspace.db");
+  fs.mkdirSync(path.dirname(sourceFile)); fs.mkdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY), { recursive: true });
   const database = openSqliteDb(sourceFile); try { migrateClientDb(database, { scope: "workspace" }); } finally { database.close(); }
   t.mock.method(fs.promises, "rename", async () => { throw fsError("EACCES"); });
   await assert.rejects(snapshotWorkspaceDatabase({ type: "workspace-db.snapshot", sourceRoot: fixture.source, targetRoot: fixture.target,
@@ -270,7 +271,7 @@ test("D18 snapshot rename 失败只清本次副本并释放源库只读锁", asy
       assert.ok((error.details.failures as Array<Record<string, string>>).some(failure => failure.stage === "snapshot.publish" && failure.osErrorCode === "EACCES"));
       return true;
     });
-  assert.deepEqual(fs.readdirSync(path.join(fixture.target, ".codeflow")), []);
+  assert.deepEqual(fs.readdirSync(path.join(fixture.target, WORKSPACE_CODEFLOWAI_DIRECTORY)), []);
   const unlocked = openSqliteDb(sourceFile, { busyTimeoutMs: 0 }); try { unlocked.exec("BEGIN EXCLUSIVE; ROLLBACK"); } finally { unlocked.close(); }
 });
 
