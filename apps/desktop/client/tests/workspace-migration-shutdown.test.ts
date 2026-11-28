@@ -99,14 +99,13 @@ if (${JSON.stringify(scenario)} === 'unclosed') {
     res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
   });
   const wss = new WebSocketServer({ server });
-  const row = { catalogItemId: "codex-default", engine: "codex", providerId: "openai", providerLabel: "OpenAI", modelId: "gpt-6.1-sol", displayName: "Codex", description: "test", inputModalities: ["text"], supportedReasoningEfforts: [], defaultReasoningEffort: null, contextWindow: 100000, maxContextWindow: null, supportsFastMode: false, supports1MContext: false, isDefault: true, sortOrder: 1, runtimeProfileId: "native", transportModelId: null, fastTaskModelId: null, subagentModelId: null };
   wss.on("connection", current => {
     socket = current;
     current.on("message", raw => {
       const message = JSON.parse(String(raw)) as Record<string, unknown>; received.push(message);
       if (message.t === "client.hello") current.send(JSON.stringify({ t: "client.helloAck", keyHash: "test-hash", serverNow: Date.now(), accountSessionId: "shutdown-session",
         userSummary: { userId: "shutdown-user", email: "shutdown@example.test", fullName: "shutdown", phone: "", avatarUrl: null, accountRole: "personal_normal", status: "active", enterpriseId: null, enterpriseName: null },
-        engineModelCatalog: { schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [row, { ...row, catalogItemId: "claude-default", engine: "claude", providerId: "anthropic", providerLabel: "Anthropic", modelId: "claude-fable-5" }] }, capabilities: {} }));
+        capabilities: {} }));
       if (message.t === "engine.models.applied") current.send(JSON.stringify({ t: "engine.models.appliedConfirmed", ...(message.ack as object) }));
     });
   });

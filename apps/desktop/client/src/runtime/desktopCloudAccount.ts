@@ -70,8 +70,7 @@ export function createDesktopCloudAccount(input: {
   onHello(message: Hello, owner: DesktopCloudAccountOwner, activation: { send(message: ClientToServerMessage): WsSendJsonResult; assertCurrent(): void }): Promise<void>;
   onMessage(message: ServerToClientMessage, owner: DesktopCloudAccountOwner): Promise<void>;
   onOwnerInvalidated(owner: DesktopCloudAccountOwner, reason: "network" | "revoked"): void;
-  /** 身份绑定撤销时清理可离线读的本机状态，即使连接已经断开。 */
-  onAccountBindingRevoked?: () => void;
+  /** 连接失败观测入口；本机模型与账号事实由各自 owner 管理。 */
   onFailure(error: Error, context: { generation: number; serverOrigin: string | null }): void;
   onRequestCancelled?: (context: { generation: number; serverOrigin: string }) => void;
   getCredentialCleanupErrorCode?: () => string | null;
@@ -89,7 +88,7 @@ export function createDesktopCloudAccount(input: {
   /** 断网后仅为比较重连目标保留指纹，不保留令牌或授予 owner 资格。 */
   const tokenDigest = (token: string): string => crypto.createHash("sha256").update(token).digest("hex");
   /** 丢弃离线身份及其目录；在线 owner 的授权仍由 revoke 收口。 */
-  const revokeBinding = (): void => { offlineBinding = null; input.onAccountBindingRevoked?.(); };
+  const revokeBinding = (): void => { offlineBinding = null; };
   let state: DesktopCloudAccountState = { status: "unlinked", generation, serverOrigin: null, userSummary: null, errorCode: null };
   const cleanup = new Set<Promise<void>>();
   const cleanupFailures: unknown[] = [];
@@ -197,7 +196,7 @@ export function createDesktopCloudAccount(input: {
         if (current !== attempt) return;
         attempt.fenceGeneration = fence.beginConnection();
         // 同账号远程设备通过 Server 发现本机工作区；数据仍只留在本机。
-        const sent = transport.sendJson({ t: "client.hello", clientId: input.clientId, deviceId: input.deviceId, version: input.clientVersion, platform: process.platform, arch: process.arch, workspaceIds: input.getWorkspaceIds(), capabilities: { desktopLocalRuntimeV1: true, desktopAccountScheduledTasksV1: true, localCanonicalRelayV1: true, localCanonicalRelayOnDemandV1: true, remoteDataDemandV1: true, sharedThreadAclLocal: true, sharedThreadAclInlineList: true, sharedOrchestrationResourceAclLocal: true, hostRpcHttpLongPoll: true, threadInputActionsV1: true, engineModelCatalogV1: true } });
+        const sent = transport.sendJson({ t: "client.hello", clientId: input.clientId, deviceId: input.deviceId, version: input.clientVersion, platform: process.platform, arch: process.arch, workspaceIds: input.getWorkspaceIds(), capabilities: { desktopLocalRuntimeV1: true, desktopAccountScheduledTasksV1: true, localCanonicalRelayV1: true, localCanonicalRelayOnDemandV1: true, remoteDataDemandV1: true, sharedThreadAclLocal: true, sharedThreadAclInlineList: true, sharedOrchestrationResourceAclLocal: true, hostRpcHttpLongPoll: true, threadInputActionsV1: true } });
         if (!sent.accepted) fail(attempt, cloudConnectionError("DESKTOP_CLOUD_HELLO_SEND_FAILED"));
       },
       onClose(info) {

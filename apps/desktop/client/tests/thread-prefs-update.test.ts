@@ -68,6 +68,26 @@ test("ThreadRepo partial update 保留未修改的模型和其它偏好", () => 
   }
 });
 
+test("ThreadRepo 读取旧会话时解析退役模型及其窗口", () => {
+  const { db, repo } = setupDb();
+  try {
+    const cases = [
+      { engine: "codex", retired: "gpt-5.6-sol", model: "gpt-6.2-sol", contextWindow: 872_000 },
+      { engine: "claude", retired: "claude-fable-5", model: "claude-fable-5-2", contextWindow: 1_000_000 },
+    ] as const;
+    for (const { engine, retired, model, contextWindow } of cases) {
+      const threadId = `thread-legacy-${engine}` as ThreadId;
+      repo.create({ id: threadId, workspaceId: WORKSPACE_ID, engine, title: "旧会话" });
+      db.prepare("UPDATE threads SET model = ?, context_window = ? WHERE id = ?").run(retired, 200_000, threadId);
+      const thread = repo.get(threadId);
+      assert.equal(thread?.model, model);
+      assert.equal(thread?.contextWindow, contextWindow);
+    }
+  } finally {
+    db.close();
+  }
+});
+
 test("ThreadRepo 将显式 null 解释为清空并恢复引擎默认", () => {
   const { db, repo } = setupDb();
   try {
@@ -78,7 +98,7 @@ test("ThreadRepo 将显式 null 解释为清空并恢复引擎默认", () => {
       engine: "codex",
       title: "explicit null prefs",
       prefs: {
-        model: "gpt-5.5",
+        model: "gpt-6.1-sol",
         effort: "high",
         contextWindow: 272_000,
         serviceTier: "fast",
@@ -161,13 +181,13 @@ test("ThreadRepo 将 undefined 字段视为省略而不是清空", () => {
       workspaceId: WORKSPACE_ID,
       engine: "codex",
       title: "undefined prefs",
-      prefs: { model: "gpt-5.5", effort: "high" },
+      prefs: { model: "gpt-6.1-sol", effort: "high" },
     });
 
     repo.updatePrefs(threadId, { effort: undefined });
 
     const thread = repo.get(threadId);
-    assert.equal(thread?.model, "gpt-5.5");
+    assert.equal(thread?.model, "gpt-6.1-sol");
     assert.equal(thread?.effort, "high");
   } finally {
     db.close();

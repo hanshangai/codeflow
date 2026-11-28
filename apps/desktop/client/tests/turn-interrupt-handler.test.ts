@@ -5,7 +5,6 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
   MANUAL_TURN_INTERRUPT_CODE,
   type ThreadId,
   type WorkspaceId,
@@ -13,8 +12,6 @@ import {
 import { createTurnErrorEventInput } from "../src/errors/turnErrors.ts";
 
 import { openClientDb } from "../src/db/clientDb.ts";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
 import { ThreadStore } from "../src/threads/threadStore.ts";
 import { handleApiRequest, type ApiHandlerContext, type ApiRequestMessage } from "../src/app/handleApiRequest.ts";
 import { getPendingTurnTerminalFailure, interruptTurnBestEffort, retryPendingTurnTerminal, settleTurnTerminalOnce } from "../src/app/turnInterrupt.ts";
@@ -24,14 +21,6 @@ import type { ClientToServerMessage } from "../src/protocol/messages.ts";
 const WORKSPACE_ID = "client-test:ws-interrupt" as WorkspaceId;
 const THREAD_ID = "thread-interrupt-handler" as ThreadId;
 const TURN_ID = "turn-interrupt-handler" as any;
-
-test.before(() => applyEngineModelCatalogSnapshot({
-  schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-  configVersion: 1,
-  capturedAt: 0,
-  rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1],
-}));
-test.after(() => resetEngineModelCatalogRuntimeForTest());
 
 /** 创建最小中断测试上下文，避免拉起真实引擎 session。 */
 function setupInterruptHarness() {

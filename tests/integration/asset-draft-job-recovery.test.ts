@@ -15,10 +15,8 @@ import { openClientDb, type ClientDb } from "../../apps/desktop/client/src/db/cl
 import { reconcileAssetDraftJobsOnStartup } from "../../apps/desktop/client/src/startup/assetDraftJobReconciler.ts";
 import { handleOrchAssetDraftJobsDelete } from "../../apps/desktop/client/src/app/handlers/orchestrationHandlers.ts";
 import { AssetDraftService, AssetDraftServiceError, hasInFlightAssetDraftWork, stopAssetDraftJobsForUpdate } from "../../apps/desktop/client/src/orchestration/assetDraftService.ts";
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION } from "../../packages/shared/src/index.ts";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
+import { resetEngineModelCatalogRuntimeForTest } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
 import { ThreadStore } from "../../apps/desktop/client/src/threads/threadStore.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "../../packages/shared/src/engineModelCatalogSeed.ts";
 import { WorkspaceOperationGate } from "../../apps/desktop/client/src/workspace-migration/workspaceOperationGate.ts";
 
 type RecoveryHarness = {
@@ -305,7 +303,6 @@ async function waitForAssetUpdateCondition(check: () => boolean): Promise<void> 
 
 for (const assetKind of ["role", "skill"] as const) test(`已受理${assetKind}首轮准备和重试暂停可稍后恢复，不应写失败`, async () => {
   const h = createRecoveryHarness(), threads = new ThreadStore();
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1, rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1) });
   let paused = false, ready!: () => void, release!: () => void, blockedReads = 0, sends = 0;
   const contextReady = new Promise<void>(resolve => { ready = resolve; }), contextGate = new Promise<void>(resolve => { release = resolve; });
   const service = new AssetDraftService({ db: h.db, workspaces: new Map([[h.workspaceId, h.db.workspaces.get(h.workspaceId)!.path]]), threads, isTaskAdmissionPaused: () => { if (paused) blockedReads++; return paused; }, sessions: {
@@ -332,7 +329,6 @@ for (const assetKind of ["role", "skill"] as const) test(`已受理${assetKind}�
 
 for (const assetKind of ["role", "skill"] as const) for (const phase of ["首轮", "重试"] as const) test(`${assetKind}${phase}等待更新选择时确认停止，不应继续派发`, async () => {
   const h = createRecoveryHarness(), threads = new ThreadStore();
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1, rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1) });
   let paused = false, ready!: () => void, release!: () => void, blockedReads = 0, sends = 0, disposals = 0;
   const contextReady = new Promise<void>(resolve => { ready = resolve; }), contextGate = new Promise<void>(resolve => { release = resolve; });
   const service = new AssetDraftService({ db: h.db, workspaces: new Map([[h.workspaceId, h.db.workspaces.get(h.workspaceId)!.path]]), threads, isTaskAdmissionPaused: () => { if (paused) blockedReads++; return paused; }, sessions: {
@@ -615,7 +611,6 @@ test("资产后台失败状态写入失败必须保留 owner 供更新观察", a
 
 test("热更新真实引擎中断后拒绝完成事件和迟到工具，等待 send 与 dispose", async () => {
   const h = createRecoveryHarness(), threads = new ThreadStore();
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1, rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1) });
   let entered!: () => void, finish!: () => void, cleanup!: () => void;
   const ready = new Promise<void>(resolve => { entered = resolve; }), sendGate = new Promise<void>(resolve => { finish = resolve; }), cleanupGate = new Promise<void>(resolve => { cleanup = resolve; });
   const events: any[] = []; let sent: any, sink: any, disposals = 0, late: any;
@@ -641,7 +636,6 @@ test("热更新真实引擎中断后拒绝完成事件和迟到工具，等待 s
 
 test("资产交互中断失败不得显示正常等待，错误保留供更新停止观察", async () => {
   const h = createRecoveryHarness(), threads = new ThreadStore();
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1, rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1) });
   const cause = new Error("asset-interaction-interrupt-failed");
   const service = new AssetDraftService({ db: h.db, workspaces: new Map([[h.workspaceId, h.db.workspaces.get(h.workspaceId)!.path]]), threads, sessions: {
     getOrCreate: () => ({ resolvePlatformToolTransport: () => "native-dynamic", prepareAssistantTerminalEvents: async () => ({ events: [], latestAssistantText: null }), interrupt: async () => { throw cause; },
@@ -691,7 +685,6 @@ test("资产更新停止日志保留聚合根因且脱敏，中断失败不继�
 
 test("资产终态协调期间确认更新不能再发 completed", async () => {
   const h = createRecoveryHarness(), threads = new ThreadStore(), events: any[] = [];
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1, rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1) });
   let stopping: Promise<void> | undefined;
   const service = new AssetDraftService({ db: h.db, workspaces: new Map([[h.workspaceId, h.db.workspaces.get(h.workspaceId)!.path]]), threads, sessions: {
     getOrCreate: () => ({ resolvePlatformToolTransport: () => "native-dynamic", prepareAssistantTerminalEvents: async () => {
@@ -734,7 +727,6 @@ function assetLogGate() {
 /** 公开生成创建真实 job/thread/turn；可在真实交互入口注入中断失败。 */
 function createPublicAssetLogHarness(assetKind: "role" | "skill" = "role", resume = false, options?: Parameters<typeof createRecoveryHarness>[0] & { interactionFailure?: { value: unknown } }) {
   const h = createRecoveryHarness(options), threads = new ThreadStore(), entered = assetLogGate(), provider = assetLogGate();
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1, rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1) });
   let sends = 0, interactionInterrupts = 0, failure: { value: unknown } | undefined;
   const service = new AssetDraftService({ db: h.db, workspaces: new Map([[h.workspaceId, h.db.workspaces.get(h.workspaceId)!.path]]), threads,
     sessions: { getOrCreate: () => ({ resolvePlatformToolTransport: () => "native-dynamic", hasActiveTurn: () => false, interrupt: async () => { interactionInterrupts++; if (options?.interactionFailure) throw options.interactionFailure.value; return true; },

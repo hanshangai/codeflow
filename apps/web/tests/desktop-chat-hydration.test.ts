@@ -64,8 +64,7 @@ async function fixture(t: test.TestContext, options?: {
       if (request.method === "runtime.info") return { status: 200, body: { ok: true, client } };
       if (request.method === "workspaces.list") return { status: 200, body: { ok: true, workspaces: knownWorkspaces } };
       if (request.method === "engines.status" && options?.engineStatus) return options.engineStatus();
-      if (request.method === "engines.status") return { status: 200, body: { ok: true, engines: [], catalogVersion: null,
-        hostAppliedCatalogVersion: null, hostCatalogSyncState: null, customModelsByEngine: {} } };
+      if (request.method === "engines.status") return { status: 200, body: { ok: true, engines: [], customModelsByEngine: {} } };
       if (request.method === "reminders.workspaceSummaries") return { status: 200, body: { ok: true, summaries: [reminderSummary] } };
       if (request.method === "reminders.items") return { status: 200, body: { ok: true, items: [], summary: reminderSummary } };
       if (request.method === "workspacePrefs.get") return { status: 200, body: { ok: true,

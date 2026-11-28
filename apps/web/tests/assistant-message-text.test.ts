@@ -19,10 +19,25 @@ test("流式消息在引用标记的每个分段都只显示正文，后续输�
   assert.equal(formatAssistantMessageText("正文。" + citation + "后续。", true), "正文。后续。");
 });
 
+test("中断的消息转为完成态后仍隐藏可识别的残缺引用", () => {
+  for (let i = "\uE200cite\uE202".length; i < citation.length; i++) {
+    assert.equal(formatAssistantMessageText("正文。" + citation.slice(0, i), false), "正文。", String(i));
+  }
+});
+
+test("独占一行的引用不打断段落，保留原有的空行", () => {
+  for (const newline of ["\n", "\r\n"]) {
+    const text = ["第一行", citation, "第二行", "", "下一段"].join(newline);
+    const expected = ["第一行", "第二行", "", "下一段"].join(newline);
+    assert.equal(formatAssistantMessageText(text, false), expected);
+  }
+});
+
 test("保留普通引用编号、其他私用字符和不符合协议的文本", () => {
   const text = "中文 turn492203view2 \uE000 \uE200cite\uE202example\uE201 \uE200cite\uE202other";
   assert.equal(formatAssistantMessageText(text, false), text);
   assert.equal(formatAssistantMessageText(text, true), text);
-  const incomplete = "正文。" + citation.slice(0, -1);
-  assert.equal(formatAssistantMessageText(incomplete, false), incomplete);
+  for (const ambiguous of ["\uE200", "\uE200ci", "\uE200cite"]) {
+    assert.equal(formatAssistantMessageText("正文。" + ambiguous, false), "正文。" + ambiguous);
+  }
 });

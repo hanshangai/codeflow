@@ -16,7 +16,6 @@ import {
 import {
   getEngineModelInfo,
   getModelContextWindowBounds as resolveModelContextBounds,
-  getModelContextBillingHint,
   normalizeThreadContextWindow,
   getDefaultReasoningEffortForModel,
   getEngineProviderLabel,
@@ -178,9 +177,7 @@ const localChatReady = computed(() => isDesktopWorkspace(config, props.workspace
 const composerConnected = computed(() => config.connected || localChatReady.value);
 const modelCatalogLoaded = computed(() => {
   const state = engines.byWorkspaceId[String(props.workspaceId)];
-  return localChatReady.value
-    ? Boolean(state?.localModels && state.lastUpdatedAt != null && !state.lastError)
-    : state?.catalogVersion != null;
+  return Boolean(state && state.lastUpdatedAt != null && !state.lastError);
 });
 
 const text = ref("");
@@ -296,7 +293,7 @@ const draftInputBlocked = computed(() => (
 const composerWriteBlockedReason = computed(() => {
   if (props.disabled) return "当前会话为只读状态";
   if (!composerConnected.value) return "服务连接已断开";
-  if (!modelCatalogLoaded.value) return "模型目录尚未加载完成";
+  if (!modelCatalogLoaded.value) return "模型列表尚未加载完成";
   if (workspaceSwitchFlushInProgress.value) return "工作区正在切换";
   if (sending.value) return "消息正在发送";
   return "当前会话不可编辑";
@@ -1942,12 +1939,11 @@ const settingsHelp = {
 
 /** 只展示模型目录明确声明的基础窗口。 */
 const baseContextWindowHint = computed(() => {
-  const baseWindow = resolvedModelInfo.value?.contextWindow;
+  const baseWindow = resolvedModelInfo.value?.baseContextWindow;
   return baseWindow != null && Number.isSafeInteger(baseWindow) && baseWindow > 0
     ? `基础窗口：${baseWindow.toLocaleString("zh-CN")} tokens。`
     : "";
 });
-const contextBillingHint = computed(() => getModelContextBillingHint(resolvedModelInfo.value));
 const contextWindowHelp = computed(() =>
   "自动使用当前模型支持的最大上下文窗口：" + formatTokens(effectiveContextWindow.value) + "。"
 );
@@ -4091,7 +4087,6 @@ defineExpose({ prefill, appendText, attachTextFile, sendExternalText, canAcceptE
                       <span class="composer__ctx-value">{{ formatTokens(effectiveContextWindow) }}</span>
                     </div>
                     <div v-if="baseContextWindowHint" class="composer__ctx-bound">{{ baseContextWindowHint }}</div>
-                    <div v-if="contextBillingHint" class="composer__ctx-bound">{{ contextBillingHint }}</div>
                   </div>
                 </div>
                 <div v-if="threadConfigLocked" class="composer__ctx-bound">

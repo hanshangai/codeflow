@@ -268,11 +268,11 @@ test("Codex defaults to GPT-6.2 Sol with an 872K window, xhigh and standard tier
   assert.equal(defaults.serviceTier, null);
 });
 
-test("Codex catalog lists GPT-6.2 and excludes GPT-5.5 and GPT-5.6", () => {
+test("Codex catalog lists supported models in descending version order", () => {
   assert.deepEqual(CODEX_MODELS.map((item) => item.id), [
-    "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+    "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna",
   ]);
-  for (const modelId of ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini"]) {
+  for (const modelId of ["gpt-6-sol", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini"]) {
     assert.equal(getEngineModelInfo("codex", modelId), null);
   }
 });
@@ -295,36 +295,50 @@ test("GPT-6 Astra is opt-in and exposes current Codex capabilities", () => {
   );
 });
 
-test("GPT-6 Sol and Luna expose their documented 1.05M multimodal capability", () => {
-  for (const [modelId, description] of [
-    ["gpt-6-sol", "Codex 复杂编码与代理模型，适合高价值工程任务"],
-    ["gpt-6-luna", "Codex 高效模型，适合聚焦、重复与高吞吐任务"],
-  ] as const) {
-    const model = getEngineModelInfo("codex", modelId);
-    assert.equal(model?.displayName, modelId === "gpt-6-sol" ? "GPT-6 Sol" : "GPT-6 Luna");
-    assert.equal(model?.description, description);
-    assert.equal(model?.isDefault, false);
-    assert.deepEqual(model?.inputModalities, ["text", "image"]);
-    assert.deepEqual(
-      model?.supportedReasoningEfforts?.map((item) => item.reasoningEffort),
-      ["none", "low", "medium", "high", "xhigh", "max"],
-    );
-    assert.equal(model?.defaultReasoningEffort, "medium");
-    assert.equal(model?.contextWindow, 1_050_000);
-    assert.equal(model?.maxContextWindow, 1_050_000);
-    assert.equal(model?.supports1MContext, true);
-    assert.equal(model?.supportsFastMode, true);
-    assert.throws(() => assertReasoningEffortSupportedForModel("codex", modelId, "minimal"), /不支持/);
-    assert.throws(() => assertReasoningEffortSupportedForModel("codex", modelId, "ultra"), /不支持/);
-    assert.equal(
-      resolveThreadPrefsWithCatalogDefaults("codex", { model: modelId, contextWindow: 200_000 }).contextWindow,
-      1_050_000,
-    );
-    assert.equal(
-      resolveThreadPrefsWithCatalogDefaults("codex", { model: modelId, serviceTier: "fast" }).serviceTier,
-      "fast",
-    );
-  }
+test("GPT-6 Luna exposes its documented 1.05M multimodal capability", () => {
+  const modelId = "gpt-6-luna";
+  const model = getEngineModelInfo("codex", modelId);
+  assert.equal(model?.displayName, "GPT-6 Luna");
+  assert.equal(model?.description, "Codex 高效模型，适合聚焦、重复与高吞吐任务");
+  assert.equal(model?.isDefault, false);
+  assert.deepEqual(model?.inputModalities, ["text", "image"]);
+  assert.deepEqual(
+    model?.supportedReasoningEfforts?.map((item) => item.reasoningEffort),
+    ["none", "low", "medium", "high", "xhigh", "max"],
+  );
+  assert.equal(model?.defaultReasoningEffort, "medium");
+  assert.equal(model?.contextWindow, 1_050_000);
+  assert.equal(model?.maxContextWindow, 1_050_000);
+  assert.equal(model?.supports1MContext, true);
+  assert.equal(model?.supportsFastMode, true);
+  assert.throws(() => assertReasoningEffortSupportedForModel("codex", modelId, "minimal"), /不支持/);
+  assert.throws(() => assertReasoningEffortSupportedForModel("codex", modelId, "ultra"), /不支持/);
+  assert.equal(
+    resolveThreadPrefsWithCatalogDefaults("codex", { model: modelId, contextWindow: 200_000 }).contextWindow,
+    1_050_000,
+  );
+  assert.equal(
+    resolveThreadPrefsWithCatalogDefaults("codex", { model: modelId, serviceTier: "fast" }).serviceTier,
+    "fast",
+  );
+});
+
+test("会话读取时迁移已知退役型号，并按目标模型解析偏好", () => {
+  const codex = resolveThreadPrefsWithCatalogDefaults("codex", { model: "gpt-5.6-sol", effort: "none", serviceTier: "fast" });
+  assert.equal(codex.model, "gpt-6.2-sol");
+  assert.equal(codex.effort, "xhigh");
+  assert.equal(codex.contextWindow, 872_000);
+  assert.equal(codex.serviceTier, "fast");
+  const gpt6Sol = resolveThreadPrefsWithCatalogDefaults("codex", { model: "gpt-6-sol", contextWindow: 1_050_000 });
+  assert.equal(gpt6Sol.model, "gpt-6.1-sol");
+  assert.equal(gpt6Sol.contextWindow, 1_000_000);
+  assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: "claude-fable-5[1m]" }).model, "claude-fable-5-2");
+  assert.equal(resolveThreadPrefsWithCatalogDefaults("claude", { model: "kimi-k2.7-code-highspeed" }).model, "kimi-k3.1-pro-highspeed");
+  assert.equal(resolveThreadPrefsWithCatalogDefaults("codex", { model: "unknown-model" }).model, "unknown-model");
+  const custom = [{ id: "gpt-5.6-sol", displayName: "Custom model", isDefault: false, contextWindow: 200_000 }];
+  const matchingCustom = resolveThreadPrefsWithCatalogDefaults("codex", { model: "gpt-5.6-sol" }, [...CODEX_MODELS, ...custom]);
+  assert.equal(matchingCustom.model, "gpt-5.6-sol");
+  assert.equal(matchingCustom.contextWindow, 200_000);
 });
 
 test("GPT-6.1 Sol exposes its documented effort ladder and Fast mode", () => {
@@ -339,6 +353,7 @@ test("GPT-6.1 Sol exposes its documented effort ladder and Fast mode", () => {
   );
   assert.equal(model?.defaultReasoningEffort, "medium");
   assert.equal(model?.contextWindow, 1_000_000);
+  assert.equal(model?.baseContextWindow, 500_000);
   assert.equal(model?.maxContextWindow, 1_000_000);
   assert.equal(model?.supports1MContext, true);
   assert.equal(model?.supportsFastMode, true);
@@ -358,7 +373,6 @@ test("GPT-6.1 Sol exposes its documented effort ladder and Fast mode", () => {
 test("Codex Fast mode is exposed as a model capability for eligible GPT models", () => {
   assert.equal(getEngineModelInfo("codex", "gpt-6-astra")?.supportsFastMode, true);
   assert.equal(getEngineModelInfo("codex", "gpt-6.1-sol")?.supportsFastMode, true);
-  assert.equal(getEngineModelInfo("codex", "gpt-6-sol")?.supportsFastMode, true);
   assert.equal(getEngineModelInfo("codex", "gpt-6-luna")?.supportsFastMode, true);
   assert.equal(getEngineModelInfo("codex", "gpt-6.2-sol")?.supportsFastMode, true);
   assert.equal(getEngineModelInfo("codex", "gpt-6.2-astra")?.supportsFastMode, true);

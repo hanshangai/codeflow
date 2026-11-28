@@ -8,14 +8,13 @@ import {
   createDefaultRoleExecutionConfig,
   createDefaultRoleInputDefinition,
   createDefaultRoleOutputDefinition,
-  ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-  type EngineModelCatalogSnapshot,
+  type EngineCustomModelEntry,
   type OrchestrationAssetRuntimeSnapshot,
   type WorkflowProposal,
   type WorkflowRuntimeDefinition,
   type WorkspaceId,
 } from "../../../../packages/shared/src/index.ts";
-import { applyEngineModelCatalogSnapshot } from "../src/engines/engineModelCatalogRuntime.ts";
+import { setEngineModelCatalogCustomModels } from "../src/engines/engineModelCatalogRuntime.ts";
 import type { ApiHandlerContext, ApiRequestMessage } from "../src/app/handleApiRequest.ts";
 import {
   createScheduledWorkflowInstance,
@@ -205,63 +204,44 @@ async function startProposal(
   return harness.responses.at(-1);
 }
 
-/** 应用只含测试模型的运行时目录；启动校验必须命中真实目录，不做静态回退。 */
-let testCatalogVersion = 0;
+/** 应用只含测试模型的本地自定义模型；启动校验必须命中真实可用模型，不做静态回退。 */
 function applyTestEngineModelCatalog(codexModelIds: string[]): void {
-  // 目录是模块级状态：同一版本号内容不同会被判定为版本碰撞，因此每次应用都推进版本。
-  testCatalogVersion += 1;
-  applyEngineModelCatalogSnapshot({
-    schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-    configVersion: testCatalogVersion,
-    capturedAt: 1,
-    rows: [
-      ...codexModelIds.map((modelId, index) => ({
-        catalogItemId: `test-${modelId}`,
-        engine: "codex" as const,
-        providerId: "openai" as const,
-        providerLabel: "OpenAI",
-        modelId,
-        displayName: modelId,
-        description: "",
-        inputModalities: ["text"] as const,
-        supportedReasoningEfforts: [],
-        defaultReasoningEffort: null,
-        contextWindow: 200_000,
-        maxContextWindow: null,
-        supportsFastMode: false,
-        supports1MContext: false,
-        isDefault: index === 0,
-        sortOrder: index + 1,
-        runtimeProfileId: "native",
-        transportModelId: null,
-        fastTaskModelId: null,
-        subagentModelId: null,
-      })),
-      // 目录校验要求每个引擎至少一个模型，这里固定补一个不会被断言的 claude 条目。
-      {
-        catalogItemId: "test-claude-default",
-        engine: "claude" as const,
-        providerId: "anthropic" as const,
-        providerLabel: "Anthropic",
-        modelId: "claude-test",
-        displayName: "claude-test",
-        description: "",
-        inputModalities: ["text"] as const,
-        supportedReasoningEfforts: [],
-        defaultReasoningEffort: null,
-        contextWindow: 200_000,
-        maxContextWindow: null,
-        supportsFastMode: false,
-        supports1MContext: false,
-        isDefault: true,
-        sortOrder: 1,
-        runtimeProfileId: "native",
-        transportModelId: null,
-        fastTaskModelId: null,
-        subagentModelId: null,
-      },
-    ],
-  } as EngineModelCatalogSnapshot);
+  const entries: EngineCustomModelEntry[] = codexModelIds.map((modelId) => ({
+    id: `test-${modelId}`,
+    engine: "codex",
+    providerId: "openai",
+    modelId,
+    displayName: modelId,
+    inputModalities: ["text"],
+    supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "" }, { reasoningEffort: "high", description: "" }],
+    defaultReasoningEffort: null,
+    contextWindow: 200_000,
+    maxContextWindow: null,
+    supportsFastMode: false,
+    supports1MContext: false,
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+  }));
+  // 补一个不会被断言的 claude 自定义条目，保持两引擎模型表形态。
+  entries.push({
+    id: "test-claude-default",
+    engine: "claude",
+    providerId: "anthropic",
+    modelId: "claude-test",
+    displayName: "claude-test",
+    inputModalities: ["text"],
+    supportedReasoningEfforts: [{ reasoningEffort: "xhigh", description: "" }, { reasoningEffort: "high", description: "" }],
+    defaultReasoningEffort: null,
+    contextWindow: 200_000,
+    maxContextWindow: null,
+    supportsFastMode: false,
+    supports1MContext: false,
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+  });
+  setEngineModelCatalogCustomModels(entries);
 }
 
 /** 读取指定表的总行数。 */

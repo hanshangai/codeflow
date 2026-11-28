@@ -81,12 +81,12 @@ const previewWrapClassName = computed(() =>
     : "message-attachment-preview-modal");
 
 
-/** 复制消息文本到剪贴板（仅浏览器端）。 */
+/** 按当前模式复制原文或清理引用后的正文。 */
 async function copyMessageText(): Promise<void> {
   if (copying.value) return;
   copying.value = true;
   try {
-    await copyToClipboard(displayText.value);
+    await copyToClipboard(showRaw.value ? props.item.text : displayText.value);
     message.success("已复制");
   } catch (e) {
     message.error(e instanceof Error ? e.message : "复制失败");

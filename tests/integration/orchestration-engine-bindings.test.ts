@@ -64,9 +64,52 @@ import { clearActiveThreadTurnIfMatches, resolveTurnErrorIndexScope } from "../.
 import { readTurnExecutionOptionsSnapshot } from "../../apps/desktop/client/src/queue/threadQueueExecutionPolicy.ts";
 import { persistOrStageCodexProviderTurn } from "../../apps/desktop/client/src/eventIndex/codexProviderTurnStarted.ts";
 import { applyThreadReminderStateEvent } from "../../apps/desktop/client/src/eventIndex/threadReminderStateEvents.ts";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "../../packages/shared/src/engineModelCatalogSeed.ts";
 import { ToolRuntimeService } from "../../apps/desktop/client/src/orchestration/toolRuntimeService.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
+
+/** 历史流程夹具引用的型号已移出内置目录，用本机自定义模型补齐可用性。 */
+function legacyBindingModel(input: {
+  engine: "claude" | "codex";
+  modelId: string;
+  contextWindow: number;
+  maxContextWindow?: number | null;
+  supportsFastMode?: boolean;
+  supports1MContext?: boolean;
+  defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max" | null;
+}) {
+  return {
+    id: `test:${input.engine}:${input.modelId}`,
+    engine: input.engine,
+    providerId: input.engine === "claude" ? "anthropic" as const : "openai" as const,
+    modelId: input.modelId,
+    displayName: input.modelId,
+    inputModalities: ["text" as const],
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort: reasoningEffort as "low" | "medium" | "high" | "xhigh" | "max", description: "" })),
+    defaultReasoningEffort: input.defaultReasoningEffort ?? "high",
+    contextWindow: input.contextWindow,
+    maxContextWindow: input.maxContextWindow ?? null,
+    supportsFastMode: input.supportsFastMode ?? false,
+    supports1MContext: input.supports1MContext ?? false,
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+}
+
+test.before(() => setEngineModelCatalogCustomModels([
+  legacyBindingModel({ engine: "claude", modelId: "claude-sonnet-4-6", contextWindow: 200_000, supports1MContext: true }),
+  legacyBindingModel({ engine: "claude", modelId: "claude-sonnet-4-6[1m]", contextWindow: 1_000_000, supports1MContext: true }),
+  legacyBindingModel({ engine: "codex", modelId: "gpt-5.4", contextWindow: 272_000, supportsFastMode: true }),
+  legacyBindingModel({ engine: "codex", modelId: "gpt-5.4-mini", contextWindow: 272_000, supportsFastMode: true }),
+  legacyBindingModel({ engine: "codex", modelId: "gpt-5.5", contextWindow: 1_000_000, maxContextWindow: 1_000_000, supportsFastMode: true }),
+  legacyBindingModel({ engine: "codex", modelId: "gpt-5.6-sol", contextWindow: 1_000_000, maxContextWindow: 1_000_000, supportsFastMode: true }),
+  legacyBindingModel({ engine: "codex", modelId: "gpt-5.6-terra", contextWindow: 372_000, maxContextWindow: 372_000, supportsFastMode: true }),
+  {
+    ...legacyBindingModel({ engine: "claude", modelId: "deepseek-v4-pro[1m]", contextWindow: 1_000_000, supports1MContext: true }),
+    providerId: "deepseek" as const,
+  },
+]));
+test.after(() => resetEngineModelCatalogRuntimeForTest());
 
 /** 临时W使用规范物理路径，避免Windows短目录别名触发真实身份门禁。 */
 function createTemporaryWorkspace(prefix: string): string {
@@ -623,11 +666,6 @@ for (const mode of ["start", "background", "diagnostic", "inactive", "cleanup", 
   assert.equal(db.orchNodeAttempts.getLatestByNode(instance.id, "next"), null);
   if (mode === "start" || mode === "parallel" || f1) await engine.waitForInFlightWork({ timeoutMs: 3000 });
 });
-
-test.before(() => {
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
-});
-test.after(() => { resetEngineModelCatalogRuntimeForTest(); });
 
 test("background start rejects preparation failures and accepts a real pending coordinator without awaiting the DAG", async t => {
   const directory = createTemporaryWorkspace(path.join(os.tmpdir(), "desktop-orch-start-"));
@@ -1813,7 +1851,7 @@ test("resolveExecutionPrefs supports instance-level engine override", () => {
     [],
   );
   assert.equal(forcedCodexPrefs.engine, "codex");
-  assert.equal(forcedCodexPrefs.model, "gpt-5.6-sol");
+  assert.equal(forcedCodexPrefs.model, "gpt-6.2-sol");
   assert.equal(forcedCodexPrefs.sourceMode, "auto");
   assert.equal(forcedCodexPrefs.accessMode, "full-access");
   assert.equal(forcedCodexPrefs.effort, "xhigh");
@@ -1826,7 +1864,7 @@ test("resolveExecutionPrefs supports instance-level engine override", () => {
     [],
   );
   assert.equal(forcedClaudePrefs.engine, "claude");
-  assert.equal(forcedClaudePrefs.model, "claude-fable-5");
+  assert.equal(forcedClaudePrefs.model, "claude-fable-5-2");
   assert.equal(forcedClaudePrefs.sourceMode, "auto");
   assert.equal(forcedClaudePrefs.accessMode, "full-access");
   assert.equal(forcedClaudePrefs.effort, "high");

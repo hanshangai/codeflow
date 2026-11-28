@@ -29,8 +29,7 @@ import {
   isFatalCodexAppServerStderrLine,
 } from "../../apps/desktop/client/src/engines/codex-app-server/codexAppServerWorkspace.ts";
 import { EngineTimeoutError } from "../../apps/desktop/client/src/engines/turnTimeoutController.ts";
-import { applyEngineModelCatalogSnapshot } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "../../packages/shared/src/engineModelCatalogSeed.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
 import {
   buildCodexDynamicToolBindingVersion,
   buildCodexDynamicToolNameByToolId,
@@ -90,25 +89,44 @@ test("Codex 允许交互时引导使用结构化提问，deny 回合不注入调
 });
 
 test.before(() => {
-  const rows = INITIAL_ENGINE_MODEL_CATALOG_V1.map((row) => structuredClone(row));
-  const codexRows = rows.filter((row) => row.engine === "codex");
-  const compatibilityTemplate = codexRows.find((row) => row.modelId === "gpt-5.6-luna") ?? codexRows[0];
-  assert.ok(compatibilityTemplate);
-  rows.push({
-    ...compatibilityTemplate,
-    catalogItemId: "test:codex:gpt-5.4",
-    modelId: "gpt-5.4",
-    displayName: "GPT-5.4（测试兼容项）",
-    isDefault: false,
-    sortOrder: codexRows.length + 1,
-  });
-  applyEngineModelCatalogSnapshot({
-    schemaVersion: "engine-model-catalog/v1",
-    configVersion: 1,
-    capturedAt: 1,
-    rows,
-  });
+  setEngineModelCatalogCustomModels([
+    {
+      id: "test:codex:gpt-5.4",
+      engine: "codex",
+      providerId: "openai",
+      modelId: "gpt-5.4",
+      displayName: "GPT-5.4（测试兼容项）",
+      inputModalities: ["text"],
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
+      contextWindow: 272_000,
+      maxContextWindow: null,
+      supportsFastMode: false,
+      supports1MContext: false,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "test:codex:gpt-5.6-luna",
+      engine: "codex",
+      providerId: "openai",
+      modelId: "gpt-5.6-luna",
+      displayName: "GPT-5.6 Luna（测试兼容项）",
+      inputModalities: ["text", "image"],
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
+      contextWindow: 1_000_000,
+      maxContextWindow: 1_000_000,
+      supportsFastMode: false,
+      supports1MContext: true,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ]);
 });
+test.after(() => resetEngineModelCatalogRuntimeForTest());
 
 /** 为旧测试夹具补齐 full turn 列表的正式响应结构。 */
 async function normalizeProviderFixture(method: string, params: unknown, response: Promise<unknown>): Promise<unknown> {
@@ -10319,7 +10337,7 @@ test("CodexAppServerThreadSession 创建会话忽略历史窗口并下发模型�
   assert.deepEqual(requests[0]?.params, {
     cwd: "Z:/code/codeflowai",
     approvalPolicy: "on-request",
-    config: { "features.default_mode_request_user_input": true, model_context_window: 372_000, model_auto_compact_token_limit: 353_400 },
+    config: { "features.default_mode_request_user_input": true, model_context_window: 872_000, model_auto_compact_token_limit: 828_400 },
     developerInstructions: withCodexExecutionInstructions(),
   });
 });
@@ -10781,7 +10799,7 @@ test("CodexAppServerThreadSession 恢复会话忽略历史窗口并下发模型�
     excludeTurns: true,
     cwd: "Z:/code/codeflowai",
     approvalPolicy: "on-request",
-    config: { "features.default_mode_request_user_input": true, model_context_window: 372_000, model_auto_compact_token_limit: 353_400 },
+    config: { "features.default_mode_request_user_input": true, model_context_window: 872_000, model_auto_compact_token_limit: 828_400 },
     developerInstructions: withCodexExecutionInstructions(),
   });
   assert.equal(requests[1]?.method, "turn/start");
@@ -10838,7 +10856,7 @@ test("CodexAppServerThreadSession 旧窗口值变化不改变模型最大容量�
     excludeTurns: true,
     cwd: "Z:/code/codeflowai",
     approvalPolicy: "on-request",
-    config: { "features.default_mode_request_user_input": true, model_context_window: 372_000, model_auto_compact_token_limit: 353_400 },
+    config: { "features.default_mode_request_user_input": true, model_context_window: 872_000, model_auto_compact_token_limit: 828_400 },
     developerInstructions: withCodexExecutionInstructions(),
   });
   const startIndex = requests.findIndex((request) => request.method === "turn/start");

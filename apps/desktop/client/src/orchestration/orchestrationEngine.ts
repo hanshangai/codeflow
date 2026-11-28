@@ -120,7 +120,7 @@ import { buildKnowledgeChangeTool, createKnowledgeSuggestionTurn, KNOWLEDGE_CHAN
 import { KnowledgeAssetError } from "../knowledge/knowledgeAssetFiles.js";
 import { assertClientReasoningEffortSupported } from "../engines/engineModelCapabilities.js";
 import {
-  getRuntimeEngineModelCatalogItem,
+  getRuntimeEngineModelInfo,
   getRuntimeEngineModels,
   resolveRuntimeEngineModelProviderId,
   resolveRuntimeRoleExecutionConfigForEngine,
@@ -8663,8 +8663,8 @@ export class OrchestrationEngine {
     if (!baseModel) return null;
     if (executionConfig.engine !== "claude") return baseModel;
     const contextWindow = Number(executionConfig.contextWindow ?? 0);
-    const modelInfo = getRuntimeEngineModelCatalogItem("claude", baseModel);
-    const hasExplicit1MVariant = Boolean(getRuntimeEngineModelCatalogItem("claude", `${baseModel}[1m]`));
+    const modelInfo = getRuntimeEngineModelInfo("claude", baseModel);
+    const hasExplicit1MVariant = Boolean(getRuntimeEngineModelInfo("claude", `${baseModel}[1m]`));
     if (
       Number.isFinite(contextWindow)
       && contextWindow > 200_000

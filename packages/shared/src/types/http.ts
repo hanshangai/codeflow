@@ -10,7 +10,6 @@ import type {
   ReasoningEffort,
   ReasoningEffortOption,
 } from "./engine";
-import type { EngineModelCatalogSyncState } from "./engineModelCatalog";
 import type { AccountRole } from "./account";
 import type { ChatWorkflowActiveStatus } from "./chatWorkflow";
 import type { SharedWorkspaceAssetPermissions, SharedWorkspaceEntryStatus, SharedWorkspaceErrorCode, SharedWorkspaceDirectEntry, SharedWorkspaceAssetMaintenancePolicy, SharedWorkspaceFileTransferPolicy } from "./sharedWorkspace";
@@ -848,9 +847,6 @@ export type EngineCustomModelsByEngine = Partial<Record<EngineType, EngineModelI
 export type GetEnginesStatusResponseBody = {
   engines: EngineStatus[];
   customModelsByEngine?: EngineCustomModelsByEngine;
-  catalogVersion?: number;
-  hostAppliedCatalogVersion?: number | null;
-  hostCatalogSyncState?: EngineModelCatalogSyncState;
 };
 
 /** 单引擎凭据配置（对应原生配置文件中的字段） */

@@ -573,8 +573,7 @@ function scheduleAutoScrollToBottom(): void {
 const assistantHelperScope = computed(() => ({
   canWrite: canWrite.value
     && !maintenanceBusy.value
-    && !conversation.value?.invalidated
-    && !catalogSyncIssue.value,
+    && !conversation.value?.invalidated,
   busy: Boolean(effectiveAssistantMode.value && isConversationRunning(displayConversation.value)),
 }));
 
@@ -599,117 +598,7 @@ const hasAssistantHelperContent = computed(() =>
 const hasComposerGuardContent = computed(() =>
   hasVisibleSlotContent(slots["composer-guard"], assistantHelperScope.value),
 );
-const CATALOG_SYNC_POLL_INTERVAL_MS = 3_000;
-const CATALOG_SYNC_WAIT_TIMEOUT_MS = 30_000;
-const CATALOG_SYNC_REQUEST_TIMEOUT_MS = 8_000;
-const catalogSyncTimedOut = ref(false);
-const catalogSyncCheckError = ref<string | null>(null);
-let catalogSyncPollTimer: ReturnType<typeof setTimeout> | null = null;
-let catalogSyncRequestAbort: AbortController | null = null;
-let catalogSyncPollGeneration = 0;
-let catalogSyncActiveKey = "";
-let catalogSyncDeadline = 0;
-
-/** 当前目录检查失败显式展示并有界重试，切换作用域后只释放请求资源。 */
-async function pollCatalogSync(workspaceId: string, generation: number): Promise<void> {
-  if (generation !== catalogSyncPollGeneration) return;
-  if (Date.now() >= catalogSyncDeadline) {
-    catalogSyncTimedOut.value = true;
-    return;
-  }
-  const controller = new AbortController();
-  catalogSyncRequestAbort = controller;
-  const requestTimer = setTimeout(() => controller.abort(), CATALOG_SYNC_REQUEST_TIMEOUT_MS);
-  try {
-    await engines.refresh(ctx.value, workspaceId, {
-      signal: controller.signal,
-      shouldApply: () => generation === catalogSyncPollGeneration && String(props.workspaceId) === workspaceId,
-    });
-    if (controller.signal.aborted) throw new Error("状态请求超时");
-    if (generation === catalogSyncPollGeneration && String(props.workspaceId) === workspaceId) catalogSyncCheckError.value = null;
-  } catch (error) {
-    if (generation !== catalogSyncPollGeneration || String(props.workspaceId) !== workspaceId) return;
-    if (isCancelledRequestError(error) && !controller.signal.aborted) return;
-    const details = isApiResultError(error) ? error.details as Record<string, unknown> | undefined : undefined;
-    const rootCause = controller.signal.aborted ? "状态请求超时" : error instanceof Error ? error.message : String(error);
-    catalogSyncCheckError.value = rootCause;
-    console.error("[chat-panel] model catalog check failed", {
-      code: "CHAT_MODEL_CATALOG_CHECK_FAILED",
-      requestId: details?.requestId ?? (error && typeof error === "object" && "requestId" in error ? error.requestId : null),
-      workspaceId, threadId: activeThreadId.value, generation, rootCause,
-    });
-  } finally {
-    clearTimeout(requestTimer);
-    if (catalogSyncRequestAbort === controller) catalogSyncRequestAbort = null;
-  }
-  if (generation !== catalogSyncPollGeneration || String(props.workspaceId) !== workspaceId) return;
-  const scoped = engines.byWorkspaceId[workspaceId];
-  if (scoped?.hostCatalogSyncState !== "waiting") return;
-  if (Date.now() >= catalogSyncDeadline) {
-    catalogSyncTimedOut.value = true;
-    return;
-  }
-  catalogSyncPollTimer = setTimeout(() => void pollCatalogSync(workspaceId, generation), CATALOG_SYNC_POLL_INTERVAL_MS);
-}
-
-function stopCatalogSyncPolling(): void {
-  catalogSyncPollGeneration += 1;
-  if (catalogSyncPollTimer) clearTimeout(catalogSyncPollTimer);
-  catalogSyncPollTimer = null;
-  catalogSyncRequestAbort?.abort();
-  catalogSyncRequestAbort = null;
-  catalogSyncActiveKey = "";
-}
-
-function startCatalogSyncPolling(): void {
-  stopCatalogSyncPolling();
-  const workspaceId = String(props.workspaceId);
-  const scoped = engines.byWorkspaceId[workspaceId];
-  if (scoped?.hostCatalogSyncState !== "waiting") return;
-  catalogSyncActiveKey = `${workspaceId}:${scoped.catalogVersion ?? "unknown"}`;
-  catalogSyncDeadline = Date.now() + CATALOG_SYNC_WAIT_TIMEOUT_MS;
-  catalogSyncTimedOut.value = false;
-  catalogSyncCheckError.value = null;
-  void pollCatalogSync(workspaceId, catalogSyncPollGeneration);
-}
-
-function retryCatalogSync(): void {
-  startCatalogSyncPolling();
-}
-
-watch(
-  () => {
-    const workspaceId = String(props.workspaceId);
-    const scoped = engines.byWorkspaceId[workspaceId];
-    return `${workspaceId}:${scoped?.catalogVersion ?? "unknown"}:${scoped?.hostCatalogSyncState ?? "unknown"}`;
-  },
-  () => {
-    const workspaceId = String(props.workspaceId);
-    const scoped = engines.byWorkspaceId[workspaceId];
-    if (scoped?.hostCatalogSyncState !== "waiting") {
-      stopCatalogSyncPolling();
-      catalogSyncTimedOut.value = false;
-      catalogSyncCheckError.value = null;
-      return;
-    }
-    const key = `${workspaceId}:${scoped.catalogVersion ?? "unknown"}`;
-    if (catalogSyncActiveKey !== key) startCatalogSyncPolling();
-  },
-  { immediate: true },
-);
-
-const catalogSyncIssue = computed(() => {
-  const state = engines.byWorkspaceId[String(props.workspaceId)]?.hostCatalogSyncState ?? null;
-  if (state === "waiting") {
-    if (catalogSyncTimedOut.value) return "模型目录同步超时，当前 Client 尚未确认最新目录。请重试同步；若仍失败，请检查 Client 连接。";
-    if (catalogSyncCheckError.value) return `检查模型目录同步状态失败：${catalogSyncCheckError.value}。正在自动重试。`;
-    return "等待当前工作区的 Client 应用最新模型目录，完成后即可发送。";
-  }
-  if (state === "unsupported") return "当前工作区的 Client 版本不支持动态模型目录，请升级 Client 后再发送。";
-  if (state === "offline") return "当前工作区的 Host Client 已离线，重新上线并同步模型目录后即可发送。";
-  return null;
-});
-const composerBlocked = computed(() => Boolean(props.composerDisabled || catalogSyncIssue.value
+const composerBlocked = computed(() => Boolean(props.composerDisabled
   || primaryKnowledgeThread.value && (knowledgeReady.value.threadId !== activeThreadId.value || !knowledgeReady.value.canContinue)));
 
 const pendingInteractionItems = computed(() => getPendingInteractionItems(displayConversation.value));
@@ -1565,7 +1454,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopRunningStateReconcile();
-  stopCatalogSyncPolling();
   if (typeof window !== "undefined") {
     window.removeEventListener("popstate", handleThreadUrlChanged);
     window.removeEventListener(THREAD_URL_CHANGED_EVENT, handleThreadUrlChanged as EventListener);
@@ -1795,20 +1683,6 @@ defineExpose({ locateMessage, prepareThreadSwitch });
               message="此共享会话仅可查看：你不是该会话的创建者或参与人，不能输入或执行操作。"
             />
           </div>
-          <div v-if="catalogSyncIssue" class="chat-panel__invalidated-banner">
-            <a-alert
-              type="warning"
-              show-icon
-              :closable="false"
-              :message="catalogSyncIssue"
-            />
-            <a-button
-              v-if="engines.byWorkspaceId[String(props.workspaceId)]?.hostCatalogSyncState === 'waiting' && (catalogSyncTimedOut || catalogSyncCheckError)"
-              type="link"
-              size="small"
-              @click="retryCatalogSync"
-            >重试同步</a-button>
-          </div>
           <div v-if="hasComposerGuardContent" class="chat-panel__composer-guard">
             <slot
               name="composer-guard"
@@ -1832,7 +1706,7 @@ defineExpose({ locateMessage, prepareThreadSwitch });
               :surface="props.surface"
               :allow-queue="primaryKnowledgeThread ? false : props.allowQueue"
               :preserve-draft-on-disable="(props.preserveDraftOnDisable || primaryKnowledgeThread) && !threadReadOnly && !conversation?.invalidated"
-              :allow-draft-when-disabled="props.allowDraftWhenDisabled && !threadReadOnly && !conversation?.invalidated && !maintenanceBusy && !catalogSyncIssue && (!primaryKnowledgeThread || knowledgeReady.threadId === activeThreadId && knowledgeReady.canContinue)"
+              :allow-draft-when-disabled="props.allowDraftWhenDisabled && !threadReadOnly && !conversation?.invalidated && !maintenanceBusy && (!primaryKnowledgeThread || knowledgeReady.threadId === activeThreadId && knowledgeReady.canContinue)"
               @model-prefs-change="emit('modelPrefsChange', $event)"
             >
               <template v-if="slots['toolbar-before-model']" #toolbar-before-model="slotProps"><slot name="toolbar-before-model" v-bind="slotProps" /></template>

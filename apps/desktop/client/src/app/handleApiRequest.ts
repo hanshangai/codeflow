@@ -1665,7 +1665,7 @@ async function onThreadsSendMessage(ctx: ApiHandlerContext, req: ApiRequestMessa
   const roleId = parseRoleId(body?.roleId);
   const planMode = Boolean(body?.planMode ?? false);
   const accessMode = parseAccessMode(body?.accessMode);
-  const model: string | null = typeof body?.model === "string" ? body.model.trim() || null : null;
+  const requestedModel = typeof body?.model === "string" ? body.model.trim() || null : null;
   const effort: string | null = typeof body?.effort === "string" ? body.effort.trim() || null : null;
   const serviceTier = parseServiceTier(body?.serviceTier);
   const rawContextWindow = body?.contextWindow;
@@ -1725,6 +1725,8 @@ async function onThreadsSendMessage(ctx: ApiHandlerContext, req: ApiRequestMessa
   const explicitInputContract = hasExplicitThreadInputContract(body);
   const isOrdinaryChatThread = persistedThread?.threadSubtype == null
     && persistedThread?.threadType !== "orchestration";
+  // 普通会话省略模型时，校验和派发共用从本地目录解析后的会话模型。
+  const model = requestedModel ?? (isOrdinaryChatThread ? persistedThread?.model ?? null : null);
   const isKnowledgeChatThread = persistedThread?.threadSubtype === "knowledge-conversation";
   const isKnowledgeExecutionThread = persistedThread?.threadSubtype === "knowledge-assets";
   const isKnowledgeTextInput = (isKnowledgeChatThread || isKnowledgeExecutionThread) && inputContract.inputKind !== "provider-slash" && !inputContract.skillMentions?.length;

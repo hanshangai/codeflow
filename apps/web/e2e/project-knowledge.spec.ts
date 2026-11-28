@@ -102,7 +102,7 @@ async function installKnowledgeScenario(page: Page, options: { empty?: boolean; 
   };
   const json = (route: Route, data: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(data) });
 
-  await page.route("**/api/engines/status**", route => json(route, { ok: true, catalogVersion: 2, hostAppliedCatalogVersion: 2, hostCatalogSyncState: "applied", engines: [{
+  await page.route("**/api/engines/status**", route => json(route, { ok: true, engines:[{
     engineType: "codex", installed: true, version: "test", binPath: null, features: { streaming: true, reasoning: true, toolUse: true, sessionContinuation: true, imageInput: true }, error: null,
     credentialStatus: { available: true, source: "local_oauth", message: null }, providerCredentialStatus: [{ providerId: "openai", available: true, sources: ["local_oauth"], message: null }],
     models: ["gpt-test", "gpt-second"].map((id, index) => ({ id, displayName: index ? "测试模型 B" : "测试模型 A", providerId: "openai", isDefault: !index, supportedReasoningEfforts: index && options.secondModelLowOnly ? [{ reasoningEffort: "low", description: "" }] : [{ reasoningEffort: "high", description: "" }, { reasoningEffort: "low", description: "" }], defaultReasoningEffort: index && options.secondModelLowOnly ? "low" : "high" })),
@@ -383,7 +383,7 @@ async function startKnowledgeDiscussion(page: Page): Promise<void> {
 
 /** 同时提供两个引擎，并让 DeepSeek 与 Claude 默认模型不同，验证不会换供应商。 */
 async function installKnowledgeEngineCatalog(page: Page, deepseekAvailable = true): Promise<void> {
-  await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, catalogVersion: 2, hostAppliedCatalogVersion: 2, hostCatalogSyncState: "applied", engines: [
+  await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, engines:[
     { engineType: "codex", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "openai", available: true }], models: [{ id: "gpt-test", displayName: "测试模型 A", providerId: "openai", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }], defaultReasoningEffort: "high" }] },
     { engineType: "claude", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "anthropic", available: true }, { providerId: "deepseek", available: deepseekAvailable, message: deepseekAvailable ? null : "DeepSeek 缺少凭据" }], models: [{ id: "claude-test", displayName: "默认 Anthropic", providerId: "anthropic", isDefault: true }, { id: "deepseek-flash", displayName: "DeepSeek Flash", providerId: "deepseek", isDefault: false, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }], defaultReasoningEffort: "high" }] },
   ] } }));
@@ -469,7 +469,7 @@ async function installBuildScenario(page: Page, options: { failApplyOnce?: boole
   /** 快照只投影已生效节点，未采用候选由任务预览提供。 */
   const visibleNodes = () => adopted ? candidateNodes : cancelled ? candidateNodes.filter(node => node.id === "project") : options.existingDocument ? candidateNodes.filter(node => node.id !== "guide") : [];
   const fulfill = (route: Route, data: unknown) => route.fulfill({ json: { ok: true, data } });
-  if (options.claudeOnly) await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, catalogVersion: 2, hostAppliedCatalogVersion: 2, hostCatalogSyncState: "applied", engines: [{ engineType: "claude", installed: true, version: "test", binPath: null, features: { streaming: true, reasoning: true, toolUse: true, sessionContinuation: true, imageInput: true }, credentialStatus: { available: true, source: "local_oauth", message: null }, providerCredentialStatus: [{ providerId: "anthropic", available: true, sources: ["local_oauth"], message: null }], models: [{ id: "claude-test", displayName: "Claude 测试模型", isDefault: true, supportedReasoningEfforts: [], defaultReasoningEffort: null }], error: null }] } }));
+  if (options.claudeOnly) await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, engines:[{ engineType: "claude", installed: true, version: "test", binPath: null, features: { streaming: true, reasoning: true, toolUse: true, sessionContinuation: true, imageInput: true }, credentialStatus: { available: true, source: "local_oauth", message: null }, providerCredentialStatus: [{ providerId: "anthropic", available: true, sources: ["local_oauth"], message: null }], models: [{ id: "claude-test", displayName: "Claude 测试模型", isDefault: true, supportedReasoningEfforts: [], defaultReasoningEffort: null }], error: null }] } }));
   await page.route("**/api/knowledge/assets/**", async route => {
     const action = new URL(route.request().url()).pathname.split("/").at(-1);
     const body = (route.request().postDataJSON() ?? {}) as RequestBody;
@@ -3542,7 +3542,7 @@ test.describe("项目知识库资产协作", () => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page, { empty: true });
     const longLabel = "测试模型 B · 一个需要完整显示的长模型名称";
-    await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, catalogVersion: 2, hostAppliedCatalogVersion: 2, hostCatalogSyncState: "applied", engines: [{ engineType: "codex", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "openai", available: true }], models: ["gpt-test", "gpt-second"].map((id, index) => ({ id, displayName: index ? longLabel : "模型 A", providerId: "openai", isDefault: !index, supportsFastMode: true, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }, { reasoningEffort: "low", description: "" }], defaultReasoningEffort: "high" })) }] } }));
+    await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, engines:[{ engineType: "codex", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "openai", available: true }], models: ["gpt-test", "gpt-second"].map((id, index) => ({ id, displayName: index ? longLabel : "模型 A", providerId: "openai", isDefault: !index, supportsFastMode: true, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }, { reasoningEffort: "low", description: "" }], defaultReasoningEffort: "high" })) }] } }));
     await page.route("**/api/threads/prefs", route => route.fulfill({ json: { ok: true, prefs: { model: "gpt-test", effort: "high", accessMode: "read-only", serviceTier: "fast" } } }));
     await openKnowledge(page, scenario.threadId);
     const assistant = page.getByTestId("knowledge-assistant"), input = assistant.locator(".composer__textarea"), model = assistant.locator(".composer__model-select");
@@ -3680,7 +3680,7 @@ test.describe("项目知识库资产协作", () => {
   test("PK-engine-effort 旧强度不被新模型支持时，构建使用工具栏实际显示的有效强度", async ({ page }) => {
     await installSession(page);
     const scenario = await installKnowledgeScenario(page, { secondModelLowOnly: true });
-    await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, catalogVersion: 2, hostAppliedCatalogVersion: 2, hostCatalogSyncState: "applied", engines: [{ engineType: "codex", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "openai", available: true }], models: [
+    await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, engines:[{ engineType: "codex", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "openai", available: true }], models: [
       { id: "gpt-test", displayName: "测试模型 A", providerId: "openai", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }, { reasoningEffort: "low", description: "" }], defaultReasoningEffort: "low" },
       { id: "gpt-second", displayName: "测试模型 B", providerId: "openai", isDefault: false, supportedReasoningEfforts: [{ reasoningEffort: "low", description: "" }], defaultReasoningEffort: "low" },
     ] }] } }));
@@ -3699,7 +3699,7 @@ test.describe("项目知识库资产协作", () => {
     await installSession(page);
     const scenario = await installBuildScenario(page);
     await page.evaluate(workspaceId => localStorage.setItem(`codeflow:knowledge-build-prefs:${workspaceId}`, JSON.stringify({ engine: "claude", model: "deepseek-flash", effort: "high" })), WORKSPACE_ID);
-    await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, catalogVersion: 2, hostAppliedCatalogVersion: 2, hostCatalogSyncState: "applied", engines: [{ engineType: "claude", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "anthropic", available: true }, { providerId: "deepseek", available, message: available ? null : "DeepSeek 缺少凭据" }], models: [{ id: "claude-test", displayName: "默认 Anthropic", providerId: "anthropic", isDefault: true }, { id: "deepseek-flash", displayName: "DeepSeek Flash", providerId: "deepseek", isDefault: false, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }], defaultReasoningEffort: "high" }] }] } }));
+    await page.route("**/api/engines/status**", route => route.fulfill({ json: { ok: true, engines:[{ engineType: "claude", installed: true, features: {}, credentialStatus: { available: true }, providerCredentialStatus: [{ providerId: "anthropic", available: true }, { providerId: "deepseek", available, message: available ? null : "DeepSeek 缺少凭据" }], models: [{ id: "claude-test", displayName: "默认 Anthropic", providerId: "anthropic", isDefault: true }, { id: "deepseek-flash", displayName: "DeepSeek Flash", providerId: "deepseek", isDefault: false, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }], defaultReasoningEffort: "high" }] }] } }));
     await openKnowledge(page);
     await startKnowledgeBuild(page);
     if (!available) {

@@ -14,8 +14,7 @@ import { openClientDb } from "../src/db/clientDb.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
 import { createLocalEventPersistence, createLocalEventPipeline } from "../src/runtime/localEventPersistence.js";
 import { ClientDbWriterService } from "../src/db/clientDbWriterService.js";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
+import { resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
 import { logger } from "../src/logger.js";
 import { OrchAssetAuthorityRuntimeReadService, createClientDbOrchAssetLegacyRuntimeReader } from "../src/orchestration/orchAssetAuthorityRuntimeReadService.js";
 import { createDefaultRoleExecutionConfig, createDefaultRoleInputDefinition, createDefaultRoleOutputDefinition } from "@codeflowai/shared";
@@ -306,7 +305,6 @@ test("owner拒绝空身份与非法超时，也不覆盖同一精确回合的在
 
 /** 真实 API、SQLite、事件与终态入口，仅让 provider 发送和终态准备可控。 */
 function apiFixture(t: TestContext) {
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
   const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "ordinary-update-stop-")));
   const scope: owners.OrdinaryTurnExecutionScope = { workspaceId: path.basename(directory), threadId: "thread", turnId: "turn" };
   const app = openClientDb({ dbPath: path.join(directory, "client.db"), localCanonicalEvents: true });
@@ -344,7 +342,7 @@ function apiFixture(t: TestContext) {
     send(message: any) { responses.push(message); }, onBeforeEmitConversationEvent(event: any) { persistence.persist({ t: "conversation.event", event }); },
   } as unknown as ApiHandlerContext;
   const request = () => handleApiRequest(ctx, { t: "api.req", id: "ordinary-request", method: "threads.sendMessage", path: "/send",
-    body: { ...scope, text: "更新测试", model: "claude-sonnet-4-6", effort: "medium" } });
+    body: { ...scope, text: "更新测试", model: "claude-sonnet-5", effort: "medium" } });
   return { scope, ctx, db, app, directory, threads, sessions, session, entered, sending, terminal, responses, request, errors,
     ownWriter(close: () => Promise<void>) { closeWriter = close; },
     /** 回归断言读取实际W日志，应用logger不再替代回合诊断。 */
@@ -577,7 +575,7 @@ test("ordinary public API host callback preserves real tool-file preparation rej
       if (index === 2) t.mock.method(f.db, "writeWorkspaceLog", () => { throw logging; });
       const turnId = `execute-turn-${index}`;
       await handleApiRequest(f.ctx, { t: "api.req", id: `ordinary-execute-${index}`, method: "threads.sendMessage", path: "/send",
-        body: { ...f.scope, turnId, roleId: role.id, text: "执行", model: "claude-sonnet-4-6", effort: "medium" } });
+        body: { ...f.scope, turnId, roleId: role.id, text: "执行", model: "claude-sonnet-5", effort: "medium" } });
       await owners.waitForOrdinaryTurnExecution(f.sessions, { ...f.scope, turnId });
       assert.equal(f.db.turns.get(turnId)?.status, "completed");
     }
@@ -619,7 +617,7 @@ for (const mode of ["logged", "failed", "stale-release", "notice", "release-diag
     f.ctx.onBeforeEmitConversationEvent = event => { if (event.type === "turn.error") throw notification; persist(event); };
   }
   await handleApiRequest(f.ctx, { t: "api.req", id: "ordinary-skill-request😀", method: "threads.sendMessage", path: "/send",
-    body: { ...f.scope, roleId: role.id, text: "Skill", model: "claude-sonnet-4-6", effort: "medium" } });
+    body: { ...f.scope, roleId: role.id, text: "Skill", model: "claude-sonnet-5", effort: "medium" } });
   let result: any;
   await assert.rejects(owners.waitForOrdinaryTurnExecution(f.sessions, f.scope), (error: any) => { result = error; return true; });
   const failure = mode === "stale-release" || mode === "notice" || mode === "release-diagnostic" || mode === "notice-diagnostic" ? result.errors[0] : result;
@@ -930,6 +928,22 @@ test("普通Codex已受理但尚未派发时精确停止，不要求不存在的
     f.sending.resolve({ responseText: "停止后禁止发送" });
     await owners.waitForOrdinaryTurnExecution(f.sessions, f.scope);
   }
+});
+
+test("普通会话省略模型时按旧会话迁移后的型号派发", async t => {
+  const f = apiFixture(t);
+  f.db.db.prepare("UPDATE threads SET model = ?, effort = ?, thread_type = 'chat', thread_subtype = NULL WHERE id = ?")
+    .run("claude-opus-4-8", "high", f.scope.threadId);
+  const send = t.mock.method(f.session, "sendMessage");
+  await handleApiRequest(f.ctx, { t: "api.req", id: "legacy-model-send", method: "threads.sendMessage", path: "/send",
+    body: { ...f.scope, text: "继续旧会话" } });
+  assert.equal(f.responses.find(message => message.t === "api.res" && message.id === "legacy-model-send")?.status, 200);
+  await f.entered.promise;
+  f.sending.resolve({ responseText: "完成" });
+  await owners.waitForOrdinaryTurnExecution(f.sessions, f.scope);
+  assert.equal(send.mock.callCount(), 1);
+  const [input] = send.mock.calls[0]!.arguments as unknown as [{ model: string }];
+  assert.equal(input.model, "claude-opus-5-5");
 });
 
 test("普通Codex已派发的owner不能证明本地取消，缺provider身份仍显式失败", async t => {

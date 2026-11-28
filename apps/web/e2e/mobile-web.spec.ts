@@ -43,11 +43,6 @@ async function prepare(page: Page, loggedIn = true, role = "enterprise_admin"): 
   await page.route("**/api/orch/pending-mine?*", (route) => route.fulfill({ json: { ok: true, items: [] } }));
   await page.route("**/api/account/enterprise/relay/status", (route) => route.fulfill({ json: { ok: true, state: "disabled" } }));
   await page.route("**/api/threads/draft/clear", (route) => route.fulfill({ json: { ok: true } }));
-  // The shared mock predates Client catalog acknowledgements; model an online, synchronized Client.
-  await page.route("**/api/engines/status?*", async (route) => {
-    const response = await route.fetch();
-    await route.fulfill({ json: { ...await response.json(), catalogVersion: 1, hostAppliedCatalogVersion: 1, hostCatalogSyncState: "applied" } });
-  });
   return retiredRequests;
 }
 

@@ -61,7 +61,7 @@ const CODEX_EFFORTS_LOW_TO_ULTRA: NonNullable<EngineModelInfo["supportedReasonin
   { reasoningEffort: "ultra", description: "极限思考，适合最复杂代理任务" },
 ];
 
-// GPT-6 Sol/Luna 官方支持 none、low、medium、high、xhigh、max；不含旧版 minimal，也不含 Ultra。
+// GPT-6 Luna 支持 none、low、medium、high、xhigh、max。
 const CODEX_EFFORTS_GPT6: NonNullable<EngineModelInfo["supportedReasoningEfforts"]> = [
   { reasoningEffort: "none", description: "禁用思考，极速响应" },
   { reasoningEffort: "low", description: "低强度思考" },
@@ -348,6 +348,38 @@ const CLAUDE_SILENT_MODEL_ALIASES: Readonly<Record<string, string>> = {
   "deepseek-flash[1m]": "deepseek-flash",
 };
 
+/** 本次移出内置目录的型号只用于迁移已保存的偏好。 */
+const RETIRED_THREAD_MODELS: Record<EngineType, Readonly<Record<string, string>>> = {
+  codex: {
+    "gpt-5.5": "gpt-6.2-sol",
+    "gpt-5.6-sol": "gpt-6.2-sol",
+    "gpt-5.6-terra": "gpt-6.2-astra",
+    "gpt-5.6-luna": "gpt-6-luna",
+    "gpt-6-sol": "gpt-6.1-sol",
+  },
+  claude: {
+    "claude-fable-5": "claude-fable-5-2",
+    "claude-fable-5[1m]": "claude-fable-5-2",
+    "claude-opus-4-8": "claude-opus-5-5",
+    "claude-opus-4-8[1m]": "claude-opus-5-5",
+    "claude-opus-4-7": "claude-opus-5-5",
+    "claude-opus-4-7[1m]": "claude-opus-5-5",
+    "claude-opus-4-6": "claude-opus-5-5",
+    "claude-opus-4-6[1m]": "claude-opus-5-5",
+    "claude-opus-4-5-20251101": "claude-opus-5-5",
+    "claude-sonnet-4-6": "claude-sonnet-5-5",
+    "claude-sonnet-4-5-20250929": "claude-sonnet-5-5",
+    "kimi-k2.7-code": "kimi-k3.1-pro",
+    "kimi-k2.7-code-highspeed": "kimi-k3.1-pro-highspeed",
+    "kimi-k2.6": "kimi-k3",
+    "glm-5.1": "glm-5.4",
+    "glm-5-turbo": "glm-5.4",
+    "glm-4.7": "glm-5.4",
+    "qwen3.7-max": "qwen3.8-max",
+    "qwen3.6-flash": "qwen3.8-flash",
+  },
+};
+
 export const CODEX_MODELS: EngineModelInfo[] = [
   {
     ...MODEL_PROVIDER_OPENAI,
@@ -359,6 +391,7 @@ export const CODEX_MODELS: EngineModelInfo[] = [
     defaultReasoningEffort: "xhigh",
     inputModalities: ["text", "image"],
     contextWindow: 500_000,
+    baseContextWindow: 500_000,
     maxContextWindow: 872_000,
     supportsFastMode: true,
     supports1MContext: true,
@@ -373,23 +406,10 @@ export const CODEX_MODELS: EngineModelInfo[] = [
     defaultReasoningEffort: "xhigh",
     inputModalities: ["text", "image"],
     contextWindow: 272_000,
+    baseContextWindow: 272_000,
     maxContextWindow: 872_000,
     supportsFastMode: true,
     supports1MContext: true,
-  },
-  {
-    ...MODEL_PROVIDER_OPENAI,
-    id: "gpt-6-astra",
-    displayName: "GPT-6 Astra",
-    description: "适合复杂代理与高要求任务",
-    isDefault: false,
-    supportedReasoningEfforts: CODEX_EFFORTS_LOW_TO_ULTRA,
-    defaultReasoningEffort: "xhigh",
-    inputModalities: ["text", "image"],
-    contextWindow: 272_000,
-    supportsFastMode: true,
-    supports1MContext: true,
-    maxContextWindow: 872_000,
   },
   {
     ...MODEL_PROVIDER_OPENAI,
@@ -401,23 +421,25 @@ export const CODEX_MODELS: EngineModelInfo[] = [
     defaultReasoningEffort: "medium",
     inputModalities: ["text", "image"],
     contextWindow: 1_000_000,
+    baseContextWindow: 500_000,
     supportsFastMode: true,
     supports1MContext: true,
     maxContextWindow: 1_000_000,
   },
   {
     ...MODEL_PROVIDER_OPENAI,
-    id: "gpt-6-sol",
-    displayName: "GPT-6 Sol",
-    description: "Codex 复杂编码与代理模型，适合高价值工程任务",
+    id: "gpt-6-astra",
+    displayName: "GPT-6 Astra",
+    description: "适合复杂代理与高要求任务",
     isDefault: false,
-    supportedReasoningEfforts: CODEX_EFFORTS_GPT6,
-    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: CODEX_EFFORTS_LOW_TO_ULTRA,
+    defaultReasoningEffort: "xhigh",
     inputModalities: ["text", "image"],
-    contextWindow: 1_050_000,
+    contextWindow: 272_000,
+    baseContextWindow: 272_000,
     supportsFastMode: true,
     supports1MContext: true,
-    maxContextWindow: 1_050_000,
+    maxContextWindow: 872_000,
   },
   {
     ...MODEL_PROVIDER_OPENAI,
@@ -762,7 +784,7 @@ export function resolveCatalogDefaultThreadPrefs(
   };
 }
 
-/** 补齐会话偏好；Fast 省略或显式 null 时均使用标准档。 */
+/** 解析已知退役型号，再按实际选中的模型补齐窗口、思考强度和服务档位。 */
 export function resolveThreadPrefsWithCatalogDefaults(
   engine: EngineType,
   prefs?: ThreadPrefs | null,
@@ -770,11 +792,10 @@ export function resolveThreadPrefsWithCatalogDefaults(
 ): ResolvedThreadPrefs {
   const defaults = resolveCatalogDefaultThreadPrefs(engine, models);
   const model = String(prefs?.model ?? "").trim() || defaults.model;
-  const modelInfo = model ? getEngineModelInfo(engine, model, models) : null;
-  // 静默别名（如 deepseek-flash[1m]）读取时直接归一为目录条目 ID，不保留历史变体；
-  // legacy 别名（已下线）与精确匹配的 modelInfo.id 均等于传入 model，不会误归一。
-  const resolvedModel = modelInfo && modelInfo.id !== model ? modelInfo.id : model;
-  const modelEffort = getDefaultReasoningEffortForModel(engine, model, models);
+  const modelInfo = getEngineModelInfo(engine, model, models)
+    ?? (model ? getEngineModelInfo(engine, RETIRED_THREAD_MODELS[engine][model], models) : null);
+  const resolvedModel = modelInfo?.id ?? model;
+  const modelEffort = getDefaultReasoningEffortForModel(engine, resolvedModel, models);
   const effort = resolveThreadPrefsReasoningEffort(
     modelInfo,
     normalizeReasoningEffort(prefs?.effort),
@@ -789,9 +810,9 @@ export function resolveThreadPrefsWithCatalogDefaults(
   const autoCompactPct = Number.isFinite(rawAutoCompactPct) && rawAutoCompactPct >= 50 && rawAutoCompactPct <= 99
     ? Math.round(rawAutoCompactPct)
     : defaults.autoCompactPct;
-  const contextWindow = normalizeThreadContextWindow(engine, model, prefs?.contextWindow, models);
+  const contextWindow = normalizeThreadContextWindow(engine, resolvedModel, prefs?.contextWindow, models);
   const serviceTier = normalizeCodexServiceTier(
-    engine, model, prefs?.serviceTier, models,
+    engine, resolvedModel, prefs?.serviceTier, models,
   );
   return {
     model: resolvedModel,

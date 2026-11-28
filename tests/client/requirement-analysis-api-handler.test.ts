@@ -20,9 +20,25 @@ import { ThreadStore } from "../../apps/desktop/client/src/threads/threadStore.t
 import { ThreadQueueDispatcher } from "../../apps/desktop/client/src/queue/threadQueueDispatcher.ts";
 import { waitForOrdinaryTurnExecution } from "../../apps/desktop/client/src/app/ordinaryTurnExecution.ts";
 import { flushClientLogger, logger } from "../../apps/desktop/client/src/logger.ts";
-import { initializeLocalEngineModelCatalog, resetEngineModelCatalogRuntimeForTest } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
 
-test.beforeEach(() => initializeLocalEngineModelCatalog());
+test.beforeEach(() => setEngineModelCatalogCustomModels([
+  ...[
+    { modelId: "gpt-5.5", contextWindow: 1_000_000, defaultEffort: "high" as const, efforts: ["low", "medium", "high", "xhigh", "max"] as const },
+    { modelId: "gpt-5.6-sol", contextWindow: 1_000_000, defaultEffort: "medium" as const, efforts: ["low", "medium", "high", "xhigh", "max"] as const },
+  ].map(({ modelId, contextWindow, defaultEffort, efforts }) => ({
+    id: `test:codex:${modelId}`, engine: "codex" as const, providerId: "openai" as const, modelId, displayName: modelId,
+    inputModalities: ["text" as const], supportedReasoningEfforts: efforts.map(reasoningEffort => ({ reasoningEffort, description: "" })),
+    defaultReasoningEffort: defaultEffort, contextWindow, maxContextWindow: 1_000_000,
+    supportsFastMode: true, supports1MContext: true, enabled: true, createdAt: 1, updatedAt: 1,
+  })),
+  ...["kimi-k2.7-code", "kimi-k2.7-code-highspeed"].map(modelId => ({
+    id: `test:claude:${modelId}`, engine: "claude" as const, providerId: "moonshot" as const, modelId, displayName: modelId,
+    inputModalities: ["text" as const], supportedReasoningEfforts: [], defaultReasoningEffort: null,
+    contextWindow: 256_000, maxContextWindow: null, supportsFastMode: false, supports1MContext: false,
+    enabled: true, createdAt: 1, updatedAt: 1,
+  })),
+]));
 test.afterEach(() => resetEngineModelCatalogRuntimeForTest());
 
 function buildPhasingAssessment(summary: string) {
@@ -490,7 +506,7 @@ test("handleApiRequest 让 requirement-analysis thread 复用 threads.sendMessag
       contextWindow: 300_000,
       serviceTier: "fast",
     });
-    assert.equal(sendRes.status, 200);
+    assert.equal(sendRes.status, 200, JSON.stringify(sendRes.body));
     await harness.flushAsync();
     assert.equal(harness.getSendMessageInputs()[0]?.contextWindow, 300_000);
     assert.equal(harness.getSendMessageInputs()[0]?.serviceTier, "fast");
@@ -1852,7 +1868,7 @@ test("threads.updatePrefs 拒绝具体模型不支持的显式 effort 且不改�
     });
     assert.equal(acceptedAfterModelReset.status, 200);
     const resetThread = harness.db.threads.get(defaultModelThreadId as any);
-    assert.equal(resetThread?.model, "claude-fable-5");
+    assert.equal(resetThread?.model, "claude-fable-5-2");
     assert.equal(resetThread?.effort, "medium");
 
     const response = await harness.call("threads.updatePrefs", {
@@ -1951,7 +1967,7 @@ test("threads.updatePrefs 的 partial prefs 不会把省略的模型字段重置
       title: "partial API 偏好",
       threadType: "chat",
       initialPrefs: {
-        model: "gpt-5.5",
+        model: "gpt-6.2-astra",
         effort: "high",
         accessMode: "full-access",
         planMode: true,
@@ -1971,9 +1987,9 @@ test("threads.updatePrefs 的 partial prefs 不会把省略的模型字段重置
     assert.equal(updateRes.status, 200);
 
     const storedThread = harness.db.threads.get(threadId as any);
-    assert.equal(storedThread?.model, "gpt-5.5");
+    assert.equal(storedThread?.model, "gpt-6.2-astra");
     assert.equal(storedThread?.effort, "medium");
-    assert.equal(storedThread?.contextWindow, 272_000);
+    assert.equal(storedThread?.contextWindow, 872_000);
     assert.equal(storedThread?.serviceTier, "fast");
     assert.equal(storedThread?.planMode, true);
     assert.equal(storedThread?.roleId, "role-prefs-api");
@@ -2005,8 +2021,8 @@ test("threads.updatePrefs 保留显式 model null 的恢复默认语义", async 
     assert.equal(updateRes.status, 200);
 
     const storedThread = harness.db.threads.get(threadId as any);
-    assert.equal(storedThread?.model, "gpt-5.6-sol");
-    assert.equal(storedThread?.contextWindow, 372_000);
+    assert.equal(storedThread?.model, "gpt-6.2-sol");
+    assert.equal(storedThread?.contextWindow, 872_000);
     assert.equal(storedThread?.effort, "ultra");
     assert.equal(storedThread?.serviceTier, "fast");
   } finally {
@@ -2355,7 +2371,7 @@ test("threads.create 会把 node-discussion 初始偏好锁定为只读讨论模
       threadType: "chat",
       threadSubtype: "node-discussion",
       initialPrefs: {
-        model: "gpt-5.5",
+        model: "gpt-6.2-sol",
         effort: "high",
         accessMode: "full-access",
         planMode: true,
@@ -2365,7 +2381,7 @@ test("threads.create 会把 node-discussion 初始偏好锁定为只读讨论模
 
     const storedThread = harness.db.threads.get(threadId as any);
     assert.equal(storedThread?.threadSubtype, "node-discussion");
-    assert.equal(storedThread?.model, "gpt-5.5");
+    assert.equal(storedThread?.model, "gpt-6.2-sol");
     assert.equal(storedThread?.effort, "high");
     assert.equal(storedThread?.accessMode, "read-only");
     assert.equal(storedThread?.planMode, false);

@@ -13,13 +13,6 @@ import { logger } from "../../apps/desktop/client/src/logger.ts";
 import { ClaudeThreadSession } from "../../apps/desktop/client/src/engines/claude/claudeThreadSession.ts";
 import { testEngineWorkspaceLog } from "../../apps/desktop/client/tests/engine-workspace-log-fixture.ts";
 import { ActiveTurnInputClosedError } from "../../apps/desktop/client/src/engines/threadSession.ts";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "../../packages/shared/src/engineModelCatalogSeed.ts";
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION } from "../../packages/shared/src/index.ts";
-
-test.before(() => applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 0, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] }));
-test.after(() => resetEngineModelCatalogRuntimeForTest());
-
 /** 排空测试自有资源并保全全部收尾错误，不覆盖测试本身已报告的断言。 */
 async function cleanupResources(actions: Array<() => void | Promise<unknown>>): Promise<void> {
   const errors: unknown[] = [];

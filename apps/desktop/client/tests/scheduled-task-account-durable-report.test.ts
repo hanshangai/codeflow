@@ -12,10 +12,9 @@ import { ScheduledTaskScheduler, toErrorLog } from "../src/scheduled-tasks/sched
 import { handleScheduledTaskRunNow } from "../src/app/handlers/scheduledTaskHandlers.js";
 import { logger } from "../src/logger.js";
 import { scheduledTaskAccountRuntimeKey } from "../src/db/repos/scheduledTaskRuntimeStateRepo.js";
-import { applyEngineModelCatalogSnapshot, cancelEngineModelCatalogDispatchPause, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
 import { OrchestrationEngine } from "../src/orchestration/orchestrationEngine.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
 import { openSqliteDb } from "../src/db/sqliteDb.js";
 import { WorkspaceOperationGate } from "../src/workspace-migration/workspaceOperationGate.js";
 import { ClientDbWriterService } from "../src/db/clientDbWriterService.js";
@@ -349,7 +348,6 @@ test("D08 原 workflow 迁移延期变型为 script 后仍消费 W 原计划点"
 /** 固定资产输入，保留真实实例创建、原引擎执行与物理 runtime 路由。 */
 function installWorkflow(f: Parameters<Parameters<typeof fixture>[1]>[0]) {
   resetEngineModelCatalogRuntimeForTest();
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
   const workflowId = "d08-workflow", starts: string[] = [];
   f.apiContext.orchAssetLaunchSnapshot = { createFromWorkflowId: (workspaceId: WorkspaceId) => {
     const workflow = { id: workflowId, workspaceId, family: "feature-dev", name: "d08", description: "d08", version: 1,
@@ -790,44 +788,6 @@ test("派发拒绝日志写入失败保双因并显式失败，原running保留�
     assert.equal(f.db.scheduledTaskRuntimeStates.get(scheduledTaskAccountRuntimeKey(TASK, OWNER))?.runningRunId, runId);
     assert.equal(f.reports.some(body => body.run?.status === "failed"), false);
   } finally { release(); await running; }
-}));
-
-for (const change of ["disabled", "deleted"] as const) for (const phase of ["waiting", "started"] as const) test(`流程 ${phase} 时完整快照 ${change}：仅阻止新派发，已派发自然收尾`, async t => fixture(t, async f => {
-  resetEngineModelCatalogRuntimeForTest();
-  t.after(() => resetEngineModelCatalogRuntimeForTest());
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] }, Date.now(), "dispatch-pause");
-  const workspaceId = "dispatch-workspace" as WorkspaceId;
-  f.db.workspaces.upsert({ id: workspaceId, title: "dispatch", path: f.root }); f.apiContext.workspaces.set(workspaceId, f.root);
-  const workflow = { id: "dispatch-workflow", workspaceId, family: "feature-dev", name: "dispatch", description: "dispatch", version: 1,
-    nodes: [{ id: "start", type: "start", label: "start", position: { x: 0, y: 0 } }, { id: "end", type: "end", label: "end", position: { x: 100, y: 0 } }],
-    edges: [{ id: "start-end", sourceNodeId: "start", targetNodeId: "end", dataMappings: [] }] };
-  const snapshot = { authorityMode: "server", workflow: { assetType: "workflow", assetId: workflow.id, definition: workflow,
-    source: { authorityMode: "server", metadata: { revision: 1, scopeType: "user", syncChangeSeq: 1, contentHash: "a".repeat(64), cacheStatus: "ready" } } },
-    roles: {}, knowledgeBundles: {}, toolsets: {}, skills: {} } as unknown as OrchestrationAssetRuntimeSnapshot;
-  // 固定资产输入，实例创建与引擎执行仍走原实现。
-  f.apiContext.orchAssetLaunchSnapshot = { createFromWorkflowId: () => snapshot } as unknown as ApiHandlerContext["orchAssetLaunchSnapshot"];
-  const engine = new OrchestrationEngine({ db: f.db.forWorkspace(workspaceId), threads: new ThreadStore(), sessions: {} as any, workspaces: f.apiContext.workspaces,
-    timeoutPolicy: { mode: "activity", startupTimeoutMs: 1000, engineIdleTimeoutMs: 1000 }, emitConversation() {}, emitRaw() {} });
-  let started = false, releaseStart!: () => void;
-  const heldStart = new Promise<void>(resolve => { releaseStart = resolve; });
-  if (phase === "started") {
-    const start = engine.start.bind(engine);
-    t.mock.method(engine, "start", async (...args: Parameters<typeof engine.start>) => { await start(...args); started = true; await heldStart; });
-    cancelEngineModelCatalogDispatchPause("dispatch-pause");
-  }
-  f.apiContext.orchEngine = engine; f.remote.terminalFails = false;
-  const config = { ...task(), taskType: "workflow", payload: { workflowId: workflow.id, contextWorkspaceId: workspaceId } } as ScheduledTask;
-  f.remote.tasks = [config];
-  const running = f.scheduler.runNow(TASK).then(value => ({ value }), error => ({ error }));
-  try {
-    await waitFor(() => phase === "started" ? started : f.reports.some(body => body.run?.status === "running")); await new Promise(setImmediate);
-    f.remote.tasks = change === "deleted" ? [] : [{ ...config, enabled: false }]; await f.scheduler.sync("observed-during-model-wait");
-    cancelEngineModelCatalogDispatchPause("dispatch-pause"); releaseStart(); const result = await running;
-    assert.ok("value" in result); assert.equal(result.value?.status, phase === "waiting" ? "failed" : "success");
-    const instances = f.db.forWorkspace(workspaceId).orchInstances.listByWorkspace(workspaceId);
-    if (phase === "waiting") { assert.match(result.value?.errorMessage ?? "", /SCHEDULED_TASK_ACCOUNT_UNAVAILABLE/); assert.deepEqual(instances, []); }
-    else { assert.equal(instances.length, 1); assert.equal(instances[0]?.status, "completed"); assert.equal(result.value?.workflowInstanceId, instances[0]?.id); }
-  } finally { cancelEngineModelCatalogDispatchPause("dispatch-pause"); releaseStart(); await running; await engine.waitForInFlightWork(); resetEngineModelCatalogRuntimeForTest(); }
 }));
 
 for (const change of ["disabled", "deleted"] as const) test(`执行中完整快照 ${change} 后自然成功，停用可补报、删除不补报`, async t => fixture(t, async f => {

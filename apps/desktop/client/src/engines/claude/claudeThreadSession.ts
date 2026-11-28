@@ -33,7 +33,6 @@ import {
 } from "../assistantLifecycle.js";
 import { buildClaudeArgs, buildSingleModelProviderRuntimeEnv, CLAUDE_FIXED_PROMPT_CACHING_ENV, resolveClaudeCli, resolveClaudeLaunchModelId, resolveClaudeModelRuntimeEnv, resolveClaudeModelSettingsEnv, shouldClaudeForceSandboxEnv } from "./claudeCli.js";
 import {
-  acquireEngineModelCatalogDispatchLease,
   assertRuntimeEngineModelAvailable,
   resolveRuntimeEngineModelProviderId,
 } from "../engineModelCatalogRuntime.js";
@@ -433,7 +432,6 @@ export class ClaudeThreadSession implements ThreadEngineSession {
     const requestId = appendSystemPromptFile?.requestId ?? `claude-turn:${randomUUID()}`;
     let stage = "prepare";
     let platformToolBridge: ClaudePlatformToolBridge | null = null;
-    let catalogDispatchLease: Awaited<ReturnType<typeof acquireEngineModelCatalogDispatchLease>> | null = null;
     let primaryFailure: { error: unknown } | undefined;
     const secondaryErrors: unknown[] = [];
     let response: { responseText: string } | undefined;
@@ -504,8 +502,6 @@ export class ClaudeThreadSession implements ThreadEngineSession {
     this.currentPlatformToolNames = new Set(platformToolBridge?.toolNames ?? []);
     stage = "model_args";
     let args: string[];
-      // 获取租约同样可能失败，必须进入工具桥和提示文件的清理边界。
-      catalogDispatchLease = await acquireEngineModelCatalogDispatchLease({ engine: "claude", model: input.model });
       assertDispatchCurrent();
       assertRuntimeEngineModelAvailable("claude", input.model);
       args = buildClaudeArgs({
@@ -608,9 +604,6 @@ export class ClaudeThreadSession implements ThreadEngineSession {
       providerChild = child;
       appendSystemPromptFile?.bindChild(child, childFacts);
       childForPlatformTools = child;
-      const dispatchLease = catalogDispatchLease;
-      catalogDispatchLease = null;
-      dispatchLease.release();
     const runToken = ++this.lifecycleToken;
     const stdinLifecycle = new ClaudeStdinLifecycle();
 
@@ -1297,7 +1290,6 @@ export class ClaudeThreadSession implements ThreadEngineSession {
       primaryFailure = { error };
     }
     appendSystemPromptFile?.prepare();
-    try { catalogDispatchLease?.release(); } catch (error) { secondaryErrors.push(error); }
     let stopFailed = false;
     if (boundary.stopping) {
       try { await boundary.stopping; }

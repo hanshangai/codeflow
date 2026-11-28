@@ -396,15 +396,10 @@ const candidateActionsHint = computed(() => {
   if (selectedCount.value === 0 && readyCount.value === 0 && pendingCount.value > 0) return "";
   return createDisabledReason.value;
 });
-const catalogSyncBlocked = computed(() => {
-  const state = engines.byWorkspaceId[String(props.workspaceId)]?.hostCatalogSyncState ?? null;
-  return state === "waiting" || state === "unsupported" || state === "offline";
-});
 const canSubmitClarification = computed(() =>
   Boolean(selectedThreadId.value)
   && !selectedSessionReadOnly.value
   && !selectedConversation.value?.invalidated
-  && !catalogSyncBlocked.value
   && !selectedRunningTurnId.value,
 );
 const clarificationBatchSending = computed(() =>

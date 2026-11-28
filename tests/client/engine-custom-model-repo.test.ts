@@ -8,6 +8,9 @@ import { migrateClientDb } from "../../apps/desktop/client/src/db/migrateClientD
 import { EngineCustomModelRepo } from "../../apps/desktop/client/src/db/repos/engineCustomModelRepo.ts";
 import { openSqliteDb } from "../../apps/desktop/client/src/db/sqliteDb.ts";
 import { assertClientReasoningEffortSupported } from "../../apps/desktop/client/src/engines/engineModelCapabilities.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
+
+test.afterEach(() => resetEngineModelCatalogRuntimeForTest());
 
 function withRepo(fn: (repo: EngineCustomModelRepo) => void): void {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codeflowai-engine-model-repo-"));
@@ -77,19 +80,44 @@ test("EngineCustomModelRepo persists configured effort metadata", () => {
 });
 
 test("Client effort validation resolves custom model 1M aliases through base metadata", () => {
-  withRepo((repo) => {
-    repo.insert({
-      engine: "claude",
-      providerId: "anthropic",
-      modelId: "vendor/custom-long-context",
-      displayName: "Custom Long Context",
-      supportedReasoningEfforts: ["low"],
-      defaultReasoningEffort: "low",
-      contextWindow: 200_000,
-      supports1MContext: true,
-      maxContextWindow: 1_000_000,
-    });
-    const capabilityDb = { engineCustomModels: repo };
+  withRepo(() => {
+    setEngineModelCatalogCustomModels([
+      {
+        id: "test:claude:vendor/custom-long-context",
+        engine: "claude",
+        providerId: "anthropic",
+        modelId: "vendor/custom-long-context",
+        displayName: "Custom Long Context",
+        inputModalities: ["text"],
+        supportedReasoningEfforts: [{ reasoningEffort: "low", description: "" }],
+        defaultReasoningEffort: "low",
+        contextWindow: 200_000,
+        maxContextWindow: 1_000_000,
+        supportsFastMode: false,
+        supports1MContext: true,
+        enabled: true,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+      {
+        id: "test:claude:vendor/custom-fixed-1m",
+        engine: "claude",
+        providerId: "anthropic",
+        modelId: "vendor/custom-fixed-1m",
+        displayName: "Custom Fixed 1M",
+        inputModalities: ["text"],
+        supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }],
+        defaultReasoningEffort: "high",
+        contextWindow: 1_000_000,
+        maxContextWindow: null,
+        supportsFastMode: false,
+        supports1MContext: true,
+        enabled: true,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]);
+    const capabilityDb = {};
 
     assert.doesNotThrow(() => assertClientReasoningEffortSupported(
       capabilityDb,
@@ -107,15 +135,6 @@ test("Client effort validation resolves custom model 1M aliases through base met
       /vendor\/custom-long-context.*high/,
     );
 
-    repo.insert({
-      engine: "claude",
-      providerId: "anthropic",
-      modelId: "vendor/custom-fixed-1m",
-      displayName: "Custom Fixed 1M",
-      supportedReasoningEfforts: ["high"],
-      defaultReasoningEffort: "high",
-      contextWindow: 1_000_000,
-    });
     assert.doesNotThrow(() => assertClientReasoningEffortSupported(
       capabilityDb,
       "claude",
@@ -140,7 +159,7 @@ test("EngineCustomModelRepo rejects built-in and invalid provider definitions", 
       () => repo.insert({
         engine: "codex",
         providerId: "openai",
-        modelId: "gpt-5.5",
+        modelId: "gpt-6.2-sol",
         displayName: "Duplicate Builtin",
       }),
       /内置目录/,

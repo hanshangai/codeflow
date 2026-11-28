@@ -64,13 +64,15 @@ export type EngineModelInfo = {
   defaultReasoningEffort?: ReasoningEffort | null;
   /** 可选：输入模态（用于判断图片输入是否可用）。 */
   inputModalities?: InputModality[];
-  /** 模型基础容量（token 数）；未声明最大容量时使用。 */
+  /** 会话目录容量（token 数）；未声明最大容量时使用。 */
   contextWindow?: number;
+  /** 供应商明确声明的基础窗口，用于展示。 */
+  baseContextWindow?: number;
   /** Codex 专属：是否支持 Fast mode 服务档位。 */
   supportsFastMode?: boolean;
   /** 是否支持扩展上下文（1M beta） */
   supports1MContext?: boolean;
-  /** 模型最大上下文容量；会话自动使用，省略时使用基础容量。 */
+  /** 模型最大上下文容量；会话自动使用，省略时使用 contextWindow。 */
   maxContextWindow?: number;
   /** 实际输入上下文超过此 token 数时按双倍计费；仅用于显示上游计费规则。 */
   doubleBillingThreshold?: number | null;

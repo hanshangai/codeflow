@@ -40,61 +40,6 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   return parsed as Record<string, unknown>;
 }
 
-// ===== 引擎模型目录（helloAck 下发；没有它 Web 侧无法新建会话） =====
-
-/** 与 Client 一致的目录快照：每引擎至少一行、恰有一个 isDefault、sortOrder 从 1 连续递增。 */
-const mockEngineModelCatalog = {
-  schemaVersion: "engine-model-catalog/v1",
-  configVersion: 1,
-  capturedAt: 1,
-  rows: [
-    {
-      catalogItemId: "e2e-openai-gpt-5-codex",
-      engine: "codex",
-      providerId: "openai",
-      providerLabel: "OpenAI",
-      modelId: "gpt-5-codex",
-      displayName: "GPT-5 Codex",
-      description: "E2E 默认 Codex 模型",
-      inputModalities: ["text", "image"],
-      supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "默认" }],
-      defaultReasoningEffort: "medium",
-      contextWindow: 272000,
-      maxContextWindow: null,
-      supportsFastMode: true,
-      supports1MContext: false,
-      isDefault: true,
-      sortOrder: 1,
-      runtimeProfileId: "native",
-      transportModelId: "gpt-5-codex",
-      fastTaskModelId: null,
-      subagentModelId: null,
-    },
-    {
-      catalogItemId: "e2e-anthropic-claude-sonnet-5",
-      engine: "claude",
-      providerId: "anthropic",
-      providerLabel: "Anthropic",
-      modelId: "claude-sonnet-5",
-      displayName: "Claude Sonnet 5",
-      description: "E2E 默认 Claude 模型",
-      inputModalities: ["text", "image"],
-      supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "默认" }],
-      defaultReasoningEffort: "medium",
-      contextWindow: 200000,
-      maxContextWindow: null,
-      supportsFastMode: false,
-      supports1MContext: false,
-      isDefault: true,
-      sortOrder: 1,
-      runtimeProfileId: "native",
-      transportModelId: "claude-sonnet-5",
-      fastTaskModelId: null,
-      subagentModelId: null,
-    },
-  ],
-};
-
 // ===== 会话内存态（threads REST 端点 + conversation.event 推送共用） =====
 
 type MockThread = {
@@ -442,7 +387,6 @@ function handleWsUpgrade(req: IncomingMessage, socket: Duplex): void {
     homePath: identity.homePath,
     userSummary: identity.userSummary,
     accessContext: identity.accessContext,
-    engineModelCatalog: mockEngineModelCatalog,
   });
   sendWs(conn, buildPresencePayload());
   socket.on("data", (chunk: Buffer) => {
@@ -683,14 +627,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (req.method === "GET" && url.pathname === "/api/engines/status") {
     sendJson(res, 200, {
       ok: true,
-      // 目录版本必须与 helloAck 下发的 mockEngineModelCatalog 对齐并声明 Host 已应用；
-      // 缺失时 Web 侧判定 hostCatalogSyncState=waiting，会让整个输入框（含工具栏）禁用。
-      catalogVersion: mockEngineModelCatalog.configVersion,
-      hostAppliedCatalogVersion: mockEngineModelCatalog.configVersion,
-      hostCatalogSyncState: "applied",
       engines: [
-        { engineType: "codex", installed: true, version: "0.1.0", binPath: null, features: {}, models: [], providerCredentialStatus: [{ providerId: "openai", available: true, sources: [], message: null }], error: null },
-        { engineType: "claude", installed: true, version: "0.1.0", binPath: null, features: {}, models: [], providerCredentialStatus: [{ providerId: "anthropic", available: true, sources: [], message: null }], error: null },
+        { engineType: "codex", installed: true, version: "0.1.0", binPath: null, features: {}, models: [{ id: "gpt-6.2-sol", displayName: "GPT-6.2 Sol", providerId: "openai", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }], defaultReasoningEffort: "high" }], providerCredentialStatus: [{ providerId: "openai", available: true, sources: [], message: null }], error: null },
+        { engineType: "claude", installed: true, version: "0.1.0", binPath: null, features: {}, models: [{ id: "claude-fable-5-2", displayName: "Claude Fable 5.2", providerId: "anthropic", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }], defaultReasoningEffort: "high" }], providerCredentialStatus: [{ providerId: "anthropic", available: true, sources: [], message: null }], error: null },
       ],
     });
     return;

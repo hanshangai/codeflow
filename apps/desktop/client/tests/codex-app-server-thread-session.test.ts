@@ -6,7 +6,6 @@ import type { ConversationEventInput, SessionId, TurnId, WorkspaceId } from "@co
 
 import { buildCodexDeveloperInstructions, CodexAppServerThreadSession } from "../src/engines/codex-app-server/codexAppServerThreadSession.ts";
 import * as catalog from "../src/engines/engineModelCatalogRuntime.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
 import { buildCodexDynamicToolNameByToolId } from '../src/engines/codex-app-server/codexAppServerProtocol.js';
 
 test("Codex 原生提问提示只在允许交互时要求使用结构化问题", () => {
@@ -90,21 +89,11 @@ test('revoked builtin Codex credential blocks auxiliary engine operations before
   ]) await assert.rejects(operation(), error => error === denied);
 });
 
-/** 提供已确认的桌面云端补充目录，每项测试独立清理暂停态。 */
+/** 本地内置模型恒就绪；仅隔离自定义模型状态。 */
 function setupCompactCatalog(t: test.TestContext): void {
   catalog.resetEngineModelCatalogRuntimeForTest();
   t.after(() => catalog.resetEngineModelCatalogRuntimeForTest());
   catalog.initializeLocalEngineModelCatalog();
-  const base = INITIAL_ENGINE_MODEL_CATALOG_V1.find((row) => row.engine === "codex")!;
-  catalog.confirmEngineModelCatalogApplied(catalog.applyEngineModelCatalogSnapshot({
-    schemaVersion: "engine-model-catalog/v1",
-    configVersion: 1,
-    capturedAt: 1,
-    rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1, {
-      ...base, catalogItemId: "cloud-history", modelId: "cloud-history", displayName: "Cloud history",
-      isDefault: false, sortOrder: INITIAL_ENGINE_MODEL_CATALOG_V1.filter((row) => row.engine === "codex").length + 1,
-    }],
-  }, 1, "compact-test"));
 }
 
 test('accepted builtin turn retains its lease for continuous provider tool requests until natural completion', async t => {
@@ -233,22 +222,6 @@ test("Codex 正常完成与停止竞态复用已有终态证明，保存期间�
   assert.equal(requests.includes("turn/interrupt"), false);
 });
 
-test("Codex 历史云端模型在断连后拒绝压缩且不恢复 provider", async (t) => {
-  setupCompactCatalog(t);
-  catalog.pauseEngineModelCatalogDispatchForReconnect("disconnect");
-  const requests: string[] = [];
-  const session = createHistoricalCompactSession(async (method) => {
-    requests.push(method);
-    throw new Error("不应调用已暂停云端模型的 provider");
-  });
-  await assert.rejects(session.compactThread({
-    turnId: "turn-history-cloud-paused" as TurnId,
-    catalogModel: "cloud-history",
-  }, { conversation() {}, raw() {} }), (error: any) => error.code === "ENGINE_MODEL_NOT_AVAILABLE");
-  assert.deepEqual(requests, []);
-  assert.equal(session.hasActiveTurn(), false);
-});
-
 test("Codex 历史本地模型在断连后继续恢复且不覆盖 provider 模型参数", async (t) => {
   setupCompactCatalog(t);
   catalog.pauseEngineModelCatalogDispatchForReconnect("disconnect");
@@ -270,25 +243,6 @@ test("Codex 历史本地模型在断连后继续恢复且不覆盖 provider 模�
   const config = (requests[0]?.params as { config: Record<string, unknown> }).config;
   assert.equal(config.model_context_window, 1000000);
   assert.equal(config.model_auto_compact_token_limit, 800000);
-  assert.equal(session.hasActiveTurn(), false);
-});
-
-test("Codex 历史云端模型恢复期间断连会在 compact 启动前重新拒绝", async (t) => {
-  setupCompactCatalog(t);
-  const requests: string[] = [];
-  const session = createHistoricalCompactSession(async (method) => {
-    requests.push(method);
-    if (method === "thread/resume") {
-      catalog.pauseEngineModelCatalogDispatchForReconnect("disconnect");
-      return {};
-    }
-    throw new Error(`不应继续调用已暂停云端模型：${method}`);
-  });
-  await assert.rejects(session.compactThread({
-    turnId: "turn-history-cloud-disconnected" as TurnId,
-    catalogModel: "cloud-history",
-  }, { conversation() {}, raw() {} }), (error: any) => error.code === "ENGINE_MODEL_NOT_AVAILABLE");
-  assert.deepEqual(requests, ["thread/resume"]);
   assert.equal(session.hasActiveTurn(), false);
 });
 

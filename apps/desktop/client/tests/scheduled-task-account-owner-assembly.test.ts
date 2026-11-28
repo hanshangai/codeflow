@@ -7,7 +7,6 @@ import test from "node:test";
 import ts from "typescript";
 import { WebSocketServer } from "ws";
 import type { ScheduledTask, WorkflowId, WorkspaceId } from "@codeflowai/shared";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
 import { ScheduledTaskScheduler } from "../src/scheduled-tasks/scheduledTaskScheduler.js";
 import { createDesktopCloudAccount, type DesktopCloudAccountOwner } from "../src/runtime/desktopCloudAccount.js";
 import { createDesktopStartupRecovery } from "../src/runtime/desktopStartupRecovery.js";
@@ -18,7 +17,7 @@ import { listenLoopbackHttpServer } from "./helpers/listenLoopbackHttpServer.js"
 import { createScheduledWorkflowInstance } from "../src/app/handlers/orchestrationHandlers.js";
 import { OrchAssetAuthorityRuntimeReadService, createClientDbOrchAssetLegacyRuntimeReader } from "../src/orchestration/orchAssetAuthorityRuntimeReadService.js";
 import { OrchAssetLaunchSnapshotService } from "../src/orchestration/orchAssetLaunchSnapshotService.js";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
 
 /** 执行原 index 中的完整装配函数，不复制 getter 或启动真实 Client 服务。 */
 function assembly() {
@@ -125,7 +124,6 @@ test("index 桌面账号流程沿真实工作区落本机scope，账号任务不
     listAssets() { throw new Error("PERSONAL_FLOW_MUST_NOT_READ_SERVER"); }, getAsset() { throw new Error("PERSONAL_FLOW_MUST_NOT_READ_SERVER"); },
   }, { getRuntimeReadinessRequirement: () => null });
   resetEngineModelCatalogRuntimeForTest();
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
   const f = assembly(); f.state.desktop = true;
   f.state.desktopContext = { db: scoped, clientId: "client-1", workspaces: new Map([[workspaceId, root]]), orchAssetLaunchSnapshot: new OrchAssetLaunchSnapshotService(reader) } as ApiHandlerContext;
   const input = f.schedulerInput();

@@ -1,6 +1,5 @@
 export * from "./types/ids.js";
 export * from "./types/engine.js";
-export * from "./types/engineModelCatalog.js";
 export * from "./engineCatalog.js";
 export * from "./workspacePathIndexDefaults.js";
 export * from "./types/engineCall.js";

@@ -17,8 +17,7 @@ import { OrchestrationEngine } from "../src/orchestration/orchestrationEngine.js
 import { ThreadStore } from "../src/threads/threadStore.js";
 import { createClientDbOrchAssetLegacyRuntimeReader, OrchAssetAuthorityRuntimeReadService } from "../src/orchestration/orchAssetAuthorityRuntimeReadService.js";
 import { OrchAssetLaunchSnapshotService } from "../src/orchestration/orchAssetLaunchSnapshotService.js";
-import { applyEngineModelCatalogSnapshot, cancelEngineModelCatalogDispatchPause, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
+import { resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
 import { logger } from "../src/logger.js";
 import { createDesktopUpdateControl } from "../src/runtime/desktopUpdateControl.js";
 import { WorkspaceOperationGate } from "../src/workspace-migration/workspaceOperationGate.js";
@@ -530,7 +529,6 @@ test("本机任务不能使用其他设备或非真实本机工作区", async ()
 /** 使用真实本机资产 Reader、完整启动图和编排引擎，流程本身无需外部模型进程。 */
 function installWorkflow(f: ReturnType<typeof createFixture>): OrchestrationEngine {
   resetEngineModelCatalogRuntimeForTest();
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
   const workflowId = "local-workflow" as WorkflowId;
   f.db.orchWorkflows.upsert({ id: workflowId, workspaceId: WORKSPACE, family: "feature-dev", name: "本机流程", description: "local workflow", version: 1,
     nodes: [{ id: "start", type: "start", label: "start", position: { x: 0, y: 0 } }, { id: "end", type: "end", label: "end", position: { x: 100, y: 0 } }],
@@ -562,24 +560,6 @@ test("本机流程复用完整本机图和真实后台启动，受理历史记�
     await engine.waitForInFlightWork();
     assert.equal(f.db.scheduledTaskRuns.get(run.id)?.status, "success");
   } finally { await engine.waitForInFlightWork(); resetEngineModelCatalogRuntimeForTest(); }
-}));
-
-test("本机模型准备沿原 owner：稍后保留运行，确认打断等待且零迟到实例", async () => fixture(async f => {
-  const engine = installWorkflow(f);
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] }, Date.now(), "local-update-wait");
-  const running = f.scheduler.runLocalNow("task-1");
-  try {
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(f.db.scheduledTaskRuns.list({}).items[0].status, "running");
-    assert.equal(f.scheduler.hasInFlightWork(), true);
-    f.scheduler.beginUpdateStop("local-update-confirmed");
-    await f.scheduler.stopForUpdate({ requestId: "local-update-confirmed", timeoutMs: 2_000 });
-    assert.equal((await running).status, "failed");
-    assert.equal(f.db.scheduledTaskRuns.list({}).items[0].errorMessage, "SCHEDULED_TASK_INTERRUPTED_FOR_UPDATE");
-    cancelEngineModelCatalogDispatchPause("local-update-wait");
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(f.db.orchInstances.listByWorkspace(WORKSPACE).length, 0);
-  } finally { cancelEngineModelCatalogDispatchPause("local-update-wait"); await running; await engine.waitForInFlightWork(); resetEngineModelCatalogRuntimeForTest(); }
 }));
 
 test("本机事务日志保留领域原因码和内部 cause，不输出 SQL/脚本正文", async t => fixture(async ({ db, appDb, scheduler }) => {
@@ -864,28 +844,3 @@ for (const change of ["disable", "delete"] as const) test(`本机迁移延期 ${
   assert.equal(fs.existsSync(path.join(f.root, "executed")), false);
 }));
 
-test("本机模型准备由原更新 control 执行 prepare、稍后与确认", async () => fixture(async f => {
-  const engine = installWorkflow(f);
-  f.db.scheduledTaskConfigs.update({ config: config({ taskType: "workflow", missedPolicy: "run_once_on_reconnect",
-    payload: { contextWorkspaceId: WORKSPACE, workflowId: "local-workflow" as WorkflowId } }), expectedRevision: 1, at: 2 });
-  const control = createDesktopUpdateControl({ context: f.ctx, requestId: "local-control", timeoutMs: 2_000, scheduledTaskScheduler: f.scheduler,
-    queueDispatcher: { hasInFlightWork: () => false, assertNoFailure() {}, resumeWorkspace() {} }, terminalManager: { hasRunningTerminals: () => false, stopAllForUpdate: async () => {} },
-    hasBlockingTransaction: () => false, hasKnowledgeWork: () => false, stopKnowledgeWork: async () => {}, hasAssetDraftWork: () => false,
-    stopAssetDraftWork: async () => {}, interruptTurn: async () => {} });
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] }, Date.now(), "local-control-wait");
-  const running = f.scheduler.runLocalNow("task-1");
-  try {
-    await new Promise(resolve => setImmediate(resolve));
-    f.pause(true);
-    assert.deepEqual(await control.prepare!(), { hasRunningSessions: true });
-    await assert.rejects(f.scheduler.runLocalNow("task-1"), { code: "DESKTOP_UPDATE_TASKS_PAUSED" });
-    f.pause(false); await control.resume!();
-    await f.scheduler.syncAndTick("after-later");
-    assert.equal(f.db.scheduledTaskRuns.list({}).items[0].status, "running");
-    f.pause(true); await control.prepare!(); await control.interrupt!();
-    assert.equal((await running).status, "failed");
-    cancelEngineModelCatalogDispatchPause("local-control-wait");
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(f.db.orchInstances.listByWorkspace(WORKSPACE).length, 0);
-  } finally { cancelEngineModelCatalogDispatchPause("local-control-wait"); await running; await engine.waitForInFlightWork(); resetEngineModelCatalogRuntimeForTest(); }
-}));

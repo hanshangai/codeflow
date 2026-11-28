@@ -14,10 +14,6 @@ import { handleChatWorkflowRequest } from "../../apps/desktop/client/src/app/han
 import { ThreadQueueDispatcher } from "../../apps/desktop/client/src/queue/threadQueueDispatcher.ts";
 import { ThreadStore } from "../../apps/desktop/client/src/threads/threadStore.ts";
 import { setTimeout as delay } from "node:timers/promises";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "../../packages/shared/src/engineModelCatalogSeed.ts";
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION } from "../../packages/shared/src/index.ts";
-
 type Harness = ReturnType<typeof harness>;
 
 function prepareAction(h: Harness, requestId = "start"): ChatWorkflowActionInput {
@@ -377,8 +373,6 @@ test("shared refusal retains authenticated actor and shared write context when q
 });
 
 test("dismissal reaches the normal provider send after an active turn ends", async t => {
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 0, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
-  t.after(() => resetEngineModelCatalogRuntimeForTest());
   const h = harness(t);
   const rec = h.recommend();
   const providerInputs: any[] = [];

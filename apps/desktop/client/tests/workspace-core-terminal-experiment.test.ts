@@ -5,9 +5,9 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION, type ControlledExperimentRunStartRpcRequest, type WorkspaceId } from "@codeflowai/shared";
+import { type ControlledExperimentRunStartRpcRequest, type WorkspaceId } from "@codeflowai/shared";
 import { openClientDb } from "../src/db/clientDb.js";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../src/engines/engineModelCatalogRuntime.js";
 import { ControlledExperimentExecutor } from "../src/experiments/controlledExperimentExecutor.js";
 import { handleControlledExperimentRunStatus } from "../src/app/handlers/controlledExperimentHandlers.js";
 import type { ApiHandlerContext } from "../src/app/handleApiRequest.js";
@@ -169,17 +169,14 @@ function experimentFixture(t: test.TestContext) {
     fs.mkdirSync(directory); workspaces.set(workspaceId, directory);
     db.workspaces.upsert({ id: workspaceId, title: name, path: directory });
   }
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1,
-    rows: [{ catalogItemId: "workspace-test-model", engine: "claude", providerId: "anthropic", providerLabel: "Anthropic",
-      modelId: "claude-test", displayName: "Test", description: "", inputModalities: ["text"], supportedReasoningEfforts: [],
-      defaultReasoningEffort: null, contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false,
-      supports1MContext: false, isDefault: true, sortOrder: 1, runtimeProfileId: "native", transportModelId: null,
-      fastTaskModelId: null, subagentModelId: null },
-    { catalogItemId: "workspace-test-codex", engine: "codex", providerId: "openai", providerLabel: "OpenAI",
-      modelId: "codex-test", displayName: "Codex Test", description: "", inputModalities: ["text"], supportedReasoningEfforts: [],
-      defaultReasoningEffort: null, contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false,
-      supports1MContext: false, isDefault: true, sortOrder: 1, runtimeProfileId: "native", transportModelId: null,
-      fastTaskModelId: null, subagentModelId: null }] });
+  setEngineModelCatalogCustomModels([
+    { id: "workspace-test-model", engine: "claude", providerId: "anthropic", modelId: "claude-test", displayName: "Test",
+      inputModalities: ["text"], supportedReasoningEfforts: [], defaultReasoningEffort: null, contextWindow: 200_000,
+      maxContextWindow: null, supportsFastMode: false, supports1MContext: false, enabled: true, createdAt: 1, updatedAt: 1 },
+    { id: "workspace-test-codex", engine: "codex", providerId: "openai", modelId: "codex-test", displayName: "Codex Test",
+      inputModalities: ["text"], supportedReasoningEfforts: [], defaultReasoningEffort: null, contextWindow: 200_000,
+      maxContextWindow: null, supportsFastMode: false, supports1MContext: false, enabled: true, createdAt: 1, updatedAt: 1 },
+  ]);
   db.engineKeys.insert({ label: "测试", engine: "claude", providerId: "anthropic", apiKey: "local-test-key" });
   const inputSha256 = "1".repeat(64), configSha256 = hash(JSON.stringify({ engine: "claude", model: "claude-test", effort: null, providerId: "anthropic" }));
   for (const workspaceId of workspaces.keys()) db.forWorkspace(workspaceId).controlledExperiments.commitFreeze({ experimentId: "same-experiment", freezeRevision: 1,

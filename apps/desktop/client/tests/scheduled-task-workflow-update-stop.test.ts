@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { getEventListeners } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -8,15 +7,12 @@ import test from "node:test";
 import type { OrchestrationAssetRuntimeSnapshot, OrchestrationId, ScheduledTask, ScheduledTaskRun, WorkspaceId } from "@codeflowai/shared";
 import type { ApiHandlerContext } from "../src/app/handleApiRequest.js";
 import { openClientDb } from "../src/db/clientDb.js";
-import { applyEngineModelCatalogSnapshot, cancelEngineModelCatalogDispatchPause, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
 import { createDesktopUpdateControl } from "../src/runtime/desktopUpdateControl.js";
 import { ScheduledTaskScheduler } from "../src/scheduled-tasks/scheduledTaskScheduler.js";
 import { OrchestrationEngine } from "../src/orchestration/orchestrationEngine.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
 import { ScheduledTaskRuntimeStateRepo } from "../src/db/repos/scheduledTaskRuntimeStateRepo.js";
-
-const catalog = { schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] };
 
 /** 原失败可经存储边界包装；包括假值也必须留在完整 cause 链。 */
 function containsFailure(error: unknown, expected: unknown): boolean {
@@ -51,7 +47,6 @@ async function fixture(run: (f: {
   pause(value: boolean): void; run(): Promise<ScheduledTaskRun>; gate(): ReturnType<typeof deferred>;
 }) => Promise<void>, realEngine = false): Promise<void> {
   resetEngineModelCatalogRuntimeForTest();
-  applyEngineModelCatalogSnapshot(catalog);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cf-scheduled-workflow-update-"));
   const applicationDb = openClientDb({ dbPath: path.join(root, "client.db") });
   const workspaceId = "workflow-update-workspace" as WorkspaceId;
@@ -165,69 +160,6 @@ test("running ACK 在取消快照之后释放时零新实例且明确上报更�
   }, true);
 });
 
-test("模型目录仍暂停时确认可收口，恢复目录后零迟到派发", async () => {
-  await fixture(async f => {
-    applyEngineModelCatalogSnapshot(catalog, Date.now(), "catalog-paused");
-    const running = f.run();
-    await waitFor(() => f.reports.some(run => run.status === "running"));
-    await new Promise<void>(resolve => setImmediate(resolve));
-    f.pause(true); assert.equal((await f.control.prepare()).hasRunningSessions, true);
-    try { await f.control.interrupt(); }
-    finally { cancelEngineModelCatalogDispatchPause("catalog-paused"); }
-    assert.equal((await running).status, "failed");
-    await new Promise<void>(resolve => setImmediate(resolve));
-    assert.deepEqual(f.starts, []);
-    assert.equal(f.db.orchInstances.listByWorkspace("workflow-update-workspace").length, 0);
-  }, true);
-});
-
-test("账号在模型目录等待后失效不能创建流程实例", async () => {
-  await fixture(async f => {
-    applyEngineModelCatalogSnapshot(catalog, Date.now(), "stale-account-catalog");
-    const running = f.run(); await waitFor(() => f.reports.some(run => run.status === "running"));
-    f.hooks.accountCurrent = () => { throw Object.assign(new Error("controlled account stale"), { code: "SCHEDULED_TASK_ACCOUNT_STALE" }); };
-    cancelEngineModelCatalogDispatchPause("stale-account-catalog");
-    await assert.rejects(running); assert.deepEqual(f.starts, []);
-    assert.deepEqual(f.db.orchInstances.listByWorkspace("workflow-update-workspace"), []);
-  });
-});
-
-test("prepare 与稍后不取消已认领流程，目录恢复后恰好启动一次", async () => {
-  await fixture(async f => {
-    applyEngineModelCatalogSnapshot(catalog, Date.now(), "catalog-later");
-    const running = f.run();
-    await waitFor(() => f.reports.some(run => run.status === "running"));
-    f.pause(true); assert.equal((await f.control.prepare()).hasRunningSessions, true);
-    f.pause(false); await f.control.resume();
-    cancelEngineModelCatalogDispatchPause("catalog-later");
-    const result = await running;
-    assert.equal(result.status, "success");
-    assert.equal(f.starts.length, 1); assert.deepEqual(f.cancels, []);
-    assert.equal(result.workflowInstanceId, f.starts[0]);
-  });
-});
-
-test("更新打断模型等待后解绑监听，原目录迟到拒绝仍被受理且零实例", async t => {
-  await fixture(async f => {
-    const aborted = new Set<AbortSignal>(), listenerCounts: number[] = [], abort = AbortController.prototype.abort;
-    t.mock.method(AbortController.prototype, "abort", function (this: AbortController, reason?: unknown) {
-      aborted.add(this.signal); listenerCounts.push(getEventListeners(this.signal, "abort").length); return abort.call(this, reason);
-    });
-    applyEngineModelCatalogSnapshot(catalog, Date.now(), "catalog-late-rejection");
-    const running = f.run();
-    await waitFor(() => f.reports.some(run => run.status === "running"));
-    await new Promise<void>(resolve => setImmediate(resolve));
-    f.pause(true); await f.control.prepare(); await f.control.interrupt();
-    assert.equal((await running).status, "failed");
-    assert.equal(aborted.size, 1);
-    assert.equal(listenerCounts[0], 1);
-    for (const signal of aborted) assert.equal(getEventListeners(signal, "abort").length, 0);
-    resetEngineModelCatalogRuntimeForTest();
-    await new Promise<void>(resolve => setImmediate(resolve));
-    assert.deepEqual(f.starts, []);
-    assert.equal(f.scheduler.hasInFlightWork(), false);
-  }, true);
-});
 
 test("已建实例只沿 control 取消一次，原启动与最终上报收口后才停止终端", async () => {
   await fixture(async f => {

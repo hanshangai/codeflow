@@ -377,7 +377,6 @@ test("旧连接只丢弃连接级命令并继续交付 ACK 与定价更新", asy
   first.receive({ t: "client.helloAck" });
   first.receive({ t: "api.req", id: "stale-api" });
   first.receive({ t: "sharedWorkspace.command", requestId: "stale-command" });
-  first.receive({ t: "engine.models.updated", catalog: { configVersion: 8 } });
   first.receive({ t: "raw.eventAck", seq: 7 });
   first.receive({ t: "relay.pricing.updated", version: 9 });
   first.remoteClose(1006, "network reset with queued messages");
@@ -388,7 +387,6 @@ test("旧连接只丢弃连接级命令并继续交付 ACK 与定价更新", asy
   assert.ok(harness.diagnostics.some((message) => message.includes("discarded stale client.helloAck")));
   assert.ok(harness.diagnostics.some((message) => message.includes("discarded stale api.req")));
   assert.ok(harness.diagnostics.some((message) => message.includes("discarded stale sharedWorkspace.command")));
-  assert.ok(harness.diagnostics.some((message) => message.includes("discarded stale engine.models.updated")));
   harness.transport.stop();
 });
 
@@ -606,74 +604,6 @@ test("evidence 使用独立 FIFO，不被更早入队的大 bulk 帧阻塞", () 
   assert.deepEqual(
     business.filter((message) => message.evidenceSeq).map((message) => message.evidenceSeq),
     [1, 2, 3, 4, 5, 6],
-  );
-  harness.transport.stop();
-});
-
-test("模型目录应用 ACK 可在 hello 就绪前发送并由确认帧释放业务队列", async () => {
-  let harness!: Harness;
-  harness = createHarness(undefined, undefined, (data) => {
-    const message = typeof data === "string"
-      ? JSON.parse(data) as Record<string, unknown>
-      : data as Record<string, unknown>;
-    if (message.t === "engine.models.appliedConfirmed") harness.transport.markReady();
-  });
-  const socket = openSocket(harness, false);
-  const business = harness.transport.sendJson({ t: "api.req", id: "queued-before-catalog-confirmed" });
-  const receipt = harness.transport.sendJson({
-    t: "engine.models.applied",
-    ack: {
-      operationId: "hello-catalog-3",
-      configVersion: 3,
-      digest: "a".repeat(64),
-      appliedAt: 1,
-    },
-  });
-
-  assert.equal(business.accepted, true);
-  assert.equal(receipt.accepted, true);
-  assert.deepEqual(readTypes(socket), ["client.hello", "engine.models.applied"]);
-  socket.completeNext();
-  assert.deepEqual(
-    readTypes(socket),
-    ["client.hello", "engine.models.applied"],
-    "Server 确认目录回执前不得释放业务队列",
-  );
-
-  socket.receive({
-    t: "engine.models.appliedConfirmed",
-    operationId: "hello-catalog-3",
-    configVersion: 3,
-    digest: "a".repeat(64),
-  });
-  await nextImmediate();
-  drainSocket(socket);
-  assert.deepEqual(readTypes(socket), ["client.hello", "engine.models.applied", "api.req"]);
-  harness.transport.stop();
-});
-
-test("模型目录暂停 ACK 可在 hello 就绪前发送且不提前释放业务队列", () => {
-  const harness = createHarness();
-  const socket = openSocket(harness, false);
-  const business = harness.transport.sendJson({ t: "api.req", id: "queued-before-dispatch-pause" });
-  const receipt = harness.transport.sendJson({
-    t: "engine.models.dispatchPaused",
-    ack: {
-      operationId: "catalog-pause-4",
-      configVersion: 4,
-      digest: "b".repeat(64),
-      pausedAt: 2,
-    },
-  });
-
-  assert.equal(business.accepted, true);
-  assert.equal(receipt.accepted, true);
-  assert.deepEqual(readTypes(socket), ["client.hello", "engine.models.dispatchPaused"]);
-  socket.completeNext();
-  assert.deepEqual(
-    readTypes(socket),
-    ["client.hello", "engine.models.dispatchPaused"],
-    "暂停回执完成后仍须等待 hello 激活完成",
   );
   harness.transport.stop();
 });
@@ -1083,7 +1013,7 @@ test("Client helloAck 在异步阶段前后按连接代际门控副作用", () =
   assert.ok(completionStart >= 0 && completionEnd > completionStart);
   const completion = source.slice(completionStart, completionEnd);
   const fence = "if (shutdownRequested || !isCurrentClientHello(msg, messageConnectionGeneration)) return;";
-  for (const awaited of ["await waitForEngineModelCatalogDispatchReady();", "await recoverCatalogDependentRuntime();"]) {
+  for (const awaited of ["await recoverCatalogDependentRuntime();"]) {
     const start = completion.indexOf(awaited);
     assert.ok(start >= 0);
     assert.ok(completion.slice(start + awaited.length).trimStart().startsWith(fence), "异步激活结果必须复核连接代际");

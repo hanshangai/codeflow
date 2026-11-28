@@ -11,7 +11,7 @@ import { handleApiRequest, type ApiHandlerContext } from "../src/app/handleApiRe
 import { waitForOrdinaryTurnExecution } from "../src/app/ordinaryTurnExecution.js";
 import { evaluateSharedWorkspaceProviderNativeToolPolicy } from "../src/app/sharedWorkspaceToolPolicy.js";
 import { openClientDb } from "../src/db/clientDb.js";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../src/engines/engineModelCatalogRuntime.js";
 import { createClientDbOrchAssetLegacyRuntimeReader, OrchAssetAuthorityRuntimeReadService } from "../src/orchestration/orchAssetAuthorityRuntimeReadService.js";
 import { OrchestrationEngine } from "../src/orchestration/orchestrationEngine.js";
 import { XmlNodePromptRenderer } from "../src/orchestration/promptRenderer.js";
@@ -19,11 +19,16 @@ import { CodexAppServerThreadSession } from "../src/engines/codex-app-server/cod
 import { ThreadQueueDispatcher } from "../src/queue/threadQueueDispatcher.js";
 import { createLocalEventPersistence } from "../src/runtime/localEventPersistence.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
 
 /** 保留真实API、资产读取、SQLite与终态，仅隔离provider调用和授权owner。 */
 function chatFixture(t: TestContext) {
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
+  setEngineModelCatalogCustomModels([{
+    id: "test:claude:claude-sonnet-4-6", engine: "claude", providerId: "anthropic", modelId: "claude-sonnet-4-6",
+    displayName: "Claude Sonnet 4.6", inputModalities: ["text"],
+    supportedReasoningEfforts: ["low", "medium", "high"].map(reasoningEffort => ({ reasoningEffort, description: "" })),
+    defaultReasoningEffort: "medium", contextWindow: 200_000, maxContextWindow: null,
+    supportsFastMode: false, supports1MContext: false, enabled: true, createdAt: 1, updatedAt: 1,
+  }]);
   const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "desktop-asset-dispatch-")));
   const scope = { workspaceId: path.basename(directory) as WorkspaceId, threadId: "thread" as any, turnId: "turn" as any };
   const app = openClientDb({ dbPath: path.join(directory, "client.db"), localCanonicalEvents: true });

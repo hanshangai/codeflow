@@ -1,7 +1,5 @@
 import crypto from "node:crypto";
 import {
-  cloneEngineModelCatalogSnapshot,
-  engineModelCatalogRowsToModelInfo,
   getDefaultReasoningEffortForModel,
   getEngineModelInfo,
   getEngineModels,
@@ -11,12 +9,7 @@ import {
   resolveRoleExecutionConfigForEngine,
   resolveRoleExecutionConfigForStrategy,
   resolveThreadPrefsWithCatalogDefaults,
-  serializeEngineModelCatalogDigestPayload,
-  type EngineModelCatalogAppliedAck,
-  type EngineModelCatalogDispatchPauseAck,
   type EngineCustomModelEntry,
-  type EngineModelCatalogItem,
-  type EngineModelCatalogSnapshot,
   type EngineModelInfo,
   type EngineModelProviderId,
   type EngineType,
@@ -27,289 +20,102 @@ import {
   type ThreadPrefs,
 } from "@codeflowai/shared";
 
-type ActiveEngineModelCatalog = {
-  snapshot: EngineModelCatalogSnapshot;
-  digest: string;
-  models: Record<EngineType, EngineModelInfo[]>;
-};
+/**
+ * 模型目录运行时只保留本地内置模型与本机自定义模型。
+ * 兼容导出保留到调用点清理完成；不再维护 Server 快照、版本、租约或暂停状态。
+ */
+const COMPAT_CATALOG_VERSION = 1;
 
-let activeCatalog: ActiveEngineModelCatalog | null = null;
-let localCatalogEnabled = false;
 let customModelsByEngine: Record<EngineType, EngineModelInfo[]> = { claude: [], codex: [] };
-let dispatchPause: {
-  operationId: string;
-  configVersion: number;
-  digest: string;
-  kind: "apply" | "reconnect" | "publication";
-  resumed: Promise<void>;
-  resume: () => void;
-  drained: Promise<void>;
-  markDrained: () => void;
-} | null = null;
-let activeDispatchLeases = 0;
-const pendingHelloConfirmations = new Set<string>();
 
-/** 桌面在配置与数据库初始化前启用本地目录；不伪造 Server 快照或确认。 */
-export function initializeLocalEngineModelCatalog(): void {
-  localCatalogEnabled = true;
-}
+/** 桌面启动占位；模型恒为本地内置，无需初始化同步状态。 */
+export function initializeLocalEngineModelCatalog(): void {}
 
-/** 桌面撤销云端 owner 时只清 Server 补充，保留本机目录与自配模型。 */
-export function clearDesktopCloudEngineModelCatalog(): void {
-  if (!localCatalogEnabled) throw catalogRuntimeError("ENGINE_MODEL_CATALOG_SCOPE_INVALID", "仅桌面本地目录可撤销云端补充");
-  activeCatalog = null;
-  pendingHelloConfirmations.clear();
-  resumeEngineModelCatalogDispatch();
-}
+/** 账号撤销不再影响模型表；保留导出供既有调用点过渡。 */
+export function clearDesktopCloudEngineModelCatalog(): void {}
 
-/** 单调应用 Server 目录；桌面握手可接续旧连接的确认暂停。 */
+/** 兼容旧调用：不再保存快照，仅回显版本与输入摘要。 */
 export function applyEngineModelCatalogSnapshot(
   value: unknown,
   appliedAt = Date.now(),
   operationId?: string,
-  source?: "desktopHello",
-): EngineModelCatalogAppliedAck {
-  const snapshot = cloneEngineModelCatalogSnapshot(value);
-  const digest = crypto
-    .createHash("sha256")
-    .update(serializeEngineModelCatalogDigestPayload(snapshot), "utf8")
-    .digest("hex");
-  const desktopHello = localCatalogEnabled && source === "desktopHello" ? operationId?.trim() : undefined;
-  const publicationPaused = dispatchPause?.kind === "publication";
-  if (activeCatalog) {
-    if (snapshot.configVersion < activeCatalog.snapshot.configVersion) {
-      throw catalogRuntimeError(
-        "ENGINE_MODEL_CATALOG_STALE",
-        `收到旧模型目录版本：current=${activeCatalog.snapshot.configVersion}, received=${snapshot.configVersion}`,
-      );
-    }
-    if (snapshot.configVersion === activeCatalog.snapshot.configVersion) {
-      if (digest !== activeCatalog.digest) {
-        throw catalogRuntimeError(
-          "ENGINE_MODEL_CATALOG_VERSION_COLLISION",
-          `同一模型目录版本内容不一致：version=${snapshot.configVersion}`,
-        );
-      }
-      // 重连握手不能替代未完成发布的确认，也不能释放发布暂停。
-      if (desktopHello && dispatchPause && !publicationPaused) dispatchPause.operationId = desktopHello;
-      if (publicationPaused && desktopHello) pendingHelloConfirmations.add(desktopHello);
-      const confirmationOperationId = publicationPaused && desktopHello
-        ? desktopHello : desktopHello && !dispatchPause ? desktopHello : ensureCatalogApplyConfirmationPause(operationId, snapshot.configVersion, digest);
-      return {
-        configVersion: snapshot.configVersion,
-        digest,
-        appliedAt,
-        ...(confirmationOperationId ? { operationId: confirmationOperationId } : {}),
-      };
-    }
-  }
-
-  const models = buildCatalogModels(snapshot);
-  if (desktopHello && dispatchPause && !publicationPaused) dispatchPause.operationId = desktopHello;
-  if (publicationPaused && desktopHello) pendingHelloConfirmations.add(desktopHello);
-  const confirmationOperationId = publicationPaused && desktopHello
-    ? desktopHello : ensureCatalogApplyConfirmationPause(operationId, snapshot.configVersion, digest);
-  activeCatalog = { snapshot, digest, models };
+): { configVersion: number; digest: string; appliedAt: number; operationId?: string } {
+  const configVersion = Number((value as { configVersion?: unknown } | null)?.configVersion);
   return {
-    configVersion: snapshot.configVersion,
-    digest,
+    configVersion: Number.isSafeInteger(configVersion) && configVersion > 0 ? configVersion : COMPAT_CATALOG_VERSION,
+    digest: crypto.createHash("sha256").update(JSON.stringify(value ?? null), "utf8").digest("hex"),
     appliedAt,
-    ...(confirmationOperationId ? { operationId: confirmationOperationId } : {}),
+    ...(operationId ? { operationId } : {}),
   };
 }
 
-/** 更新本地自定义模型；桌面离线首装同样可读，远程模式重建 Server 覆盖层。 */
+/** 更新本地自定义模型；内置模型始终优先且不依赖连接状态。 */
 export function setEngineModelCatalogCustomModels(entries: EngineCustomModelEntry[]): void {
   customModelsByEngine = {
     claude: entries.filter((entry) => entry.enabled && entry.engine === "claude").map(toEngineModelInfoFromCustomModel),
     codex: entries.filter((entry) => entry.enabled && entry.engine === "codex").map(toEngineModelInfoFromCustomModel),
   };
-  if (!activeCatalog) return;
-  activeCatalog = { ...activeCatalog, models: buildCatalogModels(activeCatalog.snapshot) };
 }
 
-/** 发布前收口目录读租约；桌面只暂停云端补充，不阻断本地模型派发。 */
+/** 兼容旧调用：发布暂停已无意义，直接回执。 */
 export async function pauseEngineModelCatalogDispatch(input: {
   operationId: string;
   configVersion: number;
   digest: string;
-}, pausedAt = Date.now()): Promise<EngineModelCatalogDispatchPauseAck> {
-  const catalog = requireActiveEngineModelCatalog();
+}, pausedAt = Date.now()): Promise<{ operationId: string; configVersion: number; digest: string; pausedAt: number }> {
   const operationId = String(input.operationId ?? "").trim();
   if (!operationId) throw catalogRuntimeError("ENGINE_MODEL_CATALOG_PAUSE_INVALID", "模型目录派发暂停操作缺少 operationId");
-  if (!Number.isSafeInteger(input.configVersion) || input.configVersion < catalog.snapshot.configVersion) {
-    throw catalogRuntimeError(
-      "ENGINE_MODEL_CATALOG_PAUSE_MISMATCH",
-      `模型目录派发暂停版本落后：current=${catalog.snapshot.configVersion}, received=${input.configVersion}`,
-    );
-  }
-  if (!/^[a-f0-9]{64}$/u.test(String(input.digest ?? ""))) {
-    throw catalogRuntimeError("ENGINE_MODEL_CATALOG_PAUSE_MISMATCH", "模型目录派发暂停摘要无效");
-  }
-  if (input.configVersion === catalog.snapshot.configVersion && input.digest !== catalog.digest) {
-    throw catalogRuntimeError("ENGINE_MODEL_CATALOG_PAUSE_MISMATCH", "模型目录派发暂停摘要与当前目录不一致");
-  }
-  if (dispatchPause && dispatchPause.operationId !== operationId) {
-    throw catalogRuntimeError(
-      "ENGINE_MODEL_CATALOG_PAUSE_CONFLICT",
-      `模型目录派发已被另一发布操作暂停：operationId=${dispatchPause.operationId}`,
-    );
-  }
-  if (!dispatchPause) {
-    let resume!: () => void;
-    let markDrained!: () => void;
-    const resumed = new Promise<void>((resolve) => {
-      resume = resolve;
-    });
-    const drained = new Promise<void>((resolve) => {
-      markDrained = resolve;
-    });
-    dispatchPause = {
-      operationId,
-      configVersion: input.configVersion,
-      digest: input.digest,
-      kind: "publication",
-      resumed,
-      resume,
-      drained,
-      markDrained,
-    };
-    if (activeDispatchLeases === 0) markDrained();
-  }
-  await dispatchPause.drained;
   return { operationId, configVersion: input.configVersion, digest: input.digest, pausedAt };
 }
 
-/** 目录发布取消时，仅释放匹配操作建立的暂停态。 */
-export function cancelEngineModelCatalogDispatchPause(operationId: string): void {
-  if (dispatchPause?.operationId !== String(operationId ?? "").trim()) return;
-  resumeEngineModelCatalogDispatch();
+/** 兼容旧调用：无暂停状态可取消。 */
+export function cancelEngineModelCatalogDispatchPause(_operationId: string): void {}
+
+/** 兼容旧调用：重连不再冻结模型表。 */
+export function pauseEngineModelCatalogDispatchForReconnect(_operationId: string): string | null {
+  return null;
 }
 
-/** 连接中断冻结 Server 目录；桌面的本地目录不随连接关闭。 */
-export function pauseEngineModelCatalogDispatchForReconnect(operationId: string): string | null {
-  if (!activeCatalog) return null;
-  if (dispatchPause) return dispatchPause.operationId;
-  const normalizedOperationId = String(operationId ?? "").trim();
-  if (!normalizedOperationId) {
-    throw catalogRuntimeError("ENGINE_MODEL_CATALOG_PAUSE_INVALID", "模型目录重连暂停操作缺少 operationId");
-  }
-  return ensureCatalogApplyConfirmationPause(
-    normalizedOperationId,
-    activeCatalog.snapshot.configVersion,
-    activeCatalog.digest,
-    "reconnect",
-  );
-}
+/** 本地模型恒可用，不存在等待目录同步的阶段。 */
+export async function waitForEngineModelCatalogDispatchReady(): Promise<void> {}
 
-/** 远程派发等待发布确认，桌面继续使用本地目录。 */
-export async function waitForEngineModelCatalogDispatchReady(): Promise<void> {
-  while (!localCatalogEnabled && dispatchPause) await dispatchPause.resumed;
-  getRuntimeModels();
-}
-
-/** 短租约绑定实际模型表；桌面租约不被 Server 的发布或重连等待阻塞。 */
-export async function acquireEngineModelCatalogDispatchLease(selection?: { engine: EngineType; model?: string | null }): Promise<{
+/** 兼容旧调用：本地模型租约为空操作。 */
+export async function acquireEngineModelCatalogDispatchLease(_selection?: { engine: EngineType; model?: string | null }): Promise<{
   configVersion: number;
   digest: string;
   release: () => void;
 }> {
-  while (!localCatalogEnabled && dispatchPause) await dispatchPause.resumed;
-  const identity = localCatalogEnabled
-    ? { configVersion: 0, digest: getLocalDispatchDigest(selection) }
-    : requireActiveEngineModelCatalog();
-  activeDispatchLeases += 1;
-  let released = false;
-  return {
-    configVersion: "snapshot" in identity ? identity.snapshot.configVersion : identity.configVersion,
-    digest: identity.digest,
-    release: () => {
-      if (released) return;
-      released = true;
-      activeDispatchLeases -= 1;
-      if (activeDispatchLeases === 0) dispatchPause?.markDrained();
-    },
-  };
+  return { configVersion: 0, digest: "local", release: () => {} };
 }
 
-/** 防止同一 provider 启动链的 setup 与 mutation 跨越两版目录。 */
+/** 兼容旧调用：本地模型在派发期间不会发生目录版本切换。 */
 export function assertEngineModelCatalogDispatchLeaseCurrent(
-  expected: { configVersion: number; digest: string },
-  current: { configVersion: number; digest: string },
-): void {
-  if (expected.configVersion === current.configVersion && expected.digest === current.digest) return;
-  throw catalogRuntimeError(
-    "ENGINE_MODEL_CATALOG_CHANGED_DURING_DISPATCH",
-    `模型目录在 provider 启动期间已更新：setup=${expected.configVersion}, current=${current.configVersion}`,
-  );
-}
+  _expected: { configVersion: number; digest: string },
+  _current: { configVersion: number; digest: string },
+): void {}
 
-/** Server 已登记 applied ACK 后释放本地写锁，允许自主调度继续。 */
-export function confirmEngineModelCatalogApplied(input: {
+/** 兼容旧调用：无需向 Server 确认目录已应用。 */
+export function confirmEngineModelCatalogApplied(_input: {
   operationId?: string | null;
   configVersion: number;
   digest: string;
-}): void {
-  const catalog = requireActiveEngineModelCatalog();
-  if (input.configVersion !== catalog.snapshot.configVersion || input.digest !== catalog.digest) {
-    throw catalogRuntimeError(
-      "ENGINE_MODEL_CATALOG_CONFIRMATION_MISMATCH",
-      `Server 模型目录确认与当前目录不一致：current=${catalog.snapshot.configVersion}, confirmed=${input.configVersion}`,
-    );
-  }
-  if (!dispatchPause) return;
-  const operationId = String(input.operationId ?? "").trim();
-  if (pendingHelloConfirmations.delete(operationId)) return;
-  if (!operationId || operationId !== dispatchPause.operationId) {
-    throw catalogRuntimeError(
-      "ENGINE_MODEL_CATALOG_CONFIRMATION_OPERATION_MISMATCH",
-      `Server 模型目录确认操作不一致：expected=${dispatchPause.operationId}, confirmed=${operationId || "missing"}`,
-    );
-  }
-  resumeEngineModelCatalogDispatch();
-}
+}): void {}
 
-/** 仅云端补充使用 Server 档案；本地模型沿现有引擎原生映射运行。 */
+/** 本地模型没有 Server 运行档案。 */
 export function getRuntimeEngineModelCatalogItem(
-  engine: EngineType,
-  modelId: string | null | undefined,
-): EngineModelCatalogItem | null {
-  const normalized = String(modelId ?? "").trim();
-  if (!normalized || !activeCatalog) return null;
-  if (localCatalogEnabled && (dispatchPause || isLocalEngineModel(engine, normalized))) return null;
-  const rows = localCatalogEnabled
-    ? activeCatalog.snapshot.rows.filter((row) => row.engine === engine && !isLocalEngineModel(engine, row.modelId))
-    : activeCatalog.snapshot.rows;
-  const direct = rows.find((row) => row.engine === engine && row.modelId === normalized);
-  if (direct) return direct;
-  const transport = rows.find((row) =>
-    row.engine === engine
-    && (row.transportModelId === normalized || row.fastTaskModelId === normalized || row.subagentModelId === normalized),
-  );
-  if (transport) return transport;
-  if (normalized.endsWith("[1m]")) {
-    const base = rows.find(
-      (row) => row.engine === engine && row.modelId === normalized.slice(0, -4),
-    );
-    if (
-      base
-      && (base.supports1MContext || base.contextWindow === 1_000_000 || base.maxContextWindow === 1_000_000)
-    ) return base;
-  }
+  _engine: EngineType,
+  _modelId: string | null | undefined,
+): null {
   return null;
 }
 
-/** 从同一有效模型表解析 provider；本地模型不被 Server 同 ID 档案替换。 */
+/** 从内置 + 自定义模型解析 provider。 */
 export function resolveRuntimeEngineModelProviderId(
   engine: EngineType,
   modelId: string | null | undefined,
 ): EngineModelProviderId {
-  const models = getRuntimeModels()[engine];
+  const models = getRuntimeEngineModels(engine);
   const normalized = String(modelId ?? "").trim();
-  const row = normalized
-    ? getRuntimeEngineModelCatalogItem(engine, normalized)
-    : null;
-  if (row) return row.providerId;
   const modelInfo = normalized ? getRuntimeEngineModelInfo(engine, normalized) : models.find((model) => model.isDefault) ?? null;
   if (modelInfo?.providerId) return modelInfo.providerId;
   throw catalogRuntimeError(
@@ -320,28 +126,27 @@ export function resolveRuntimeEngineModelProviderId(
   );
 }
 
-/** 发送、偏好保存和编排共用有效目录，未确认云端补充保持不可执行。 */
+/** 发送、偏好保存和编排共用本地有效模型表。 */
 export function assertRuntimeEngineModelAvailable(engine: EngineType, modelId: string | null | undefined): void {
-  const models = getRuntimeModels()[engine];
+  const models = getRuntimeEngineModels(engine);
   const normalized = String(modelId ?? "").trim();
   if (!normalized) return;
   if (getEngineModelInfo(engine, normalized, models)) return;
-  // 本地自定义模型不在 Server 全局行中，1M 别名统一复用运行时模型解析。
   if (normalized.endsWith("[1m]") && getRuntimeEngineModelInfo(engine, normalized)) return;
   throw catalogRuntimeError("ENGINE_MODEL_NOT_AVAILABLE", `模型「${normalized}」已从当前目录移除，请重新选择模型`);
 }
 
-/** 返回同一本地优先或 Server 权威模型表，模式在启动时显式确定。 */
+/** 返回内置 + 本机自定义模型。 */
 export function getRuntimeEngineModels(engine: EngineType): EngineModelInfo[] {
-  return getRuntimeModels()[engine].map(cloneEngineModelInfo);
+  return getLocalEngineModels(engine).map(cloneEngineModelInfo);
 }
 
-/** 桌面启动期已有内置目录；远程 Client 仍等待 Server 首次同步。 */
+/** 本地模型恒就绪。 */
 export function getRuntimeEngineModelsIfReady(engine: EngineType): EngineModelInfo[] | null {
-  return localCatalogEnabled || activeCatalog ? getRuntimeEngineModels(engine) : null;
+  return getRuntimeEngineModels(engine);
 }
 
-/** 从当前动态目录解析模型元数据；目录未就绪时显式失败。 */
+/** 从本地模型解析元数据，保留 1M 别名合成。 */
 export function getRuntimeEngineModelInfo(
   engine: EngineType,
   modelId: string | null | undefined,
@@ -350,15 +155,6 @@ export function getRuntimeEngineModelInfo(
   const models = getRuntimeEngineModels(engine);
   const direct = getEngineModelInfo(engine, normalized, models);
   if (direct || !normalized.endsWith("[1m]")) return direct;
-  const runtimeItem = getRuntimeEngineModelCatalogItem(engine, normalized);
-  if (runtimeItem) {
-    const baseModel = models.find((model) => model.id === runtimeItem.modelId);
-    if (baseModel) return {
-      ...baseModel,
-      id: normalized,
-      contextWindow: baseModel.maxContextWindow ?? baseModel.contextWindow,
-    };
-  }
   const base = models.find((model) => model.id === normalized.slice(0, -4));
   if (!base?.supports1MContext) return null;
   return {
@@ -369,35 +165,30 @@ export function getRuntimeEngineModelInfo(
   };
 }
 
-/** 会话默认项、effort、窗口和 Fast 档位统一从当前动态目录派生。 */
+/** 会话默认项、effort、窗口和 Fast 档位统一从本地模型派生。 */
 export function resolveRuntimeThreadPrefsWithCatalogDefaults(
   engine: EngineType,
   prefs?: ThreadPrefs | null,
 ): ResolvedThreadPrefs {
-  const models = getRuntimeEngineModels(engine);
-  return resolveThreadPrefsWithCatalogDefaults(engine, prefs, models);
+  return resolveThreadPrefsWithCatalogDefaults(engine, prefs, getRuntimeEngineModels(engine));
 }
 
-/** 编排 auto 档案按当前动态目录解析，避免沿用模块加载时的静态默认项。 */
+/** 编排 auto 档案按本地模型解析默认项。 */
 export function resolveRuntimeRoleExecutionConfigForEngine(
   raw: Partial<RoleExecutionConfig> | RoleExecutionConfig | null | undefined,
   engine: EngineType,
   fallbackPreferredEngine: EngineType = "codex",
 ): ResolvedRoleExecutionConfig {
-  return applyRuntimeAutoDefaults(
-    resolveRoleExecutionConfigForEngine(raw, engine, fallbackPreferredEngine),
-  );
+  return applyRuntimeAutoDefaults(resolveRoleExecutionConfigForEngine(raw, engine, fallbackPreferredEngine));
 }
 
-/** 按编排策略选择引擎后，再从当前动态目录解析 auto 默认项。 */
+/** 按编排策略选择引擎后，再从本地模型解析 auto 默认项。 */
 export function resolveRuntimeRoleExecutionConfigForStrategy(
   raw: Partial<RoleExecutionConfig> | RoleExecutionConfig | null | undefined,
   strategy: OrchestrationExecutionEngineStrategy | null | undefined,
   fallbackEngine: EngineType = "codex",
 ): ResolvedRoleExecutionConfig {
-  return applyRuntimeAutoDefaults(
-    resolveRoleExecutionConfigForStrategy(raw, strategy, fallbackEngine),
-  );
+  return applyRuntimeAutoDefaults(resolveRoleExecutionConfigForStrategy(raw, strategy, fallbackEngine));
 }
 
 function applyRuntimeAutoDefaults(config: ResolvedRoleExecutionConfig): ResolvedRoleExecutionConfig {
@@ -417,109 +208,24 @@ function applyRuntimeAutoDefaults(config: ResolvedRoleExecutionConfig): Resolved
   };
 }
 
-export function getActiveEngineModelCatalogSnapshot(): EngineModelCatalogSnapshot | null {
-  return activeCatalog ? cloneEngineModelCatalogSnapshot(activeCatalog.snapshot) : null;
+/** 兼容旧调用：本地模型没有 Server 快照。 */
+export function getActiveEngineModelCatalogSnapshot(): null {
+  return null;
 }
 
+/** 兼容旧调用：本地模型没有目录发布暂停。 */
 export function getEngineModelCatalogDispatchPauseOperationId(): string | null {
-  return dispatchPause?.operationId ?? null;
+  return null;
 }
 
-/** 仅供单元测试隔离全局 Client 运行时。 */
+/** 仅供单元测试隔离全局自定义模型。 */
 export function resetEngineModelCatalogRuntimeForTest(): void {
-  resumeEngineModelCatalogDispatch();
-  activeCatalog = null;
-  localCatalogEnabled = false;
   customModelsByEngine = { claude: [], codex: [] };
-  pendingHelloConfirmations.clear();
-}
-
-/** 桌面优先内置与自配模型，Server 仅追加；远程保持原覆盖层合并顺序。 */
-function buildCatalogModels(snapshot?: EngineModelCatalogSnapshot): Record<EngineType, EngineModelInfo[]> {
-  if (localCatalogEnabled) return {
-    claude: mergeEngineModelsWithCustomModels("claude", getLocalEngineModels("claude"), snapshot
-      ? engineModelCatalogRowsToModelInfo(snapshot.rows, "claude").filter((model) => !isLocalEngineModel("claude", model.id)) : []),
-    codex: mergeEngineModelsWithCustomModels("codex", getLocalEngineModels("codex"), snapshot
-      ? engineModelCatalogRowsToModelInfo(snapshot.rows, "codex").filter((model) => !isLocalEngineModel("codex", model.id)) : []),
-  };
-  return {
-    claude: mergeEngineModelsWithCustomModels("claude", engineModelCatalogRowsToModelInfo(snapshot!.rows, "claude"), customModelsByEngine.claude),
-    codex: mergeEngineModelsWithCustomModels("codex", engineModelCatalogRowsToModelInfo(snapshot!.rows, "codex"), customModelsByEngine.codex),
-  };
 }
 
 /** 沿既有内置优先规则合并本机自定义模型，不另建运行档案。 */
 function getLocalEngineModels(engine: EngineType): EngineModelInfo[] {
   return mergeEngineModelsWithCustomModels(engine, getEngineModels(engine), customModelsByEngine[engine]);
-}
-
-/** 本地可用的 1M 别名与原模型属于同一来源，不能被云端 transport 行覆盖。 */
-function isLocalEngineModel(engine: EngineType, modelId: string): boolean {
-  const models = getLocalEngineModels(engine);
-  if (getEngineModelInfo(engine, modelId, models)) return true;
-  return modelId.endsWith("[1m]") && getEngineModelInfo(engine, modelId.slice(0, -4), models)?.supports1MContext === true;
-}
-
-/** 发布暂停或等待新目录确认时仅撤下云端补充，普通断网保留已确认目录。 */
-function getRuntimeModels(): Record<EngineType, EngineModelInfo[]> {
-  return localCatalogEnabled ? buildCatalogModels(dispatchPause ? undefined : activeCatalog?.snapshot) : requireActiveEngineModelCatalog().models;
-}
-
-/** 显式模型绑定自身档案；历史会话模型未知时校验完整有效目录和云端档案。 */
-function getLocalDispatchDigest(selection?: { engine: EngineType; model?: string | null }): string {
-  let value: unknown = {
-    models: getRuntimeModels(),
-    profiles: dispatchPause ? [] : activeCatalog?.snapshot.rows.filter((row) => !isLocalEngineModel(row.engine, row.modelId)) ?? [],
-  };
-  if (selection?.model) {
-    const model = getRuntimeEngineModelInfo(selection.engine, selection.model);
-    if (!model) throw catalogRuntimeError("ENGINE_MODEL_NOT_AVAILABLE", "所选模型当前不可用");
-    value = { engine: selection.engine, model, profile: getRuntimeEngineModelCatalogItem(selection.engine, model.id) };
-  }
-  return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-function requireActiveEngineModelCatalog(): ActiveEngineModelCatalog {
-  if (activeCatalog) return activeCatalog;
-  throw catalogRuntimeError("ENGINE_MODEL_CATALOG_NOT_READY", "动态模型目录尚未同步完成，请等待 Client 重新连接");
-}
-
-function ensureCatalogApplyConfirmationPause(
-  requestedOperationId: string | undefined,
-  configVersion: number,
-  digest: string,
-  kind: "apply" | "reconnect" = "apply",
-): string | null {
-  const operationId = String(requestedOperationId ?? dispatchPause?.operationId ?? "").trim();
-  if (!operationId) return null;
-  if (dispatchPause) {
-    if (dispatchPause.operationId !== operationId) {
-      throw catalogRuntimeError(
-        "ENGINE_MODEL_CATALOG_APPLY_OPERATION_MISMATCH",
-        `模型目录应用操作不一致：expected=${dispatchPause.operationId}, received=${operationId}`,
-      );
-    }
-    dispatchPause.configVersion = configVersion;
-    dispatchPause.digest = digest;
-    return operationId;
-  }
-  let resume!: () => void;
-  let markDrained!: () => void;
-  const resumed = new Promise<void>((resolve) => {
-    resume = resolve;
-  });
-  const drained = new Promise<void>((resolve) => {
-    markDrained = resolve;
-  });
-  dispatchPause = { operationId, configVersion, digest, kind, resumed, resume, drained, markDrained };
-  if (activeDispatchLeases === 0) markDrained();
-  return operationId;
-}
-
-function resumeEngineModelCatalogDispatch(): void {
-  const paused = dispatchPause;
-  dispatchPause = null;
-  paused?.resume();
 }
 
 function cloneEngineModelInfo(model: EngineModelInfo): EngineModelInfo {

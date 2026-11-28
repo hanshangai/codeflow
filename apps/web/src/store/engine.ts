@@ -1,14 +1,5 @@
 import { defineStore } from "pinia";
-import {
-  cloneEngineModelCatalogSnapshot,
-  engineModelCatalogRowsToModelInfo,
-  mergeEngineModelsWithCustomModels,
-  type EngineCustomModelsByEngine,
-  type EngineModelCatalogSnapshot,
-  type EngineModelCatalogSyncState,
-  type EngineStatus,
-  type EngineType,
-} from "@codeflowai/shared";
+import { type EngineCustomModelsByEngine, type EngineStatus, type EngineType } from "@codeflowai/shared";
 
 import type { ApiRequestContext } from "../api/request";
 import { isCancelledRequestError } from "../api/request";
@@ -24,10 +15,6 @@ export type EngineState = {
   activeWorkspaceId: string;
   customModelsByEngine: EngineCustomModelsByEngine;
   byWorkspaceId: Record<string, EngineWorkspaceState>;
-  catalog: EngineModelCatalogSnapshot | null;
-  catalogVersion: number | null;
-  hostAppliedCatalogVersion: number | null;
-  hostCatalogSyncState: EngineModelCatalogSyncState | null;
   refreshGenerationByWorkspace: Record<string, number>;
 };
 
@@ -37,15 +24,12 @@ export type EngineWorkspaceState = {
   loading: boolean;
   lastError: string | null;
   lastUpdatedAt: number | null;
-  catalogVersion: number | null;
-  hostAppliedCatalogVersion: number | null;
-  hostCatalogSyncState: EngineModelCatalogSyncState | null;
   customModelsByEngine: EngineCustomModelsByEngine;
 };
 
 export type EngineStore = ReturnType<typeof useEngineStore>;
 
-/** 引擎状态：用于模型下拉与能力提示。 */
+/** 引擎状态：用于模型下拉与能力提示；模型列表统一来自内置模型与 Host 上报。 */
 export const useEngineStore = defineStore("engine", {
   state: (): EngineState => ({
     engines: [],
@@ -55,16 +39,10 @@ export const useEngineStore = defineStore("engine", {
     activeWorkspaceId: "",
     customModelsByEngine: {},
     byWorkspaceId: {},
-    catalog: null,
-    catalogVersion: null,
-    hostAppliedCatalogVersion: null,
-    hostCatalogSyncState: null,
     refreshGenerationByWorkspace: {},
   }),
   getters: {
-    byType: (s) => {
-      return buildEngineTypeMap(s.engines);
-    },
+    byType: (s) => buildEngineTypeMap(s.engines),
     byTypeForWorkspace: (s) => (workspaceId?: string | null) => {
       const key = normalizeEngineWorkspaceKey(workspaceId);
       const scoped = s.byWorkspaceId[key];
@@ -74,7 +52,7 @@ export const useEngineStore = defineStore("engine", {
     },
   },
   actions: {
-    /** 刷新实际执行端目录；失败保留可见错误态并向调用方抛出。 */
+    /** 刷新实际执行端状态；失败保留可见错误态并向调用方抛出。 */
     async refresh(ctx: ApiRequestContext, workspaceId?: string, opts?: { signal?: AbortSignal; shouldApply?: () => boolean }): Promise<void> {
       const key = normalizeEngineWorkspaceKey(workspaceId);
       const localModels = Boolean(getDesktopBridge() && resolveDesktopApiRequest({ method: "GET", path: `/api/engines/status?workspaceId=${encodeURIComponent(key)}` }, ctx.desktopClientId));
@@ -89,9 +67,6 @@ export const useEngineStore = defineStore("engine", {
         loading: true,
         lastError: null,
         lastUpdatedAt: this.byWorkspaceId[key]?.lastUpdatedAt ?? null,
-        catalogVersion: this.byWorkspaceId[key]?.catalogVersion ?? (localModels ? null : this.catalog?.configVersion) ?? null,
-        hostAppliedCatalogVersion: this.byWorkspaceId[key]?.hostAppliedCatalogVersion ?? null,
-        hostCatalogSyncState: this.byWorkspaceId[key]?.hostCatalogSyncState ?? null,
         customModelsByEngine: this.byWorkspaceId[key]?.customModelsByEngine ?? {},
       };
       try {
@@ -100,37 +75,15 @@ export const useEngineStore = defineStore("engine", {
         if (this.refreshGenerationByWorkspace[key] !== requestGeneration) return;
         const now = Date.now();
         const previousByType = buildEngineTypeMap(previousEngines);
-        let resolvedEngines = res.engines.map((status) =>
+        const resolvedEngines = res.engines.map((status) =>
           mergeEngineStatusAfterDetection(previousByType.get(status.engineType), status));
-        const responseVersion = res.catalogVersion ?? null;
-        const currentCatalog = localModels ? null : this.catalog;
         const customModelsByEngine = res.customModelsByEngine ?? {};
-        const responsePredatesCatalog = Boolean(
-          currentCatalog && (responseVersion == null || responseVersion < currentCatalog.configVersion),
-        );
-        if (currentCatalog && (responseVersion == null || responseVersion <= currentCatalog.configVersion)) {
-          resolvedEngines = replaceEngineModels(resolvedEngines, currentCatalog, customModelsByEngine);
-        }
-        const catalogVersion = responsePredatesCatalog
-          ? currentCatalog!.configVersion
-          : responseVersion ?? currentCatalog?.configVersion ?? null;
-        const hostAppliedCatalogVersion = res.hostAppliedCatalogVersion ?? null;
-        const hostCatalogSyncState = responsePredatesCatalog
-          ? res.hostCatalogSyncState === "offline" || res.hostCatalogSyncState === "unsupported"
-            ? res.hostCatalogSyncState
-            : hostAppliedCatalogVersion === currentCatalog!.configVersion
-              ? "applied"
-              : "waiting"
-          : res.hostCatalogSyncState ?? null;
         this.byWorkspaceId[key] = {
           localModels,
           engines: resolvedEngines,
           loading: false,
           lastError: null,
           lastUpdatedAt: now,
-          catalogVersion,
-          hostAppliedCatalogVersion,
-          hostCatalogSyncState,
           customModelsByEngine,
         };
         if (opts?.shouldApply?.() !== false) {
@@ -139,9 +92,6 @@ export const useEngineStore = defineStore("engine", {
           this.customModelsByEngine = customModelsByEngine;
           this.lastUpdatedAt = now;
           this.lastError = null;
-          this.catalogVersion = catalogVersion;
-          this.hostAppliedCatalogVersion = hostAppliedCatalogVersion;
-          this.hostCatalogSyncState = hostCatalogSyncState;
         }
       } catch (e) {
         if (isCancelledRequestError(e)) return;
@@ -153,9 +103,6 @@ export const useEngineStore = defineStore("engine", {
           loading: false,
           lastError: message,
           lastUpdatedAt: this.byWorkspaceId[key]?.lastUpdatedAt ?? null,
-          catalogVersion: this.byWorkspaceId[key]?.catalogVersion ?? (localModels ? null : this.catalog?.configVersion) ?? null,
-          hostAppliedCatalogVersion: this.byWorkspaceId[key]?.hostAppliedCatalogVersion ?? null,
-          hostCatalogSyncState: this.byWorkspaceId[key]?.hostCatalogSyncState ?? null,
           customModelsByEngine: this.byWorkspaceId[key]?.customModelsByEngine ?? {},
         };
         if (opts?.shouldApply?.() !== false) this.lastError = message;
@@ -166,29 +113,6 @@ export const useEngineStore = defineStore("engine", {
           const scoped = this.byWorkspaceId[key];
           if (scoped?.loading) this.byWorkspaceId[key] = { ...scoped, loading: false };
         }
-      }
-    },
-    /** 应用 Server 目录到远程工作区；本机模型保持 Client 返回的有效目录。 */
-    applyCatalog(value: unknown): void {
-      const catalog = cloneEngineModelCatalogSnapshot(value);
-      if (this.catalog && catalog.configVersion < this.catalog.configVersion) return;
-      this.catalog = catalog;
-      if (!this.byWorkspaceId[this.activeWorkspaceId]?.localModels) {
-        this.catalogVersion = catalog.configVersion;
-        this.engines = replaceEngineModels(this.engines, catalog, this.customModelsByEngine);
-      }
-      for (const [workspaceId, state] of Object.entries(this.byWorkspaceId)) {
-        if (state.localModels) continue;
-        this.byWorkspaceId[workspaceId] = {
-          ...state,
-          engines: replaceEngineModels(state.engines, catalog, state.customModelsByEngine),
-          catalogVersion: catalog.configVersion,
-          hostCatalogSyncState: state.hostCatalogSyncState === "offline" || state.hostCatalogSyncState === "unsupported"
-            ? state.hostCatalogSyncState
-            : state.hostAppliedCatalogVersion === catalog.configVersion
-              ? "applied"
-              : "waiting",
-        };
       }
     },
   },
@@ -205,21 +129,3 @@ function buildEngineTypeMap(engines: EngineStatus[]): Map<EngineType, EngineStat
   for (const engine of engines) map.set(engine.engineType, engine);
   return map;
 }
-
-/** 用全局目录重建模型列表，并追加当前工作区明确返回的本地自定义模型。 */
-function replaceEngineModels(
-  engines: EngineStatus[],
-  catalog: EngineModelCatalogSnapshot,
-  customModelsByEngine: EngineCustomModelsByEngine,
-): EngineStatus[] {
-  return engines.map((engine) => ({
-    ...engine,
-    models: mergeEngineModelsWithCustomModels(
-      engine.engineType,
-      engineModelCatalogRowsToModelInfo(catalog.rows, engine.engineType),
-      customModelsByEngine[engine.engineType],
-    ),
-  }));
-}
-
-

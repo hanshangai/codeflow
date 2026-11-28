@@ -22,11 +22,6 @@ import type { AccountTerminalInfo, TerminalInfo } from "./terminal";
 import type { ThreadQueueChangedReason } from "./threadQueue";
 import type { RelayPricingCatalogSnapshot } from "./relayPricing";
 import type {
-  EngineModelCatalogAppliedAck,
-  EngineModelCatalogDispatchPauseAck,
-  EngineModelCatalogSnapshot,
-} from "./engineModelCatalog";
-import type {
   WorkspaceDirectoryMigrationActivationSnapshot,
   WorkspaceDirectoryMigrationChangedEvent,
 } from "./workspaceDirectoryMigration";
@@ -75,7 +70,6 @@ export type ClientCapabilitySnapshot = {
   hostRpcHttpLongPoll?: boolean;
   workspaceDirectoryMigrationV1?: boolean;
   threadInputActionsV1?: boolean;
-  engineModelCatalogV1?: boolean;
   localCanonicalRelayV1?: boolean;
   /** 授权与实时需求分离，支持读取屏障及需求代次 ACK。 */
   localCanonicalRelayOnDemandV1?: boolean;
@@ -135,8 +129,6 @@ export type ClientToServerMessage =
   | { t: "client.workspacesChanged"; workspaceIds: string[] }
   | { t: "client.workspaceDirectoryMigrationChanged"; event: WorkspaceDirectoryMigrationChangedEvent }
   | { t: "client.workspaceDirectoryMigrationActivationSnapshot"; snapshot: WorkspaceDirectoryMigrationActivationSnapshot }
-  | { t: "engine.models.applied"; ack: EngineModelCatalogAppliedAck }
-  | { t: "engine.models.dispatchPaused"; ack: EngineModelCatalogDispatchPauseAck }
   | { t: "conversation.event"; event: ConversationEventInput }
   | { t: "conversation.event.relay"; events: ConversationEventEnvelope[]; delivery?: ConversationRelayDelivery }
   | { t: "conversation.event.relayReady"; ready: ConversationRelayReady }
@@ -184,24 +176,9 @@ export type ServerToClientMessage =
     accessContext?: AccessContext | null;
     deployment?: DeploymentInfo;
     relayPricingCatalog?: RelayPricingCatalogSnapshot;
-    engineModelCatalog?: EngineModelCatalogSnapshot;
     capabilities?: { hostRpcHttpLongPoll?: boolean; hostRpcHttpSessionId?: string; localCanonicalRelayV1?: boolean; localCanonicalRelayOnDemandV1?: boolean; remoteDataDemandV1?: boolean; desktopLocalRuntimeV1?: boolean };
   }
   | { t: "relay.pricing.updated"; catalog: RelayPricingCatalogSnapshot }
-  | {
-    t: "engine.models.dispatchPause";
-    operationId: string;
-    configVersion: number;
-    digest: string;
-  }
-  | { t: "engine.models.dispatchResume"; operationId: string }
-  | { t: "engine.models.updated"; catalog: EngineModelCatalogSnapshot; operationId?: string }
-  | {
-    t: "engine.models.appliedConfirmed";
-    operationId?: string;
-    configVersion: number;
-    digest: string;
-  }
   | { t: "conversation.eventAck"; event: ConversationEventEnvelope }
   | { t: "conversation.event.relayScopes"; scopes: ConversationRelayScope[] }
   | { t: "conversation.event.relayDemand"; demand: ConversationRelayDemand; active: boolean }
@@ -273,9 +250,7 @@ export type ServerToWebMessage =
     homePath?: string | null;
     userSummary?: AccountUserSummary | null;
     accessContext?: AccessContext | null;
-    engineModelCatalog?: EngineModelCatalogSnapshot;
   }
-  | { t: "engine.models.updated"; catalog: EngineModelCatalogSnapshot }
   | { t: "web.subscribeAck"; requestId: string; workspaceId: WorkspaceId | null; sinceSeq: number; bufferedCount: number; serverSeq: number; demandId?: string; readyThroughSeq?: number }
   | { t: "client.preempt.requested"; request: ClientPreemptRequest }
   | { t: "client.preempt.resolved"; requestId: string; decision: "accepted" | "declined" | "timeout" | "failed" }

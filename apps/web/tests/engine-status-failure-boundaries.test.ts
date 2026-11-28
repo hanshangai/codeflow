@@ -47,20 +47,9 @@ function execute(code: string, context: Record<string, any>, exported: string): 
   return context.boundary;
 }
 
-/** 提供可手动触发的计时器，用于检查有界重试和资源释放。 */
-function clock() {
-  let id = 0, now = 0;
-  const timers = new Map<number, { callback: () => void; delay: number }>();
-  return {
-    timers, Date: { now: () => now }, advance: (value: number) => { now = value; },
-    setTimeout: (callback: () => void, delay: number) => { timers.set(++id, { callback, delay }); return id; },
-    clearTimeout: (key: number) => { timers.delete(key); },
-  };
-}
-
 /** 返回真实引擎状态响应，恢复校验使用现有 store 的实际模型合并流程。 */
 function engineResponse(): Response {
-  return new Response(JSON.stringify({ ok: true, catalogVersion: 2, hostAppliedCatalogVersion: 2, hostCatalogSyncState: "applied", engines: [
+  return new Response(JSON.stringify({ ok: true, engines: [
     { engineType: "claude", installed: true, version: "test", binPath: "claude", features: {}, error: null,
       models: [{ id: "claude-test", displayName: "Claude Test", isDefault: true }] },
     { engineType: "codex", installed: true, version: "test", binPath: "codex", features: {}, error: null,
@@ -80,76 +69,6 @@ test("输入框展示当前工作区引擎读取根因，加载和空目录有�
   engines.byWorkspaceId.ws.loading = false;
   engines.byWorkspaceId.ws.lastUpdatedAt = 1;
   assert.match(issue.value, /没有可用模型/);
-});
-
-/** 复用面板真实轮询状态和方法，独立控制请求与生命周期。 */
-function catalogHarness(engines: ReturnType<typeof useEngineStore>) {
-  engines.byWorkspaceId.ws = { engines: [], loading: false, lastError: null, lastUpdatedAt: null,
-    catalogVersion: 2, hostAppliedCatalogVersion: 1, hostCatalogSyncState: "waiting", customModelsByEngine: {} };
-  const text = source("features/chat/components/chat-panel.vue");
-  const start = text.indexOf("const CATALOG_SYNC_POLL_INTERVAL_MS");
-  const end = text.indexOf("\nwatch(", start);
-  const time = clock(), logs: any[] = [];
-  const context = { ...time, AbortController, Error, isApiResultError, isCancelledRequestError, ref, engines,
-    ctx: { value: ctx }, props: { workspaceId: "ws" }, activeThreadId: ref("thread"),
-    console: { error: (...args: any[]) => logs.push(args) } };
-  const boundary = execute(text.slice(start, end), context, `({ pollCatalogSync, stopCatalogSyncPolling,
-    setDeadline(value) { catalogSyncDeadline = value; }, get generation() { return catalogSyncPollGeneration; },
-    get controller() { return catalogSyncRequestAbort; }, catalogSyncCheckError, catalogSyncTimedOut })`);
-  boundary.setDeadline(30_000);
-  return { boundary, time, logs, context };
-}
-
-test("目录同步读取失败展示错误、释放请求资源并在截止时间前重试", async t => {
-  const engines = engineFixture(t), h = catalogHarness(engines);
-  await assert.doesNotReject(h.boundary.pollCatalogSync("ws", 0));
-  assert.match(h.boundary.catalogSyncCheckError.value, /engine status offline/);
-  assert.equal(h.boundary.controller, null);
-  assert.deepEqual([...h.time.timers.values()].map(item => item.delay), [3_000]);
-  assert.equal(h.logs.length, 1);
-  assert.equal(h.logs[0][1].workspaceId, "ws");
-  assert.equal(h.logs[0][1].requestId, "engine-status-request");
-  h.time.advance(30_000);
-  await h.boundary.pollCatalogSync("ws", 0);
-  assert.equal(h.boundary.catalogSyncTimedOut.value, true);
-  h.boundary.stopCatalogSyncPolling();
-  assert.equal(h.time.timers.size, 0);
-});
-
-test("旧目录检查失败不能污染切换后的面板或排新重试", async t => {
-  const engines = engineFixture(t), h = catalogHarness(engines);
-  let reject!: (error: unknown) => void;
-  globalThis.fetch = async () => await new Promise<Response>((_resolve, fail) => { reject = fail; });
-  const pending = h.boundary.pollCatalogSync("ws", 0);
-  h.boundary.stopCatalogSyncPolling(); h.context.props.workspaceId = "other";
-  reject(failure);
-  await pending;
-  assert.equal(h.boundary.catalogSyncCheckError.value, null);
-  assert.equal(h.boundary.controller, null);
-  assert.equal(h.logs.length, 0);
-  assert.equal(h.time.timers.size, 0);
-});
-
-test("目录检查超时释放资源并继续有界重试，恢复后清除失败且停止轮询", async t => {
-  const engines = engineFixture(t), h = catalogHarness(engines);
-  let complete!: (response: Response) => void;
-  globalThis.fetch = async () => await new Promise<Response>(resolve => { complete = resolve; });
-  const pending = h.boundary.pollCatalogSync("ws", 0);
-  const requestTimer = [...h.time.timers.entries()].find(([, item]) => item.delay === 8_000)!;
-  h.time.timers.delete(requestTimer[0]); requestTimer[1].callback();
-  complete(engineResponse());
-  await pending;
-  assert.equal(h.boundary.catalogSyncCheckError.value, "状态请求超时");
-  assert.equal(h.boundary.controller, null);
-  assert.equal(h.logs.length, 1);
-  assert.deepEqual([...h.time.timers.values()].map(item => item.delay), [3_000]);
-  h.time.timers.clear();
-  globalThis.fetch = async () => engineResponse();
-  await h.boundary.pollCatalogSync("ws", 0);
-  assert.equal(h.boundary.catalogSyncCheckError.value, null);
-  assert.equal(engines.byWorkspaceId.ws?.hostCatalogSyncState, "applied");
-  assert.equal(h.time.timers.size, 0);
-  assert.equal(h.logs.length, 1);
 });
 
 /** 执行设置面板真实 watcher，保留原 generation 与 fail 处理边界。 */

@@ -39,7 +39,6 @@ import {
 import { logger } from "../logger.js";
 import { buildClientChildProcessEnv } from "../runtime/clientProcessEnv.js";
 import { WorkspaceOperationGateError } from "../workspace-migration/workspaceOperationGate.js";
-import { waitForEngineModelCatalogDispatchReady } from "../engines/engineModelCatalogRuntime.js";
 import { isDesktopLocalAssetWorkspace } from "../orchestration/desktopBuiltinAssetService.js";
 import { ScheduledTaskRunError, assertScheduledTaskAccountOwner, type ScheduledTaskAccountOwner } from "../db/repos/scheduledTaskRunRepo.js";
 import { ScheduledTaskConfigError } from "../db/repos/scheduledTaskConfigRepo.js";
@@ -1413,19 +1412,9 @@ export class ScheduledTaskScheduler {
     if (error instanceof Error) Object.assign(error, { scheduledTaskFailureLogged: true });
   }
 
-  /** 目录等待前后重核派发资格；确认更新仍可打断等待，保留原 Promise 结算。 */
+  /** 本地模型无需等待目录同步，派发前只复核运行未被中断。 */
   private async waitForWorkflowPreparation(owner: ScheduledRunOwner, task: ExecutableTask): Promise<void> {
-    (await this.withDatabase(() => this.assertRunNotInterrupted(owner, task)));
-    const signal = owner.preparationAbort.signal;
-    let onAbort!: () => void;
-    try {
-      await new Promise<void>((resolve, reject) => {
-        onAbort = () => { try { this.assertRunNotInterrupted(owner); } catch (error) { reject(error); } };
-        signal.addEventListener("abort", onAbort, { once: true });
-        void waitForEngineModelCatalogDispatchReady().then(resolve, reject);
-      });
-    } finally { signal.removeEventListener("abort", onAbort); }
-    (await this.withDatabase(() => this.assertRunNotInterrupted(owner, task)));
+    await this.withDatabase(() => this.assertRunNotInterrupted(owner, task));
   }
 
   /** 更新与账号资格沿原边界核验；传入任务时才检查派发前停删，不打断已派发运行。 */

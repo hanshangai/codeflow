@@ -5,12 +5,11 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
+  CODEX_MODELS,
   createDefaultRoleExecutionConfig,
   createDefaultRoleInputDefinition,
   createDefaultRoleOutputDefinition,
   type ConversationEventInput,
-  type EngineModelCatalogSnapshot,
   type RawEngineEventInput,
   type ThreadId,
   type WorkspaceId,
@@ -20,11 +19,7 @@ import { ClientDbWriterService } from "../../apps/desktop/client/src/db/clientDb
 import { createLocalEventPipeline } from "../../apps/desktop/client/src/runtime/localEventPersistence.ts";
 import { AssetDraftService, AssetDraftServiceError, hasInFlightAssetDraftWork, stopAssetDraftJobsForUpdate } from "../../apps/desktop/client/src/orchestration/assetDraftService.ts";
 import { flushClientLogger, resolveClientLogDir } from "../../apps/desktop/client/src/logger.ts";
-import {
-  applyEngineModelCatalogSnapshot,
-  resetEngineModelCatalogRuntimeForTest,
-} from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "../../packages/shared/src/engineModelCatalogSeed.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
 import { ThreadStore } from "../../apps/desktop/client/src/threads/threadStore.ts";
 
 function buildToolSubmission(name: string, options?: { executionConfig?: ReturnType<typeof createDefaultRoleExecutionConfig> }) {
@@ -136,15 +131,14 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
 /** 使用真实 ClientDb 与本地 provider 哨兵，所有工作区资源由 cleanup 回收。 */
 function createHarness(options?: {
   onSendMessage?: (input: any, emitters: any, meta: { callIndex: number; workspaceId: WorkspaceId; threadId: ThreadId }) => Promise<{ responseText: string }>;
-  catalog?: EngineModelCatalogSnapshot;
   localCanonicalEvents?: boolean;
 }) {
-  applyEngineModelCatalogSnapshot(options?.catalog ?? {
-    schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-    configVersion: 1,
-    capturedAt: 1,
-    rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1),
-  });
+  setEngineModelCatalogCustomModels(["gpt-5.6-terra", "gpt-5.6-sol"].map((modelId) => ({
+    id: `test:codex:${modelId}`, engine: "codex", providerId: "openai", modelId, displayName: modelId,
+    inputModalities: ["text", "image"], supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }, { reasoningEffort: "xhigh", description: "" }],
+    defaultReasoningEffort: "high", contextWindow: 372_000, maxContextWindow: 1_000_000,
+    supportsFastMode: true, supports1MContext: true, enabled: true, createdAt: 1, updatedAt: 1,
+  })));
   const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), "codeflowai-asset-draft-"));
   const workspaceId = "ws-asset-draft" as WorkspaceId;
   const dbPath = path.join(workspacePath, "client.db");
@@ -638,16 +632,8 @@ test("AssetDraftService 创建 Agent 草案时不把全量已有 Agent 注入提
 });
 
 test("AssetDraftService 新建角色草稿使用最新模型且允许自定义配置不发送 effort", async () => {
-  const dynamicDefault = INITIAL_ENGINE_MODEL_CATALOG_V1.find((row) => row.engine === "codex" && !row.isDefault);
-  assert.ok(dynamicDefault);
-  const catalog: EngineModelCatalogSnapshot = {
-    schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-    configVersion: 9,
-    capturedAt: 9,
-    rows: structuredClone(INITIAL_ENGINE_MODEL_CATALOG_V1).map((row) => row.engine === "codex"
-      ? { ...row, isDefault: row.catalogItemId === dynamicDefault.catalogItemId }
-      : row),
-  };
+  const defaultCodexModel = CODEX_MODELS.find((model) => model.isDefault);
+  assert.ok(defaultCodexModel);
   const customConfig = createDefaultRoleExecutionConfig("codex");
   customConfig.engineProfiles.codex = {
     enabled: true,
@@ -662,7 +648,6 @@ test("AssetDraftService 新建角色草稿使用最新模型且允许自定义�
     },
   };
   const harness = createHarness({
-    catalog,
     onSendMessage: async (input, emitters, meta) => {
       const toolId = input.toolRegistry.tools[0].toolId;
       const toolResult = await input.executeHostTool({
@@ -717,7 +702,7 @@ test("AssetDraftService 新建角色草稿使用最新模型且允许自定义�
     const payload = JSON.parse(String(draft?.payloadJson ?? "{}"));
     assert.equal(
       payload.draft.executionConfig.engineProfiles.codex.customConfig.model,
-      dynamicDefault.modelId,
+      defaultCodexModel.id,
     );
     assert.equal(payload.draft.executionConfig.engineProfiles.codex.customConfig.effort, "");
   } finally {

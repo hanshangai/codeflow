@@ -160,15 +160,9 @@ const EVIDENCE_TYPES = new Set([
 ]);
 const ACTIVATION_CONTROL_TYPES = new Set([
   "client.workspaceDirectoryMigrationActivationSnapshot",
-  "engine.models.applied",
-  "engine.models.dispatchPaused",
 ]);
 const CONNECTION_SCOPED_INBOUND_TYPES = new Set([
   "client.helloAck",
-  "engine.models.updated",
-  "engine.models.dispatchPause",
-  "engine.models.dispatchResume",
-  "engine.models.appliedConfirmed",
   "api.req",
   "sharedWorkspace.command",
   "conversation.event.relayScopes",

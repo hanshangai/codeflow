@@ -45,13 +45,8 @@ const saveError = ref("");
 
 const threadPrefs = computed(() => chat.threadPrefsByThreadId[String(props.threadId)] ?? {});
 const engineStatus = computed(() => engines.byTypeForWorkspace(props.workspaceId).get(props.engine) ?? null);
-const workspaceEngineState = computed(() => engines.byWorkspaceId[String(props.workspaceId)] ?? null);
 const models = computed(() => engineStatus.value?.models ?? []);
-const catalogReady = computed(() => (
-  workspaceEngineState.value?.catalogVersion != null
-  && engineStatus.value != null
-  && models.value.length > 0
-));
+const catalogReady = computed(() => engineStatus.value != null && models.value.length > 0);
 const effectivePrefs = computed(() => catalogReady.value
   ? resolveThreadPrefsWithCatalogDefaults(props.engine, threadPrefs.value, models.value)
   : null);

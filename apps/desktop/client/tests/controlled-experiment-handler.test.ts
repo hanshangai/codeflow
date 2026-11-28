@@ -11,16 +11,16 @@ import type {
   ControlledExperimentRunStartRpcRequest,
   ConversationEventInput,
   RawEngineEventInput,
-  EngineModelCatalogSnapshot,
+  EngineCustomModelEntry,
   WorkspaceId,
 } from "@codeflowai/shared";
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION, MANUAL_TURN_INTERRUPT_CODE } from "@codeflowai/shared";
+import { MANUAL_TURN_INTERRUPT_CODE } from "@codeflowai/shared";
 
 import { openClientDb, type ClientDb } from "../src/db/clientDb.ts";
 import { ClientDbWriterService } from "../src/db/clientDbWriterService.ts";
 import { ControlledExperimentExecutor } from "../src/experiments/controlledExperimentExecutor.ts";
 import { buildPromptDefinitionHash } from "../src/orchestration/promptDefinitionHash.ts";
-import { applyEngineModelCatalogSnapshot } from "../src/engines/engineModelCatalogRuntime.ts";
+import { setEngineModelCatalogCustomModels } from "../src/engines/engineModelCatalogRuntime.ts";
 import { logger } from "../src/logger.js";
 
 const WORKSPACE_ID = "client-test:controlled-experiment" as WorkspaceId;
@@ -956,7 +956,7 @@ function seedPersistedCodexRun(
 
 /** 构造真实 ClientDb、Prompt Snapshot 和可替换隔离 session。 */
 function createFixture(options: { mode?: "success" | "tool" | "deferred"; isTaskAdmissionPaused?: () => boolean } = {}) {
-  applyEngineModelCatalogSnapshot(testEngineModelCatalog());
+  setEngineModelCatalogCustomModels(testEngineModelCustomModels());
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codeflowai-controlled-experiment-"));
   const rootDb = openClientDb({ dbPath: path.join(tempDir, "client.db") });
   rootDb.workspaces.upsert({ id: WORKSPACE_ID, title: "controlled experiment", path: tempDir });
@@ -1116,80 +1116,43 @@ function createFixture(options: { mode?: "success" | "tool" | "deferred"; isTask
   };
 }
 
-function testEngineModelCatalog(): EngineModelCatalogSnapshot {
-  return {
-    schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-    configVersion: 1,
-    capturedAt: 1,
-    rows: [
-      {
-        catalogItemId: "test-claude-model",
-        engine: "claude",
-        providerId: "anthropic",
-        providerLabel: "Anthropic",
-        modelId: "claude-test",
-        displayName: "Claude Test",
-        description: "",
-        inputModalities: ["text"],
-        supportedReasoningEfforts: [],
-        defaultReasoningEffort: null,
-        contextWindow: 200_000,
-        maxContextWindow: null,
-        supportsFastMode: false,
-        supports1MContext: false,
-        isDefault: true,
-        sortOrder: 1,
-        runtimeProfileId: "native",
-        transportModelId: null,
-        fastTaskModelId: null,
-        subagentModelId: null,
-      },
-      {
-        catalogItemId: "test-codex-model",
-        engine: "codex",
-        providerId: "openai",
-        providerLabel: "OpenAI",
-        modelId: MODEL,
-        displayName: "GPT Test",
-        description: "",
-        inputModalities: ["text"],
-        supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }],
-        defaultReasoningEffort: "high",
-        contextWindow: 200_000,
-        maxContextWindow: null,
-        supportsFastMode: false,
-        supports1MContext: false,
-        isDefault: true,
-        sortOrder: 1,
-        runtimeProfileId: "native",
-        transportModelId: null,
-        fastTaskModelId: null,
-        subagentModelId: null,
-      },
-      {
-        catalogItemId: "test-deepseek-flash",
-        engine: "claude",
-        providerId: "deepseek",
-        providerLabel: "DeepSeek",
-        modelId: "deepseek-flash",
-        displayName: "DeepSeek Flash",
-        description: "",
-        inputModalities: ["text"],
-        supportedReasoningEfforts: [],
-        defaultReasoningEffort: null,
-        contextWindow: 200_000,
-        maxContextWindow: 1_000_000,
-        supportsFastMode: false,
-        supports1MContext: true,
-        isDefault: false,
-        sortOrder: 2,
-        runtimeProfileId: "claude_compatible_single_model",
-        transportModelId: "deepseek-flash",
-        fastTaskModelId: null,
-        subagentModelId: null,
-      },
-    ],
-  };
+function testEngineModelCustomModels(): EngineCustomModelEntry[] {
+  return [
+    {
+      id: "test-claude-model",
+      engine: "claude",
+      providerId: "anthropic",
+      modelId: "claude-test",
+      displayName: "Claude Test",
+      inputModalities: ["text"],
+      supportedReasoningEfforts: [],
+      defaultReasoningEffort: null,
+      contextWindow: 200_000,
+      maxContextWindow: null,
+      supportsFastMode: false,
+      supports1MContext: false,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "test-codex-model",
+      engine: "codex",
+      providerId: "openai",
+      modelId: MODEL,
+      displayName: "GPT Test",
+      inputModalities: ["text"],
+      supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }],
+      defaultReasoningEffort: "high",
+      contextWindow: 200_000,
+      maxContextWindow: null,
+      supportsFastMode: false,
+      supports1MContext: false,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  ];
 }
 
 /** 插入 Prompt Snapshot 外键依赖的最小来源实例。 */

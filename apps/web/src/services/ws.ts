@@ -834,21 +834,7 @@ export function createWebSocketClient(deps: {
       if (msg.t === "web.helloAck") {
         deps.config.setWebSessionId(msg.webSessionId);
         deps.config.applySessionFromHello(msg);
-        if (msg.engineModelCatalog) deps.engine.applyCatalog(msg.engineModelCatalog);
         deps.config.setConnectionStatus("connected");
-        return;
-      }
-
-      if (msg.t === "engine.models.updated") {
-        deps.engine.applyCatalog(msg.catalog);
-        const workspaceId = String(deps.config.workspaceId ?? "").trim();
-        if (workspaceId) {
-          void deps.engine.refresh(apiCtx(), workspaceId, {
-            shouldApply: () => String(deps.config.workspaceId ?? "").trim() === workspaceId,
-          }).catch((error) => {
-            deps.onError?.(error instanceof Error ? error.message : String(error));
-          });
-        }
         return;
       }
 

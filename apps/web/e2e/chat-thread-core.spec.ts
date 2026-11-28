@@ -1,5 +1,4 @@
 import { expect, test, type Page } from "@playwright/test";
-import { CODEX_MODELS } from "@codeflowai/shared";
 
 // 注入登录态；WS 握手与 threads 端点由 mock-codeflow-server 提供。
 // 说明：ensureSession 要求 userSummary 非空，故注入完整 userSummary 与 accessContext。
@@ -133,10 +132,11 @@ test.describe("会话核心链路", () => {
     await page.route("**/api/engines/status**", async (route) => {
       const response = await route.fetch();
       const body = await response.json();
-      body.catalogVersion = 2;
-      body.hostAppliedCatalogVersion = 2;
       body.engines = body.engines.map((engine: { engineType: string }) => engine.engineType === "codex"
-        ? { ...engine, models: CODEX_MODELS.filter(model => model.id === "gpt-5.6-sol" || model.id === "gpt-5.5") }
+        ? { ...engine, models: [
+            { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", providerId: "openai", isDefault: true, supportsFastMode: true },
+            { id: "gpt-5.5", displayName: "GPT-5.5", providerId: "openai", isDefault: false, supportsFastMode: true },
+          ] }
         : engine);
       return route.fulfill({ response, json: body });
     });

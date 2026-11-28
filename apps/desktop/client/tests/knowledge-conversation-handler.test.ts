@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION, type ConversationEventInput, type KnowledgeAssetActorContext, type ThreadId, type TurnId, type WorkspaceId } from "@codeflowai/shared";
+import { type ConversationEventInput, type KnowledgeAssetActorContext, type ThreadId, type TurnId, type WorkspaceId } from "@codeflowai/shared";
 import { openClientDb } from "../src/db/clientDb.ts";
 import { ThreadStore } from "../src/threads/threadStore.ts";
 import { handleApiRequest, type ApiHandlerContext, type ApiRequestMessage } from "../src/app/handleApiRequest.ts";
@@ -12,7 +12,7 @@ import { KnowledgeAssetStore, knowledgeCategoryNodes, withKnowledgeDocumentDefau
 import { KnowledgeChangeStore } from "../src/knowledge/knowledgeChangeStore.ts";
 import { KnowledgeGenerationService, stopKnowledgeGenerationForUpdate } from "../src/knowledge/knowledgeGenerationService.ts";
 import { logger } from "../src/logger.ts";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../src/engines/engineModelCatalogRuntime.ts";
 import type { ClientToServerMessage } from "../src/protocol/messages.ts";
 import type { SendMessageInput, ThreadEventEmitters } from "../src/engines/threadSession.ts";
 import { ClientDbWriterService } from "../src/db/clientDbWriterService.ts";
@@ -53,58 +53,43 @@ test("真实 API 受理日志拒写仅返回一次知识失败信封，不补应
   } finally { harness.cleanup(); }
 });
 
-/** 测试引擎仍走真实模型目录门禁，目录中的 gpt-test 只用于替身 session。 */
-applyEngineModelCatalogSnapshot({
-  schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-  configVersion: 1,
-  capturedAt: 1,
-  rows: [
-    {
-      catalogItemId: "test:claude",
-      engine: "claude",
-      providerId: "anthropic",
-      providerLabel: "Anthropic Claude",
-      modelId: "claude-test",
-      displayName: "Claude Test",
-      description: "",
-      inputModalities: ["text"],
-      supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }],
-      defaultReasoningEffort: "high",
-      contextWindow: 200_000,
-      maxContextWindow: null,
-      supportsFastMode: false,
-      supports1MContext: false,
-      isDefault: true,
-      sortOrder: 1,
-      runtimeProfileId: "native",
-      transportModelId: null,
-      fastTaskModelId: null,
-      subagentModelId: null,
-    },
-    {
-      catalogItemId: "test:codex",
-      engine: "codex",
-      providerId: "openai",
-      providerLabel: "OpenAI",
-      modelId: "gpt-test",
-      displayName: "GPT Test",
-      description: "",
-      inputModalities: ["text"],
-      supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }],
-      defaultReasoningEffort: "high",
-      contextWindow: 200_000,
-      maxContextWindow: null,
-      supportsFastMode: false,
-      supports1MContext: false,
-      isDefault: true,
-      sortOrder: 1,
-      runtimeProfileId: "native",
-      transportModelId: null,
-      fastTaskModelId: null,
-      subagentModelId: null,
-    },
-  ],
-});
+/** 测试引擎仍走真实模型可用性门禁，gpt-test 只用于替身 session。 */
+setEngineModelCatalogCustomModels([
+  {
+    id: "test:claude",
+    engine: "claude",
+    providerId: "anthropic",
+    modelId: "claude-test",
+    displayName: "Claude Test",
+    inputModalities: ["text"],
+    supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }],
+    defaultReasoningEffort: "high",
+    contextWindow: 200_000,
+    maxContextWindow: null,
+    supportsFastMode: false,
+    supports1MContext: false,
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+  },
+  {
+    id: "test:codex",
+    engine: "codex",
+    providerId: "openai",
+    modelId: "gpt-test",
+    displayName: "GPT Test",
+    inputModalities: ["text"],
+    supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }],
+    defaultReasoningEffort: "high",
+    contextWindow: 200_000,
+    maxContextWindow: null,
+    supportsFastMode: false,
+    supports1MContext: false,
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+  },
+]);
 test.after(() => resetEngineModelCatalogRuntimeForTest());
 
 /** 使用迁移后的工作区 DB 和 API 分发；仅替换不调用真实 AI 的引擎 session。 */

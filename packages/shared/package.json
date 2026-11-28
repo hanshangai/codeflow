@@ -46,11 +46,6 @@
       "development": "./src/desktopShellReleaseSigning.ts",
       "default": "./dist/desktopShellReleaseSigning.js"
     },
-    "./engine-model-catalog-seed": {
-      "types": "./src/engineModelCatalogSeed.ts",
-      "development": "./src/engineModelCatalogSeed.ts",
-      "default": "./dist/engineModelCatalogSeed.js"
-    },
     ".": {
       "types": "./src/index.ts",
       "development": "./src/index.ts",

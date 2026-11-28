@@ -122,18 +122,9 @@ import {
 } from "./engines/threadSessionManager.js";
 import { getOrCreateThreadInputActionHmacKey } from "./engines/threadInputActions.js";
 import {
-  applyEngineModelCatalogSnapshot,
-  clearDesktopCloudEngineModelCatalog,
-  cancelEngineModelCatalogDispatchPause,
-  confirmEngineModelCatalogApplied,
-  getEngineModelCatalogDispatchPauseOperationId,
   getRuntimeEngineModelsIfReady,
-  initializeLocalEngineModelCatalog,
-  pauseEngineModelCatalogDispatch,
-  pauseEngineModelCatalogDispatchForReconnect,
   resolveRuntimeEngineModelProviderId,
   setEngineModelCatalogCustomModels,
-  waitForEngineModelCatalogDispatchReady,
 } from "./engines/engineModelCatalogRuntime.js";
 import { ThreadStore } from "./threads/threadStore.js";
 import { prepareCodexKeySwitch } from "./app/handlers/engineKeyHandlers.js";
@@ -461,7 +452,6 @@ async function handleCliPrelude(): Promise<ClientCliPreludeResult> {
 async function main(options?: { apiKeyOverride?: unknown }) {
   const runtimeStartedAt = Date.now();
   const desktopRequestId = process.env.CODEFLOWAI_DESKTOP_REQUEST_ID;
-  if (desktopRequestId) initializeLocalEngineModelCatalog();
   const desktopLifecycle = desktopRequestId ? createDesktopLifecycle(process, desktopRequestId, {
     startup: readDesktopStartupMode(process.env.CODEFLOWAI_DESKTOP_STARTUP_MODE, process.env.CODEFLOWAI_DESKTOP_STARTUP_CONTINUATION_ID),
     abortStartup: (reason) => {
@@ -2363,24 +2353,6 @@ async function main(options?: { apiKeyOverride?: unknown }) {
     if (ownsBaseActivation) baseActivationInFlightGeneration = messageConnectionGeneration;
     if (ownsBaseActivation) {
       try {
-        if (!msg.engineModelCatalog) {
-          throw Object.assign(new Error("Server 未提供动态模型目录，Client 无法进入就绪状态"), {
-            code: "ENGINE_MODEL_CATALOG_UNAVAILABLE",
-          });
-        }
-        const catalogOperationId = getEngineModelCatalogDispatchPauseOperationId()
-          ?? `engine-model-catalog-hello-${messageConnectionGeneration}-${msg.engineModelCatalog.configVersion}`;
-        const catalogAck = await withDatabase("client:model-catalog", () => applyEngineModelCatalogSnapshot(msg.engineModelCatalog!, Date.now(), catalogOperationId));
-        const catalogAckResult = sendToServer({
-          t: "engine.models.applied",
-          ack: catalogAck,
-        } satisfies ClientToServerMessage);
-        if (!catalogAckResult.accepted) {
-          throw Object.assign(new Error(`模型目录应用回执发送失败：${catalogAckResult.reason ?? "unknown"}`), {
-            code: "ENGINE_MODEL_CATALOG_ACK_SEND_FAILED",
-          });
-        }
-        await waitForEngineModelCatalogDispatchReady();
         if (shutdownRequested || !isCurrentClientHello(msg, messageConnectionGeneration)) return;
         localEventRelay?.dispose();
         localEventRelay = createLocalEventRelay({ db, serverUrl: config.serverWsUrl, ackTimeoutMs: config.timeoutPolicy.startupTimeoutMs,
@@ -2525,7 +2497,6 @@ async function main(options?: { apiKeyOverride?: unknown }) {
       getWorkspaceIds: () => Array.from(workspaces.keys()),
       isHostCommandAuthorized: isDesktopHostCommandAuthorized,
       onOwnerInvalidated: retireDesktopOwner,
-      onAccountBindingRevoked: clearDesktopCloudEngineModelCatalog,
       getCredentialCleanupErrorCode: () => retiredCredentialFailures.length ? "DESKTOP_CREDENTIAL_RELEASE_FAILED" : null,
       onRequestCancelled: context => logger.info("desktop-cloud", "old account request cancelled after owner revocation", { code: "DESKTOP_CLOUD_OWNER_CANCELLED", requestId: desktopRequestId, clientId: config.clientId, ...context }),
       /** Key 失败显式投影并终止自动启用，已认证连接保持 linked。 */
@@ -2547,17 +2518,9 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         }
       },
       onFailure: (error, context) => { logger.error("desktop-cloud", "cloud account connection failed", { errorCode: "DESKTOP_CLOUD_CONNECTION_FAILED", requestId: desktopRequestId, clientId: config.clientId, ...context, rootCause: toBuiltInRelayFailureLogValue(error) }); },
-      /** 只应用原模型目录和计价，不进入个人资产接管、恢复或定时任务入口。 */
+      /** 只应用计价目录，不进入个人资产接管、恢复或定时任务入口。 */
       onHello: async (message, owner, activation) => {
         activation.assertCurrent();
-        if (!message.engineModelCatalog) throw new Error("DESKTOP_CLOUD_MODEL_CATALOG_REQUIRED");
-        const ack = await withDatabase("desktop-cloud:model-catalog", () => {
-          activation.assertCurrent();
-          return applyEngineModelCatalogSnapshot(message.engineModelCatalog!, Date.now(), `desktop-cloud-${owner.generation}-${message.engineModelCatalog!.configVersion}`, "desktopHello");
-        });
-        activation.assertCurrent();
-        const sent = activation.send({ t: "engine.models.applied", ack });
-        if (!sent.accepted) throw new Error("DESKTOP_CLOUD_MODEL_CATALOG_ACK_FAILED");
         if (message.relayPricingCatalog) applyRelayPricingCatalog(message.relayPricingCatalog);
         currentClientHello = message;
         apiHandlerContext.serverWsUrl = owner.serverOrigin.replace(/^http/u, "ws") + "/ws/client";
@@ -2607,20 +2570,6 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         if (message.t === "conversation.eventRelayAck" || message.t === "thread.history.cleanedAck") {
           if (!localEventRelay) throw new Error("DESKTOP_CLOUD_RELAY_UNAVAILABLE");
           if (await localEventRelay.acceptAck(message, owner.generation)) flushLocalEventRelay(); return;
-        }
-        if (message.t === "engine.models.appliedConfirmed") { confirmEngineModelCatalogApplied(message); return; }
-        if (message.t === "engine.models.dispatchResume") { cancelEngineModelCatalogDispatchPause(message.operationId); return; }
-        if (message.t === "engine.models.updated") {
-          const ack = await withDatabase("desktop-cloud:model-catalog", () => {
-            desktopCloudAccount!.assertOwner(owner);
-            return applyEngineModelCatalogSnapshot(message.catalog, Date.now(), message.operationId ?? `desktop-cloud-${owner.generation}-${message.catalog.configVersion}`);
-          });
-          desktopCloudAccount!.assertOwner(owner);
-          if (!sendToServer({ t: "engine.models.applied", ack }).accepted) throw new Error("DESKTOP_CLOUD_MODEL_CATALOG_ACK_FAILED"); return;
-        }
-        if (message.t === "engine.models.dispatchPause") {
-          const ack = await pauseEngineModelCatalogDispatch(message); desktopCloudAccount!.assertOwner(owner);
-          if (!sendToServer({ t: "engine.models.dispatchPaused", ack }).accepted) throw new Error("DESKTOP_CLOUD_MODEL_PAUSE_ACK_FAILED"); return;
         }
         if (message.t === "relay.pricing.updated") { applyRelayPricingCatalog(message.catalog); return; }
         if (message.t.startsWith("terminal.")) {
@@ -2684,7 +2633,6 @@ async function main(options?: { apiKeyOverride?: unknown }) {
             hostRpcHttpLongPoll: true,
             workspaceDirectoryMigrationV1: true,
             threadInputActionsV1: true,
-            engineModelCatalogV1: true,
             remoteDataDemandV1: true,
             localCanonicalRelayV1: true, localCanonicalRelayOnDemandV1: true,
           },
@@ -2760,11 +2708,6 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         localEventRelay?.disconnect(serverMessageConnectionGeneration);
         reminderDelivery.disconnect(new Error("REMINDER_DELIVERY_CONNECTION_RETIRED"));
         authorizedRelayScopes = []; remoteDataDemands.clear();
-        if (!shutdownRequested && info.disposition === "reconnect") {
-          pauseEngineModelCatalogDispatchForReconnect(
-            `engine-model-catalog-reconnect-${serverMessageConnectionGeneration}`,
-          );
-        }
         currentClientHello = null;
         if (!shutdownRequested) markCurrentClientDaemonStartup(info.disposition === "reconnect" ? "disconnected" : "failed");
         serverMessageHelloReadyFence.closeConnection(serverMessageConnectionGeneration);
@@ -2852,8 +2795,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
           && msg.t !== "raw.eventAck"
           && msg.t !== "conversation.eventAck"
         ) return;
-        const handlesCatalogConfirmationBeforeHelloReady = msg.t === "engine.models.appliedConfirmed";
-        if (msg.t !== "client.helloAck" && !handlesCatalogConfirmationBeforeHelloReady && !shutdownRequested) {
+        if (msg.t !== "client.helloAck" && !shutdownRequested) {
           const helloReady = await serverMessageHelloReadyFence.waitUntilReady(messageConnectionGeneration);
           if (!helloReady || !serverMessageHelloReadyFence.isCurrent(messageConnectionGeneration)) {
             logClientStep("warn", "transport.message_before_hello_ready", "skip", "server message dropped because its connection did not finish hello activation", {
@@ -2895,37 +2837,6 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         }
         if (msg.t === "relay.pricing.updated") {
           applyRelayPricingCatalog(msg.catalog);
-          return;
-        }
-        if (msg.t === "engine.models.dispatchPause") {
-          const ack = await pauseEngineModelCatalogDispatch(msg);
-          const ackResult = sendToServer({ t: "engine.models.dispatchPaused", ack } satisfies ClientToServerMessage);
-          if (!ackResult.accepted) {
-            throw Object.assign(new Error(`模型目录派发暂停回执发送失败：${ackResult.reason ?? "unknown"}`), {
-              code: "ENGINE_MODEL_CATALOG_PAUSE_ACK_SEND_FAILED",
-            });
-          }
-          return;
-        }
-        if (msg.t === "engine.models.dispatchResume") {
-          cancelEngineModelCatalogDispatchPause(msg.operationId);
-          return;
-        }
-        if (msg.t === "engine.models.updated") {
-          const operationId = msg.operationId
-            ?? getEngineModelCatalogDispatchPauseOperationId()
-            ?? `engine-model-catalog-update-${msg.catalog.configVersion}-${messageConnectionGeneration}`;
-          const ack = await withDatabase("client:model-catalog", () => applyEngineModelCatalogSnapshot(msg.catalog, Date.now(), operationId));
-          const ackResult = sendToServer({ t: "engine.models.applied", ack } satisfies ClientToServerMessage);
-          if (!ackResult.accepted) {
-            throw Object.assign(new Error(`模型目录应用回执发送失败：${ackResult.reason ?? "unknown"}`), {
-              code: "ENGINE_MODEL_CATALOG_ACK_SEND_FAILED",
-            });
-          }
-          return;
-        }
-        if (msg.t === "engine.models.appliedConfirmed") {
-          confirmEngineModelCatalogApplied(msg);
           return;
         }
         if (msg.t === "server.workspaceDirectoryMigrationAck") {
@@ -3114,23 +3025,6 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         turnId: indexedTurnId || null,
         error: toErrorLogValue(error),
       });
-      return;
-    }
-    const errorCode = String((error as { code?: unknown } | null)?.code ?? "");
-    if (
-      (msg.t === "engine.models.updated"
-        || msg.t === "engine.models.dispatchPause"
-        || msg.t === "engine.models.appliedConfirmed"
-        || msg.t === "client.helloAck")
-      && errorCode.startsWith("ENGINE_MODEL_CATALOG_")
-    ) {
-      logClientStep("warn", "transport.engine_model_catalog_message", "fail", "engine model catalog message rejected; reconnecting", {
-        target: { clientId: config.clientId },
-        messageType: msg.t,
-        errorCode,
-        error: toErrorLogValue(error),
-      });
-      transport?.reconnect("Engine model catalog reconciliation required");
       return;
     }
     const prepared = prepareTransportMessageFailure({

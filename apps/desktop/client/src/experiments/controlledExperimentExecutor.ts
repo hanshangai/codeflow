@@ -39,15 +39,14 @@ import type {
 import { logger } from "../logger.js";
 import { redactClientStartupText } from "../startup/clientStartupStatus.js";
 import { buildPromptDefinitionHash } from "../orchestration/promptDefinitionHash.js";
-import {
-  getActiveEngineModelCatalogSnapshot,
-  resolveRuntimeEngineModelProviderId,
-} from "../engines/engineModelCatalogRuntime.js";
+import { resolveRuntimeEngineModelProviderId } from "../engines/engineModelCatalogRuntime.js";
 
 type ControlledExperimentSessionRuntime = Pick<ThreadSessionManager,
   "createIsolatedSession" | "getWorkspacePath" | "interruptCodexTurnByEngineIds" | "reconcileCodexDanglingTurn">;
 
 const NO_PRICE_SNAPSHOT_SHA256 = "0".repeat(64);
+/** 本地内置模型没有远端目录版本；冻结记录保留固定版本以兼容既有数据。 */
+const COMPAT_MODEL_CATALOG_VERSION = 1;
 
 type ActiveRun = {
   handle: IsolatedThreadSessionHandle;
@@ -125,7 +124,6 @@ export class ControlledExperimentExecutor {
     const executor = this.requestExecutor(request);
     if (executor !== this) return executor.freeze(request);
     this.assertContract(request.contractVersion);
-    const activeCatalog = requireActiveCatalog();
     const experimentId = requireText(request.experimentId, "experimentId");
     const workspaceId = requireText(request.workspaceId, "workspaceId") as WorkspaceId;
     if (!this.deps.workspaces.has(workspaceId)) throw invalidFreeze("目标本地工作区不存在或已删除");
@@ -138,12 +136,7 @@ export class ControlledExperimentExecutor {
       throw invalidFreeze("冻结样本顺序无效或重复");
     }
     const existing = this.deps.db.controlledExperiments.listSnapshotsByFreeze(experimentId, request.freezeRevision);
-    if (existing.length > 0) {
-      if (existing.some((snapshot) => snapshot.catalogVersion !== activeCatalog.configVersion)) {
-        throw invalidFreeze("模型目录版本已变化，请使用新的 freeze revision 重新冻结实验");
-      }
-      return this.restoreFreezeResponse(request, existing);
-    }
+    if (existing.length > 0) return this.restoreFreezeResponse(request, existing);
 
     const baselineConfig = normalizeVariantConfig(request.baselineCohort);
     const candidateConfig = normalizeVariantConfig(request.candidate);
@@ -230,7 +223,7 @@ export class ControlledExperimentExecutor {
           ordinal: item.ordinal,
           variantKey,
           ...config,
-          catalogVersion: activeCatalog.configVersion,
+          catalogVersion: COMPAT_MODEL_CATALOG_VERSION,
           promptEnvelope: source.promptEnvelope,
           systemMessage: source.systemMessage,
           developerMessage: source.developerMessage ?? null,
@@ -266,7 +259,7 @@ export class ControlledExperimentExecutor {
       experimentId,
       freezeRevision: request.freezeRevision,
       workspaceId,
-      catalogVersion: activeCatalog.configVersion,
+      catalogVersion: COMPAT_MODEL_CATALOG_VERSION,
       variants,
       samples: sampleResponses.map(({ localSnapshotId, ...sample }) => ({ ...sample, localSnapshotId })),
     });
@@ -1124,12 +1117,6 @@ export class ControlledExperimentExecutor {
 
   /** Rejects model calls when the current Provider or credential differs from frozen evidence. */
   private assertSnapshotRuntimeEvidence(snapshot: ControlledExperimentLocalSnapshot): void {
-    const activeCatalog = requireActiveCatalog();
-    if (snapshot.catalogVersion !== activeCatalog.configVersion) {
-      throw new Error(
-        `冻结模型目录版本已过期：frozen=${snapshot.catalogVersion}, active=${activeCatalog.configVersion}`,
-      );
-    }
     assertClientReasoningEffortSupported(this.deps.db, snapshot.engine, snapshot.model, snapshot.effort);
     const config = { engine: snapshot.engine, model: snapshot.model, effort: snapshot.effort };
     const providerId = this.resolveVariantProvider(config);
@@ -1275,8 +1262,3 @@ function invalidFreeze(message: string): ControlledExperimentExecutorError {
   return new ControlledExperimentExecutorError(409, "FREEZE_EVIDENCE_INVALID", message);
 }
 
-function requireActiveCatalog() {
-  const catalog = getActiveEngineModelCatalogSnapshot();
-  if (!catalog) throw invalidFreeze("动态模型目录尚未同步完成，暂不能冻结或执行实验");
-  return catalog;
-}

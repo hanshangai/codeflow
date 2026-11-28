@@ -13,12 +13,10 @@ import { ToolRuntimeService } from "../src/orchestration/toolRuntimeService.js";
 import { ThreadSessionManager } from "../src/engines/threadSessionManager.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
 import { createDefaultRoleExecutionConfig } from "@codeflowai/shared";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
+import { resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
 
 /** 真实W库和低层SQL许可断言；仅替换外部引擎，不伪造编排持久状态。 */
 function fixture(t: test.TestContext, roleNode = false) {
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "orch-db-coordination-"));
   const app = openClientDb({ dbPath: path.join(root, "app.db") });
   const workspaceId = "orch:coordinated";

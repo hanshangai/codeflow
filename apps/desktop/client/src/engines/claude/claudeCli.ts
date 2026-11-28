@@ -2,7 +2,6 @@ import type { AccessMode, SessionId } from "@codeflowai/shared";
 import type { ConversationProfile } from "../threadSession.js";
 import {
   assertRuntimeEngineModelAvailable,
-  getRuntimeEngineModelCatalogItem,
   getRuntimeEngineModelInfo,
 } from "../engineModelCatalogRuntime.js";
 import { normalizeThreadContextWindow } from "@codeflowai/shared";
@@ -106,8 +105,7 @@ export function resolveClaudeLaunchModelId(model: string | null | undefined, con
   const s = String(model ?? "").trim();
   if (!s) return null;
   assertRuntimeEngineModelAvailable("claude", s);
-  const runtimeItem = getRuntimeEngineModelCatalogItem("claude", s);
-  const launchModel = runtimeItem?.transportModelId || CLAUDE_MODEL_ALIASES[s] || s;
+  const launchModel = CLAUDE_MODEL_ALIASES[s] || s;
   // 原生 1M 模型也显式标记窗口，确保网关接入不会仍按 200K 预算。
   const info = getRuntimeEngineModelInfo("claude", s);
   const window = Number(resolveClaudeContextWindow(s, contextWindow));
@@ -124,24 +122,6 @@ export function resolveClaudeLaunchModelId(model: string | null | undefined, con
 export function resolveClaudeModelRuntimeEnv(model: string | null | undefined, contextWindow?: number | null): Record<string, string> {
   const launchModel = resolveClaudeLaunchModelId(model, contextWindow);
   if (!launchModel) return {};
-  const runtimeItem = getRuntimeEngineModelCatalogItem("claude", model);
-  if (runtimeItem?.runtimeProfileId === "native") return {};
-  if (runtimeItem?.runtimeProfileId === "claude_compatible_tiered") {
-    const fastTaskModelId = runtimeItem.fastTaskModelId!;
-    const subagentModelId = runtimeItem.subagentModelId!;
-    return {
-      ...buildSingleModelProviderRuntimeEnv(launchModel),
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: fastTaskModelId,
-      ANTHROPIC_SMALL_FAST_MODEL: fastTaskModelId,
-      CLAUDE_CODE_SUBAGENT_MODEL: subagentModelId,
-    };
-  }
-  if (
-    runtimeItem?.runtimeProfileId === "claude_compatible_single_model"
-    || runtimeItem?.runtimeProfileId === "claude_compatible_required_thinking"
-  ) {
-    return buildSingleModelProviderRuntimeEnv(launchModel);
-  }
   if (isSingleModelClaudeProviderModel(launchModel)) return buildSingleModelProviderRuntimeEnv(launchModel);
   if (launchModel !== CLAUDE_DEEPSEEK_V4_PRO_TRANSPORT_MODEL) return {};
 
@@ -194,16 +174,12 @@ export function resolveClaudeModelSettingsEnv(model: string | null | undefined, 
     if (!launchModel.startsWith("claude-")) env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(window);
   }
   const baseModel = launchModel.replace(/\[1m\]$/, "");
-  const runtimeItem = getRuntimeEngineModelCatalogItem("claude", model);
-  if (runtimeItem?.runtimeProfileId === "claude_compatible_required_thinking" || CLAUDE_REQUIRED_THINKING_MODELS.has(baseModel)) {
+  if (CLAUDE_REQUIRED_THINKING_MODELS.has(baseModel)) {
     // 未识别模型默认输出上限为 32K；正预算开启思考，避免本地 0/关闭配置导致 K2.7 返回 400。
     env.MAX_THINKING_TOKENS = "31999";
     // Claude Code 2.1.268 的 Anthropic 兼容通道不读取 family 的 SUPPORTED_CAPABILITIES。
     // 使用实际 CLI 支持的逐模型能力覆盖：发送 enabled 思考，并阻止 K2.7 自动附带 effort。
-    const hasEffort = Boolean(
-      runtimeItem?.supportedReasoningEfforts.length
-      || getRuntimeEngineModelInfo("claude", model)?.supportedReasoningEfforts?.length,
-    );
+    const hasEffort = Boolean(getRuntimeEngineModelInfo("claude", model)?.supportedReasoningEfforts?.length);
     env.CLAUDE_CODE_MODEL_CAPABILITIES = `${baseModel}=thinking,interleaved_thinking,-adaptive_thinking,-xhigh_effort,${hasEffort ? "effort,max_effort" : "-effort,-max_effort"}`;
     env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = "0";
   }

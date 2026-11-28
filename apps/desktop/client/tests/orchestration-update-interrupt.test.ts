@@ -12,8 +12,7 @@ import { createDesktopUpdateControl } from "../src/runtime/desktopUpdateControl.
 import type { SendMessageInput } from "../src/engines/threadSession.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
 import { XmlNodePromptRenderer } from "../src/orchestration/promptRenderer.js";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "@codeflowai/shared/engine-model-catalog-seed";
+import { resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
 
 /** 分离测试控制与实际等待，不依赖固定延时判断先后。 */
 function deferred<T>() {
@@ -686,7 +685,6 @@ test("更新冻结时最终节点自然结束，必要清理后无需解除准�
 
 /** 公开启动真实最终角色，仅在 provider 与必要资源清理出口设置屏障。 */
 function publicCompletionUpdateFixture(t: TestContext) {
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
   t.after(() => resetEngineModelCatalogRuntimeForTest());
   const f = fixture(t), provider = deferred<void>(), providerEntered = deferred<void>(), cleanup = deferred<void>(), cleanupEntered = deferred<void>();
   f.setActive(null);
@@ -941,7 +939,6 @@ test("更新冻结前已经在异步准备中的启动，不绕过后续派发�
 
 /** 模型发送由测试控制，节点 Attempt、快照与 canonical turn 仍使用真实仓储。 */
 function modelAdmissionFixture(t: TestContext, send: (turn: number) => Promise<{ responseText: string }>) {
-  applyEngineModelCatalogSnapshot({ schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1] });
   t.after(() => resetEngineModelCatalogRuntimeForTest());
   const f = fixture(t);
   f.setActive(null);

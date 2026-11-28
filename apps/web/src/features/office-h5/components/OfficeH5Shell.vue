@@ -145,9 +145,6 @@ const copy = {
   logoutConfirm: "\u786e\u8ba4\u9000\u51fa\u5f53\u524d CodeFlow \u8d26\u53f7\uff1f\u529e\u516c\u5e73\u53f0\u7ed1\u5b9a\u4e0d\u4f1a\u89e3\u9664\u3002",
   workspaceRequired: "\u8bf7\u5148\u9009\u62e9\u4e00\u4e2a\u5df2\u8fde\u63a5\u7684\u5de5\u4f5c\u533a\u3002",
   modelUnavailable: "\u5f53\u524d\u4f1a\u8bdd\u672a\u914d\u7f6e\u53ef\u7528\u6a21\u578b\uff0c\u8bf7\u5148\u5728 Web \u7aef\u9009\u62e9\u6a21\u578b\u540e\u91cd\u8bd5\u3002",
-  modelCatalogWaiting: "\u7b49\u5f85\u5f53\u524d\u5de5\u4f5c\u533a\u7684 Client \u5e94\u7528\u6700\u65b0\u6a21\u578b\u76ee\u5f55\uff0c\u5b8c\u6210\u540e\u5373\u53ef\u53d1\u9001\u3002",
-  modelCatalogUnsupported: "\u5f53\u524d\u5de5\u4f5c\u533a\u7684 Client \u7248\u672c\u4e0d\u652f\u6301\u52a8\u6001\u6a21\u578b\u76ee\u5f55\uff0c\u8bf7\u5347\u7ea7 Client \u540e\u518d\u53d1\u9001\u3002",
-  modelCatalogOffline: "\u5f53\u524d\u5de5\u4f5c\u533a\u7684 Host Client \u5df2\u79bb\u7ebf\uff0c\u91cd\u65b0\u4e0a\u7ebf\u5e76\u540c\u6b65\u6a21\u578b\u76ee\u5f55\u540e\u5373\u53ef\u53d1\u9001\u3002",
   oauthRedirectFailed: "\u672a\u80fd\u6253\u5f00\u529e\u516c\u5e73\u53f0\u6388\u6743\u9875\uff0c\u8bf7\u91cd\u8bd5\u3002",
 };
 
@@ -233,19 +230,11 @@ const officeBootstrapState = computed<OfficeH5BootstrapResponse | null>(() => {
   const state = bootstrapState.value;
   return state && "platformContext" in state ? state : null;
 });
-const catalogSyncIssue = computed(() => {
-  const state = engines.byWorkspaceId[String(workspaceId.value)]?.hostCatalogSyncState ?? null;
-  if (state === "waiting") return copy.modelCatalogWaiting;
-  if (state === "unsupported") return copy.modelCatalogUnsupported;
-  if (state === "offline") return copy.modelCatalogOffline;
-  return null;
-});
 const canSend = computed(() => Boolean(
   ready.value
   && workspaceId.value
   && selectedThread.value
   && messageDraft.value.trim()
-  && !catalogSyncIssue.value
   && !actionBusy.value,
 ));
 const webChatHref = computed(() => "/chat");
@@ -974,7 +963,6 @@ async function sendMessage(): Promise<void> {
     return;
   }
   await runAction("thread.send", async () => {
-    if (catalogSyncIssue.value) throw new Error(catalogSyncIssue.value);
     const clientItemId = createOfficeH5RequestId("oh5_msg");
     const meta = await ensureActionAllowed("thread.send", { threadId: thread.id, clientItemId });
     if (!meta) return;
@@ -1284,7 +1272,6 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="conversation-composer">
-            <div v-if="catalogSyncIssue" class="data-error">{{ catalogSyncIssue }}</div>
             <textarea v-model="messageDraft" :placeholder="copy.sendPlaceholder" rows="3" />
             <button class="primary" type="button" :disabled="!canSend" @click="sendMessage">{{ copy.send }}</button>
           </div>

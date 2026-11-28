@@ -25,14 +25,12 @@ test("普通Client无订阅本地保存，需求握手后仅上传新事件，�
   const server = http.createServer((req, res) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(
     req.url === "/api/client-db/startup-context" ? { ok: true, accountNamespace: "acct_demand_fixture" } : { ok: true, tasks: [], serverNow: Date.now() })));
   const wss = new WebSocketServer({ server }); let socket: WebSocket | undefined;
-  const row = { catalogItemId: "codex-default", engine: "codex", providerId: "openai", providerLabel: "OpenAI", modelId: "gpt-6.1-sol", displayName: "Codex", description: "test", inputModalities: ["text"], supportedReasoningEfforts: [], defaultReasoningEffort: null, contextWindow: 100000, maxContextWindow: null, supportsFastMode: false, supports1MContext: false, isDefault: true, sortOrder: 1, runtimeProfileId: "native", transportModelId: null, fastTaskModelId: null, subagentModelId: null };
   wss.on("connection", current => {
     socket = current;
     current.on("message", raw => {
       const message = JSON.parse(String(raw)); received.push(message);
       if (message.t === "client.hello") current.send(JSON.stringify({ t: "client.helloAck", keyHash: "fixture", serverNow: Date.now(), accountSessionId: "fixture-session",
         userSummary: { userId: "fixture-user", email: "fixture@example.test", fullName: "fixture", phone: "", avatarUrl: null, accountRole: "personal_normal", status: "active", enterpriseId: null, enterpriseName: null },
-        engineModelCatalog: { schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [row, { ...row, catalogItemId: "claude-default", engine: "claude", providerId: "anthropic", providerLabel: "Anthropic", modelId: "claude-fable-5" }] },
         capabilities: { localCanonicalRelayV1: true, localCanonicalRelayOnDemandV1: true, remoteDataDemandV1: true } }));
       if (message.t === "engine.models.applied") current.send(JSON.stringify({ t: "engine.models.appliedConfirmed", ...message.ack }));
       if (message.t === "conversation.event.relay") current.send(JSON.stringify({ t: "conversation.eventRelayAck", delivery: message.delivery, seqs: message.events.map((event: any) => event.seq) }));

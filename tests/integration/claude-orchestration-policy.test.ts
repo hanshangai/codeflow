@@ -1,12 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION } from "../../packages/shared/src/index.ts";
-import { INITIAL_ENGINE_MODEL_CATALOG_V1 } from "../../packages/shared/src/engineModelCatalogSeed.ts";
-import {
-  applyEngineModelCatalogSnapshot,
-  resetEngineModelCatalogRuntimeForTest,
-} from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
-
 import {
   buildClaudeArgs,
   resolveClaudeLaunchModelId,
@@ -18,15 +11,52 @@ import {
 } from "../../apps/desktop/client/src/engines/claude/claudeCli.ts";
 import { resolveClaudeControlMode } from "../../apps/desktop/client/src/engines/claude/claudeApproval.ts";
 import { buildClaudeChildEnv } from "../../apps/desktop/client/src/engines/claude/claudeThreadSession.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
 
-test.before(() => {
-  applyEngineModelCatalogSnapshot({
-    schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION,
-    configVersion: 1,
-    capturedAt: 0,
-    rows: [...INITIAL_ENGINE_MODEL_CATALOG_V1],
-  });
-});
+/** 本机内置模型已覆盖主流 Claude 模型；历史兼容模型按自定义模型补齐用于传输断言。 */
+function legacyClaudeModel(input: {
+  modelId: string;
+  providerId: "anthropic" | "deepseek" | "moonshot" | "qwen" | "zai";
+  contextWindow: number;
+  supports1MContext?: boolean;
+  supportedReasoningEfforts?: Array<"low" | "medium" | "high" | "xhigh" | "max">;
+  defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max" | null;
+}) {
+  return {
+    id: `test:claude:${input.modelId}`,
+    engine: "claude" as const,
+    providerId: input.providerId,
+    modelId: input.modelId,
+    displayName: input.modelId,
+    inputModalities: ["text" as const],
+    supportedReasoningEfforts: (input.supportedReasoningEfforts ?? []).map(reasoningEffort => ({ reasoningEffort, description: "" })),
+    defaultReasoningEffort: input.defaultReasoningEffort ?? null,
+    contextWindow: input.contextWindow,
+    maxContextWindow: null,
+    supportsFastMode: false,
+    supports1MContext: input.supports1MContext ?? false,
+    enabled: true,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+}
+
+test.before(() => setEngineModelCatalogCustomModels([
+  legacyClaudeModel({ modelId: "claude-opus-4-7", providerId: "anthropic", contextWindow: 200_000, supportedReasoningEfforts: ["high"], defaultReasoningEffort: "high" }),
+  legacyClaudeModel({ modelId: "claude-fable-5", providerId: "anthropic", contextWindow: 200_000, supportedReasoningEfforts: ["high"], defaultReasoningEffort: "high" }),
+  legacyClaudeModel({ modelId: "kimi-k2.6", providerId: "moonshot", contextWindow: 256_000 }),
+  legacyClaudeModel({ modelId: "kimi-k2.7-code", providerId: "moonshot", contextWindow: 256_000 }),
+  legacyClaudeModel({ modelId: "kimi-k2.7-code-highspeed", providerId: "moonshot", contextWindow: 256_000 }),
+  legacyClaudeModel({ modelId: "glm-5.1", providerId: "zai", contextWindow: 200_000 }),
+  legacyClaudeModel({ modelId: "qwen3.7-max", providerId: "qwen", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["high", "max"], defaultReasoningEffort: "high" }),
+  legacyClaudeModel({ modelId: "deepseek-v4-pro", providerId: "deepseek", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["high", "max"], defaultReasoningEffort: "high" }),
+  legacyClaudeModel({ modelId: "kimi-k3[1m]", providerId: "moonshot", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "max" }),
+  legacyClaudeModel({ modelId: "glm-5.3[1m]", providerId: "zai", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "max" }),
+  legacyClaudeModel({ modelId: "glm-5.3-flash[1m]", providerId: "zai", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "max" }),
+  legacyClaudeModel({ modelId: "claude-sonnet-5[1m]", providerId: "anthropic", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "high" }),
+  legacyClaudeModel({ modelId: "claude-fable-5-1[1m]", providerId: "anthropic", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "high" }),
+  legacyClaudeModel({ modelId: "claude-opus-5-5[1m]", providerId: "anthropic", contextWindow: 1_000_000, supports1MContext: true, supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "medium" }),
+]));
 test.after(() => resetEngineModelCatalogRuntimeForTest());
 
 const EXPECTED_FIXED_PROMPT_CACHING_ENV = {
@@ -373,7 +403,7 @@ test("resolveClaudeModelRuntimeEnv maps single-model Claude-compatible providers
     CLAUDE_CODE_SUBAGENT_MODEL: "kimi-k2.6",
   });
   assert.equal(resolveClaudeModelRuntimeEnv("glm-5.1").ANTHROPIC_DEFAULT_OPUS_MODEL, "glm-5.1");
-  assert.equal(resolveClaudeModelRuntimeEnv("qwen3.7-max").CLAUDE_CODE_SUBAGENT_MODEL, "qwen3.7-max");
+  assert.equal(resolveClaudeModelRuntimeEnv("qwen3.7-max").CLAUDE_CODE_SUBAGENT_MODEL, "qwen3.7-max[1m]");
 });
 
 test("buildClaudeChildEnv injects DeepSeek runtime credentials into provider-managed env", () => {
@@ -503,7 +533,7 @@ test("buildClaudeChildEnv clears inherited DeepSeek env for managed Anthropic mo
   assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
 });
 
-test("native 1M models preserve their transport marker while accepting a smaller user context window", () => {
+test("native 1M models keep their transport marker and directory window", () => {
   for (const model of ["kimi-k3", "glm-5.3", "glm-5.3-flash", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"]) {
     const args = buildClaudeArgs({
       text: "verify 1m",
@@ -511,7 +541,7 @@ test("native 1M models preserve their transport marker while accepting a smaller
       planMode: false,
       accessMode: "current",
       model,
-      contextWindow: 200_000, // 用户可把原生 1M 模型的上下文预算调小。
+      contextWindow: 200_000, // 用户请求不再覆盖目录窗口，仍按模型最大容量执行。
       effort: "high",
       inputFormat: "text",
       autoCompactPct: 95,
@@ -519,8 +549,8 @@ test("native 1M models preserve their transport marker while accepting a smaller
     assert.equal(args[args.indexOf("--model") + 1], `${model}[1m]`);
     assert.equal(resolveClaudeLaunchModelId(`${model}[1m]`), `${model}[1m]`);
     const flagEnv = readSettingsEnv(args);
-    assert.equal(flagEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "200000");
-    assert.equal(flagEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT, "1");
+    assert.equal(flagEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
+    assert.equal(flagEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT, "0");
     assert.equal(flagEnv.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, "95");
     const env = buildClaudeChildEnv({
       CLAUDE_CODE_DISABLE_1M_CONTEXT: "1",
@@ -533,10 +563,10 @@ test("native 1M models preserve their transport marker while accepting a smaller
       hasConfiguredCredentials: () => true,
       readCredentials: () => ({ apiKey: "test-token", baseUrl: "https://gateway.example.com/anthropic" }),
     });
-    assert.equal(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "200000");
-    assert.equal(env.CLAUDE_CODE_DISABLE_1M_CONTEXT, "1");
+    assert.equal(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
+    assert.equal(env.CLAUDE_CODE_DISABLE_1M_CONTEXT, "0");
     if (!model.startsWith("claude-")) {
-      assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "200000");
+      assert.equal(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1000000");
       assert.equal(env.ANTHROPIC_DEFAULT_FABLE_MODEL, `${model}[1m]`);
       assert.equal(flagEnv.ANTHROPIC_DEFAULT_FABLE_MODEL, `${model}[1m]`);
     }
@@ -579,8 +609,8 @@ test("Kimi Code and GLM 5.3 enforce thinking without inventing Kimi effort level
   assert.equal(resolveClaudeModelSettingsEnv("glm-5.1").MAX_THINKING_TOKENS, undefined);
 });
 
-test("Claude 用户上下文预算接受任意有效窗口并受目录最大值限制", () => {
-  assert.equal(resolveClaudeModelSettingsEnv("claude-opus-5-5", 150_000).CLAUDE_CODE_AUTO_COMPACT_WINDOW, "150000");
+test("Claude 会话窗口统一使用目录最大值", () => {
+  assert.equal(resolveClaudeModelSettingsEnv("claude-opus-5-5", 150_000).CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
   assert.equal(resolveClaudeModelSettingsEnv("claude-opus-5-5", 1_500_000).CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
   assert.equal(resolveClaudeModelSettingsEnv("claude-opus-4-7", 1_500_000).CLAUDE_CODE_AUTO_COMPACT_WINDOW, "200000");
 });

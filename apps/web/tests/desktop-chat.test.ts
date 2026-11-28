@@ -181,14 +181,14 @@ test("面板与输入框只放行本机已接入线程，知识类型与工作�
   }
 });
 
-test("本机目录就绪使用 Client 成功快照，失败或未读取不能借云端版本放行", t => {
+test("模型列表就绪使用最近成功快照，失败或未读取不放行", t => {
   const h = fixture(t);
   for (const [type, subtype] of [["chat", null], ["chat", "knowledge-conversation"], ["orchestration", "knowledge-assets"]] as const)
   for (const [snapshot, expected] of [
-    [{ localModels: true, lastUpdatedAt: 1, lastError: null, catalogVersion: null }, true],
-    [{ localModels: true, lastUpdatedAt: null, lastError: null, catalogVersion: null }, false],
-    [{ localModels: true, lastUpdatedAt: 1, lastError: "本机读取失败", catalogVersion: 3 }, false],
-    [{ localModels: false, lastUpdatedAt: 1, lastError: null, catalogVersion: 3 }, false],
+    [{ localModels: true, lastUpdatedAt: 1, lastError: null }, true],
+    [{ localModels: true, lastUpdatedAt: null, lastError: null }, false],
+    [{ localModels: true, lastUpdatedAt: 1, lastError: "本机读取失败" }, false],
+    [{ localModels: false, lastUpdatedAt: 1, lastError: null }, true],
   ] as const) {
     const values = computedFromSource("../src/features/composer/components/chat-composer.vue", ["localChatReady", "composerConnected", "modelCatalogLoaded", "composerWriteBlocked"], {
       config: h.config, props: { workspaceId, disabled: false }, thread: ref({ threadType: type, threadSubtype: subtype }), engines: { byWorkspaceId: { [workspaceId]: snapshot } },
@@ -212,7 +212,7 @@ test("本机知识会话仍受父级禁用、模型凭据和活动任务限制",
   ] as const) {
     const values = computedFromSource("../src/features/composer/components/chat-composer.vue", ["localChatReady", "composerConnected", "modelCatalogLoaded", "composerWriteBlocked", "canSend"], {
       config: h.config, props: { workspaceId, disabled, runningTurnId, allowQueue: false }, thread: ref({ threadType: type, threadSubtype: subtype }),
-      engines: { byWorkspaceId: { [workspaceId]: { localModels: true, lastUpdatedAt: 1, lastError: null, catalogVersion: null } } },
+      engines: { byWorkspaceId: { [workspaceId]: { localModels: true, lastUpdatedAt: 1, lastError: null } } },
       workspaceSwitchFlushInProgress: ref(false), sending: ref(false), turnDraining: ref(false), turnSaveFailed: ref(false), pendingReads: ref(false),
       currentComposerInputSubmission: ref({ mode: "message" }), currentModelProviderIssue: ref(providerIssue),
       flatModelOptions: ref([{ value: CODEX_MODELS[0]!.id }]), model: ref(selectedModel), hasComposerPayload: ref(true), shouldAllowComposerSend,

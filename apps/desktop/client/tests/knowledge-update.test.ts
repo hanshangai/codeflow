@@ -3,8 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { computeNextCronTimeMs, ENGINE_MODEL_CATALOG_SCHEMA_VERSION, type KnowledgeAssetSource, type WorkspaceId } from "@codeflowai/shared";
-import { applyEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { computeNextCronTimeMs, type KnowledgeAssetSource, type WorkspaceId } from "@codeflowai/shared";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../src/engines/engineModelCatalogRuntime.js";
 import { openClientDb } from "../src/db/clientDb.js";
 import { ThreadStore } from "../src/threads/threadStore.js";
 import { handleKnowledgeAssetRequest } from "../src/app/handlers/knowledgeAssetHandlers.js";
@@ -797,10 +797,11 @@ test("复用 cron 计算保留时区、每周与夏令时重复小时的语义",
 });
 
 test("真实 Client API 从保存计划到生成复检可闭环，专用会话进入本地知识列表", async t => {
-  applyEngineModelCatalogSnapshot({ schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1,
-    rows: ["generation-model", "review-model", "claude-model"].map((modelId, index) => ({ catalogItemId: `test:${modelId}`, engine: index === 2 ? "claude" : "codex", providerId: index === 2 ? "anthropic" : "openai", providerLabel: "测试", modelId, displayName: modelId, description: "",
-      inputModalities: ["text"], supportedReasoningEfforts: ["low", "high"].map(reasoningEffort => ({ reasoningEffort, description: reasoningEffort })), defaultReasoningEffort: "high",
-      contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false, supports1MContext: false, isDefault: index !== 1, sortOrder: index === 2 ? 1 : index + 1, runtimeProfileId: "native", transportModelId: null, fastTaskModelId: null, subagentModelId: null })) });
+  setEngineModelCatalogCustomModels(["generation-model", "review-model", "claude-model"].map((modelId, index) => ({
+    id: `test:${modelId}`, engine: index === 2 ? "claude" : "codex", providerId: index === 2 ? "anthropic" : "openai", modelId, displayName: modelId,
+    inputModalities: ["text"], supportedReasoningEfforts: ["low", "high"].map(reasoningEffort => ({ reasoningEffort, description: reasoningEffort })), defaultReasoningEffort: "high",
+    contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false, supports1MContext: false, enabled: true, createdAt: 1, updatedAt: 1,
+  })));
   t.after(() => resetEngineModelCatalogRuntimeForTest());
   const f = fixture(t);
   const db = openClientDb({ dbPath: path.join(f.root, "client.db") });

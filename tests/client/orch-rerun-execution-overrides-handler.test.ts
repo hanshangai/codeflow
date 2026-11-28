@@ -18,9 +18,14 @@ import {
   type WorkspaceId,
 } from "../../packages/shared/src/index.ts";
 import { handleOrchInstancesRerunFromNode } from "../../apps/desktop/client/src/app/handlers/orchestrationHandlers.ts";
-import { initializeLocalEngineModelCatalog, resetEngineModelCatalogRuntimeForTest } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../../apps/desktop/client/src/engines/engineModelCatalogRuntime.ts";
 
-test.beforeEach(() => initializeLocalEngineModelCatalog());
+test.beforeEach(() => setEngineModelCatalogCustomModels([{
+  id: "test:codex:gpt-5.6-terra", engine: "codex", providerId: "openai", modelId: "gpt-5.6-terra", displayName: "GPT-5.6 Terra",
+  inputModalities: ["text", "image"], supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map(reasoningEffort => ({ reasoningEffort: reasoningEffort as "low" | "medium" | "high" | "xhigh" | "max", description: "" })),
+  defaultReasoningEffort: "high", contextWindow: 372_000, maxContextWindow: 372_000,
+  supportsFastMode: true, supports1MContext: false, enabled: true, createdAt: 1, updatedAt: 1,
+}]));
 test.afterEach(() => resetEngineModelCatalogRuntimeForTest());
 import type { ApiHandlerContext, ApiRequestMessage } from "../../apps/desktop/client/src/app/handleApiRequest.ts";
 import { openClientDb } from "../../apps/desktop/client/src/db/clientDb.ts";

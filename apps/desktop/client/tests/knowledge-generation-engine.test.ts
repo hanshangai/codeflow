@@ -3,9 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ENGINE_MODEL_CATALOG_SCHEMA_VERSION, MANUAL_TURN_INTERRUPT_CODE, type ConversationEventInput, type KnowledgeAssetSource } from "@codeflowai/shared";
+import { getDefaultEngineModel, MANUAL_TURN_INTERRUPT_CODE, type ConversationEventInput, type KnowledgeAssetSource } from "@codeflowai/shared";
 import { createKnowledgeGenerationExecutor, type KnowledgeGenerationEngineInput } from "../src/knowledge/knowledgeGenerationEngine.js";
-import { applyEngineModelCatalogSnapshot, getActiveEngineModelCatalogSnapshot, resetEngineModelCatalogRuntimeForTest } from "../src/engines/engineModelCatalogRuntime.js";
+import { resetEngineModelCatalogRuntimeForTest, setEngineModelCatalogCustomModels } from "../src/engines/engineModelCatalogRuntime.js";
 import { KnowledgeAssetStore } from "../src/knowledge/knowledgeAssetStore.js";
 import { KnowledgeAssetError } from "../src/knowledge/knowledgeAssetFiles.js";
 import { KnowledgeGenerationService, stopKnowledgeGenerationForUpdate } from "../src/knowledge/knowledgeGenerationService.js";
@@ -16,17 +16,20 @@ import { openClientDb } from "../src/db/clientDb.js";
 import { ClientDbWriterService } from "../src/db/clientDbWriterService.js";
 import { createLocalEventPipeline } from "../src/runtime/localEventPersistence.js";
 
-test.beforeEach(() => applyEngineModelCatalogSnapshot({
-  schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 1, capturedAt: 1,
-  rows: ["codex", "claude"].map(engine => ({
-    catalogItemId: `test:${engine}`, engine, providerId: engine === "codex" ? "openai" : "anthropic",
-    providerLabel: engine, modelId: engine === "codex" ? "model" : "claude-model", displayName: engine, description: "",
-    inputModalities: ["text"], supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }],
-    defaultReasoningEffort: "high", contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false,
-    supports1MContext: false, isDefault: true, sortOrder: 1, runtimeProfileId: "native",
-    transportModelId: null, fastTaskModelId: null, subagentModelId: null,
+test.beforeEach(() => setEngineModelCatalogCustomModels([
+  ...["model", "model-b", "codex-new"].map(modelId => ({
+    id: `test:codex:${modelId}`, engine: "codex" as const, providerId: "openai" as const, modelId, displayName: modelId,
+    inputModalities: ["text" as const], supportedReasoningEfforts: [{ reasoningEffort: "high" as const, description: "高" }],
+    defaultReasoningEffort: "high" as const, contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false,
+    supports1MContext: false, enabled: true, createdAt: 1, updatedAt: 1,
   })),
-}));
+  ...["claude-model", "claude-new"].map(modelId => ({
+    id: `test:claude:${modelId}`, engine: "claude" as const, providerId: "anthropic" as const, modelId, displayName: modelId,
+    inputModalities: ["text" as const], supportedReasoningEfforts: [{ reasoningEffort: "high" as const, description: "高" }],
+    defaultReasoningEffort: "high" as const, contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false,
+    supports1MContext: false, enabled: true, createdAt: 1, updatedAt: 1,
+  })),
+]));
 test.afterEach(() => resetEngineModelCatalogRuntimeForTest());
 
 test("知识执行器在真实Writer下创建与复用线程，provider与清理等待不持许可且终态排空", async () => {
@@ -449,18 +452,8 @@ function projectFixture(t: test.TestContext) {
   store.saveTree({ schemaVersion: 1, instructions: "", nodes: ["a", "b"].map(id => ({ id, title: id, parentId: null, orderKey: id, summary: "", tags: [], instructions: "", sourceScope: [] })) }, null);
   const f = fixture();
   const service = new KnowledgeGenerationService(store, "ws", f.execute, "req-freeze", () => ({ nodeId: null, activationVersion: 1 }), db);
-  const begin = (extra: Partial<Parameters<typeof service.begin>[0]> = {}) => service.begin({ requestId: crypto.randomUUID(), mode: "batch", ownerThreadId: "knowledge-owner", selectedNodeIds: ["a", "b"], includeDescendants: false, strategy: "all", prompt: "", treeHash: store.readTree().hash, engine: "codex", model: null, effort: null, concurrency: 1, reviewConfig: { enabled: false, model: null, effort: null }, ...extra });
+  const begin = (extra: Partial<Parameters<typeof service.begin>[0]> = {}) => service.begin({ requestId: crypto.randomUUID(), mode: "batch", ownerThreadId: "knowledge-owner", selectedNodeIds: ["a", "b"], includeDescendants: false, strategy: "all", prompt: "", treeHash: store.readTree().hash, engine: "codex", model: "model", effort: null, concurrency: 1, reviewConfig: { enabled: false, model: null, effort: null }, ...extra });
   return { f, db, store, service, begin };
-}
-
-/** 替换默认模型时可同时下架旧项，模拟批次执行期间的真实目录更新。 */
-function changeDefaultModel(removeOriginal = false): void {
-  const snapshot = getActiveEngineModelCatalogSnapshot()!;
-  const original = snapshot.rows.find(row => row.engine === "codex")!;
-  applyEngineModelCatalogSnapshot({ ...snapshot, configVersion: snapshot.configVersion + 1, rows: [
-    ...snapshot.rows.filter(row => !removeOriginal || row.engine !== "codex").map(row => row.engine === "codex" ? { ...row, isDefault: false } : row),
-    { ...original, catalogItemId: "test:second", modelId: "model-b", displayName: "新默认模型", isDefault: true, sortOrder: removeOriginal ? 1 : 2 },
-  ] });
 }
 
 /** 等待真实 worker 收口；超时显式失败，避免把排队状态当成结果。 */
@@ -478,7 +471,6 @@ for (const [mode, concurrency] of [["batch", 1], ["batch", 2], ["review", 1]] as
   const source: KnowledgeAssetSource = { kind: "code", path: "source.ts", contentHash: store.readSource("source.ts").contentHash, startLine: 1, endLine: 1, relation: "实现" };
   if (mode === "review") for (const nodeId of ["a", "b"]) store.saveDocument({ nodeId, content: "# 原文\n待修订结论。", expectedHash: null, origin: "manual", sources: [source] });
   const models: string[] = [], reportIds = new Map<string, string>(), reviewed = new Set<string>();
-  let changed = false;
   f.deps.sessions.getOrCreate = (thread: any) => ({
     resolvePlatformToolTransport: () => "native-dynamic", interrupt: async () => {},
     sendMessage: async (message: any, sink: any) => {
@@ -496,11 +488,10 @@ for (const [mode, concurrency] of [["batch", 1], ["batch", 2], ["review", 1]] as
         ? { outcome: issues.length ? "issues" : "passed", summary: "已核验", issues, sources } : { content: "# 已核验知识\n已核验的结论。", summary: "说明", sources } });
       assert.equal(submitted.ok, true, JSON.stringify(submitted));
       if (reviewing) { reviewed.add(nodeId); reportIds.set(nodeId, submitted.output.reportId); }
-      if (!reviewing && !changed) { changed = true; changeDefaultModel(); }
       sink.conversation({ workspaceId: "ws", threadId: thread.threadId, type: "turn.completed", payload: { turnId: message.turnId } });
     },
   });
-  const request = { requestId: "same-freeze-request", mode, concurrency, reviewConfig: { enabled: true, model: null, effort: null, autoRepair: true, maxRounds: 2 } };
+  const request = { requestId: "same-freeze-request", mode, concurrency, model: "model", reviewConfig: { enabled: true, model: null, effort: null, autoRepair: true, maxRounds: 2 } };
   const run = begin(request); service.start(run.id);
   const result = await settled(service, run.id);
   assert.equal(result.phase, "completed", JSON.stringify(result.error ?? result.items));
@@ -545,13 +536,14 @@ test("失败项清空模型后使用新默认和新线程，已完成项不重�
   assert.deepEqual(failed.items.map(item => item.status), ["completed", "failed"]);
   const preservedRevision = failed.items[0]!.revisionId;
   const oldThread = failed.items[1]!.executionThreadId;
-  changeDefaultModel(true); firstAttempt = false;
+  firstAttempt = false;
   service.start(run.id, { nodeIds: ["b"], model: null, effort: null });
   const result = await settled(service, run.id);
+  const defaultCodex = getDefaultEngineModel("codex")!;
   assert.equal(result.phase, "completed", JSON.stringify(result.error ?? result.items));
-  assert.deepEqual(f.sent.map(({ nodeId, input }) => [nodeId, input.model]), [["a", "model"], ["b", "model"], ["b", "model-b"]]);
+  assert.deepEqual(f.sent.map(({ nodeId, input }) => [nodeId, input.model]), [["a", "model"], ["b", "model"], ["b", defaultCodex.id]]);
   assert.notEqual(result.items[1]!.executionThreadId, oldThread);
-  assert.deepEqual(result.items[1]!.executionConfig, { model: "model-b", effort: "high" });
+  assert.deepEqual(result.items[1]!.executionConfig, { model: defaultCodex.id, effort: defaultCodex.defaultReasoningEffort });
   assert.equal(result.items[0]!.revisionId, preservedRevision);
   assert.equal(store.detail("a").drafts.length, 1);
 });
@@ -594,11 +586,11 @@ test("默认配置在规划、正文和复检前解析为真实模型并保存�
   for (const engine of ["codex", "claude"] as const) for (const purpose of ["planning", "generation", "review"] as const) {
     const f = fixture();
     await f.execute(input({ engine, purpose, model: null, effort: null }));
-    const expectedModel = engine === "codex" ? "model" : "claude-model";
-    assert.equal(f.sent[0].input.model, expectedModel);
-    assert.equal(f.sent[0].input.effort, "high");
-    assert.equal(f.created[0].prefs.model, expectedModel);
-    assert.equal(f.created[0].prefs.effort, "high");
+    const defaultModel = getDefaultEngineModel(engine)!;
+    assert.equal(f.sent[0].input.model, defaultModel.id);
+    assert.equal(f.sent[0].input.effort, defaultModel.defaultReasoningEffort ?? "high");
+    assert.equal(f.created[0].prefs.model, defaultModel.id);
+    assert.equal(f.created[0].prefs.effort, defaultModel.defaultReasoningEffort ?? "high");
   }
 });
 
@@ -1168,14 +1160,6 @@ test("通用turn错误事件不覆盖引擎抛出的具体失败原因", async (
   await assert.rejects(f.execute(input()), error => error === cause);
 });
 
-test("模型目录未就绪时明确失败，不创建执行线程", async () => {
-  resetEngineModelCatalogRuntimeForTest();
-  const f = fixture();
-  await assert.rejects(f.execute(input({ model: null, effort: null })), /动态模型目录尚未同步/);
-  assert.equal(f.created.length, 0);
-  assert.equal(f.sent.length, 0);
-});
-
 test("显式模型或思考强度已失效时拒绝执行，不静默使用默认项", async () => {
   for (const extra of [{ model: "removed" }, { effort: "xhigh" }]) {
     const f = fixture();
@@ -1188,20 +1172,11 @@ test("显式模型或思考强度已失效时拒绝执行，不静默使用默�
 test("修订默认配置沿用线程实际模型，显式调整后同步保存偏好", async () => {
   const f = fixture();
   let threadId = "";
+  const defaultCodex = getDefaultEngineModel("codex")!;
   await f.execute(input({ model: null, effort: null, onThreadCreated: id => { threadId = id; } }));
-  const catalog = { schemaVersion: ENGINE_MODEL_CATALOG_SCHEMA_VERSION, configVersion: 2, capturedAt: 2,
-    rows: ["codex", "claude"].flatMap(engine => [false, true].map(isDefault => ({
-      catalogItemId: `${engine}:${isDefault}`, engine, providerId: engine === "codex" ? "openai" : "anthropic", providerLabel: engine,
-      modelId: isDefault ? `${engine}-new` : engine === "codex" ? "model" : "claude-model", displayName: engine, description: "",
-      inputModalities: ["text"], supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }], defaultReasoningEffort: "high",
-      contextWindow: 200_000, maxContextWindow: null, supportsFastMode: false, supports1MContext: false, isDefault,
-      sortOrder: isDefault ? 2 : 1, runtimeProfileId: "native", transportModelId: null, fastTaskModelId: null, subagentModelId: null,
-    }))),
-  };
-  applyEngineModelCatalogSnapshot(catalog);
   await f.execute(input({ threadId, model: null, effort: null }));
-  assert.equal(f.sent[1].input.model, "model");
-  assert.equal(f.created[0].prefs.model, "model");
+  assert.equal(f.sent[1].input.model, defaultCodex.id);
+  assert.equal(f.created[0].prefs.model, defaultCodex.id);
   await f.execute(input({ threadId, model: "codex-new", effort: null }));
   assert.equal(f.sent[2].input.model, "codex-new");
   assert.equal(f.created[0].prefs.model, "codex-new");
