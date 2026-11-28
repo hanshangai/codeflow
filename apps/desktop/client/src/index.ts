@@ -2512,7 +2512,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
       desktopHostScopes = [];
       reminderDelivery.disconnect(new Error("REMINDER_DELIVERY_CONNECTION_RETIRED"));
       authorizedRelayScopes = []; remoteDataDemands.clear();
-      clearDesktopCloudEngineModelCatalog(); relayPricingCatalog = null;
+      relayPricingCatalog = null;
       const draining = builtInRelayCredentials.invalidateOwner(owner).then(() => sessions.releaseInvalidatedBuiltInSessions(owner));
       const tracked = draining.then(() => { retiredCredentialDrains.delete(tracked); }, error => {
         retiredCredentialDrains.delete(tracked); retiredCredentialFailures.push(error);
@@ -2525,6 +2525,7 @@ async function main(options?: { apiKeyOverride?: unknown }) {
       getWorkspaceIds: () => Array.from(workspaces.keys()),
       isHostCommandAuthorized: isDesktopHostCommandAuthorized,
       onOwnerInvalidated: retireDesktopOwner,
+      onAccountBindingRevoked: clearDesktopCloudEngineModelCatalog,
       getCredentialCleanupErrorCode: () => retiredCredentialFailures.length ? "DESKTOP_CREDENTIAL_RELEASE_FAILED" : null,
       onRequestCancelled: context => logger.info("desktop-cloud", "old account request cancelled after owner revocation", { code: "DESKTOP_CLOUD_OWNER_CANCELLED", requestId: desktopRequestId, clientId: config.clientId, ...context }),
       /** Key 失败显式投影并终止自动启用，已认证连接保持 linked。 */
@@ -2550,7 +2551,10 @@ async function main(options?: { apiKeyOverride?: unknown }) {
       onHello: async (message, owner, activation) => {
         activation.assertCurrent();
         if (!message.engineModelCatalog) throw new Error("DESKTOP_CLOUD_MODEL_CATALOG_REQUIRED");
-        const ack = await withDatabase("desktop-cloud:model-catalog", () => applyEngineModelCatalogSnapshot(message.engineModelCatalog!, Date.now(), `desktop-cloud-${owner.generation}-${message.engineModelCatalog!.configVersion}`));
+        const ack = await withDatabase("desktop-cloud:model-catalog", () => {
+          activation.assertCurrent();
+          return applyEngineModelCatalogSnapshot(message.engineModelCatalog!, Date.now(), `desktop-cloud-${owner.generation}-${message.engineModelCatalog!.configVersion}`, "desktopHello");
+        });
         activation.assertCurrent();
         const sent = activation.send({ t: "engine.models.applied", ack });
         if (!sent.accepted) throw new Error("DESKTOP_CLOUD_MODEL_CATALOG_ACK_FAILED");
@@ -2607,7 +2611,11 @@ async function main(options?: { apiKeyOverride?: unknown }) {
         if (message.t === "engine.models.appliedConfirmed") { confirmEngineModelCatalogApplied(message); return; }
         if (message.t === "engine.models.dispatchResume") { cancelEngineModelCatalogDispatchPause(message.operationId); return; }
         if (message.t === "engine.models.updated") {
-          const ack = await withDatabase("desktop-cloud:model-catalog", () => applyEngineModelCatalogSnapshot(message.catalog, Date.now(), message.operationId ?? `desktop-cloud-${owner.generation}-${message.catalog.configVersion}`));
+          const ack = await withDatabase("desktop-cloud:model-catalog", () => {
+            desktopCloudAccount!.assertOwner(owner);
+            return applyEngineModelCatalogSnapshot(message.catalog, Date.now(), message.operationId ?? `desktop-cloud-${owner.generation}-${message.catalog.configVersion}`);
+          });
+          desktopCloudAccount!.assertOwner(owner);
           if (!sendToServer({ t: "engine.models.applied", ack }).accepted) throw new Error("DESKTOP_CLOUD_MODEL_CATALOG_ACK_FAILED"); return;
         }
         if (message.t === "engine.models.dispatchPause") {

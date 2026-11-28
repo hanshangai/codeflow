@@ -126,10 +126,9 @@ test.describe("会话核心链路", () => {
     await expect(page.getByRole("radio", { name: "Codex" })).toBeChecked();
   });
 
-  test("新建会话默认关闭 Fast、Spec、WorkFlow，手动开启后刷新保留且不影响下一会话", async ({ page }) => {
+  test("新建会话默认关闭 Fast、WorkFlow，手动开启后刷新保留且不影响下一会话", async ({ page }) => {
     let prefs: Record<string, unknown> = {};
     let workflowEnabled = false;
-    let snapshotRequests = 0;
     await page.route("**/api/account/me/model-context-preferences", (route) => route.fulfill({ json: { ok: true, preferences: [] } }));
     await page.route("**/api/engines/status**", async (route) => {
       const response = await route.fetch();
@@ -141,11 +140,7 @@ test.describe("会话核心链路", () => {
         : engine);
       return route.fulfill({ response, json: body });
     });
-    await page.route("**/api/threads/latest-prefs**", (route) => route.fulfill({ json: { ok: true, prefs: { model: "gpt-5.6-sol", serviceTier: "fast", knowledgeEnabled: true } } }));
-    await page.route("**/api/knowledge/assets/snapshot?**", (route) => {
-      snapshotRequests += 1;
-      return route.fulfill({ json: { ok: true, data: { initialized: true } } });
-    });
+    await page.route("**/api/threads/latest-prefs**", (route) => route.fulfill({ json: { ok: true, prefs: { model: "gpt-5.6-sol", serviceTier: "fast" } } }));
     await page.route("**/api/orch/chat/**", (route) => {
       const endpoint = new URL(route.request().url()).pathname.split("/").pop();
       if (endpoint === "settings") workflowEnabled = route.request().postDataJSON().enabled;
@@ -172,9 +167,8 @@ test.describe("会话核心链路", () => {
     await page.goto("/chat");
     await createThread(page, "开关默认关闭会话");
     const fast = page.getByRole("button", { name: "Fast", exact: true });
-    const spec = page.getByRole("button", { name: "Spec", exact: true });
     const workflow = page.getByRole("button", { name: "WorkFlow", exact: true });
-    for (const toggle of [fast, spec, workflow]) {
+    for (const toggle of [fast, workflow]) {
       await expect(toggle).toBeVisible();
       await expect(toggle).not.toHaveClass(/composer__toggle--on/u);
     }
@@ -186,23 +180,19 @@ test.describe("会话核心链路", () => {
     await fast.click();
     await expect.poll(() => prefs.serviceTier).toBe("fast");
     await expect(fast).toHaveClass(/composer__toggle--on/u);
-    await spec.click();
-    await expect.poll(() => prefs.knowledgeEnabled).toBe(true);
-    expect(snapshotRequests).toBeGreaterThan(0);
     await workflow.click();
     await expect.poll(() => workflowEnabled).toBe(true);
     await page.reload();
-    for (const toggle of [fast, spec, workflow]) await expect(toggle).toHaveClass(/composer__toggle--on/u);
+    for (const toggle of [fast, workflow]) await expect(toggle).toHaveClass(/composer__toggle--on/u);
     await fast.click();
     await expect.poll(() => prefs.serviceTier).toBeNull();
     await expect(fast).not.toHaveClass(/composer__toggle--on/u);
     await page.reload();
     await expect(fast).toBeVisible();
     await expect(fast).not.toHaveClass(/composer__toggle--on/u);
-    await expect(spec).toHaveClass(/composer__toggle--on/u);
     await expect(workflow).toHaveClass(/composer__toggle--on/u);
     await createThread(page, "下一会话仍默认关闭");
-    for (const toggle of [fast, spec, workflow]) await expect(toggle).not.toHaveClass(/composer__toggle--on/u);
+    for (const toggle of [fast, workflow]) await expect(toggle).not.toHaveClass(/composer__toggle--on/u);
   });
 
   test("CT-03 发送消息并收到回复", async ({ page }) => {

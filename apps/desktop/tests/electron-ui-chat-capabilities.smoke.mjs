@@ -136,7 +136,7 @@ try {
   // 空会话尚无用量，核对原上下文组件已挂载，实际用量仍由组件决定是否展示。
   await expect(composer.locator(".composer__context-bar")).toBeAttached();
   await expect(composer.getByRole("button", { name: "常用提示词", exact: true })).toBeDisabled();
-  await expect(composer.getByRole("button", { name: "Spec", exact: true })).toBeVisible();
+  await expect(composer.getByRole("button", { name: "Spec", exact: true })).toHaveCount(0);
   const workflow = composer.getByRole("button", { name: "WorkFlow", exact: true });
   await expect(workflow).toHaveAttribute("aria-pressed", "false");
   await workflow.click();

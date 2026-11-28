@@ -8,7 +8,7 @@ import http from "node:http";
 import { fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { ConversationEventEnvelope, DesktopApiRequest, DesktopApiResponse } from "@codeflowai/shared";
+import type { ConversationEventEnvelope, DesktopApiRequest, DesktopApiResponse, EngineStatus } from "@codeflowai/shared";
 import { openClientDb } from "../src/db/clientDb.js";
 import { createLocalEventDatabaseIndex } from "../src/runtime/localEventIndex.js";
 import { createLocalEventPersistence, type LocalEventBatch } from "../src/runtime/localEventPersistence.js";
@@ -20,7 +20,8 @@ async function waitFor<T>(read: () => T | undefined): Promise<T> {
   throw new Error("DESKTOP_CLOUD_INTEGRATION_TIMEOUT");
 }
 
-test("real desktop runtime links A/B with same-account RPC and keeps session tokens out of config", async t => {
+/** 启动真实 Client 与隔离的云端握手，供关联与断线测试复用。 */
+async function startCloudIntegration(t: test.TestContext) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cf-d15-runtime-"));
   await fs.writeFile(path.join(root, "device-identity.json"), JSON.stringify({ deviceId: crypto.randomUUID(), createdAt: new Date().toISOString() }), "utf8");
   const builtin = path.join(root, "package"); await fs.mkdir(builtin);
@@ -34,14 +35,17 @@ test("real desktop runtime links A/B with same-account RPC and keeps session tok
   const sockets = new Map<string, WebSocket>(); const received: any[] = [];
   const catalog = { schemaVersion: "engine-model-catalog/v1", configVersion: 1, capturedAt: 1, rows: [{ catalogItemId: "codex-default", engine: "codex", providerId: "openai", providerLabel: "OpenAI", modelId: "gpt-6.1-sol", displayName: "Codex", description: "test", inputModalities: ["text"], supportedReasoningEfforts: [], defaultReasoningEffort: null, contextWindow: 100000, maxContextWindow: null, supportsFastMode: false, supports1MContext: false, isDefault: true, sortOrder: 1, runtimeProfileId: "native", transportModelId: null, fastTaskModelId: null, subagentModelId: null }] };
   catalog.rows.push({ ...catalog.rows[0]!, catalogItemId: "claude-default", engine: "claude", providerId: "anthropic", providerLabel: "Anthropic", modelId: "claude-fable-5", displayName: "Claude" });
+  const extraModel = { ...catalog.rows[0]!, catalogItemId: "cloud-extra", modelId: "cloud-extra", isDefault: false, sortOrder: 2 };
+  let accountACatalog = { ...catalog, configVersion: 7 };
+  let holdCatalogConfirmation = false;
   const summary = (id: string) => ({ userId: id, email: `${id}@example.test`, fullName: id, phone: "", avatarUrl: null, accountRole: "personal_normal", status: "active", enterpriseId: null, enterpriseName: null });
   wss.on("connection", (socket, req) => {
     const id = req.headers.authorization!.slice(7); sockets.set(id, socket);
     socket.on("message", raw => {
       const message = JSON.parse(String(raw)); received.push({ id, message });
-      if (message.t === "client.hello") socket.send(JSON.stringify({ t: "client.helloAck", keyHash: `hash-${id}`, serverNow: Date.now(), accountSessionId: `session-${id}`, userSummary: summary(id), engineModelCatalog: { ...catalog, configVersion: id === "A" ? 7 : 1 }, capabilities: { desktopLocalRuntimeV1: true, localCanonicalRelayV1: true, localCanonicalRelayOnDemandV1: true, remoteDataDemandV1: true } }));
+      if (message.t === "client.hello") socket.send(JSON.stringify({ t: "client.helloAck", keyHash: `hash-${id}`, serverNow: Date.now(), accountSessionId: `session-${id}`, userSummary: summary(id), engineModelCatalog: id === "A" ? accountACatalog : catalog, capabilities: { desktopLocalRuntimeV1: true, localCanonicalRelayV1: true, localCanonicalRelayOnDemandV1: true, remoteDataDemandV1: true } }));
       if (message.t === "engine.models.applied") {
-        socket.send(JSON.stringify({ t: "engine.models.appliedConfirmed", ...message.ack }));
+        if (!holdCatalogConfirmation) socket.send(JSON.stringify({ t: "engine.models.appliedConfirmed", ...message.ack }));
         socket.send(JSON.stringify({ t: "conversation.event.relayScopes", scopes: [] }));
       }
     });
@@ -76,7 +80,24 @@ test("real desktop runtime links A/B with same-account RPC and keeps session tok
   const project = path.join(root, "private-project"); await fs.mkdir(project);
   const created = await request({ method: "workspaces.upsert", body: { title: "本机私有项目", path: project } }); assert.equal(created.status, 200, JSON.stringify(created.body));
   const workspaceId = (created.body as any).workspace.id;
-  const linkedA = await request({ method: "runtime.cloudAccount.link", body: { serverOrigin: `http://127.0.0.1:${port}`, sessionToken: "A" } });
+  const linkA = { method: "runtime.cloudAccount.link" as const, body: { serverOrigin: `http://127.0.0.1:${port}`, sessionToken: "A" } };
+  /** 等待受测 Client 完成正常停机，便于检查落盘日志。 */
+  const shutdown = async () => {
+    child.send({ t: "desktop.shutdown", requestId: parentId });
+    await waitFor(() => exitCode === undefined ? undefined : true);
+    assert.equal(exitCode, 0, stderr);
+  };
+  return { root, workspaceId, port, request, sockets, received, relayRequests, linkA, catalog, extraModel, shutdown,
+    /** 控制 A 的目录，并可扣住确认以验证下一版本不会提前放行。 */
+    publishA(next: typeof accountACatalog, holdConfirmation = false) { accountACatalog = next; holdCatalogConfirmation = holdConfirmation; },
+    /** 回归断言完整通过后才允许清理现场。 */
+    complete() { completed = true; },
+  };
+}
+
+test("real desktop runtime links A/B with same-account RPC and keeps session tokens out of config", async t => {
+  const { root, workspaceId, port, request, sockets, received, relayRequests, linkA, shutdown, complete } = await startCloudIntegration(t);
+  const linkedA = await request(linkA);
   assert.equal(linkedA.status, 200, JSON.stringify(linkedA.body)); assert.equal((linkedA.body as any).account.userSummary.userId, "A");
   assert.equal((linkedA.body as any).account.status, "linked");
   assert.equal((linkedA.body as any).account.builtInRelayErrorCode, "DESKTOP_BUILTIN_AUTO_ENABLE_FAILED");
@@ -95,14 +116,68 @@ test("real desktop runtime links A/B with same-account RPC and keeps session tok
   const config = JSON.parse(await fs.readFile(path.join(root, "config.json"), "utf8"));
   assert.equal(config.apiKey, ""); assert.equal(config.sessionToken, undefined);
   assert.equal(received.filter(item => ["raw.event", "conversation.event", "conversation.event.relay", "orchestration.event"].includes(item.message.t)).length, 0);
-  child.send({ t: "desktop.shutdown", requestId: parentId });
-  await waitFor(() => exitCode === undefined ? undefined : true); assert.equal(exitCode, 0, stderr);
+  await shutdown();
   const logFiles = await fs.readdir(path.join(root, "logs"));
   const logs = (await Promise.all(logFiles.map(name => fs.readFile(path.join(root, "logs", name), "utf8")))).join("\n");
   const cloudErrors = logs.split(/\r?\n/u).filter(line => line.includes("DESKTOP_BUILTIN_AUTO_ENABLE_FAILED"));
   assert.equal(cloudErrors.length, 1, "auto Key failure is logged once at its handling boundary");
   for (const field of ["requestId", "clientId", "accountSessionId", "userId", "providerId", "rootCause", "RELAY_MISCONFIGURED"]) assert.ok(cloudErrors[0]!.includes(field), field);
-  completed = true;
+  complete();
+});
+
+test("desktop cloud models survive network loss without bypassing publication or logout", async t => {
+  const { workspaceId, request, sockets, received, linkA, catalog, extraModel, publishA, complete } = await startCloudIntegration(t);
+  const initial = { ...catalog, configVersion: 7, rows: [...catalog.rows, extraModel] };
+  publishA(initial);
+  const linked = await request(linkA);
+  assert.equal(linked.status, 200, JSON.stringify(linked.body));
+  /** 读取工作台使用的本机目录，超时即失败。 */
+  const readModels = async (): Promise<string[]> => {
+    const status = await request({ method: "engines.status", body: { workspaceId } });
+    assert.equal(status.status, 200, JSON.stringify(status.body));
+    const body = status.body as { engines: EngineStatus[] };
+    return body.engines.find(engine => engine.engineType === "codex")!.models.map(model => model.id);
+  };
+  /** 等 Client 真正观察到 WS 断线，再读取离线行为。 */
+  const dropA = async (): Promise<void> => {
+    sockets.get("A")!.terminate();
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const connection = await request({ method: "runtime.cloudAccount.status" });
+      if ((connection.body as any).account.status === "failed") return;
+      assert.ok(Date.now() < deadline, "desktop cloud account did not observe the disconnect");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  assert.ok((await readModels()).includes("cloud-extra"));
+  await dropA();
+  assert.ok((await readModels()).includes("cloud-extra"));
+  publishA(initial, true);
+  assert.equal((await request(linkA)).status, 200);
+  assert.ok((await readModels()).includes("cloud-extra"), "same confirmed snapshot stays usable while its new receipt is pending");
+  const lastApplied = received.filter(item => item.id === "A" && item.message.t === "engine.models.applied").at(-1)!.message.ack;
+  sockets.get("A")!.send(JSON.stringify({ t: "engine.models.dispatchPause", operationId: "publish", configVersion: 8, digest: "a".repeat(64) }));
+  await waitFor(() => received.find(item => item.message.t === "engine.models.dispatchPaused"));
+  await dropA();
+  assert.deepEqual((await readModels()).filter(id => id === "cloud-extra" || id === "gpt-6.1-sol"), ["gpt-6.1-sol"]);
+  const nextCatalog = { ...initial, configVersion: 8, rows: [...catalog.rows, { ...extraModel, catalogItemId: "cloud-next", modelId: "cloud-next" }] };
+  publishA(nextCatalog, true);
+  assert.equal((await request(linkA)).status, 200, "reconnect keeps the interrupted publication pause");
+  assert.deepEqual((await readModels()).filter(id => id === "cloud-extra" || id === "cloud-next" || id === "gpt-6.1-sol"), ["gpt-6.1-sol"]);
+  const nextApplied = received.find(item => item.id === "A" && item.message.t === "engine.models.applied" && item.message.ack.configVersion === 8)!.message.ack;
+  assert.notEqual(nextApplied.operationId, lastApplied.operationId);
+  sockets.get("A")!.send(JSON.stringify({ t: "engine.models.updated", operationId: "publish", catalog: nextCatalog }));
+  await waitFor(() => received.find(item => item.id === "A" && item.message.t === "engine.models.applied" && item.message.ack.operationId === "publish"));
+  const publicationAck = received.find(item => item.id === "A" && item.message.t === "engine.models.applied" && item.message.ack.operationId === "publish")!.message.ack;
+  sockets.get("A")!.send(JSON.stringify({ t: "engine.models.appliedConfirmed", operationId: "publish", configVersion: 8, digest: publicationAck.digest }));
+  sockets.get("A")!.send(JSON.stringify({ t: "api.req", id: "confirm-barrier", method: "threads.list", path: "/api/threads", body: { workspaceId } }));
+  await waitFor(() => received.find(item => item.message.id === "confirm-barrier"));
+  assert.deepEqual((await readModels()).filter(id => id.startsWith("cloud-")), ["cloud-next"]);
+  await dropA();
+  assert.ok((await readModels()).includes("cloud-next"));
+  assert.equal((await request({ method: "runtime.cloudAccount.unlink" })).status, 200);
+  assert.equal((await readModels()).includes("cloud-next"), false, "logout discards the offline binding before another account links");
+  complete();
 });
 
 for (const pendingType of ["turn.started", "turn.completed"] as const) {

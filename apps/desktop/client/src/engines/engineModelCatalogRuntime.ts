@@ -40,12 +40,14 @@ let dispatchPause: {
   operationId: string;
   configVersion: number;
   digest: string;
+  kind: "apply" | "reconnect" | "publication";
   resumed: Promise<void>;
   resume: () => void;
   drained: Promise<void>;
   markDrained: () => void;
 } | null = null;
 let activeDispatchLeases = 0;
+const pendingHelloConfirmations = new Set<string>();
 
 /** 桌面在配置与数据库初始化前启用本地目录；不伪造 Server 快照或确认。 */
 export function initializeLocalEngineModelCatalog(): void {
@@ -56,20 +58,24 @@ export function initializeLocalEngineModelCatalog(): void {
 export function clearDesktopCloudEngineModelCatalog(): void {
   if (!localCatalogEnabled) throw catalogRuntimeError("ENGINE_MODEL_CATALOG_SCOPE_INVALID", "仅桌面本地目录可撤销云端补充");
   activeCatalog = null;
+  pendingHelloConfirmations.clear();
   resumeEngineModelCatalogDispatch();
 }
 
-/** 单调、原子应用 Server 模型目录；旧版本或同版本异内容会显式失败。 */
+/** 单调应用 Server 目录；桌面握手可接续旧连接的确认暂停。 */
 export function applyEngineModelCatalogSnapshot(
   value: unknown,
   appliedAt = Date.now(),
   operationId?: string,
+  source?: "desktopHello",
 ): EngineModelCatalogAppliedAck {
   const snapshot = cloneEngineModelCatalogSnapshot(value);
   const digest = crypto
     .createHash("sha256")
     .update(serializeEngineModelCatalogDigestPayload(snapshot), "utf8")
     .digest("hex");
+  const desktopHello = localCatalogEnabled && source === "desktopHello" ? operationId?.trim() : undefined;
+  const publicationPaused = dispatchPause?.kind === "publication";
   if (activeCatalog) {
     if (snapshot.configVersion < activeCatalog.snapshot.configVersion) {
       throw catalogRuntimeError(
@@ -84,7 +90,11 @@ export function applyEngineModelCatalogSnapshot(
           `同一模型目录版本内容不一致：version=${snapshot.configVersion}`,
         );
       }
-      const confirmationOperationId = ensureCatalogApplyConfirmationPause(operationId, snapshot.configVersion, digest);
+      // 重连握手不能替代未完成发布的确认，也不能释放发布暂停。
+      if (desktopHello && dispatchPause && !publicationPaused) dispatchPause.operationId = desktopHello;
+      if (publicationPaused && desktopHello) pendingHelloConfirmations.add(desktopHello);
+      const confirmationOperationId = publicationPaused && desktopHello
+        ? desktopHello : desktopHello && !dispatchPause ? desktopHello : ensureCatalogApplyConfirmationPause(operationId, snapshot.configVersion, digest);
       return {
         configVersion: snapshot.configVersion,
         digest,
@@ -94,8 +104,11 @@ export function applyEngineModelCatalogSnapshot(
     }
   }
 
-  const confirmationOperationId = ensureCatalogApplyConfirmationPause(operationId, snapshot.configVersion, digest);
   const models = buildCatalogModels(snapshot);
+  if (desktopHello && dispatchPause && !publicationPaused) dispatchPause.operationId = desktopHello;
+  if (publicationPaused && desktopHello) pendingHelloConfirmations.add(desktopHello);
+  const confirmationOperationId = publicationPaused && desktopHello
+    ? desktopHello : ensureCatalogApplyConfirmationPause(operationId, snapshot.configVersion, digest);
   activeCatalog = { snapshot, digest, models };
   return {
     configVersion: snapshot.configVersion,
@@ -155,6 +168,7 @@ export async function pauseEngineModelCatalogDispatch(input: {
       operationId,
       configVersion: input.configVersion,
       digest: input.digest,
+      kind: "publication",
       resumed,
       resume,
       drained,
@@ -184,6 +198,7 @@ export function pauseEngineModelCatalogDispatchForReconnect(operationId: string)
     normalizedOperationId,
     activeCatalog.snapshot.configVersion,
     activeCatalog.digest,
+    "reconnect",
   );
 }
 
@@ -244,6 +259,7 @@ export function confirmEngineModelCatalogApplied(input: {
   }
   if (!dispatchPause) return;
   const operationId = String(input.operationId ?? "").trim();
+  if (pendingHelloConfirmations.delete(operationId)) return;
   if (!operationId || operationId !== dispatchPause.operationId) {
     throw catalogRuntimeError(
       "ENGINE_MODEL_CATALOG_CONFIRMATION_OPERATION_MISMATCH",
@@ -415,6 +431,7 @@ export function resetEngineModelCatalogRuntimeForTest(): void {
   activeCatalog = null;
   localCatalogEnabled = false;
   customModelsByEngine = { claude: [], codex: [] };
+  pendingHelloConfirmations.clear();
 }
 
 /** 桌面优先内置与自配模型，Server 仅追加；远程保持原覆盖层合并顺序。 */
@@ -443,7 +460,7 @@ function isLocalEngineModel(engine: EngineType, modelId: string): boolean {
   return modelId.endsWith("[1m]") && getEngineModelInfo(engine, modelId.slice(0, -4), models)?.supports1MContext === true;
 }
 
-/** Server 未确认或重连期间仅撤下云端补充，个人本地目录持续可用。 */
+/** 发布暂停或等待新目录确认时仅撤下云端补充，普通断网保留已确认目录。 */
 function getRuntimeModels(): Record<EngineType, EngineModelInfo[]> {
   return localCatalogEnabled ? buildCatalogModels(dispatchPause ? undefined : activeCatalog?.snapshot) : requireActiveEngineModelCatalog().models;
 }
@@ -471,6 +488,7 @@ function ensureCatalogApplyConfirmationPause(
   requestedOperationId: string | undefined,
   configVersion: number,
   digest: string,
+  kind: "apply" | "reconnect" = "apply",
 ): string | null {
   const operationId = String(requestedOperationId ?? dispatchPause?.operationId ?? "").trim();
   if (!operationId) return null;
@@ -493,7 +511,7 @@ function ensureCatalogApplyConfirmationPause(
   const drained = new Promise<void>((resolve) => {
     markDrained = resolve;
   });
-  dispatchPause = { operationId, configVersion, digest, resumed, resume, drained, markDrained };
+  dispatchPause = { operationId, configVersion, digest, kind, resumed, resume, drained, markDrained };
   if (activeDispatchLeases === 0) markDrained();
   return operationId;
 }

@@ -25,26 +25,22 @@ function desktopToolbarSource(): string {
   throw new Error("桌面端工具栏模板块未闭合");
 }
 
-test("桌面工具栏按 Fast、Spec、WorkFlow、Agent 排列，H5 不渲染", () => {
+test("桌面工具栏按 Fast、WorkFlow、Agent 排列，H5 不渲染", () => {
   const toolbar = desktopToolbarSource();
   const fastIndex = toolbar.indexOf("Fast");
-  const specIndex = toolbar.indexOf("Spec");
   const recommendIndex = toolbar.indexOf("WorkFlow");
   const agentIndex = toolbar.indexOf(`placeholder="Agent"`);
-  assert.ok(fastIndex >= 0 && specIndex > fastIndex, "Spec 应排在 Fast 之后");
-  assert.ok(recommendIndex > specIndex, "主动推荐按钮应排在 Spec 之后");
+  assert.ok(fastIndex >= 0 && recommendIndex > fastIndex, "主动推荐按钮应排在 Fast 之后");
   assert.ok(agentIndex > recommendIndex, "主动推荐按钮应排在 Agent 之前");
 
   const separators = (start: number, end: number) => toolbar.slice(start, end).split("composer__toolbar-sep").length - 1;
-  assert.equal(separators(fastIndex, specIndex), 1, "Fast 与 Spec 之间应恰好一个分隔符");
-  assert.equal(separators(specIndex, recommendIndex), 1, "Spec 与主动推荐之间应恰好一个分隔符");
+  assert.equal(separators(fastIndex, recommendIndex), 1, "Fast 与主动推荐之间应恰好一个分隔符");
   assert.equal(separators(recommendIndex, agentIndex), 1, "主动推荐与 Agent 之间应恰好一个分隔符");
 
   assert.match(composerSource, /workflowToggleVisible\?: boolean;/u);
-  assert.match(composerSource, /knowledgeToggleVisible\?: boolean;/u);
-  assert.match(composerSource, /:aria-pressed="knowledgeEnabled"/u);
-  assert.match(composerSource, /@click="toggleKnowledgeEnabled"/u);
-  assert.match(chatPanelSource, /:knowledge-toggle-visible="chatKnowledgeToggleVisible"/u);
+  assert.doesNotMatch(composerSource, /knowledgeToggleVisible/u);
+  assert.doesNotMatch(composerSource, /toggleKnowledgeEnabled/u);
+  assert.doesNotMatch(chatPanelSource, /chatKnowledgeToggleVisible/u);
   assert.match(composerSource, /workflowToggleVisible: false,/u);
   assert.match(composerSource, /<span v-if="workflowToggleVisible" class="composer__toolbar-sep" \/>/u);
 });

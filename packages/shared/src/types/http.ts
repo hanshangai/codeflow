@@ -1275,7 +1275,7 @@ export type ThreadPrefs = {
   effort?: string | null;
   accessMode?: AccessMode | null;
   planMode?: boolean | null;
-  /** 普通会话是否允许读取项目知识；新会话在资产树已初始化时默认开启。 */
+  /** 已废弃：知识注入改为按已采用知识自动判定；字段仅保留兼容旧数据。 */
   knowledgeEnabled?: boolean | null;
   autoCompactPct?: number | null;
   contextWindow?: number | null;

@@ -44,9 +44,10 @@ test("测试路径与 Claude Code SDK 一致：在 Base URL 后追加 /v1/messag
     engine: "claude",
     providerId: "qwen",
     apiKey: "sk-test",
-    baseUrl: "https://portal.qwen.ai",
+    baseUrl: null,
   });
-  assert.equal(request.url, "https://portal.qwen.ai/v1/messages");
+  assert.equal(request.url, "https://token-plan.maas.qwencloudapi.com/apps/anthropic/v1/messages");
+  assert.equal(request.model, "qwen4-max");
 });
 
 test("Codex 供应商使用真实 Responses 端点并带 Bearer", () => {
@@ -60,7 +61,7 @@ test("Codex 供应商使用真实 Responses 端点并带 Bearer", () => {
   assert.equal(request.method, "POST");
   assert.equal(request.headers.authorization, "Bearer sk-test");
   assert.equal(request.headers["x-api-key"], undefined);
-  assert.equal((JSON.parse(request.body ?? "{}") as { model?: string }).model, "gpt-5.6-sol");
+  assert.equal((JSON.parse(request.body ?? "{}") as { model?: string }).model, "gpt-6.2-sol");
 });
 
 test("失败详情提取供应商错误并隐藏完整 API Key", () => {

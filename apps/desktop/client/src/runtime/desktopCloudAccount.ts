@@ -70,6 +70,8 @@ export function createDesktopCloudAccount(input: {
   onHello(message: Hello, owner: DesktopCloudAccountOwner, activation: { send(message: ClientToServerMessage): WsSendJsonResult; assertCurrent(): void }): Promise<void>;
   onMessage(message: ServerToClientMessage, owner: DesktopCloudAccountOwner): Promise<void>;
   onOwnerInvalidated(owner: DesktopCloudAccountOwner, reason: "network" | "revoked"): void;
+  /** 身份绑定撤销时清理可离线读的本机状态，即使连接已经断开。 */
+  onAccountBindingRevoked?: () => void;
   onFailure(error: Error, context: { generation: number; serverOrigin: string | null }): void;
   onRequestCancelled?: (context: { generation: number; serverOrigin: string }) => void;
   getCredentialCleanupErrorCode?: () => string | null;
@@ -82,6 +84,12 @@ export function createDesktopCloudAccount(input: {
   const fence = new ServerMessageHelloReadyFence();
   let generation = 0;
   let current: Attempt | null = null;
+  let offlineBinding: { owner: DesktopCloudAccountOwner; tokenDigest: string } | null = null;
+
+  /** 断网后仅为比较重连目标保留指纹，不保留令牌或授予 owner 资格。 */
+  const tokenDigest = (token: string): string => crypto.createHash("sha256").update(token).digest("hex");
+  /** 丢弃离线身份及其目录；在线 owner 的授权仍由 revoke 收口。 */
+  const revokeBinding = (): void => { offlineBinding = null; input.onAccountBindingRevoked?.(); };
   let state: DesktopCloudAccountState = { status: "unlinked", generation, serverOrigin: null, userSummary: null, errorCode: null };
   const cleanup = new Set<Promise<void>>();
   const cleanupFailures: unknown[] = [];
@@ -171,6 +179,9 @@ export function createDesktopCloudAccount(input: {
   /** 当前连接故障只隔离云模块，不终止可独立工作的本机运行时。 */
   const fail = (attempt: Attempt, error: Error, reason: "network" | "revoked" = "revoked"): void => {
     if (current !== attempt) return;
+    if (reason === "network") {
+      if (attempt.owner) offlineBinding = { owner: attempt.owner, tokenDigest: tokenDigest(attempt.input.sessionToken) };
+    } else revokeBinding();
     revoke(attempt, reason); current = null;
     state = { status: "failed", generation: attempt.generation, serverOrigin: attempt.input.serverOrigin, userSummary: null, errorCode: "DESKTOP_CLOUD_CONNECTION_FAILED" };
     settle(attempt, error);
@@ -191,7 +202,7 @@ export function createDesktopCloudAccount(input: {
       },
       onClose(info) {
         fail(attempt, cloudConnectionError("DESKTOP_CLOUD_CONNECTION_CLOSED", cloudConnectionError(`WS_CLOSE_${info.code}`)),
-          info.code === 1006 ? "network" : "revoked");
+          info.disposition === "reconnect" ? "network" : "revoked");
       },
       onError(_message, context) {
         const network = context?.source === "socket" && context.code !== null
@@ -200,7 +211,8 @@ export function createDesktopCloudAccount(input: {
         fail(attempt, cloudConnectionError("DESKTOP_CLOUD_TRANSPORT_FAILED", cause), network ? "network" : "revoked");
       },
       onDeliveryFailure(failure) {
-        fail(attempt, cloudConnectionError("DESKTOP_CLOUD_DELIVERY_FAILED", cloudConnectionError(`WS_DELIVERY_${failure.phase.toUpperCase()}`)));
+        fail(attempt, cloudConnectionError("DESKTOP_CLOUD_DELIVERY_FAILED", cloudConnectionError(`WS_DELIVERY_${failure.phase.toUpperCase()}`)),
+          failure.phase === "socket_closed" ? "network" : "revoked");
       },
       onMessageFailure(failure) { fail(attempt, failure.error instanceof Error ? failure.error : cloudConnectionError("DESKTOP_CLOUD_MESSAGE_FAILED", failure.error)); },
       async onMessage(data) {
@@ -212,6 +224,9 @@ export function createDesktopCloudAccount(input: {
         if (message.t === "client.helloAck") {
           if (attempt.owner || !message.userSummary?.userId || !message.accountSessionId || message.capabilities?.desktopLocalRuntimeV1 !== true) throw cloudConnectionError("DESKTOP_CLOUD_HELLO_INVALID");
           const owner: DesktopCloudAccountOwner = { serverOrigin: attempt.input.serverOrigin, ownerUserId: message.userSummary.userId, accountSessionId: message.accountSessionId, generation: attempt.generation };
+          if (offlineBinding && (offlineBinding.owner.ownerUserId !== owner.ownerUserId
+            || offlineBinding.owner.accountSessionId !== owner.accountSessionId)) revokeBinding();
+          offlineBinding = null;
           attempt.owner = owner;
           attempt.hostRpcSessionId = message.capabilities.hostRpcHttpSessionId ?? null;
           await input.onHello(message, owner, { send: value => transport.sendJson(value), assertCurrent() {
@@ -391,7 +406,11 @@ export function createDesktopCloudAccount(input: {
       const attempt: Attempt = { input: normalized, generation, owner: null, transport: null, host: null, fenceGeneration: 0, timer: null, promise, resolve, reject, settled: false,
         controller: new AbortController(), hostRpcSessionId: null, operations: new Set(), hostScopeWaiters: new Set() };
       current = attempt; state = { status: "linking", generation, serverOrigin: normalized.serverOrigin, userSummary: null, errorCode: null };
-      if (old) { revoke(old); settle(old, new Error("DESKTOP_CLOUD_LINK_SUPERSEDED")); }
+      if (offlineBinding && (offlineBinding.owner.serverOrigin !== normalized.serverOrigin || offlineBinding.tokenDigest !== tokenDigest(normalized.sessionToken))) revokeBinding();
+      if (old) {
+        if (old.owner) revokeBinding();
+        revoke(old); settle(old, new Error("DESKTOP_CLOUD_LINK_SUPERSEDED"));
+      }
       const previousTransition = transitionTail;
       if (old) { const previousRelease = transitionRelease; transitionRelease = async () => { await previousRelease?.(); await releaseOperations(old); }; }
       const transition = (async () => { await previousTransition; if (old) await drain(old); if (current === attempt) { transitionRelease = null; start(attempt); } })();
@@ -406,6 +425,7 @@ export function createDesktopCloudAccount(input: {
     async unlink(): Promise<DesktopCloudAccountState> {
       const old = current; current = null; generation += 1;
       state = { status: "unlinked", generation, serverOrigin: null, userSummary: null, errorCode: null };
+      revokeBinding();
       if (old) { revoke(old); settle(old, new Error("DESKTOP_CLOUD_LINK_CANCELLED")); }
       if (old) await retire(old); else await transitionTail;
       return snapshot();
@@ -437,7 +457,9 @@ export function createDesktopCloudAccount(input: {
     disconnect(error: Error): void { if (current) fail(current, error); },
     /** 停机收口所有已登记传输；事件清理错误不能被成功状态覆盖。 */
     async stopAndDrain(): Promise<void> {
-      const old = current; current = null; if (old) { revoke(old); settle(old, new Error("DESKTOP_CLOUD_STOPPED")); }
+      const old = current; current = null;
+      revokeBinding();
+      if (old) { revoke(old); settle(old, new Error("DESKTOP_CLOUD_STOPPED")); }
       const results = await Promise.allSettled([transitionTail, old ? drain(old) : undefined, ...cleanup]);
       const failures = [...cleanupFailures, ...results.flatMap(result => result.status === "rejected" ? [result.reason] : [])];
       if (failures.length) throw new AggregateError(failures, "DESKTOP_CLOUD_CLEANUP_FAILED");

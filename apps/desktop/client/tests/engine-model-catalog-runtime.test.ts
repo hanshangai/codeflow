@@ -9,7 +9,7 @@ import { resolveClaudeLaunchModelId, resolveClaudeModelRuntimeEnv, resolveClaude
 function snapshot(configVersion = 1): EngineModelCatalogSnapshot {
   return { schemaVersion: "engine-model-catalog/v1", configVersion, capturedAt: 1, rows: [
     { catalogItemId: "claude-default", engine: "claude", providerId: "anthropic", providerLabel: "Anthropic",
-      modelId: "claude-fable-5", displayName: "Server override", description: "server", inputModalities: ["text"],
+      modelId: "claude-fable-5-2", displayName: "Server override", description: "server", inputModalities: ["text"],
       supportedReasoningEfforts: [], defaultReasoningEffort: null, contextWindow: 100_000, maxContextWindow: null,
       supportsFastMode: false, supports1MContext: false, isDefault: true, sortOrder: 1, runtimeProfileId: "native",
       transportModelId: null, fastTaskModelId: null, subagentModelId: null },
@@ -44,7 +44,12 @@ test("desktop local catalog starts without a Server snapshot and keeps native Cl
   reset(t);
   catalog.initializeLocalEngineModelCatalog();
   catalog.setEngineModelCatalogCustomModels([customModel()]);
-  assert.ok(catalog.getRuntimeEngineModels("codex").some((model) => model.id === "gpt-6.1-sol"));
+  const codexPrefs = catalog.resolveRuntimeThreadPrefsWithCatalogDefaults("codex");
+  assert.equal(codexPrefs.model, "gpt-6.2-sol");
+  assert.equal(codexPrefs.contextWindow, 872_000);
+  const claudePrefs = catalog.resolveRuntimeThreadPrefsWithCatalogDefaults("claude");
+  assert.equal(claudePrefs.model, "claude-fable-5-2");
+  assert.equal(resolveClaudeModelSettingsEnv(claudePrefs.model).CLAUDE_CODE_AUTO_COMPACT_WINDOW, "1000000");
   assert.equal(catalog.getRuntimeEngineModelInfo("codex", "my-model")?.displayName, "My local model");
   assert.equal(catalog.resolveRuntimeEngineModelProviderId("codex", "my-model"), "openai");
   assert.equal(catalog.getActiveEngineModelCatalogSnapshot(), null, "local startup must not fabricate Server application");
@@ -59,24 +64,24 @@ test("confirmed Server supplement cannot override or delete local models or loca
   reset(t);
   catalog.initializeLocalEngineModelCatalog();
   catalog.setEngineModelCatalogCustomModels([customModel()]);
-  const localClaude = catalog.getRuntimeEngineModelInfo("claude", "claude-fable-5");
+  const localClaude = catalog.getRuntimeEngineModelInfo("claude", "claude-fable-5-2");
   const defaults = catalog.getRuntimeEngineModels("codex").filter((model) => model.isDefault).map((model) => model.id);
   const update = snapshot();
   update.rows[1]!.isDefault = false;
   update.rows[2]!.isDefault = true;
   update.rows.push({ ...update.rows[2]!, catalogItemId: "custom-conflict", modelId: "my-model", displayName: "Wrong server name", isDefault: false, sortOrder: 3 });
-  update.rows.push({ ...update.rows[0]!, catalogItemId: "alias-conflict", modelId: "claude-sonnet-4-6[1m]", displayName: "Wrong alias", isDefault: false, sortOrder: 2 });
+  update.rows.push({ ...update.rows[0]!, catalogItemId: "alias-conflict", modelId: "claude-opus-5[1m]", displayName: "Wrong alias", isDefault: false, sortOrder: 2 });
   const ack = catalog.applyEngineModelCatalogSnapshot(update, 2, "hello");
   assert.throws(() => catalog.assertRuntimeEngineModelAvailable("codex", "cloud-extra"), /尚未|移除|不可用/);
   catalog.confirmEngineModelCatalogApplied(ack);
-  assert.deepEqual(catalog.getRuntimeEngineModelInfo("claude", "claude-fable-5"), localClaude);
-  assert.equal(catalog.getRuntimeEngineModelCatalogItem("claude", "claude-fable-5"), null);
+  assert.deepEqual(catalog.getRuntimeEngineModelInfo("claude", "claude-fable-5-2"), localClaude);
+  assert.equal(catalog.getRuntimeEngineModelCatalogItem("claude", "claude-fable-5-2"), null);
   assert.equal(catalog.getRuntimeEngineModelInfo("codex", "my-model")?.displayName, "My local model");
   assert.equal(catalog.getRuntimeEngineModelInfo("codex", "cloud-extra")?.displayName, "Cloud extra");
   assert.deepEqual(catalog.getRuntimeEngineModels("codex").filter((model) => model.isDefault).map((model) => model.id), defaults);
   assert.ok(catalog.getRuntimeEngineModelInfo("claude", "deepseek-v4-pro"));
-  assert.equal(catalog.getRuntimeEngineModelInfo("claude", "claude-sonnet-4-6[1m]")?.contextWindow, 1_000_000);
-  assert.equal(catalog.getRuntimeEngineModelCatalogItem("claude", "claude-sonnet-4-6[1m]"), null);
+  assert.equal(catalog.getRuntimeEngineModelInfo("claude", "claude-opus-5[1m]")?.contextWindow, 1_000_000);
+  assert.equal(catalog.getRuntimeEngineModelCatalogItem("claude", "claude-opus-5[1m]"), null);
 });
 
 test("desktop publication and disconnect pause only cloud supplement while local dispatch continues", async (t) => {
@@ -165,7 +170,7 @@ test("remote Client keeps Server authority and confirmation fences", async (t) =
   assert.equal(ready, false);
   catalog.confirmEngineModelCatalogApplied(ack);
   await waiting;
-  assert.equal(catalog.getRuntimeEngineModelInfo("claude", "claude-fable-5")?.displayName, "Server override");
+  assert.equal(catalog.getRuntimeEngineModelInfo("claude", "claude-fable-5-2")?.displayName, "Server override");
   assert.equal(catalog.getRuntimeEngineModelInfo("claude", "deepseek-v4-pro"), null);
 });
 

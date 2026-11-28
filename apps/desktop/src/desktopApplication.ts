@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readPendingRelease, savePendingRelease, clearPendingRelease, markPendingDatabaseMigration, type PendingRelease } from "./pendingRelease.js";
 import { createReleaseDatabaseBackup } from "./releaseDatabaseBackup.js";
 import { assertDesktopStoragePath } from "./desktopStorageLocation.js";
-import { assertReleaseBundleManifest, assertShellReleaseManifest, compareNumericVersion, snapshotDesktopStartupMode, snapshotDesktopStartupReady, type DesktopApiRequest, type DesktopStartupMode, type DesktopEvent, type DesktopUpdateDiagnostics, type DesktopUpdateState, type DesktopUpdateDetails, type DesktopBundleVersion, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress, type DesktopUpdateClientErrorReport } from "@codeflowai/shared";
+import { assertReleaseBundleManifest, assertShellReleaseManifest, compareNumericVersion, snapshotDesktopStartupMode, snapshotDesktopStartupReady, type DesktopApiRequest, type DesktopApiResponse, type DesktopStartupMode, type DesktopEvent, type DesktopUpdateDiagnostics, type DesktopUpdateState, type DesktopUpdateDetails, type DesktopBundleVersion, type DesktopUpdateNotice, type DesktopUpdateNoticeDismissAction, type DesktopUpdateProgress, type DesktopUpdateClientErrorReport } from "@codeflowai/shared";
 import { toUpdateDiagnosticCause, toShellUpdateDiagnosticCause } from "@codeflowai/shared/desktop-update-failure";
 
 import { loadOrCreateDeviceIdentity, type DeviceIdentity } from "./deviceIdentity.js";
@@ -188,12 +188,13 @@ export function createDesktopApplication(input: {
   let initialExpectation: ClientRuntimeExpectation | undefined;
   let identity: DeviceIdentity | undefined;
   let cloudLinkPreparation: AbortController | undefined;
+  let lastRegisteredCloudLink: { runtime: ClientRuntime; serverOrigin: string; tokenDigest: string } | undefined;
   /** 只撤销尚在准备的云关联；已转交 Client 的账号资格仍由原连接 owner 管理。 */
   const cancelCloudLinkPreparation = (): void => {
     cloudLinkPreparation?.abort(Object.assign(new Error("DESKTOP_CLOUD_LINK_CANCELLED"), { code: "DESKTOP_CLOUD_LINK_CANCELLED" }));
     cloudLinkPreparation = undefined;
   };
-  /** 先撤销旧账号并向目标 Server 登记签名身份，确认后才允许 Client 关联和同步任务。 */
+  /** 切换前撤销旧账号；同一登记目标断线后可保留目录，仍须先完成签名登记。 */
   const linkCloudAccount = async (request: DesktopApiRequest) => {
     const body = request.body;
     if (typeof body?.serverOrigin !== "string" || !URL.canParse(body.serverOrigin)) throw new Error("DESKTOP_CLOUD_ORIGIN_INVALID");
@@ -214,11 +215,32 @@ export function createDesktopApplication(input: {
       }
     };
     try {
-      const unlinked = await targetRuntime.request({ method: "runtime.cloudAccount.unlink" });
-      assertCurrent();
-      const result = unlinked.body as { ok?: unknown; account?: { status?: unknown } } | null;
-      if (unlinked.status >= 400 || result?.ok === false) return unlinked;
-      if (result?.ok !== true || result.account?.status !== "unlinked") throw new Error("DESKTOP_CLOUD_ACCOUNT_STATE_INVALID");
+      const tokenDigest = crypto.createHash("sha256").update(body.sessionToken).digest("hex");
+      const sameRegistration = lastRegisteredCloudLink?.runtime === targetRuntime
+        && lastRegisteredCloudLink.serverOrigin === url.origin && lastRegisteredCloudLink.tokenDigest === tokenDigest;
+      /** 读取原 Client 状态；非成功响应会中止本次关联。 */
+      const accountStatus = (response: DesktopApiResponse): string | null => {
+        const result = response.body as { ok?: unknown; account?: { status?: unknown } } | null;
+        if (response.status >= 400 || result?.ok === false) return null;
+        if (result?.ok !== true || typeof result.account?.status !== "string") throw new Error("DESKTOP_CLOUD_ACCOUNT_STATE_INVALID");
+        return result.account.status;
+      };
+      let reconnecting = false;
+      if (sameRegistration) {
+        const status = await targetRuntime.request({ method: "runtime.cloudAccount.status" });
+        assertCurrent();
+        const value = accountStatus(status);
+        if (value === null) return status;
+        reconnecting = value === "failed";
+      }
+      if (!reconnecting) {
+        lastRegisteredCloudLink = undefined;
+        const unlinked = await targetRuntime.request({ method: "runtime.cloudAccount.unlink" });
+        assertCurrent();
+        const value = accountStatus(unlinked);
+        if (value === null) return unlinked;
+        if (value !== "unlinked") throw new Error("DESKTOP_CLOUD_ACCOUNT_STATE_INVALID");
+      }
       const registrationRequestId = crypto.randomUUID();
       try {
         await createDesktopUpdateTransport({ dataDir: input.dataDir, identity: identity!, configuredServerOrigin: url.origin,
@@ -226,9 +248,20 @@ export function createDesktopApplication(input: {
       } catch (error) {
         // 原 IPC 边界只记录一次，保留设备及签名请求关联，不附加账号凭据或响应正文。
         if (error instanceof Error) Object.assign(error, { deviceId: identity!.deviceId, registrationRequestId });
+        const status = (error as { status?: number } | null)?.status;
+        if (reconnecting && (status === 401 || status === 403) && !controller.signal.aborted && runtime === targetRuntime) {
+          lastRegisteredCloudLink = undefined;
+          try {
+            const unlinked = await targetRuntime.request({ method: "runtime.cloudAccount.unlink" });
+            if (accountStatus(unlinked) !== "unlinked") throw new Error("DESKTOP_CLOUD_ACCOUNT_UNLINK_FAILED");
+          } catch (unlinkError) {
+            throw new AggregateError([error, unlinkError], "DESKTOP_CLOUD_ACCOUNT_UNLINK_FAILED", { cause: error });
+          }
+        }
         throw error;
       }
       assertCurrent();
+      lastRegisteredCloudLink = { runtime: targetRuntime, serverOrigin: url.origin, tokenDigest };
       return await targetRuntime.request(link);
     } finally {
       if (cloudLinkPreparation === controller) cloudLinkPreparation = undefined;
@@ -1803,7 +1836,10 @@ export function createDesktopApplication(input: {
               && ["workspaces.upsert", "workspaces.delete", "workspaceExecutionProfile.update"].includes(request?.method))) {
               throw Object.assign(new Error('DESKTOP_OPERATION_IN_PROGRESS'), { code: 'DESKTOP_OPERATION_IN_PROGRESS', operation });
             }
-            if (request.method === "runtime.cloudAccount.unlink") cancelCloudLinkPreparation();
+            if (request.method === "runtime.cloudAccount.unlink") {
+              cancelCloudLinkPreparation();
+              lastRegisteredCloudLink = undefined;
+            }
             if (request.method === "runtime.cloudAccount.link") return await linkCloudAccount(request);
             return await runtime.request(request);
           },

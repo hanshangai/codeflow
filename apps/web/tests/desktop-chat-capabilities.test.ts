@@ -98,23 +98,22 @@ test("本机附件和上下文入口真实渲染，并保留只读与 H5 条件"
   assert.equal(renderEntry("composer", "composer__context-bar", { ...base, props: { surface: "h5" } }).some(node => node.type === "ContextUsageBar"), false);
 });
 
-test("本机普通会话恢复 Spec/WorkFlow、文件变更与托管进程，节点和助手保持限制", () => {
+test("本机普通会话恢复 WorkFlow、文件变更与托管进程，节点和助手保持限制", () => {
   const props = vue.reactive({ surface: "default", assistantMode: false });
   const thread = vue.ref({ threadType: "chat", threadSubtype: null as string | null });
   const assistant = vue.ref(false), shared = vue.ref(false);
-  const values = evaluate("panel", ["chatWorkflowVisible", "chatWorkflowToggleVisible", "chatKnowledgeToggleVisible", "fileChangeCount", "managedServicesVisible"], {
+  const values = evaluate("panel", ["chatWorkflowVisible", "chatWorkflowToggleVisible", "fileChangeCount", "managedServicesVisible"], {
     props, thread, localChatReady: vue.ref(true), effectiveAssistantMode: assistant, isSharedWorkspace: shared,
     fileChangesState: vue.ref({ items: [{ path: "src/example.ts" }] }), managedServicesScope: vue.ref({ visible: true }),
   });
   assert.equal(values.chatWorkflowToggleVisible.value, true);
-  assert.equal(values.chatKnowledgeToggleVisible.value, true);
   assert.equal(values.fileChangeCount.value, 1);
   assert.equal(values.managedServicesVisible.value, true);
   props.surface = "h5";
   assert.equal(values.chatWorkflowToggleVisible.value, false);
   props.surface = "default";
   thread.value.threadSubtype = "node";
-  assert.equal(values.chatKnowledgeToggleVisible.value, false);
+  assert.equal(values.chatWorkflowToggleVisible.value, false);
   assistant.value = true;
   assert.equal(values.managedServicesVisible.value, false);
   assistant.value = false;

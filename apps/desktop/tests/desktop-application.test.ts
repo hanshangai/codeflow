@@ -210,6 +210,39 @@ test("设备登记失败显式拒绝云关联，下一次请求重新登记后�
   assert.deepEqual(f.calls, ["runtime.cloudAccount.unlink", "runtime.cloudAccount.unlink", "runtime.cloudAccount.link"]);
 });
 
+test("断线后同一登录重新签名登记且不退出，设备拒绝或切换时清理旧账号", async t => {
+  const f = await cloudRegistrationFixture(t), identity = await loadOrCreateDeviceIdentity(f.dataDir);
+  let failure: "network" | "revoked" | null = null;
+  t.mock.method(globalThis, "fetch", async () => {
+    if (failure === "network") throw new Error("isolated network failure");
+    if (failure === "revoked") return Response.json({ ok: false, code: "DESKTOP_DEVICE_REVOKED" }, { status: 403 });
+    return Response.json({ ok: true, deviceId: identity.deviceId, publicKeySha256: desktopDevicePublicKeySha256(identity.publicKeyBase64) });
+  });
+  const originalRequest = f.runtime.request;
+  f.runtime.request = async request => {
+    if (request.method !== "runtime.cloudAccount.status") return await originalRequest(request);
+    f.calls.push(request.method);
+    return { status: 200, body: { ok: true, account: { status: "failed" } } };
+  };
+  const request = { method: "runtime.cloudAccount.link" as const, body: { serverOrigin: "https://account-server.invalid", sessionToken: "session-A" } };
+  await f.bridge.request(request);
+  f.calls.length = 0;
+  failure = "network";
+  await assert.rejects(f.bridge.request(request), { code: "DESKTOP_UPDATE_TRANSPORT_FAILED" });
+  assert.deepEqual(f.calls.splice(0), ["runtime.cloudAccount.status"]);
+  failure = null;
+  await f.bridge.request(request);
+  assert.deepEqual(f.calls.splice(0), ["runtime.cloudAccount.status", "runtime.cloudAccount.link"]);
+  failure = "revoked";
+  await assert.rejects(f.bridge.request(request), { code: "DESKTOP_DEVICE_REVOKED" });
+  assert.deepEqual(f.calls.splice(0), ["runtime.cloudAccount.status", "runtime.cloudAccount.unlink"]);
+  failure = null;
+  await f.bridge.request(request);
+  f.calls.length = 0;
+  await f.bridge.request({ ...request, body: { ...request.body, sessionToken: "session-B" } });
+  assert.deepEqual(f.calls, ["runtime.cloudAccount.unlink", "runtime.cloudAccount.link"]);
+});
+
 for (const action of ["unlink", "switch", "exit"] as const) test(`登记期间${action}取消旧关联，迟到登记不能恢复旧账号`, async t => {
   const f = await cloudRegistrationFixture(t), identity = await loadOrCreateDeviceIdentity(f.dataDir);
   let release!: () => void, started!: () => void;
