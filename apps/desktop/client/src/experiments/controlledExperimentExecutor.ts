@@ -4,6 +4,7 @@ import {
   CONTROLLED_EXPERIMENT_CONTRACT_VERSION,
   extractTurnErrorMetadata,
   normalizeEngineKeyProviderId,
+  resolveRetiredEngineModelId,
   type ControlledExperimentFreezeRpcRequest,
   type ControlledExperimentFreezeRpcResponse,
   type ControlledExperimentRunRpcFailureResponse,
@@ -582,7 +583,7 @@ export class ControlledExperimentExecutor {
         assistantItemId: deterministicId("omcai", run.id),
         reasoningItemId: deterministicId("omcri", run.id),
         accessMode: "read-only",
-        model: snapshot.model,
+        model: resolveRetiredEngineModelId(snapshot.engine, snapshot.model) ?? snapshot.model,
         effort: snapshot.effort,
         timeoutPolicy: {
           mode: "legacy-turn",
@@ -1117,8 +1118,9 @@ export class ControlledExperimentExecutor {
 
   /** Rejects model calls when the current Provider or credential differs from frozen evidence. */
   private assertSnapshotRuntimeEvidence(snapshot: ControlledExperimentLocalSnapshot): void {
-    assertClientReasoningEffortSupported(this.deps.db, snapshot.engine, snapshot.model, snapshot.effort);
-    const config = { engine: snapshot.engine, model: snapshot.model, effort: snapshot.effort };
+    const model = resolveRetiredEngineModelId(snapshot.engine, snapshot.model) ?? snapshot.model;
+    assertClientReasoningEffortSupported(this.deps.db, snapshot.engine, model, snapshot.effort);
+    const config = { engine: snapshot.engine, model, effort: snapshot.effort };
     const providerId = this.resolveVariantProvider(config);
     if (!providerId || !this.deps.db.engineKeys.getActive(snapshot.engine, providerId)) {
       throw new Error("冻结 Provider 或 CodeFlow Key 已失效");

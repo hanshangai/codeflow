@@ -32,7 +32,6 @@ test("普通Client无订阅本地保存，需求握手后仅上传新事件，�
       if (message.t === "client.hello") current.send(JSON.stringify({ t: "client.helloAck", keyHash: "fixture", serverNow: Date.now(), accountSessionId: "fixture-session",
         userSummary: { userId: "fixture-user", email: "fixture@example.test", fullName: "fixture", phone: "", avatarUrl: null, accountRole: "personal_normal", status: "active", enterpriseId: null, enterpriseName: null },
         capabilities: { localCanonicalRelayV1: true, localCanonicalRelayOnDemandV1: true, remoteDataDemandV1: true } }));
-      if (message.t === "engine.models.applied") current.send(JSON.stringify({ t: "engine.models.appliedConfirmed", ...message.ack }));
       if (message.t === "conversation.event.relay") current.send(JSON.stringify({ t: "conversation.eventRelayAck", delivery: message.delivery, seqs: message.events.map((event: any) => event.seq) }));
     });
   });
@@ -60,7 +59,6 @@ test("普通Client无订阅本地保存，需求握手后仅上传新事件，�
   });
   const hello = await observe(() => received.find(message => message.t === "client.hello"), alive);
   assert.equal(hello.capabilities.localCanonicalRelayOnDemandV1, true);
-  await observe(() => received.find(message => message.t === "engine.models.applied"), alive);
   let requestSeq = 0;
   /** 实际WS请求使用独立身份，响应必须对应当前请求且成功。 */
   const request = async (method: string, body: Record<string, unknown> = {}, expectedStatus = 200) => {

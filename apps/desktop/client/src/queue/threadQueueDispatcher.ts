@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import {
+  resolveRetiredEngineModelId,
   type ConversationEventInput,
   type EngineType,
   type EngineCallTrace,
@@ -1185,6 +1186,8 @@ export class ThreadQueueDispatcher {
         this.assertQueueAssetExecution(context, threadId, item);
         return context;
       });
+      const threadEngine = executionContext.db.threads.get(threadId)?.engine;
+      const queuedModel = item.sendOptions.model;
       await this.createRequirementAnalysisService(executionContext).sendMessage({
         workspaceId,
         sessionId: threadId as any,
@@ -1192,7 +1195,7 @@ export class ThreadQueueDispatcher {
         turnId,
         planMode: item.sendOptions.planMode,
         accessMode: item.sendOptions.accessMode,
-        model: item.sendOptions.model,
+        model: threadEngine ? resolveRetiredEngineModelId(threadEngine, queuedModel) ?? queuedModel : queuedModel,
         effort: item.sendOptions.effort,
         images: item.images.map((image) => image.dataUrl),
         files: item.files,

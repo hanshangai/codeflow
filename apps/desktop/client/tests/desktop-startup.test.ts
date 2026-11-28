@@ -222,7 +222,7 @@ test("desktop initializes and replays persisted history after restart without a 
         assert.deepEqual((raw.body as any).events.map((event: any) => event.seq), [historySeq + 1]);
         const prefs = await client.request({ method: "threads.prefs", body: historyBody });
         assert.equal(prefs.status, 200);
-        assert.equal((prefs.body as any).prefs.model, "gpt-5.5");
+        assert.equal((prefs.body as any).prefs.model, "gpt-6.2-sol");
         assert.equal((await client.request({ method: "threads.summary", body: historyBody })).status, 200);
         assert.equal((await client.request({ method: "threads.latestPrefs", body: { workspaceId, engine: "codex" } })).status, 200);
         assert.equal((await client.request({ method: "threads.groups.list", body: { workspaceId } })).status, 200);

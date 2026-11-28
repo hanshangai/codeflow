@@ -942,10 +942,10 @@ test("desktop reads persisted local history, summaries and prefs without Server 
   assert.equal((summary.body as any).thread.id, f.threadId);
   const prefs = await f.call({ method: "threads.prefs", body });
   assert.equal(prefs.status, 200);
-  assert.equal((prefs.body as any).prefs.model, "gpt-5.5");
+  assert.equal((prefs.body as any).prefs.model, "gpt-6.2-sol");
   const latestPrefs = await f.call({ method: "threads.latestPrefs", body: { workspaceId: f.workspaceId, engine: "codex", threadId: f.threadId } });
   assert.equal(latestPrefs.status, 200, JSON.stringify(latestPrefs.body));
-  assert.equal((latestPrefs.body as any).prefs.model, "gpt-5.5");
+  assert.equal((latestPrefs.body as any).prefs.model, "gpt-6.2-sol");
   assert.deepEqual(f.sent, []);
 });
 

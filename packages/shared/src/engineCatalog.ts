@@ -784,6 +784,17 @@ export function resolveCatalogDefaultThreadPrefs(
   };
 }
 
+/** 解析已下架型号，仅用于迁移已持久化的偏好或执行配置。 */
+export function resolveRetiredEngineModelId(engine: EngineType, modelId: string | null | undefined): string | null {
+  const normalized = String(modelId ?? "").trim();
+  if (!normalized) return null;
+  const direct = RETIRED_THREAD_MODELS[engine]?.[normalized];
+  if (direct) return direct;
+  if (!normalized.endsWith("[1m]")) return null;
+  const replacement = RETIRED_THREAD_MODELS[engine]?.[normalized.slice(0, -4)];
+  return replacement ? `${replacement}[1m]` : null;
+}
+
 /** 解析已知退役型号，再按实际选中的模型补齐窗口、思考强度和服务档位。 */
 export function resolveThreadPrefsWithCatalogDefaults(
   engine: EngineType,
@@ -792,8 +803,9 @@ export function resolveThreadPrefsWithCatalogDefaults(
 ): ResolvedThreadPrefs {
   const defaults = resolveCatalogDefaultThreadPrefs(engine, models);
   const model = String(prefs?.model ?? "").trim() || defaults.model;
+  const retired = resolveRetiredEngineModelId(engine, model);
   const modelInfo = getEngineModelInfo(engine, model, models)
-    ?? (model ? getEngineModelInfo(engine, RETIRED_THREAD_MODELS[engine][model], models) : null);
+    ?? (retired ? getEngineModelInfo(engine, retired, models) : null);
   const resolvedModel = modelInfo?.id ?? model;
   const modelEffort = getDefaultReasoningEffortForModel(engine, resolvedModel, models);
   const effort = resolveThreadPrefsReasoningEffort(

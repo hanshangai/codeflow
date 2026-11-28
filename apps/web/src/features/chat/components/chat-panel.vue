@@ -10,7 +10,6 @@ import { copyToClipboard } from "../../../composables/useClipboard";
 import { useChatStore } from "../../../store/chat";
 import { useComposerStore } from "../../../store/composer";
 import { useConfigStore } from "../../../store/config";
-import { useEngineStore } from "../../../store/engine";
 import { useReminderStore } from "../../../store/reminders";
 import { getConversationItemsForMessageList, getPendingInteractionItems, getPendingInteractionState, isConversationActivelyProcessing, isConversationAwaitingInteraction, isConversationRunning } from "../chatTypes";
 import { formatToolDisplayName } from "../toolDisplayName";
@@ -82,7 +81,6 @@ type SharedThreadSummary = ThreadSummary & {
 const config = useConfigStore();
 const chat = useChatStore();
 const composer = useComposerStore();
-const engines = useEngineStore();
 const reminders = useReminderStore();
 const { ctx } = useApiContext();
 const appModals = inject(APP_MODALS_KEY, null);

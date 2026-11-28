@@ -6,6 +6,7 @@ import {
   mergeEngineModelsWithCustomModels,
   toEngineModelInfoFromCustomModel,
   resolveCatalogDefaultThreadPrefs,
+  resolveRetiredEngineModelId,
   resolveRoleExecutionConfigForEngine,
   resolveRoleExecutionConfigForStrategy,
   resolveThreadPrefsWithCatalogDefaults,
@@ -156,7 +157,8 @@ export function getRuntimeEngineModelInfo(
   const direct = getEngineModelInfo(engine, normalized, models);
   if (direct || !normalized.endsWith("[1m]")) return direct;
   const base = models.find((model) => model.id === normalized.slice(0, -4));
-  if (!base?.supports1MContext) return null;
+  if (!base || (!base.supports1MContext
+    && base.contextWindow !== 1_000_000 && base.maxContextWindow !== 1_000_000)) return null;
   return {
     ...base,
     id: normalized,
@@ -193,8 +195,9 @@ export function resolveRuntimeRoleExecutionConfigForStrategy(
 
 function applyRuntimeAutoDefaults(config: ResolvedRoleExecutionConfig): ResolvedRoleExecutionConfig {
   if (config.sourceMode !== "auto") {
-    assertRuntimeEngineModelAvailable(config.engine, config.model);
-    return config;
+    const model = resolveRetiredEngineModelId(config.engine, config.model) ?? config.model;
+    assertRuntimeEngineModelAvailable(config.engine, model);
+    return { ...config, model };
   }
   const models = getRuntimeEngineModels(config.engine);
   const defaults = resolveCatalogDefaultThreadPrefs(config.engine, models);
