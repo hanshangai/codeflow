@@ -22,7 +22,7 @@ const labels = { state_error: "读取失败", generation_failed: "生成失败",
 <template>
   <section class="knowledge-overview" data-testid="knowledge-overview" aria-label="项目规格概览">
     <header class="overview-intro"><div><span class="eyebrow">项目规格</span><h2>{{ overview.initialized ? '要求有归处，研发有依据' : '建立项目的研发依据' }}</h2><p>把项目要求沉淀为可维护的规格，让 AI 在设计、编码和交付时有据可查，减少反复说明和偏离。</p></div><a-tag v-if="snapshot && !canWrite">只读</a-tag></header>
-    <p class="overview-guide">整理或补充要求 → 核对并采用 → 研发会话开启 Spec。<a-button type="link" size="small" @click="emit('policy')">了解使用原则</a-button></p>
+    <p class="overview-guide">整理或补充要求 → 核对并采用 → 研发会话自动使用。<a-button type="link" size="small" @click="emit('policy')">了解使用原则</a-button></p>
     <a-alert v-if="stateError || runError" type="error" show-icon :message="stateError || runError"><template #description><p>读取失败的部分尚不能判断，请重试后再核对。</p><a-button size="small" @click="emit('retry')">重新读取状态</a-button></template></a-alert>
     <div v-if="loading" class="overview-loading" role="status"><a-spin /><p>正在读取项目规格…</p></div>
     <template v-else>

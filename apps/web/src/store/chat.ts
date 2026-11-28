@@ -1796,7 +1796,7 @@ export const useChatStore = defineStore("chat", {
       }
     },
 
-    /** 创建会话并继承最近模型配置；Fast 与 Spec 始终默认关闭。 */
+    /** 创建会话并继承最近模型配置；Fast 始终默认关闭。 */
     async createThread(ctx: ApiRequestContext, body: CreateThreadRequestBody): Promise<ThreadId> {
       const engines = useEngineStore();
       const engineKeys = useEngineKeysStore();

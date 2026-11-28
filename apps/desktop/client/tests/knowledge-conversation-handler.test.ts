@@ -108,17 +108,19 @@ applyEngineModelCatalogSnapshot({
 test.after(() => resetEngineModelCatalogRuntimeForTest());
 
 /** 使用迁移后的工作区 DB 和 API 分发；仅替换不调用真实 AI 的引擎 session。 */
-function setupHarness(options: { ordinary?: boolean; staleDynamicBinding?: boolean; knowledgeEnabled?: boolean; toolTransport?: "native-dynamic" | "protocol"; validateEvidence?: boolean } = {}) {
+function setupHarness(options: { ordinary?: boolean; staleDynamicBinding?: boolean; adoptedSpecifications?: boolean; toolTransport?: "native-dynamic" | "protocol"; validateEvidence?: boolean } = {}) {
   const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), "codeflowai-knowledge-handler-"));
   const application = openClientDb({ dbPath: path.join(workspacePath, "client.db") });
   application.workspaces.upsert({ id: WORKSPACE_ID, title: "项目知识接入测试", path: workspacePath });
   const db = application.forWorkspace(WORKSPACE_ID);
-  db.threads.create({ id: THREAD_ID, workspaceId: WORKSPACE_ID, title: options.ordinary ? "普通研发会话" : "独立知识会话", engine: "codex", prefs: { model: "gpt-test", effort: "high", knowledgeEnabled: options.ordinary && options.knowledgeEnabled !== false }, ...(options.ordinary ? {} : { threadSubtype: "knowledge-conversation" as const }) });
+  db.threads.create({ id: THREAD_ID, workspaceId: WORKSPACE_ID, title: options.ordinary ? "普通研发会话" : "独立知识会话", engine: "codex", prefs: { model: "gpt-test", effort: "high" }, ...(options.ordinary ? {} : { threadSubtype: "knowledge-conversation" as const }) });
   if (!options.ordinary) db.db.prepare("INSERT INTO knowledge_conversations (thread_id, node_id, created_by_user_id) VALUES (?, NULL, ?)").run(THREAD_ID, ACTOR.userId);
   const store = new KnowledgeAssetStore(workspacePath);
   if (options.ordinary) {
-    store.saveTree({ schemaVersion: 1, instructions: "", nodes: [{ id: "feature", parentId: null, title: "原有功能", orderKey: "1", summary: "", tags: [], instructions: "", sourceScope: [] }] }, null);
-    store.saveDocument({ nodeId: "feature", content: "# 原有文档", sources: [], expectedHash: null, origin: "manual" });
+    store.saveTree({ schemaVersion: 3, instructions: "", nodes: [...knowledgeCategoryNodes(), {
+      id: "feature", parentId: "knowledge-specifications", title: "原有功能", orderKey: "1", summary: "", tags: [], instructions: "", sourceScope: [], contentMode: "generated",
+    }] }, null);
+    store.saveDocument({ nodeId: "feature", content: "# 原有文档", sources: [], expectedHash: null, origin: "manual", ...(options.adoptedSpecifications === false ? { adopt: false } : {}) });
   }
   const sent: ClientToServerMessage[] = [];
   const engineInputs: SendMessageInput[] = [];
@@ -148,7 +150,7 @@ function setupHarness(options: { ordinary?: boolean; staleDynamicBinding?: boole
         activeTurnId = null;
         throw Object.assign(new Error("动态工具绑定不一致"), { code: "codex_thread_capability_incompatible" });
       }
-      if (!options.ordinary || options.knowledgeEnabled !== false) {
+      if (!options.ordinary || options.adoptedSpecifications !== false) {
         assert.ok(input.executeHostTool, "知识写工具必须走真实 host tool 执行入口");
         toolResult = await input.executeHostTool({
           toolId: (options.ordinary ? "knowledge.change.propose" : "knowledge.plan.submit") as any,
@@ -361,8 +363,8 @@ test("普通旧 Codex 会话缺少知识工具时提示新建会话，保留绑�
   } finally { h.cleanup(); }
 });
 
-test("普通会话关闭知识库时不注入知识提示词或工具，不要求动态注册", async () => {
-  const h = setupHarness({ ordinary: true, knowledgeEnabled: false, toolTransport: "protocol" });
+test("普通会话无已采用规格时不注入知识提示词或工具，不要求动态注册", async () => {
+  const h = setupHarness({ ordinary: true, adoptedSpecifications: false, toolTransport: "protocol" });
   const turnId = "turn-ordinary-knowledge-disabled" as TurnId;
   try {
     await h.request("send-disabled", "threads.sendMessage", {

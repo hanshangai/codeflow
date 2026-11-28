@@ -313,14 +313,17 @@ test("规格确定加载且仅正式版本生效，适用范围独立于证据�
   assert.deepEqual(global.scoped.map(rule => rule.nodeId), ["frontend"]);
   assert.deepEqual(store.rules(["apps/web/src/a.vue"]).rules.map(rule => rule.nodeId), ["global", "frontend"]);
   assert.deepEqual(store.rules(["apps/server/src/a.ts"]).rules.map(rule => rule.nodeId), ["global"]);
-  const prompt = resolveWorkspaceKnowledgeChatContext({ workspacePath: root, engine: "codex", enabled: true });
+  const prompt = resolveWorkspaceKnowledgeChatContext({ workspacePath: root, engine: "codex" });
   assert.match(prompt.systemRule!, /使用已有组件/);
   assert.doesNotMatch(prompt.systemRule!, /未经采用的规则/);
   assert.ok(prompt.knowledgeAssetTools?.tools.some(tool => tool.toolId === "knowledge.rules.read"));
   assert.equal(executeKnowledgeAssetReadTool(store, "knowledge.rules.read", { paths: ["apps/web"] }).ok, true);
   assert.throws(() => executeKnowledgeAssetReadTool(store, "knowledge.rules.read", { paths: "bad" }), /数组/);
   fs.unlinkSync(path.join(root, "docs/style.md"));
-  assert.throws(() => resolveWorkspaceKnowledgeChatContext({ workspacePath: root, engine: "codex", enabled: true }), /ENOENT|不存在/);
+  assert.throws(() => store.rules(), /ENOENT|不存在/);
+  const degraded = resolveWorkspaceKnowledgeChatContext({ workspacePath: root, engine: "codex" });
+  assert.equal(degraded.systemRule, null, "规格原文缺失时自动注入降级，普通会话继续");
+  assert.equal(degraded.knowledgeAssetTools, undefined);
 });
 
 test("规格读取核验正式指针摘要，不能加载外部改写但未经采用的版本", t => {

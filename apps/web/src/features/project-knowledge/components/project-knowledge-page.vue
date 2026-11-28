@@ -2698,7 +2698,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
         <div v-else class="empty page-empty">
           <span class="empty-symbol" aria-hidden="true">✦</span>
           <h2>{{ selectedNode ? '此目录暂无内容' : '建立规格知识库' }}</h2>
-          <p>先明确规格约束，再实现与验证。点击“一键生成规格”整理规格及支撑文档，确认采用后，在研发会话中开启 Spec 使用。</p>
+          <p>先明确规格约束，再实现与验证。点击“一键生成规格”整理规格及支撑文档，确认采用后，研发会话会自动使用已采用的规格。</p>
         </div>
           </section>
         </div>
@@ -2765,7 +2765,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
           </div>
           <div v-else class="conversation-start">
             <div class="conversation-welcome">
-              <div class="conversation-intro"><span aria-hidden="true">✦</span><h3>和 AI 一起明确规格</h3><p>确认约束，整理架构与产品文档。<br>采用后在研发会话中开启 Spec 使用。</p></div>
+              <div class="conversation-intro"><span aria-hidden="true">✦</span><h3>和 AI 一起明确规格</h3><p>确认约束，整理架构与产品文档。<br>采用后研发会话会自动使用。</p></div>
               <div v-if="canWrite" class="conversation-start-form">
                 <p class="scope-description">围绕项目规格与支撑文档交流，目录与多选只限定本次任务。</p>
                 <p v-if="buildPrefs?.model">新建会话模型：{{ buildPrefs.model }}</p>
@@ -2921,7 +2921,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
 .page-error { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 8px 22px; color: var(--app-danger); background: color-mix(in srgb, var(--app-danger) 7%, var(--app-bg)); font-size: 12px; overflow-wrap: anywhere; }
 .page-error-content { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .page-error-diagnostics { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--app-muted); font-size: 11px; }
-.layout { --tree-width: clamp(220px, 17vw, 260px); --assistant-width: clamp(360px, 31vw, 480px); flex: 1; min-height: 0; min-width: 0; display: grid; grid-template-columns: var(--tree-width) minmax(0, 1fr) var(--assistant-width); overflow: hidden; }
+.layout { --tree-width: clamp(220px, 17vw, 260px); --assistant-width: clamp(288px, 24.8vw, 384px); flex: 1; min-height: 0; min-width: 0; display: grid; grid-template-columns: var(--tree-width) minmax(0, 1fr) var(--assistant-width); overflow: hidden; }
 .layout.assistant-collapsed { --assistant-width: 40px; }
 .layout--resizing { cursor: col-resize; user-select: none; }
 .assistant-container { position: relative; display: flex; min-width: 0; min-height: 0; }
@@ -3112,7 +3112,7 @@ onBeforeUnmount(() => { scopeEpoch += 1; nodeEpoch += 1; readController?.abort()
   .import-footer { flex-wrap: wrap; gap: 8px; }.import-footer > div { margin-left: auto; }
 }
 @media (max-width: 1200px) {
-  .layout { --tree-width: 200px; --assistant-width: 370px; }
+  .layout { --tree-width: 200px; --assistant-width: 296px; }
   .layout.assistant-collapsed { --assistant-width: 40px; }
   .main-nav, .main-head, .content { padding-inline: 16px; }
 }

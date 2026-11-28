@@ -8,8 +8,8 @@ import type {
 } from "@codeflowai/shared";
 
 import type { RequiredWorkspaceSkill } from "../engines/threadSession.js";
+import { logger } from "../logger.js";
 import { KnowledgeAssetStore } from "../knowledge/knowledgeAssetStore.js";
-import { KnowledgeAssetError } from "../knowledge/knowledgeAssetFiles.js";
 import { KNOWLEDGE_ASSET_READING_RULE, buildKnowledgeAssetReadTools, renderKnowledgeSpecificationRules } from "../knowledge/knowledgeAssetTools.js";
 import { buildKnowledgeChangeTool, KNOWLEDGE_CHANGE_RULE } from "../knowledge/knowledgeChangeTools.js";
 import { buildKnowledgeAcceptanceTool } from "../knowledge/knowledgeSpecificationTurn.js";
@@ -43,17 +43,25 @@ export type WorkspaceKnowledgeChatPrompt = {
 
 export type WorkspaceKnowledgeChatContext = WorkspaceKnowledgeReadiness & WorkspaceKnowledgeChatPrompt;
 
-/** 读取当前项目资产知识状态，并把新知识工具挂到普通会话。 */
+/** 自动注入降级日志需要的主键与业务上下文，便于按会话检索。 */
+export type WorkspaceKnowledgeLogContext = {
+  requestId?: string | null;
+  turnId?: string | null;
+  workspaceId?: string | null;
+  threadId?: string | null;
+};
+
+/** 读取当前项目资产知识状态，存在任一已采用知识文档时自动挂载知识与规格工具。 */
 export function resolveWorkspaceKnowledgeChatContext(input: {
   workspacePath: string;
   engine: EngineType;
-  enabled?: boolean;
   paths?: string[];
+  logContext?: WorkspaceKnowledgeLogContext;
 }): WorkspaceKnowledgeChatContext {
   const readiness = resolveWorkspaceKnowledgeReadiness(input);
   return {
     ...readiness,
-    ...renderWorkspaceKnowledgeChatPrompt(readiness, input.enabled === true, input.paths),
+    ...renderWorkspaceKnowledgeChatPrompt(readiness, input.paths, input.logContext),
   };
 }
 
@@ -102,22 +110,63 @@ export function resolveWorkspaceKnowledgeReadiness(input: {
   }
 }
 
-/** 启用知识时读取失败必须中止；规格确定加载，其他知识按需导航。 */
-export function renderWorkspaceKnowledgeChatPrompt(readiness: WorkspaceKnowledgeReadiness, enabled = false, paths: string[] = []): WorkspaceKnowledgeChatPrompt {
-  if (enabled && readiness.status === "unavailable") {
-    throw new KnowledgeAssetError(readiness.reasonCode ?? "KNOWLEDGE_READINESS_UNAVAILABLE", readiness.issues.map(issue => issue.message).join("；") || "项目知识库不可用", 503);
+/**
+ * 规格确定加载，其他知识按需导航；存在任一已采用知识文档即自动启用。
+ * 降级：规格库不可用、规格文件损坏或总量超限时跳过注入并记录日志，保证普通会话可继续；
+ * 影响仅限本回合系统提示与知识工具，不修改规格资产或已提交代码；修复规格库后新回合自动恢复。
+ * 日志标识 [workspace-knowledge.auto-inject.skipped] 携带 requestId/workspaceId/threadId/原因。
+ */
+export function renderWorkspaceKnowledgeChatPrompt(
+  readiness: WorkspaceKnowledgeReadiness,
+  paths: string[] = [],
+  logContext: WorkspaceKnowledgeLogContext = {},
+): WorkspaceKnowledgeChatPrompt {
+  if (readiness.status !== "ready") {
+    if (readiness.status === "unavailable") {
+      logKnowledgeInjectionSkip(readiness, logContext, readiness.reasonCode ?? "KNOWLEDGE_READINESS_UNAVAILABLE", readiness.issues.map(issue => issue.message).join("；"));
+    }
+    return { systemRule: null, requiredWorkspaceSkills: [] };
   }
-  if (!enabled || readiness.status !== "ready") return { systemRule: null, requiredWorkspaceSkills: [] };
   const store = new KnowledgeAssetStore(readiness.workspacePath);
-  const specifications = store.rules(paths);
-  return {
-    specifications,
-    systemRule: [`项目知识实际目录：${readiness.knowledgeEntryPath}。`,
-      renderKnowledgeSpecificationRules(store, specifications),
-      KNOWLEDGE_ASSET_READING_RULE, KNOWLEDGE_CHANGE_RULE].filter(Boolean).join("\n"),
-    requiredWorkspaceSkills: [],
-    knowledgeAssetTools: { tools: [...buildKnowledgeAssetReadTools(true).tools, buildKnowledgeChangeTool(), buildKnowledgeAcceptanceTool()] },
-  };
+  try {
+    if (!store.hasAdoptedKnowledge()) return { systemRule: null, requiredWorkspaceSkills: [] };
+    const specifications = store.rules(paths);
+    return {
+      specifications,
+      systemRule: [`项目知识实际目录：${readiness.knowledgeEntryPath}。`,
+        renderKnowledgeSpecificationRules(store, specifications),
+        KNOWLEDGE_ASSET_READING_RULE, KNOWLEDGE_CHANGE_RULE].filter(Boolean).join("\n"),
+      requiredWorkspaceSkills: [],
+      knowledgeAssetTools: { tools: [...buildKnowledgeAssetReadTools(true).tools, buildKnowledgeChangeTool(), buildKnowledgeAcceptanceTool()] },
+    };
+  } catch (error) {
+    logKnowledgeInjectionSkip(readiness, logContext, knowledgeErrorCode(error), errorMessage(error));
+    return { systemRule: null, requiredWorkspaceSkills: [] };
+  }
+}
+
+/** 保留知识资产错误码，便于日志直接检索修复方向。 */
+function knowledgeErrorCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code.trim() ? code.trim() : "KNOWLEDGE_INJECTION_FAILED";
+}
+
+/** 记录自动注入降级事实；日志标识稳定可检索，根因中的工作区绝对路径先脱敏。 */
+function logKnowledgeInjectionSkip(
+  readiness: WorkspaceKnowledgeReadiness,
+  logContext: WorkspaceKnowledgeLogContext,
+  reasonCode: string,
+  reason: string,
+): void {
+  logger.warn("workspace-knowledge", "[workspace-knowledge.auto-inject.skipped]", {
+    code: reasonCode,
+    requestId: logContext.requestId ?? null,
+    turnId: logContext.turnId ?? null,
+    workspaceId: logContext.workspaceId ?? null,
+    threadId: logContext.threadId ?? null,
+    status: readiness.status,
+    reason: reason.split(readiness.workspacePath).join("<workspace>"),
+  });
 }
 
 function errorMessage(error: unknown): string {

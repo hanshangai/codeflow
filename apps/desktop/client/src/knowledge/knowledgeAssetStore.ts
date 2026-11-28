@@ -478,6 +478,18 @@ export class KnowledgeAssetStore {
   category(id: string, tree = this.readTree().tree): KnowledgeAssetNode["category"] {
     return this.ancestry(id, tree)[0]?.category;
   }
+  /** 是否存在任一已采用知识文档（正式版本指针或原文引用节点），供普通会话自动启用判定；只查文件存在，不解析版本。 */
+  hasAdoptedKnowledge(): boolean {
+    const tree = this.readTree(false).tree;
+    const nodes = this.scope(null, tree);
+    if (nodes.some(node => node.contentMode === "reference")) return true;
+    const assetsRoot = `${this.root}/assets`;
+    if (!this.files.exists(assetsRoot)) return false;
+    // 先列出资产目录，只为确有资产目录的节点检查当前指针，避免按全树逐节点探测。
+    const assetIds = new Set(this.files.directories(assetsRoot));
+    return nodes.some(node => node.contentMode !== "directory" && assetIds.has(knowledgeId(node.id))
+      && this.files.exists(`${assetsRoot}/${knowledgeId(node.id)}/current.json`));
+  }
   /** 仅读取正式树中已采用规格，排除默认投影和未发布的准备指针；局部规则按路径匹配。 */
   rules(paths: string[] = []): import("@codeflowai/shared").KnowledgeSpecificationRules {
     const requested = paths.map(knowledgeRelativePath);

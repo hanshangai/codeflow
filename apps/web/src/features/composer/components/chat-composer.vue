@@ -58,7 +58,6 @@ import {
 
 import { createApiResultError, isApiResultError, isCancelledRequestError, type ApiRequestContext } from "../../../api/request";
 import { extractDocumentAttachment, fetchFsSearch, fetchFsStat } from "../../../api/fs";
-import { requestKnowledgeAsset } from "../../../api/projectKnowledge";
 import { getChatWorkflow, setChatWorkflowEnabled } from "../../../api/chatWorkflow";
 import { listThreadInputActions } from "../../../api/threads";
 import { copyToClipboard } from "../../../composables/useClipboard";
@@ -145,7 +144,6 @@ type Props = {
   allowDraftWhenDisabled?: boolean;
   /** 主动推荐开关的可见性，由会话面板按工作流面板同源条件下发；H5 不渲染该开关。 */
   workflowToggleVisible?: boolean;
-  knowledgeToggleVisible?: boolean;
   /** H5 使用紧凑输入栏，运行参数统一由会话设置页维护。 */
   surface?: "default" | "h5";
 };
@@ -156,7 +154,6 @@ const props = withDefaults(defineProps<Props>(), {
   preserveDraftOnDisable: false,
   allowDraftWhenDisabled: false,
   workflowToggleVisible: false,
-  knowledgeToggleVisible: false,
 });
 
 const DRAFT_SAVE_DEBOUNCE_MS = 1500;
@@ -1608,7 +1605,6 @@ type ThreadPrefsPatch = {
   contextWindow?: number | null;
   serviceTier?: CodexServiceTier | null;
   roleId?: RoleId | null;
-  knowledgeEnabled?: boolean | null;
 };
 
 /** 合并本地 thread prefs，并按配置选择立即或延迟持久化。 */
@@ -1758,38 +1754,6 @@ onUnmounted(() => { roleOptionsRefreshVersion += 1; });
 const recommendationEnabled = ref(false);
 const workflowToggleBusy = ref(false);
 let workflowPrefVersion = 0;
-
-const knowledgeEnabled = computed(() => !isKnowledgeSession.value && threadPrefs.value.knowledgeEnabled === true);
-const knowledgeToggleBusy = ref(false);
-
-/** 开启 Spec 前确认当前项目已初始化规格库，避免注入空资产范围。 */
-async function toggleKnowledgeEnabled(): Promise<void> {
-  if (composerWriteBlocked.value || isKnowledgeSession.value || knowledgeToggleBusy.value) return;
-  const next = !knowledgeEnabled.value;
-  if (!next) {
-    patchThreadPrefs({ knowledgeEnabled: false }, { immediateSave: true });
-    return;
-  }
-  const workspaceId = props.workspaceId;
-  const threadId = props.threadId;
-  knowledgeToggleBusy.value = true;
-  try {
-    const result = await requestKnowledgeAsset(ctx.value, "snapshot", { workspaceId });
-    if (!result.ok) throw createApiResultError(result);
-    if (workspaceId !== props.workspaceId || threadId !== props.threadId) return;
-    if (!result.data.initialized) {
-      message.info("当前项目尚未初始化规格库，请先进入“规格库”点击“一键生成规格”");
-      return;
-    }
-    patchThreadPrefs({ knowledgeEnabled: true }, { immediateSave: true });
-  } catch (error) {
-    if (workspaceId !== props.workspaceId || threadId !== props.threadId) return;
-    console.error("[chat-knowledge.toggle.failed]", { ...describeWorkflowFailure(error), workspaceId, threadId, error });
-    message.error(error instanceof Error ? `规格库状态校验失败：${error.message}` : "规格库状态校验失败");
-  } finally {
-    knowledgeToggleBusy.value = false;
-  }
-}
 
 /** 归一化 API 失败为可检索的错误码与 requestId。 */
 function describeWorkflowFailure(source: unknown): { code: string; requestId: string | null } {
@@ -1971,12 +1935,18 @@ const settingsHelp = {
   model: '模型 (Model)\nClaude → --model <id>\nCodex → turn/start.model\n留空使用引擎默认模型',
   effort: '思考强度 (Reasoning Effort)\n可选项由当前模型配置动态决定\nClaude → --effort\nCodex → effort\n更高 = 更深入推理，消耗更多 token',
   fastMode: 'Fast 模式\nCodex 请求响应会更快，但费用消耗可能增加30%~50%',
-  knowledge: 'Spec 模式 \n开启后，会话会按已采用的规格和知识约束代码实现与验证。',
   recommendation: '工作流模式\n开启后，会话中会根据需要，主动推荐您合适的工作流，您可以在会话中选择工作流来实现需求开发与验证。',
   planMode: '计划模式\nAI 仅做分析和规划，不执行任何修改',
   autoCompactPct: `压缩阈值 (Auto-Compact %)\n上下文使用达到此百分比时自动触发压缩\n默认值：${PRODUCT_DEFAULT_AUTO_COMPACT_PCT}%\nClaude → --settings env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE\nCodex → 运行时换算为 model_auto_compact_token_limit`,
 };
 
+/** 只展示模型目录明确声明的基础窗口。 */
+const baseContextWindowHint = computed(() => {
+  const baseWindow = resolvedModelInfo.value?.contextWindow;
+  return baseWindow != null && Number.isSafeInteger(baseWindow) && baseWindow > 0
+    ? `基础窗口：${baseWindow.toLocaleString("zh-CN")} tokens。`
+    : "";
+});
 const contextBillingHint = computed(() => getModelContextBillingHint(resolvedModelInfo.value));
 const contextWindowHelp = computed(() =>
   "自动使用当前模型支持的最大上下文窗口：" + formatTokens(effectiveContextWindow.value) + "。"
@@ -3993,23 +3963,6 @@ defineExpose({ prefill, appendText, attachTextFile, sendExternalText, canAcceptE
                 Fast
               </a-button>
             </a-tooltip>
-            <span v-if="knowledgeToggleVisible" class="composer__toolbar-sep" />
-
-            <a-tooltip v-if="knowledgeToggleVisible" :title="settingsHelp.knowledge" placement="top" color="var(--app-panel-bg)"
-              :overlay-style="{ whiteSpace: 'pre-line', maxWidth: '300px' }"
-              overlay-class-name="composer__tooltip">
-              <a-button
-                size="small"
-                type="text"
-                :disabled="composerWriteBlocked || knowledgeToggleBusy"
-                :loading="knowledgeToggleBusy"
-                :class="knowledgeEnabled ? 'composer__toggle--on' : ''"
-                :aria-pressed="knowledgeEnabled"
-                @click="toggleKnowledgeEnabled"
-              >
-                Spec
-              </a-button>
-            </a-tooltip>
             <span v-if="workflowToggleVisible" class="composer__toolbar-sep" />
 
             <a-tooltip v-if="workflowToggleVisible" :title="settingsHelp.recommendation" placement="top" color="var(--app-panel-bg)"
@@ -4137,6 +4090,7 @@ defineExpose({ prefill, appendText, attachTextFile, sendExternalText, canAcceptE
                       </div>
                       <span class="composer__ctx-value">{{ formatTokens(effectiveContextWindow) }}</span>
                     </div>
+                    <div v-if="baseContextWindowHint" class="composer__ctx-bound">{{ baseContextWindowHint }}</div>
                     <div v-if="contextBillingHint" class="composer__ctx-bound">{{ contextBillingHint }}</div>
                   </div>
                 </div>

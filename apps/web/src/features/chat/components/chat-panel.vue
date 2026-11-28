@@ -178,9 +178,8 @@ const chatWorkflowVisible = computed(() => {
   const current = thread.value;
   return Boolean(current && current.threadType === "chat" && !current.threadSubtype && !props.assistantMode);
 });
-/** WorkFlow 与知识库开关只在桌面普通会话工具栏提供入口，H5 不渲染。 */
+/** WorkFlow 开关只在桌面普通会话工具栏提供入口，H5 不渲染。 */
 const chatWorkflowToggleVisible = computed(() => chatWorkflowVisible.value && props.surface !== "h5");
-const chatKnowledgeToggleVisible = computed(() => chatWorkflowVisible.value && props.surface !== "h5");
 const primaryRouteResolution = computed(() => (isRouteDrivenPrimarySurface.value ? chat.primaryRouteResolution : null));
 const routeThreadSwitchPending = computed(() => {
   const requestedThreadId = routeRequestedThreadId.value;
@@ -1830,7 +1829,6 @@ defineExpose({ locateMessage, prepareThreadSwitch });
               :running-turn-id="effectiveRunningState?.runningTurnId ?? null"
               :activation-managed="!props.threadId"
               :workflow-toggle-visible="chatWorkflowToggleVisible"
-              :knowledge-toggle-visible="chatKnowledgeToggleVisible"
               :surface="props.surface"
               :allow-queue="primaryKnowledgeThread ? false : props.allowQueue"
               :preserve-draft-on-disable="(props.preserveDraftOnDisable || primaryKnowledgeThread) && !threadReadOnly && !conversation?.invalidated"
